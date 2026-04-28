@@ -1,0 +1,30 @@
+# Editor / agent state
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local config / secrets
+.env
+.env.local
+*.local
