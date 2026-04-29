@@ -1,5 +1,7 @@
 # draupnir
 
+[![CI](https://github.com/momoshell/draupnir/actions/workflows/ci.yml/badge.svg)](https://github.com/momoshell/draupnir/actions/workflows/ci.yml)
+
 Draupnir is a backend-first CAD/BIM ingestion and estimation system. The MVP
 focuses on accepting common real-world drawing inputs, extracting structured
 geometry and semantic data, producing deterministic quantities and estimates,

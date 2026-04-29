@@ -23,6 +23,9 @@
 requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
 [project]
 name = "draupnir"
 version = "0.1.0"

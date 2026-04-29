@@ -1,0 +1,88 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,test]"
+
+      - name: Run ruff
+        run: ruff check app tests
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,test]"
+
+      - name: Run mypy
+        run: mypy app tests
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # NOTE: TRD mentions PostgreSQL 18 (planned); latest stable is 17.
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: draupnir_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev,test]"
+
+      - name: Run pytest
+        run: pytest
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/draupnir_test
