@@ -19,6 +19,7 @@ repos:
       - id: check-toml
 
   # --- Ruff: lint + format --------------------------------------------------
+  # NOTE: keep this rev in sync with the ruff version pinned in pyproject.toml
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.6
     hooks:
