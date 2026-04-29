@@ -1,0 +1,150 @@
+# =============================================================================
+# Draupnir — CAD/BIM Ingestion, Estimation & Revision System
+# =============================================================================
+# pyproject.toml — PEP 621 project metadata with optional dependency groups.
+#
+# Dependency isolation strategy (per ADR-0006, ADR-0007, ADR-0008):
+#   Core backend (FastAPI, Pydantic, logging) does NOT depend on ingestion
+#   libraries directly.  All CAD/PDF/geometry adapters are isolated behind
+#   the ingestion adapter contract and installed via the [ingestion] extra.
+#   This allows swapping tools (e.g. LibreDWG → ODA, PyMuPDF → pdfplumber)
+#   without touching the core application code.
+#
+# System-level dependencies (NOT on PyPI):
+#   - LibreDWG (GPL-3.0+): required for DWG ingestion (ADR-0006).
+#     Install via system package manager (brew/apt) or conda.
+#   - IfcOpenShell: required for IFC ingestion.
+#     Install via conda-forge or platform-specific wheels.
+#   - Tesseract OCR: required by pytesseract (ADR-0008).
+#     Install via system package manager (brew/apt).
+# =============================================================================
+
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "draupnir"
+version = "0.1.0"
+description = "CAD/BIM ingestion, estimation, and revision system"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Draupnir Contributors" },
+]
+
+# ---------------------------------------------------------------------------
+# Core runtime — installed with: pip install -e .
+# ---------------------------------------------------------------------------
+dependencies = [
+    # Web framework & ASGI server
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.25",
+
+    # Data validation & configuration
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+
+    # File upload handling
+    "python-multipart>=0.0.9",
+
+    # Future API key / auth scaffolding
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+
+    # HTTP client for adapter/service calls
+    "httpx>=0.27",
+
+    # Structured JSON logging (TRD observability requirement)
+    "structlog>=24.1",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# Database layer — SQLAlchemy 2.x, Alembic migrations, Postgres drivers
+db = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "asyncpg>=0.29",          # async Postgres driver (for later async migration)
+    "psycopg2-binary>=2.9",   # sync Postgres driver (MVP)
+]
+
+# Background job processing — Celery + Redis result backend
+jobs = [
+    "celery>=5.3",
+    "redis>=5.0",
+]
+
+# Ingestion adapters — isolated behind the adapter contract (ADR-0006/0007/0008).
+# NOTE: LibreDWG and IfcOpenShell are NOT pip-installable; see top comments.
+ingestion = [
+    # DXF handling
+    "ezdxf>=1.2",
+
+    # Vector PDF adapter (ADR-0007) — PyMuPDF/MuPDF is AGPL or commercial;
+    # pdfplumber (MIT) is the designated fallback if licensing becomes an issue.
+    "pymupdf>=1.23",
+
+    # Raster-to-vector tracing (ADR-0008)
+    "vtracer>=0.6",
+
+    # OCR wrapper (ADR-0008) — requires Tesseract installed at system level
+    "pytesseract>=0.3",
+
+    # Image processing for raster/OCR pipelines
+    "pillow>=10.0",
+
+    # Preprocessing & centerline extraction (ADR-0008)
+    "opencv-python>=4.9",
+
+    # Skeletonization & centerline extraction (ADR-0008)
+    "scikit-image>=0.22",
+
+    # Geometry post-processing
+    "shapely>=2.0",
+]
+
+# Development tooling — linting, type checking, git hooks (issue #18)
+dev = [
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "pre-commit>=3.6",
+]
+
+# Test suite
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.1",
+    "factory-boy>=3.3",
+]
+
+# Convenience: install everything
+all = [
+    "draupnir[db,jobs,ingestion,dev,test]",
+]
+
+# ---------------------------------------------------------------------------
+# Tool configuration
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
