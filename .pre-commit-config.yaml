@@ -1,0 +1,37 @@
+# =============================================================================
+# Draupnir — Pre-commit Hooks
+# =============================================================================
+# Install:  pip install -e ".[dev]" && pre-commit install
+# Run all:  pre-commit run --all-files
+# =============================================================================
+
+repos:
+  # --- Basic hygiene --------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ["--maxkb=10240"]  # 10 MB
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-toml
+
+  # --- Ruff: lint + format --------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.6
+    hooks:
+      - id: ruff
+        args: ["--fix", "--show-fixes"]
+      - id: ruff-format
+
+  # --- mypy: static type checking -------------------------------------------
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system
+        types: [python]
+        pass_filenames: true
