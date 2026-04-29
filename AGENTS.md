@@ -93,6 +93,8 @@ section with exact commands for:
 - Do not introduce GPL/AGPL/commercially risky dependencies without documenting
   the decision in `docs/decisions/`.
 - Use adapters for DWG/PDF conversion so tooling can be swapped later.
+- All committed test fixtures must be listed in `tests/fixtures/manifest.yaml` with source, license, and expected extraction metadata.
+- Do not use opencode's `read` tool on binary CAD/drawing files (`.dxf`, `.dwg`, `.step`, `.stp`, `.iges`, `.igs`). Use `bash cat`/`head` or a dedicated parser — opencode auto-attaches these as `image/*` and the Anthropic API rejects the message, poisoning the session.
 
 ## Handoff Protocol
 

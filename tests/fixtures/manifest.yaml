@@ -1,0 +1,17 @@
+# Fixture Manifest
+# All test fixtures must be registered here with complete metadata.
+# See README.md for fixture policy.
+
+fixtures:
+  - filename: dxf/simple-line.dxf
+    format: DXF
+    source: generated
+    license: CC0-1.0
+    allowed_in_git: true
+    units: meters
+    expected_extraction_notes: |
+      Single LINE entity from (0,0,0) to (10,0,0) on layer 0.
+      Header sets $INSUNITS to 6 (meters).
+    expected_quantities:
+      line_count: 1
+      total_length: 10.0
