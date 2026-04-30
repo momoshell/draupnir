@@ -80,6 +80,7 @@ db = [
 jobs = [
     "celery>=5.3",
     "redis>=5.0",
+    "flower>=2.0",
 ]
 
 # Ingestion adapters — isolated behind the adapter contract (ADR-0006/0007/0008).

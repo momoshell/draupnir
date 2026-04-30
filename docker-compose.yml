@@ -1,0 +1,152 @@
+# =============================================================================
+# Draupnir — Docker Compose Development Stack
+# =============================================================================
+# Usage:
+#   docker compose up -d     — Start all services in background
+#   docker compose down      — Stop all services
+#   docker compose down -v   — Stop and remove volumes
+#   docker compose logs -f   — Follow logs
+#   docker compose ps        — Show service status
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # FastAPI Application
+  # -------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/draupnir
+      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+      - SERVICE_NAME=${SERVICE_NAME:-draupnir}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - draupnir-network
+
+  # -------------------------------------------------------------------------
+  # Celery Worker
+  # -------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/draupnir
+      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+      - SERVICE_NAME=${SERVICE_NAME:-draupnir}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'from app.jobs.worker import celery_app; print(celery_app.control.ping(timeout=1))' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    command: celery -A app.jobs.worker worker --loglevel=info
+    networks:
+      - draupnir-network
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL Database
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-draupnir}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - draupnir-network
+
+  # -------------------------------------------------------------------------
+  # RabbitMQ Message Broker
+  # -------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - draupnir-network
+
+  # -------------------------------------------------------------------------
+  # Flower — Celery Dashboard (optional)
+  # -------------------------------------------------------------------------
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5555:5555"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+    restart: unless-stopped
+    command: celery -A app.jobs.worker flower --port=5555 --broker=${BROKER_URL:-amqp://guest:guest@rabbitmq:5672//}
+    networks:
+      - draupnir-network
+
+# -------------------------------------------------------------------------
+# Volumes
+# -------------------------------------------------------------------------
+volumes:
+  postgres_data:
+    driver: local
+
+# -------------------------------------------------------------------------
+# Networks
+# -------------------------------------------------------------------------
+networks:
+  draupnir-network:
+    driver: bridge

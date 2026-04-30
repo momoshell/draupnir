@@ -9,7 +9,96 @@ and exposing everything through a UI-agnostic API.
 
 ## Current Status
 
-Planning and scaffolding phase. No application code has been generated yet.
+Docker Compose development stack is available. See "Local Development" below for setup instructions.
+
+## Local Development
+
+### Prerequisites
+
+- Docker and Docker Compose (v2)
+- Python 3.12 (for local development without Docker)
+
+### Quick Start with Docker
+
+1. **Copy environment file**:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Start all services**:
+   ```bash
+   make up
+   # or: docker compose up -d
+   ```
+
+3. **Verify services are running**:
+   ```bash
+   make ps
+   # or: docker compose ps
+   ```
+
+4. **Check API health**:
+   ```bash
+   curl http://localhost:8000/v1/health
+   ```
+
+5. **View RabbitMQ management UI**:
+   - Open http://localhost:15672 in your browser
+   - Login: guest / guest
+
+6. **View logs**:
+   ```bash
+   make logs
+   # or: docker compose logs -f
+   ```
+
+7. **Stop all services**:
+   ```bash
+   make down
+   # or: docker compose down
+   ```
+
+### Docker Compose Services
+
+| Service   | Port(s)              | Description                    |
+|-----------|----------------------|--------------------------------|
+| api       | 8000                 | FastAPI application            |
+| worker    | —                    | Celery background worker       |
+| postgres  | 5432                 | PostgreSQL database            |
+| rabbitmq  | 5672, 15672          | RabbitMQ message broker        |
+| flower    | 5555                 | Celery dashboard (optional)    |
+
+### Useful Commands
+
+```bash
+make shell-api      # Open shell in API container
+make shell-worker   # Open shell in worker container
+make migrate        # Run database migrations
+make down -v        # Stop and remove volumes (destructive)
+```
+
+### Local Development (without Docker)
+
+1. **Install dependencies**:
+   ```bash
+   pip install -e ".[db,jobs,dev,test]"
+   ```
+
+2. **Set up environment**:
+   ```bash
+   cp .env.example .env
+   # Adjust DATABASE_URL and BROKER_URL for local services
+   ```
+
+3. **Run the API**:
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+
+4. **Run the worker**:
+   ```bash
+   celery -A app.jobs.worker worker --loglevel=info
+   ```
 
 ## MVP Direction
 
