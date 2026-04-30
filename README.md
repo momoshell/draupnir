@@ -154,6 +154,18 @@ docker compose exec api alembic upgrade head
 - Each migration should be idempotent and reversible
 - Schema changes require a migration - no exceptions
 
+## Live API
+
+The API surface is auto-documented from the running FastAPI application:
+
+- **OpenAPI JSON schema**: `GET /v1/openapi.json`
+- **Swagger UI**: `GET /v1/docs`
+- **ReDoc**: `GET /v1/redoc`
+
+The static `docs/API.md` API plan was retired once Phase 1 shipped. The live
+OpenAPI schema is the canonical source of truth for endpoints and request/response
+shapes.
+
 ## MVP Direction
 
 - Backend API that any web UI, TUI, CLI, or service can consume.
@@ -197,8 +209,7 @@ The repo holds normative docs that travel with code through PR review:
 - [Architecture decisions](docs/decisions/)
 - [Agent instructions](AGENTS.md)
 
-Two transitional docs will be retired in favor of live equivalents:
+One transitional doc will be retired in favor of a live equivalent:
 
-- [API plan](docs/API.md) - replaced by `/v1/openapi.json` once Phase 1 ships.
 - [Data model](docs/DATA_MODEL.md) - replaced by Alembic migrations once Phase
   2 ships.
