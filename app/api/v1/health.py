@@ -6,6 +6,9 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -22,4 +25,5 @@ health_router = APIRouter()
 async def get_health() -> HealthResponse:
     """Return service health status and optionally version."""
     version = settings.app_version if settings.expose_version_in_health else None
+    logger.info("health_check_requested")
     return HealthResponse(status="ok", version=version)
