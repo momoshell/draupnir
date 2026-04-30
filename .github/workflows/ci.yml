@@ -25,7 +25,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
-        run: pip install -e ".[dev,test]"
+        run: pip install -e ".[dev,test,jobs]"
 
       - name: Run ruff
         run: ruff check app tests
@@ -45,7 +45,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
-        run: pip install -e ".[dev,test]"
+        run: pip install -e ".[dev,test,jobs]"
 
       - name: Run mypy
         run: mypy app tests
@@ -80,7 +80,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install dependencies
-        run: pip install -e ".[dev,test]"
+        run: pip install -e ".[dev,test,jobs]"
 
       - name: Run pytest
         run: pytest

@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     service_name: str = "draupnir"
 
+    # Database configuration
+    database_url: str | None = None
+
+    # Message broker configuration
+    broker_url: str = "amqp://guest:guest@localhost:5672//"
+
+    # Application settings
+    max_upload_mb: int = 50
+
     @field_validator("api_prefix")
     @classmethod
     def validate_api_prefix(cls, value: str) -> str:
@@ -26,6 +35,13 @@ class Settings(BaseSettings):
             raise ValueError("api_prefix must start with '/'")
         if value != "/" and value.endswith("/"):
             raise ValueError("api_prefix must not end with '/'")
+        return value
+
+    @field_validator("max_upload_mb")
+    @classmethod
+    def validate_max_upload_mb(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("max_upload_mb must be positive")
         return value
 
     model_config = SettingsConfigDict(

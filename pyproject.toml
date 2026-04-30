@@ -79,7 +79,9 @@ db = [
 # Background job processing — Celery + Redis result backend
 jobs = [
     "celery>=5.3",
+    "celery-stubs>=0.1",  # Type stubs for celery
     "redis>=5.0",
+    "flower>=2.0",
 ]
 
 # Ingestion adapters — isolated behind the adapter contract (ADR-0006/0007/0008).
