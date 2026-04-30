@@ -1,6 +1,7 @@
 """Tests for RequestIdMiddleware."""
 
 import uuid
+from typing import Any
 
 from fastapi import FastAPI
 from starlette.testclient import TestClient
@@ -17,7 +18,7 @@ def create_test_app() -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     @app.get("/test")
-    def test_endpoint() -> dict:
+    def test_endpoint() -> dict[str, Any]:
         return {"ok": True}
 
     return app
