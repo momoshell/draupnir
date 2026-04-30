@@ -85,4 +85,4 @@ jobs:
       - name: Run pytest
         run: pytest
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/draupnir_test
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
