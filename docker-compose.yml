@@ -31,6 +31,8 @@ services:
       - draupnir-network
     volumes:
       - ./app:/app/app
+      - ./alembic.ini:/app/alembic.ini
+      - ./alembic:/app/alembic
 
   worker:
     build: .
