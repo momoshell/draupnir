@@ -1,50 +1,34 @@
-# =============================================================================
-# Draupnir — Dockerfile
-# =============================================================================
-# Multi-stage build for lean production image with development mode support.
-# =============================================================================
-
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-# ---------------------------------------------------------------------------
-# System dependencies
-# ---------------------------------------------------------------------------
-# Install curl for healthchecks and build tools for psycopg2
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------------------------------------------------------------------------
-# Working directory
-# ---------------------------------------------------------------------------
+# Set working directory
 WORKDIR /app
 
-# ---------------------------------------------------------------------------
-# Install Python dependencies
-# ---------------------------------------------------------------------------
-# Copy dependency files first for better layer caching
-COPY pyproject.toml uv.lock* README.md ./
+# Copy dependency manifest first (cache-friendly layer)
+COPY pyproject.toml ./
 
-# Install the package with db and jobs extras
-# Using pip with --no-cache-dir to keep image lean
-RUN pip install --no-cache-dir -e ".[db,jobs]"
+# Install build dependencies before project source is available
+RUN pip install --no-cache-dir build
 
-# ---------------------------------------------------------------------------
-# Copy application code
-# ---------------------------------------------------------------------------
+# Copy application source
 COPY app/ ./app/
 
-# ---------------------------------------------------------------------------
-# Create non-root user for security
-# ---------------------------------------------------------------------------
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /app
+# Install package in editable mode (needs app/ on disk for discovery)
+RUN pip install --no-cache-dir -e ".[db,jobs]"
 
+# Create non-root user
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# ---------------------------------------------------------------------------
-# Default command (overridden in docker-compose.yml)
-# ---------------------------------------------------------------------------
+# Expose port
+EXPOSE 8000
+
+# Default command
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

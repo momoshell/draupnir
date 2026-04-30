@@ -1,95 +1,76 @@
-# =============================================================================
-# Draupnir — Docker Compose Development Stack
-# =============================================================================
-# Usage:
-#   docker compose up -d     — Start all services in background
-#   docker compose down      — Stop all services
-#   docker compose down -v   — Stop and remove volumes
-#   docker compose logs -f   — Follow logs
-#   docker compose ps        — Show service status
-# =============================================================================
+# Local development stack only. Do not use in production.
+#
+# Internal services (postgres, rabbitmq management, flower) bind to 127.0.0.1
+# to avoid exposing data-plane and admin ports on shared hosts.
 
 services:
-  # -------------------------------------------------------------------------
-  # FastAPI Application
-  # -------------------------------------------------------------------------
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "8000:8000"
+      - "${API_HOST_PORT:-8000}:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/draupnir
+      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - LOG_LEVEL=info
+      - MAX_UPLOAD_MB=50
+      - SERVICE_NAME=draupnir-api
     depends_on:
       postgres:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/draupnir
-      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
-      - SERVICE_NAME=${SERVICE_NAME:-draupnir}
-    env_file:
-      - .env
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    restart: unless-stopped
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    networks:
-      - draupnir-network
-
-  # -------------------------------------------------------------------------
-  # Celery Worker
-  # -------------------------------------------------------------------------
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    environment:
-      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@postgres:5432/draupnir
-      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
-      - SERVICE_NAME=${SERVICE_NAME:-draupnir}
-    env_file:
-      - .env
-    healthcheck:
-      test: ["CMD-SHELL", "python -c 'from app.jobs.worker import celery_app; print(celery_app.control.ping(timeout=1))' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - draupnir-network
+    volumes:
+      - ./app:/app/app
+
+  worker:
+    build: .
+    command: celery -A app.jobs.worker worker --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/draupnir
+      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - LOG_LEVEL=info
+      - MAX_UPLOAD_MB=50
+      - SERVICE_NAME=draupnir-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD-SHELL",
+         "celery -A app.jobs.worker inspect ping --timeout 5 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
       start_period: 30s
     restart: unless-stopped
-    command: celery -A app.jobs.worker worker --loglevel=info
     networks:
       - draupnir-network
 
-  # -------------------------------------------------------------------------
-  # PostgreSQL Database
-  # -------------------------------------------------------------------------
   postgres:
     image: postgres:17-alpine
-    ports:
-      - "5432:5432"
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:-postgres}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
-      - POSTGRES_DB=${POSTGRES_DB:-draupnir}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: draupnir
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
@@ -97,56 +78,42 @@ services:
     networks:
       - draupnir-network
 
-  # -------------------------------------------------------------------------
-  # RabbitMQ Message Broker
-  # -------------------------------------------------------------------------
   rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI
+    image: rabbitmq:3.13.7-management
     environment:
-      - RABBITMQ_DEFAULT_USER=guest
-      - RABBITMQ_DEFAULT_PASS=guest
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 30s
+      timeout: 10s
+      retries: 3
       start_period: 10s
     restart: unless-stopped
     networks:
       - draupnir-network
 
-  # -------------------------------------------------------------------------
-  # Flower — Celery Dashboard (optional)
-  # -------------------------------------------------------------------------
   flower:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: mher/flower:2.0.1
+    profiles:
+      - debug
+    environment:
+      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
     ports:
-      - "5555:5555"
+      - "127.0.0.1:${FLOWER_HOST_PORT:-5555}:5555"
     depends_on:
       rabbitmq:
         condition: service_healthy
-    environment:
-      - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
     restart: unless-stopped
-    command: celery -A app.jobs.worker flower --port=5555 --broker=${BROKER_URL:-amqp://guest:guest@rabbitmq:5672//}
     networks:
       - draupnir-network
 
-# -------------------------------------------------------------------------
-# Volumes
-# -------------------------------------------------------------------------
 volumes:
   postgres_data:
-    driver: local
 
-# -------------------------------------------------------------------------
-# Networks
-# -------------------------------------------------------------------------
 networks:
   draupnir-network:
     driver: bridge
