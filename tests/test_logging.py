@@ -12,14 +12,14 @@ from app.core.logging import configure_logging, get_logger
 class TestLoggingConfiguration:
     """Test cases for logging setup."""
 
-    def test_configure_logging_sets_up_structlog(self):
+    def test_configure_logging_sets_up_structlog(self) -> None:
         """Should configure structlog without errors."""
         configure_logging(service_name="test-service", log_level="DEBUG")
         logger = get_logger("test")
         # Should not raise
         logger.info("test_message", extra_field="value")
 
-    def test_logs_are_valid_json_with_required_fields(self):
+    def test_logs_are_valid_json_with_required_fields(self) -> None:
         """Log output should be valid JSON with required TRD fields."""
         configure_logging(service_name="test-service", log_level="INFO")
 
@@ -52,7 +52,7 @@ class TestLoggingConfiguration:
         assert "event" in log_entry, "Missing 'event' field"
         assert "msg" in log_entry, "Missing 'msg' field"
 
-    def test_request_id_in_log_context(self):
+    def test_request_id_in_log_context(self) -> None:
         """Should include request_id from contextvars."""
         configure_logging()
 
@@ -85,7 +85,7 @@ class TestLoggingConfiguration:
         # Cleanup
         structlog.contextvars.clear_contextvars()
 
-    def test_exception_logging_includes_stack_trace(self):
+    def test_exception_logging_includes_stack_trace(self) -> None:
         """Should include stack trace in error logs."""
         configure_logging()
 

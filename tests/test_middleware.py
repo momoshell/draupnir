@@ -17,7 +17,7 @@ def create_test_app() -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     @app.get("/test")
-    def test_endpoint():
+    def test_endpoint() -> dict:
         return {"ok": True}
 
     return app
@@ -29,7 +29,7 @@ client = TestClient(create_test_app())
 class TestRequestIdMiddleware:
     """Test cases for X-Request-Id middleware."""
 
-    def test_generates_request_id_when_absent(self):
+    def test_generates_request_id_when_absent(self) -> None:
         """Should generate a request ID when X-Request-Id header is absent."""
         response = client.get("/test")
 
@@ -45,7 +45,7 @@ class TestRequestIdMiddleware:
                 f"Generated request ID is not a valid UUID: {request_id}"
             ) from None
 
-    def test_preserves_valid_existing_request_id(self):
+    def test_preserves_valid_existing_request_id(self) -> None:
         """Should preserve a valid X-Request-Id header if provided."""
         test_request_id = "valid-id-12345"
         response = client.get("/test", headers={"X-Request-Id": test_request_id})
@@ -53,7 +53,7 @@ class TestRequestIdMiddleware:
         assert response.status_code == 200
         assert response.headers["X-Request-Id"] == test_request_id
 
-    def test_rejects_invalid_request_id_and_generates_new(self):
+    def test_rejects_invalid_request_id_and_generates_new(self) -> None:
         """Should reject invalid request IDs and generate a new UUID."""
         # Test with too long ID
         invalid_long_id = "a" * 100
@@ -69,7 +69,7 @@ class TestRequestIdMiddleware:
                 f"Should have generated valid UUID, got: {request_id}"
             ) from None
 
-    def test_rejects_malformed_request_id(self):
+    def test_rejects_malformed_request_id(self) -> None:
         """Should reject request IDs with invalid characters."""
         invalid_id = "../../../etc/passwd"
         response = client.get("/test", headers={"X-Request-Id": invalid_id})
@@ -84,7 +84,7 @@ class TestRequestIdMiddleware:
                 f"Should have generated valid UUID, got: {request_id}"
             ) from None
 
-    def test_different_requests_get_different_ids(self):
+    def test_different_requests_get_different_ids(self) -> None:
         """Each request should get a unique request ID."""
         response1 = client.get("/test")
         response2 = client.get("/test")
