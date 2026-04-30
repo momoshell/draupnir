@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     api_prefix: str = "/v1"
     expose_version_in_health: bool = False
 
+    # Logging configuration
+    log_level: str = "INFO"
+    service_name: str = "draupnir"
+
     @field_validator("api_prefix")
     @classmethod
     def validate_api_prefix(cls, value: str) -> str:
