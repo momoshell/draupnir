@@ -184,7 +184,7 @@ warn_return_any = true
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
-check_untyped_calls = true
+# check_untyped_calls = true  # Removed: not a valid mypy option
 disallow_untyped_defs = true
 strict_optional = true
 
