@@ -1,9 +1,11 @@
 """FastAPI application factory."""
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 
-from app.api.v1 import health_router
+from app.api.v1 import health_router, project_router
 from app.core.config import settings
+from app.core.exceptions import custom_http_exception_handler, request_validation_exception_handler
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import RequestIdMiddleware
 
@@ -24,10 +26,14 @@ def create_app() -> FastAPI:
         debug=settings.debug,
     )
 
+    app.add_exception_handler(HTTPException, custom_http_exception_handler)
+    app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
+
     # Add middleware
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health_router, prefix=settings.api_prefix)
+    app.include_router(project_router, prefix=f"{settings.api_prefix}/projects")
 
     logger.info("app_started", version=settings.app_version)
 

@@ -82,6 +82,11 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev,test,jobs,db]"
 
+      - name: Run Alembic migrations
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
+
       - name: Run pytest
         run: pytest
         env:
