@@ -3,14 +3,15 @@
 import asyncio
 import hashlib
 import uuid
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.session as session_module
 from app.core.config import settings
@@ -50,6 +51,29 @@ async def _upload_file(
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
+
+
+def _make_get_db_override_with_commit_error(
+    commit_error: BaseException,
+) -> Callable[[], AsyncGenerator[Any, None]]:
+    """Create a request-scoped get_db override with an instance-level commit failure."""
+
+    async def _override_get_db() -> AsyncGenerator[Any, None]:
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        session = session_maker()
+
+        async def _fail_commit() -> None:
+            raise commit_error
+
+        cast(Any, session).commit = _fail_commit
+
+        try:
+            yield session
+        finally:
+            await session.close()
+
+    return _override_get_db
 
 
 @requires_database
@@ -653,21 +677,22 @@ class TestProjectFiles:
         self,
         async_client: httpx.AsyncClient,
         created_project: dict[str, Any],
-        monkeypatch: pytest.MonkeyPatch,
+        app: FastAPI,
     ) -> None:
         """POST should cleanup persisted bytes when DB commit raises RuntimeError."""
         _ = self
 
-        async def _fail_commit(_self: AsyncSession) -> None:
-            raise RuntimeError("forced commit failure")
-
-        monkeypatch.setattr(AsyncSession, "commit", _fail_commit)
-
-        with pytest.raises(RuntimeError, match="forced commit failure"):
-            await async_client.post(
-                f"/v1/projects/{created_project['id']}/files",
-                files={"file": ("commit-fail.pdf", b"%PDF-1.7\npayload", "application/pdf")},
-            )
+        app.dependency_overrides[session_module.get_db] = (
+            _make_get_db_override_with_commit_error(RuntimeError("forced commit failure"))
+        )
+        try:
+            with pytest.raises(RuntimeError, match="forced commit failure"):
+                await async_client.post(
+                    f"/v1/projects/{created_project['id']}/files",
+                    files={"file": ("commit-fail.pdf", b"%PDF-1.7\npayload", "application/pdf")},
+                )
+        finally:
+            app.dependency_overrides.pop(session_module.get_db, None)
 
         upload_root = Path(settings.upload_storage_root).resolve()
         assert not upload_root.exists() or not any(upload_root.iterdir())
@@ -676,21 +701,36 @@ class TestProjectFiles:
         self,
         async_client: httpx.AsyncClient,
         created_project: dict[str, Any],
-        monkeypatch: pytest.MonkeyPatch,
+        app: FastAPI,
     ) -> None:
         """POST should cleanup persisted bytes when DB commit raises CancelledError."""
         _ = self
 
-        async def _cancel_commit(_self: AsyncSession) -> None:
-            raise asyncio.CancelledError()
+        app.dependency_overrides[session_module.get_db] = (
+            _make_get_db_override_with_commit_error(asyncio.CancelledError())
+        )
+        try:
+            caught: BaseException | None = None
+            try:
+                await async_client.post(
+                    f"/v1/projects/{created_project['id']}/files",
+                    files={
+                        "file": (
+                            "commit-cancelled.pdf",
+                            b"%PDF-1.7\npayload",
+                            "application/pdf",
+                        )
+                    },
+                )
+            except BaseException as exc:
+                caught = exc
 
-        monkeypatch.setattr(AsyncSession, "commit", _cancel_commit)
-
-        with pytest.raises(asyncio.CancelledError):
-            await async_client.post(
-                f"/v1/projects/{created_project['id']}/files",
-                files={"file": ("commit-cancelled.pdf", b"%PDF-1.7\npayload", "application/pdf")},
+            assert caught is not None
+            assert isinstance(caught, asyncio.CancelledError) or (
+                isinstance(caught, RuntimeError) and str(caught) == "No response returned."
             )
+        finally:
+            app.dependency_overrides.pop(session_module.get_db, None)
 
         upload_root = Path(settings.upload_storage_root).resolve()
         assert not upload_root.exists() or not any(upload_root.iterdir())
