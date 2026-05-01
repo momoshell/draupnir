@@ -13,6 +13,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from sqlalchemy import select
 
+import app.api.v1.files as files_api
 import app.db.session as session_module
 from app.core.config import settings
 from app.models.file import File as FileModel
@@ -79,6 +80,15 @@ def _make_get_db_override_with_commit_error(
 @requires_database
 class TestProjectFiles:
     """Tests for project file upload and retrieval endpoints."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_enqueue_ingest_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stub enqueue publish so file endpoint tests do not require RabbitMQ."""
+
+        def _fake_enqueue(job_id: uuid.UUID) -> None:
+            _ = job_id
+
+        monkeypatch.setattr(files_api, "enqueue_ingest_job", _fake_enqueue)
 
     async def test_upload_file_creates_file_and_pending_job(
         self,

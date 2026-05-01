@@ -7,7 +7,7 @@ import json
 import os
 import uuid
 from contextlib import suppress
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 from uuid import UUID
@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
+from app.jobs.worker import enqueue_ingest_job
 from app.models.file import File as FileModel
 from app.models.job import Job
 from app.models.project import Project
@@ -359,6 +360,17 @@ async def upload_project_file(
         raise
 
     await db.refresh(file_row)
+    await db.refresh(ingest_job)
+
+    try:
+        enqueue_ingest_job(ingest_job.id)
+    except Exception as exc:
+        ingest_job.status = "failed"
+        ingest_job.error_code = None
+        ingest_job.error_message = f"Failed to enqueue ingest job: {exc}"
+        ingest_job.finished_at = datetime.now(UTC)
+        await db.commit()
+
     return file_row
 
 
