@@ -28,3 +28,6 @@ htmlcov/
 .env
 .env.local
 *.local
+
+# Local runtime artifacts
+var/
