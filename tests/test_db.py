@@ -158,6 +158,23 @@ class TestAlembicMigrations:
 
         assert result.returncode == 0, f"Alembic downgrade failed: {stderr.decode()}"
 
+        # Restore schema for subsequent tests that require migrated tables.
+        reupgrade_result = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "alembic",
+            "upgrade",
+            "head",
+            cwd=str(Path(__file__).parent.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        _stdout, reupgrade_stderr = await reupgrade_result.communicate()
+        assert reupgrade_result.returncode == 0, (
+            f"Alembic re-upgrade failed after downgrade test: {reupgrade_stderr.decode()}"
+        )
+
     @requires_database
     @pytest.mark.asyncio
     async def test_alembic_current(self) -> None:
