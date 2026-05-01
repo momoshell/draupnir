@@ -6,3 +6,5 @@ for Alembic autogenerate support. Example:
     from . import drawing, revision, estimate
 
 """
+
+from . import project as project
