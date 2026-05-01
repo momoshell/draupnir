@@ -7,4 +7,6 @@ for Alembic autogenerate support. Example:
 
 """
 
+from . import file as file
+from . import job as job
 from . import project as project

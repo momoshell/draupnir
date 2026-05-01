@@ -4,14 +4,80 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 
+from fastapi import status
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from structlog.contextvars import bind_contextvars, clear_contextvars
+
+from app.core.config import settings
+from app.core.exceptions import create_error_response
 
 # Valid request ID pattern: alphanumeric, hyphens, underscores, max 64 chars
 REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9\-_]{1,64}$")
 MAX_REQUEST_ID_LENGTH = 64
+
+
+class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
+    """Pre-parse request-size guard for upload endpoint Content-Length."""
+
+    _MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+    _UPLOAD_ROUTE_PREFIX = "" if settings.api_prefix == "/" else settings.api_prefix
+    _UPLOAD_PATH_PATTERN = re.compile(
+        rf"^{re.escape(_UPLOAD_ROUTE_PREFIX)}/projects/[^/]+/files/?$"
+    )
+
+    @classmethod
+    def _is_upload_request(cls, request: Request) -> bool:
+        """Return True only for POST upload route."""
+        return request.method == "POST" and bool(cls._UPLOAD_PATH_PATTERN.match(request.url.path))
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if self._is_upload_request(request):
+            content_length = request.headers.get("content-length")
+            if content_length is None:
+                return JSONResponse(
+                    status_code=status.HTTP_411_LENGTH_REQUIRED,
+                    content=create_error_response(
+                        code="INPUT_INVALID",
+                        message=(
+                            "Content-Length header is required for upload requests. "
+                            "This API enforces max_upload_mb as a maximum request body size "
+                            "pre-parse guard."
+                        ),
+                        details=None,
+                    ),
+                )
+
+            try:
+                content_length_bytes = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=create_error_response(
+                        code="INPUT_INVALID",
+                        message="Content-Length header must be a valid integer.",
+                        details=None,
+                    ),
+                )
+
+            # Middleware allows bounded multipart overhead; endpoint enforces exact
+            # uploaded file-byte cap.
+            max_file_bytes = settings.max_upload_mb * 1024 * 1024
+            max_request_body_bytes = max_file_bytes + self._MULTIPART_OVERHEAD_BYTES
+            if content_length_bytes > max_request_body_bytes:
+                return JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content=create_error_response(
+                        code="INPUT_INVALID",
+                        message="Request body exceeds maximum allowed size for uploads.",
+                        details=None,
+                    ),
+                )
+
+        return await call_next(request)
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):

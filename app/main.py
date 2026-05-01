@@ -3,11 +3,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 
-from app.api.v1 import health_router, project_router
+from app.api.v1 import files_router, health_router, project_router
 from app.core.config import settings
 from app.core.exceptions import custom_http_exception_handler, request_validation_exception_handler
 from app.core.logging import configure_logging, get_logger
-from app.core.middleware import RequestIdMiddleware
+from app.core.middleware import ContentLengthLimitMiddleware, RequestIdMiddleware
 
 logger = get_logger(__name__)
 
@@ -30,10 +30,12 @@ def create_app() -> FastAPI:
     app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
     # Add middleware
+    app.add_middleware(ContentLengthLimitMiddleware)
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(project_router, prefix=f"{settings.api_prefix}/projects")
+    app.include_router(files_router, prefix=settings.api_prefix)
 
     logger.info("app_started", version=settings.app_version)
 

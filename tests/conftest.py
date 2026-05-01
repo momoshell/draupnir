@@ -1,7 +1,9 @@
 """Shared fixtures for integration tests."""
 
 import os
-from collections.abc import AsyncGenerator
+import shutil
+from collections.abc import AsyncGenerator, Generator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,6 +13,7 @@ from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.main import app as fastapi_app
 
@@ -35,6 +38,21 @@ async def init_database_resources() -> AsyncGenerator[None, None]:
     yield
 
     await session_module.close_db()
+
+
+@pytest.fixture(autouse=True)
+def isolate_upload_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[None, None, None]:
+    """Use a per-test temporary upload root and clean up only that root."""
+    upload_root = (tmp_path / "uploads").resolve()
+    monkeypatch.setattr(settings, "upload_storage_root", str(upload_root))
+
+    yield
+
+    if upload_root.exists():
+        shutil.rmtree(upload_root)
 
 
 @pytest.fixture
@@ -74,7 +92,7 @@ async def async_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient, None]:
 
 @pytest_asyncio.fixture
 async def cleanup_projects() -> AsyncGenerator[None, None]:
-    """Truncate projects table after each test to ensure clean state."""
+    """Truncate projects table after each test to ensure clean DB state."""
     if not os.environ.get("DATABASE_URL"):
         yield
         return

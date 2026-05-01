@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 50
+    upload_storage_root: str = "var/uploads"
 
     @field_validator("api_prefix")
     @classmethod
@@ -42,6 +43,13 @@ class Settings(BaseSettings):
     def validate_max_upload_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("max_upload_mb must be positive")
+        return value
+
+    @field_validator("upload_storage_root")
+    @classmethod
+    def validate_upload_storage_root(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("upload_storage_root must not be empty")
         return value
 
     model_config = SettingsConfigDict(
