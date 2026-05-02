@@ -40,27 +40,23 @@ Agent layer:    Pydantic AI later, optional
 ### DWG
 
 DWG is a required starting input, but it must be handled through an adapter.
-The adapter should normalize DWG into an internal representation and, where
+The accepted first DWG adapter is LibreDWG behind the adapter contract. The
+adapter should normalize DWG into an internal representation and, where
 possible, DXF-compatible geometry.
-
-Candidate adapter options:
-
-- ODA Drawings SDK
-- Autodesk RealDWG
-- QCAD Professional command-line tools
-- LibreDWG only if licensing and coverage are explicitly accepted
 
 ### Vector PDF
 
 Vector PDF is a required starting input. The system should attempt to extract
-vector geometry and normalize it into drawing entities. Semantic loss is expected
-and must be represented through confidence/provenance fields.
+vector geometry and normalize it into drawing entities. The accepted first
+vector PDF adapter is PyMuPDF behind the adapter contract. Semantic loss is
+expected and must be represented through confidence/provenance fields.
 
 ### Raster PDF
 
 Raster PDF is important for the product, but it is higher-risk than DWG/vector
-PDF. It should be implemented behind an experimental adapter. Initial support may
-produce trace candidates and review items rather than fully trusted quantities.
+PDF. It is implemented behind an experimental adapter strategy using VTracer,
+centerline extraction, and Tesseract. Initial support may produce trace
+candidates and review items rather than fully trusted quantities.
 
 ### DXF
 
@@ -279,9 +275,6 @@ Required behavior:
 
 ## Open Technical Questions
 
-- Final DWG adapter choice.
-- Final vector PDF adapter choice.
-- Final raster PDF tracing/OCR strategy.
 - Whether PDF generation uses WeasyPrint or ReportLab.
 - Whether geometry validation starts with FreeCAD or direct OCCT bindings.
 - Webhook/SSE event delivery vs polling-only for MVP.

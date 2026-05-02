@@ -142,7 +142,7 @@ Rules:
 - The local filesystem backend uses `chmod 0o444` and rejects writes to existing
   paths to enforce immutability.
 - Generated artifacts use a separate prefix (`artifacts/{artifact_id}/...`) and
-  are not marked immutable so they can be regenerated.
+  are immutable records/objects once written.
 
 ## Job Pipeline Orchestration
 
@@ -181,9 +181,9 @@ env vars stable so the same configuration can be lifted to a managed runtime.
 
 - Generated artifacts are written through the storage interface and recorded in
   `export_artifacts` with checksum, source job, and source revision.
-- An artifact can be regenerated from its source revision and changeset; clients
-  should never modify an artifact in place.
+- An artifact can be regenerated from its source revision and changeset, but
+  regeneration creates a new artifact record/object; clients should never modify
+  an artifact in place.
 - A scheduled cleanup job (post-MVP) removes orphaned artifacts whose source
   revision has been superseded and which have no active references. MVP keeps
   everything to simplify debugging.
-

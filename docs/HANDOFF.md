@@ -16,3 +16,9 @@
 - Geometry validation engine (FreeCAD vs OCCT)
 - Webhook/SSE vs polling-only for MVP events
 - Materials: shared catalog vs per-project
+
+## External Review Follow-Ups
+
+- External architecture review follow-ups are tracked in issues #54-#69.
+- Keep these docs aligned with accepted ADRs; do not expand full specs for those
+  follow-up issues here.
