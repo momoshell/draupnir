@@ -2,6 +2,7 @@
 # Draupnir — Development Makefile
 # =============================================================================
 # Usage:
+#   make sync        — Sync uv environment with local extras
 #   make lint        — Run ruff linter on app/ and tests/
 #   make typecheck   — Run mypy on app/ and tests/
 #
@@ -10,7 +11,7 @@
 #   make test        — Run pytest
 #   make format      — Run ruff formatter on app/ and tests/
 #   make check       — Run lint + typecheck + test
-#   make hooks       — Install pre-commit hooks
+#   make hooks       — Install pre-commit hooks via uv
 #   make up          — Start Docker Compose stack
 #   make down        — Stop Docker Compose stack
 #   make logs        — Follow Docker Compose logs
@@ -20,24 +21,29 @@
 #   make migrate     — Run Alembic migrations
 # =============================================================================
 
-.PHONY: lint typecheck test format check hooks up down logs ps shell-api shell-worker migrate
+UV_SYNC_ARGS = --extra db --extra jobs --extra dev --extra test
+
+.PHONY: sync lint typecheck test format check hooks up down logs ps shell-api shell-worker migrate
+
+sync:
+	uv sync $(UV_SYNC_ARGS)
 
 lint:
-	ruff check app tests
+	uv run ruff check app tests
 
 typecheck:
-	mypy app tests
+	uv run mypy app tests
 
 test:
-	pytest
+	uv run pytest
 
 format:
-	ruff format app tests
+	uv run ruff format app tests
 
 check: lint typecheck test
 
 hooks:
-	pre-commit install
+	uv run pre-commit install
 
 # ---------------------------------------------------------------------------
 # Docker Compose targets

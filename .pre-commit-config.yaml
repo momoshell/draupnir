@@ -1,8 +1,8 @@
 # =============================================================================
 # Draupnir — Pre-commit Hooks
 # =============================================================================
-# Install:  pip install -e ".[dev]" && pre-commit install
-# Run all:  pre-commit run --all-files
+# Install:  uv sync --extra db --extra jobs --extra dev --extra test && uv run pre-commit install
+# Run all:  uv run pre-commit run --all-files
 # =============================================================================
 
 repos:
@@ -19,20 +19,25 @@ repos:
       - id: check-toml
 
   # --- Ruff: lint + format --------------------------------------------------
-  # NOTE: keep this rev in sync with the ruff version pinned in pyproject.toml
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.6
+  - repo: local
     hooks:
       - id: ruff
-        args: ["--fix", "--show-fixes"]
+        name: ruff
+        entry: uv run ruff check --fix --show-fixes
+        language: system
+        types: [python]
       - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format
+        language: system
+        types: [python]
 
   # --- mypy: static type checking -------------------------------------------
   - repo: local
     hooks:
       - id: mypy
         name: mypy
-        entry: mypy
+        entry: uv run mypy
         language: system
         types: [python]
         pass_filenames: true

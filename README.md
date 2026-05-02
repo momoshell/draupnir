@@ -16,7 +16,7 @@ Docker Compose development stack is available. See "Local Development" below for
 ### Prerequisites
 
 - Docker and Docker Compose (v2)
-- Python 3.12 (for local development without Docker)
+- uv
 
 ### Quick Start with Docker
 
@@ -81,7 +81,7 @@ make down -v        # Stop and remove volumes (destructive)
 
 1. **Install dependencies**:
    ```bash
-   pip install -e ".[db,jobs,dev,test]"
+   uv sync --extra db --extra jobs --extra dev --extra test
    ```
 
 2. **Set up environment**:
@@ -92,12 +92,12 @@ make down -v        # Stop and remove volumes (destructive)
 
 3. **Run the API**:
    ```bash
-   uvicorn app.main:app --reload
+   uv run uvicorn app.main:app --reload
    ```
 
 4. **Run the worker**:
    ```bash
-   celery -A app.jobs.worker worker --loglevel=info
+   uv run celery -A app.jobs.worker worker --loglevel=info
    ```
 
 ### Database Migrations
@@ -108,36 +108,36 @@ Database schema changes are managed with Alembic. All migrations are stored in `
 
 ```bash
 # Ensure DATABASE_URL is set in .env
-# Run initial migration to create schema
-.venv/bin/alembic upgrade head
+# Sync dependencies first if needed
+uv run alembic upgrade head
 ```
 
 **Common commands:**
 
 ```bash
 # Check current migration state
-.venv/bin/alembic current
+uv run alembic current
 
 # Create a new migration (autogenerate from models)
-.venv/bin/alembic revision --autogenerate -m "description"
+uv run alembic revision --autogenerate -m "description"
 
 # Create an empty migration
-.venv/bin/alembic revision -m "description"
+uv run alembic revision -m "description"
 
 # Apply all pending migrations
-.venv/bin/alembic upgrade head
+uv run alembic upgrade head
 
 # Downgrade one migration
-.venv/bin/alembic downgrade -1
+uv run alembic downgrade -1
 
 # Downgrade to base (remove all tables)
-.venv/bin/alembic downgrade base
+uv run alembic downgrade base
 
 # View migration history
-.venv/bin/alembic history
+uv run alembic history
 
 # Show SQL for a migration (without applying)
-.venv/bin/alembic upgrade head --sql
+uv run alembic upgrade head --sql
 ```
 
 **In Docker:**

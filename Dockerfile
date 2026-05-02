@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.8 /uv /uvx /bin/
+
+ENV PATH="/app/.venv/bin:$PATH"
+
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -12,16 +16,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy dependency manifest first (cache-friendly layer)
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock README.md ./
 
-# Install build dependencies before project source is available
-RUN pip install --no-cache-dir build
+# Sync runtime dependencies before project source is available
+RUN uv sync --locked --no-install-project --no-dev --extra db --extra jobs
 
 # Copy application source
 COPY app/ ./app/
 
-# Install package in editable mode (needs app/ on disk for discovery)
-RUN pip install --no-cache-dir -e ".[db,jobs]"
+# Install project and runtime extras into the project environment
+RUN uv sync --locked --no-dev --extra db --extra jobs
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

@@ -38,7 +38,7 @@ authors = [
 ]
 
 # ---------------------------------------------------------------------------
-# Core runtime — installed with: pip install -e .
+# Core runtime — synced with: uv sync
 # ---------------------------------------------------------------------------
 dependencies = [
     # Web framework & ASGI server
@@ -65,12 +65,13 @@ dependencies = [
 
 # ---------------------------------------------------------------------------
 # Optional dependency groups
+# Local development sync: uv sync --extra db --extra jobs --extra dev --extra test
 # ---------------------------------------------------------------------------
 [project.optional-dependencies]
 
 # Database layer — SQLAlchemy 2.x, Alembic migrations, Postgres drivers
 db = [
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
     "alembic>=1.13",
     "asyncpg>=0.29",          # async Postgres driver (for later async migration)
     "psycopg2-binary>=2.9",   # sync Postgres driver (MVP)
