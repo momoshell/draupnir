@@ -250,7 +250,52 @@ Required data:
 - Upload size must be configurable.
 - Ingestion adapters must have timeouts.
 - Failures must be stored in job records.
-- Generated artifacts must be reproducible from stored revisions and changesets.
+- Generated artifacts must be reproducible from stored revisions and their
+  recorded lineage inputs.
+
+## Generated Artifact Contract
+
+Generated artifacts are immutable, append-only outputs. The system must never
+overwrite an existing generated artifact row/object in place, even when
+regenerating the same logical export.
+
+Minimum artifact lineage fields:
+
+- `source_file_id`
+- `drawing_revision_id`
+- `changeset_id` when produced from a revision export
+- `quantity_takeoff_id` when produced from quantity output
+- `estimate_id` when produced from estimate output
+- `job_id`
+- `generator_name`
+- `generator_version`
+- `generator_config_snapshot` or equivalent options snapshot
+- `checksum`
+
+Rules:
+
+- Regeneration or re-export creates a new artifact id, row, and storage object.
+- Artifacts may reference a prior artifact for lineage, supersession, or UI
+  history, but the prior artifact remains immutable.
+- Artifact storage keys are server-derived and unique per artifact record.
+- Reproducibility means the system can trace which stored source revision,
+  changeset/takeoff/estimate context, job, and generator configuration produced
+  the artifact.
+- Original uploads and generated artifacts follow the same immutability rule but
+  remain distinct storage classes and records.
+
+## MVP Retention And Deletion Policy
+
+For MVP, retention is conservative:
+
+- keep original uploads and generated artifacts by default
+- prefer soft-delete or hidden metadata state before physical deletion
+- require manual/administrative action for physical artifact deletion
+- do not auto-delete superseded artifacts in MVP
+
+Any physical deletion flow must preserve at least the metadata needed to explain
+what was produced and must not imply that a replacement artifact overwrote the
+prior one.
 
 ## API Conventions
 
