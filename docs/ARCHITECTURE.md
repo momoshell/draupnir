@@ -66,6 +66,24 @@ IFC adapter
 
 Adapters must report confidence and provenance.
 
+The backend also maintains an adapter capability registry that reports, per
+adapter, installed availability, input/output format support, extraction and
+export features, expected confidence ranges, and experimental/license status.
+Operator-facing system detail lives under `/v1/system/capabilities` and
+`/v1/system/health`; `/v1/health` remains a shallow liveness endpoint returning
+only the current `{status, version}` shape.
+
+Missing adapter binaries or required license material are reported as
+`ADAPTER_UNAVAILABLE`. Bounded capability or health probes that exceed their
+time budget are reported as `ADAPTER_TIMEOUT`.
+
+Risky parsers and external adapter binaries are mandatory isolation candidates:
+they must run in dedicated subprocesses or containers with bounded CPU/memory/
+file descriptor/file-access controls, explicit time budgets/timeouts, per-job
+tempdir ownership and cleanup, and network disabled by default unless an
+allowlist is explicitly required, rather than in-process with the API. Adapter
+stdout/stderr and exit status remain untrusted inputs.
+
 ### CAD Revision Engine
 
 Applies approved changesets to normalized data and exports revised CAD artifacts.
