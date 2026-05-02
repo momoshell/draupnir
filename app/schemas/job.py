@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,3 +25,23 @@ class JobRead(BaseModel):
     started_at: datetime | None = Field(None, description="Job start timestamp")
     finished_at: datetime | None = Field(None, description="Job completion timestamp")
     created_at: datetime = Field(..., description="Job creation timestamp")
+
+
+class JobEventRead(BaseModel):
+    """Schema for reading a persisted job event."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(..., description="Unique job event identifier (UUID)")
+    job_id: uuid.UUID = Field(..., description="Owning job identifier")
+    level: str = Field(..., description="Structured event level")
+    message: str = Field(..., description="Human-readable event message")
+    data_json: dict[str, Any] | None = Field(None, description="Optional structured event payload")
+    created_at: datetime = Field(..., description="Event creation timestamp")
+
+
+class JobEventPage(BaseModel):
+    """Cursor-paginated job event response."""
+
+    items: list[JobEventRead] = Field(default_factory=list, description="Ordered job events")
+    next_cursor: str | None = Field(None, description="Opaque cursor for the next page")

@@ -15,6 +15,7 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.jobs.worker import process_ingest_job, recover_incomplete_ingest_jobs
 from app.models.job import Job
+from app.models.job_event import JobEvent
 from tests.conftest import requires_database
 
 
@@ -101,6 +102,34 @@ async def _update_job(
         await session.commit()
 
     return await _get_job(job_id)
+
+
+async def _create_job_event(
+    job_id: uuid.UUID,
+    *,
+    level: str,
+    message: str,
+    data_json: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
+) -> JobEvent:
+    """Persist and return a job event for test setup."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        event = JobEvent(
+            job_id=job_id,
+            level=level,
+            message=message,
+            data_json=data_json,
+        )
+        if created_at is not None:
+            event.created_at = created_at
+        session.add(event)
+        await session.commit()
+        await session.refresh(event)
+
+    return event
 
 
 @pytest.fixture
@@ -215,6 +244,226 @@ class TestJobs:
                 "details": None,
             }
         }
+
+    async def test_list_job_events_returns_404_for_unknown_job(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        """GET events should return the standard Job 404 envelope for unknown ids."""
+        _ = self
+        _ = cleanup_projects
+
+        missing_job_id = uuid.uuid4()
+        response = await async_client.get(f"/v1/jobs/{missing_job_id}/events")
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Job with identifier '{missing_job_id}' not found",
+                "details": None,
+            }
+        }
+
+    async def test_list_job_events_returns_chronological_order(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """GET events should return ascending created-at ordered results."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        base = datetime.now(UTC).replace(microsecond=0)
+        await _create_job_event(
+            job.id,
+            level="info",
+            message="third",
+            created_at=base + timedelta(seconds=2),
+        )
+        await _create_job_event(
+            job.id,
+            level="info",
+            message="first",
+            created_at=base,
+        )
+        await _create_job_event(
+            job.id,
+            level="info",
+            message="second",
+            created_at=base + timedelta(seconds=1),
+        )
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == [
+            "first",
+            "second",
+            "third",
+        ]
+        assert data["next_cursor"] is None
+
+    async def test_list_job_events_supports_cursor_pagination(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """GET events should support opaque cursor pagination."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        base = datetime.now(UTC).replace(microsecond=0)
+        await _create_job_event(job.id, level="info", message="first", created_at=base)
+        await _create_job_event(
+            job.id,
+            level="info",
+            message="second",
+            created_at=base + timedelta(seconds=1),
+        )
+        await _create_job_event(
+            job.id,
+            level="info",
+            message="third",
+            created_at=base + timedelta(seconds=2),
+        )
+
+        first_response = await async_client.get(f"/v1/jobs/{job.id}/events?limit=2")
+        assert first_response.status_code == 200
+        first_data = first_response.json()
+        assert [event["message"] for event in first_data["items"]] == ["first", "second"]
+        assert first_data["next_cursor"] is not None
+
+        second_response = await async_client.get(
+            f"/v1/jobs/{job.id}/events?limit=2&cursor={first_data['next_cursor']}"
+        )
+        assert second_response.status_code == 200
+        second_data = second_response.json()
+        assert [event["message"] for event in second_data["items"]] == ["third"]
+        assert second_data["next_cursor"] is None
+
+    async def test_list_job_events_preserves_same_transaction_emission_order_on_ties(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """GET events should preserve insertion order for same-timestamp events."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        tied_created_at = datetime.now(UTC).replace(microsecond=0)
+        first_id = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        second_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                JobEvent(
+                    id=first_id,
+                    job_id=job.id,
+                    level="info",
+                    message="first emitted",
+                    created_at=tied_created_at,
+                )
+            )
+            session.add(
+                JobEvent(
+                    id=second_id,
+                    job_id=job.id,
+                    level="info",
+                    message="second emitted",
+                    created_at=tied_created_at,
+                )
+            )
+            await session.commit()
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == [
+            "first emitted",
+            "second emitted",
+        ]
+        assert data["next_cursor"] is None
+
+    async def test_list_job_events_invalid_cursor_returns_error_envelope(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """GET events should return standard envelope for invalid cursor values."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events?cursor=not-base64")
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "error": {
+                "code": "INVALID_CURSOR",
+                "message": "Invalid cursor format",
+                "details": None,
+            }
+        }
+
+    async def test_list_job_events_includes_worker_lifecycle_events(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """GET events should expose worker-emitted lifecycle events."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await process_ingest_job(job.id)
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert [event["message"] for event in data["items"]] == [
+            "Job started",
+            "Job succeeded",
+        ]
+        assert [event["data_json"]["status"] for event in data["items"]] == [
+            "running",
+            "succeeded",
+        ]
+        assert data["next_cursor"] is None
 
     async def test_process_ingest_job_transitions_to_succeeded(
         self,

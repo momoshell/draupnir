@@ -1,21 +1,27 @@
 """Job status endpoints."""
 
+import base64
+import binascii
+import json
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import raise_not_found
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
 from app.models.job import Job
-from app.schemas.job import JobRead
+from app.models.job_event import JobEvent
+from app.schemas.job import JobEventPage, JobEventRead, JobRead
 
 jobs_router = APIRouter()
 
+_DEFAULT_EVENTS_LIMIT = 50
+_MAX_EVENTS_LIMIT = 200
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 
 
@@ -41,6 +47,51 @@ async def _get_job_for_update_or_404(db: AsyncSession, job_id: UUID) -> Job:
     return job
 
 
+def _encode_job_events_cursor(event: JobEvent) -> str:
+    """Encode a pagination cursor from a job event row."""
+    created_at = event.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+
+    payload = json.dumps(
+        {
+            "created_at": created_at.astimezone(UTC).isoformat(),
+            "sequence_id": event.sequence_id,
+            "id": str(event.id),
+        },
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
+
+
+def _decode_job_events_cursor(cursor: str) -> tuple[datetime, int | None, UUID]:
+    """Decode a pagination cursor into its sort key values."""
+    try:
+        padded_cursor = cursor + ("=" * (-len(cursor) % 4))
+        decoded = base64.urlsafe_b64decode(padded_cursor.encode("utf-8")).decode("utf-8")
+        payload = json.loads(decoded)
+        created_at = datetime.fromisoformat(payload["created_at"])
+        sequence_id_raw = payload.get("sequence_id")
+        sequence_id = int(sequence_id_raw) if sequence_id_raw is not None else None
+        if sequence_id is not None and sequence_id < 0:
+            raise ValueError("sequence_id must be non-negative")
+        cursor_id = UUID(payload["id"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=create_error_response(
+                code="INVALID_CURSOR",
+                message="Invalid cursor format",
+                details=None,
+            ),
+        ) from exc
+
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+
+    return created_at.astimezone(UTC), sequence_id, cursor_id
+
+
 @jobs_router.get(
     "/jobs/{job_id}",
     response_model=JobRead,
@@ -51,6 +102,64 @@ async def get_job(
 ) -> Job:
     """Return persisted status for a single job."""
     return await _get_job_or_404(db, job_id)
+
+
+@jobs_router.get(
+    "/jobs/{job_id}/events",
+    response_model=JobEventPage,
+)
+async def list_job_events(
+    job_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=_MAX_EVENTS_LIMIT, description="Page size"),
+    ] = _DEFAULT_EVENTS_LIMIT,
+) -> JobEventPage:
+    """Return cursor-paginated lifecycle events for a single job."""
+    await _get_job_or_404(db, job_id)
+
+    statement = select(JobEvent).where(JobEvent.job_id == job_id)
+    if cursor is not None:
+        created_at, sequence_id, cursor_id = _decode_job_events_cursor(cursor)
+        if sequence_id is None:
+            statement = statement.where(
+                or_(
+                    JobEvent.created_at > created_at,
+                    and_(JobEvent.created_at == created_at, JobEvent.id > cursor_id),
+                )
+            )
+        else:
+            statement = statement.where(
+                or_(
+                    JobEvent.created_at > created_at,
+                    and_(JobEvent.created_at == created_at, JobEvent.sequence_id > sequence_id),
+                    and_(
+                        JobEvent.created_at == created_at,
+                        JobEvent.sequence_id == sequence_id,
+                        JobEvent.id > cursor_id,
+                    ),
+                )
+            )
+
+    statement = statement.order_by(
+        JobEvent.created_at.asc(),
+        JobEvent.sequence_id.asc(),
+        JobEvent.id.asc(),
+    ).limit(limit + 1)
+    result = await db.execute(statement)
+    events = list(result.scalars())
+
+    next_cursor: str | None = None
+    if len(events) > limit:
+        next_cursor = _encode_job_events_cursor(events[limit - 1])
+        events = events[:limit]
+
+    return JobEventPage(
+        items=[JobEventRead.model_validate(event) for event in events],
+        next_cursor=next_cursor,
+    )
 
 
 @jobs_router.post(
