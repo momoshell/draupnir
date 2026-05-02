@@ -7,6 +7,7 @@ from uuid import UUID
 from celery import Celery
 from celery.signals import worker_ready
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -17,9 +18,10 @@ logger = get_logger(__name__)
 
 _INGEST_NOOP_DELAY_SECONDS = 0.01
 _INCOMPLETE_JOB_STATUSES = ("pending", "running")
-_TERMINAL_JOB_STATUSES = {"failed", "succeeded"}
+_TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
+_JOB_CANCELLED_ERROR_CODE = "JOB_CANCELLED"
 
 celery_app = Celery(
     "draupnir",
@@ -55,6 +57,12 @@ def _is_stale_running_job(job: Job, *, now: datetime) -> bool:
     return started_at <= now - _RUNNING_JOB_STALE_AFTER
 
 
+async def _get_job_for_update(session: AsyncSession, job_id: UUID) -> Job | None:
+    """Load and lock a persisted job row."""
+    result = await session.execute(select(Job).where(Job.id == job_id).with_for_update())
+    return result.scalar_one_or_none()
+
+
 async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
     """Persist a failed job state with the supplied message."""
     session_maker = get_session_maker()
@@ -62,7 +70,7 @@ async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await session.get(Job, job_id)
+        job = await _get_job_for_update(session, job_id)
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
@@ -81,32 +89,82 @@ async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
         await session.commit()
 
 
+def _finalize_job_cancelled(job: Job) -> None:
+    """Apply the persisted cancelled terminal state to a job."""
+    job.status = "cancelled"
+    job.error_code = _JOB_CANCELLED_ERROR_CODE
+    job.error_message = None
+    job.finished_at = _utcnow()
+
+
+async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
+    """Claim, resume, or cancel a persisted ingest job under a row lock."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    now = _utcnow()
+
+    async with session_maker() as session:
+        job = await _get_job_for_update(session, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "ingest_job_cancel_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not job.cancel_requested:
+            if job.status == "running":
+                if _is_stale_running_job(job, now=now):
+                    job.attempts += 1
+                    job.started_at = now
+                    job.finished_at = None
+                    job.error_code = None
+                    job.error_message = None
+                    await session.commit()
+                    logger.warning(
+                        "ingest_job_reclaimed_stale_running_status",
+                        job_id=str(job_id),
+                        status=job.status,
+                    )
+                    return True
+
+                logger.info(
+                    "ingest_job_continuing_running_status",
+                    job_id=str(job_id),
+                    status=job.status,
+                )
+                return True
+
+            job.attempts += 1
+            job.status = "running"
+            job.started_at = now
+            job.finished_at = None
+            job.error_code = None
+            job.error_message = None
+            await session.commit()
+            return True
+
+        _finalize_job_cancelled(job)
+        await session.commit()
+
+    logger.info("ingest_job_cancelled", job_id=str(job_id))
+    return False
+
+
 async def process_ingest_job(job_id: UUID) -> None:
     """Load a persisted ingest job, perform a no-op, and persist state transitions."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
-    async with session_maker() as session:
-        job = await session.get(Job, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "ingest_job_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return
-
-        job.attempts += 1
-        job.status = "running"
-        job.started_at = _utcnow()
-        job.finished_at = None
-        job.error_code = None
-        job.error_message = None
-        await session.commit()
+    if not await _begin_or_resume_ingest_job(job_id):
+        return
 
     try:
         await asyncio.sleep(_INGEST_NOOP_DELAY_SECONDS)
@@ -116,13 +174,27 @@ async def process_ingest_job(job_id: UUID) -> None:
         raise
 
     async with session_maker() as session:
-        job = await session.get(Job, job_id)
+        job = await _get_job_for_update(session, job_id)
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
         if job.status in _TERMINAL_JOB_STATUSES:
             logger.info(
                 "ingest_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return
+
+        if job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await session.commit()
+            logger.info("ingest_job_cancelled", job_id=str(job_id))
+            return
+
+        if job.status != "running":
+            logger.info(
+                "ingest_job_completion_skipped_non_running_status",
                 job_id=str(job_id),
                 status=job.status,
             )
