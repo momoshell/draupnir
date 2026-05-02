@@ -70,11 +70,19 @@ quantities, relationships, and geometry where available.
 
 ## Canonical Representation
 
+The normalized representation is versioned. MVP adapters and persistence target
+`canonical_entity_schema_version = "0.1"`.
+
+Every drawing revision produced by ingestion or revision export must record the
+canonical entity schema version used for its stored entities.
+
 The normalized representation must capture:
 
 - project
 - source file
 - drawing revision
+- canonical entity schema version
+- layouts
 - layers
 - blocks
 - entities
@@ -84,6 +92,102 @@ The normalized representation must capture:
 - quantities
 - provenance
 - confidence
+
+Minimum top-level canonical revision payload requirements:
+
+- `canonical_entity_schema_version` - revision-level canonical contract version
+- `layouts` - list of extracted layout descriptors (includes modelspace entry
+  when applicable)
+- `layers` - list of normalized layer descriptors
+- `blocks` - list of normalized block definitions/instances metadata
+- `entities` - list of canonical entities linked to layout/layer/block context
+
+`layouts`, `layers`, `blocks`, and `entities` are required keys and may be
+empty lists when extraction finds none.
+
+### Canonical Entity Schema v0.1
+
+Canonical entity schema v0.1 is a JSON-first strict contract for normalized
+drawing data now, with room for future relational persistence without changing
+the meaning of stored entities.
+
+Each entity record must include:
+
+- `entity_id` - stable revision-scoped entity id
+- `entity_type` - canonical entity type
+- `entity_schema_version` - entity payload version, `0.1` for MVP
+- `geometry` - normalized geometry payload for the entity type
+- `properties` - normalized semantic properties and adapter-carried attributes
+- `provenance` - structured origin and extraction metadata
+- `confidence` - float in `[0, 1]`
+
+Version-field rule: `canonical_entity_schema_version` is revision-scoped and
+declares the canonical contract for the full revision payload. The
+`entity_schema_version` field is per-entity for forward compatibility; in MVP
+it must equal the revision-level `canonical_entity_schema_version`.
+
+Required linkage fields:
+
+- `drawing_revision_id`
+- `source_file_id`
+- `layout_ref` - modelspace or named layout/paper space source
+- `layer_ref`
+- `block_ref` when the entity comes from a block definition or insert context
+- `parent_entity_ref` when the entity is nested, exploded from a parent, or
+  otherwise derived from another entity in the same revision
+
+Canonical v0.1 entity types:
+
+- `line`
+- `polyline`
+- `arc`
+- `circle`
+- `ellipse`
+- `spline`
+- `point`
+- `hatch`
+- `text`
+- `mtext`
+- `dimension`
+- `insert`
+- `face`
+- `solid`
+- `mesh`
+- `ifc_product`
+- `image_reference`
+- `viewport`
+- `unknown`
+
+Required geometry fields are entity-type specific, but every entity must carry
+enough normalized geometry for deterministic quantity computation plus:
+
+- `bbox`
+- `transform` when block, layout, or source transforms apply
+- `units`
+- `geometry_summary` for fast indexing/query use
+
+Required properties fields:
+
+- `source_type`
+- `source_handle` or equivalent adapter-native identifier when available
+- `style_ref` when applicable
+- `name` or `tag` when applicable
+- `material_ref` when applicable
+- `quantity_hints` when the adapter can safely provide them
+- adapter-native attributes preserved under a namespaced payload
+
+Block/layout/parent linkage must preserve source structure. The system must be
+able to distinguish a direct entity from a block instance, block definition
+member, exploded child, or nested derived entity. Block explosion and dedup
+logic must not lose source identity.
+
+Entity identity must preserve source-native identity when available and also
+record a normalized source hash or equivalent fingerprint so dedup/re-ingestion
+logic can compare semantically identical entities across adapter passes.
+
+For raster-derived entities, the canonical payload must also record page-scoped
+or view-scoped scale calibration metadata when used, because quantities are not
+trustworthy without explicit scale context.
 
 ## Revision Model
 
@@ -198,7 +302,15 @@ Every ingestion adapter must implement the same shape:
 ```text
 adapt(source_file, options) ->
   AdapterResult {
-    canonical: { layers, blocks, entities, units, ... },
+    canonical: {
+      canonical_entity_schema_version: "0.1",
+      layouts,
+      layers,
+      blocks,
+      entities,
+      units,
+      ...
+    },
     provenance: ...,
     confidence: float in [0, 1],
     warnings: [...],
@@ -230,10 +342,32 @@ Required behavior:
 ## Provenance And Confidence
 
 - `provenance_json` is a structured object, not free text. Required keys:
-  `adapter`, `source_ref`, `extraction_path`, `notes`.
+  `origin`, `adapter`, `source_ref`, `source_identity`, `source_hash`,
+  `extraction_path`, `notes`.
+- `origin` must be one of exactly: `source_direct`, `adapter_normalized`,
+  `inferred`, `user_created`, `agent_proposed`, `generated_export`.
+- Origin meanings:
+  - `source_direct` - direct source-native entity mapped without semantic
+    inference.
+  - `adapter_normalized` - adapter-transformed/normalized representation of
+    source data.
+  - `inferred` - derived or imputed from source context, not explicitly present
+    in source data.
+  - `user_created` - explicitly created by a user action in a revision
+    changeset.
+  - `agent_proposed` - created or modified by an automated assistant proposal,
+    pending/subject to review workflow.
+  - `generated_export` - synthesized during export generation from approved
+    revision state.
+- `source_identity` records the adapter-native source identifier when available
+  (for example handle, GUID, object id, page/object tuple, or IFC global id).
+- `source_hash` records a stable normalized fingerprint when the adapter can
+  compute one.
 - `confidence` is a float in [0, 1] with documented reference points: 1.0 for
   direct DXF/IFC reads, 0.7-0.9 for vector PDF, 0.3-0.6 for raster PDF before
   human review.
+- Entities and revisions must persist confidence alongside provenance so review
+  workflows can distinguish trusted geometry from review-first extraction.
 - Quantity dedup rules must be documented per quantity type so the same entity
   is not counted twice across length/area/volume aggregates.
 
