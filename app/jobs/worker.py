@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from celery import Celery
@@ -13,6 +14,7 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
 from app.models.job import Job
+from app.models.job_event import JobEvent
 
 logger = get_logger(__name__)
 
@@ -63,6 +65,34 @@ async def _get_job_for_update(session: AsyncSession, job_id: UUID) -> Job | None
     return result.scalar_one_or_none()
 
 
+async def emit_job_event(
+    job_id: UUID,
+    *,
+    level: str,
+    message: str,
+    data_json: dict[str, Any] | None = None,
+    session: AsyncSession | None = None,
+) -> None:
+    """Persist a job lifecycle event."""
+    event = JobEvent(
+        job_id=job_id,
+        level=level,
+        message=message,
+        data_json=data_json,
+    )
+    if session is not None:
+        session.add(event)
+        return
+
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as managed_session:
+        managed_session.add(event)
+        await managed_session.commit()
+
+
 async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
     """Persist a failed job state with the supplied message."""
     session_maker = get_session_maker()
@@ -86,6 +116,13 @@ async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
         job.error_code = None
         job.error_message = error_message
         job.finished_at = _utcnow()
+        await emit_job_event(
+            job_id,
+            level="error",
+            message="Job failed",
+            data_json={"status": "failed", "error_message": error_message},
+            session=session,
+        )
         await session.commit()
 
 
@@ -126,6 +163,17 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                     job.finished_at = None
                     job.error_code = None
                     job.error_message = None
+                    await emit_job_event(
+                        job.id,
+                        level="info",
+                        message="Job started",
+                        data_json={
+                            "status": "running",
+                            "attempts": job.attempts,
+                            "reclaimed": True,
+                        },
+                        session=session,
+                    )
                     await session.commit()
                     logger.warning(
                         "ingest_job_reclaimed_stale_running_status",
@@ -147,10 +195,24 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
             job.finished_at = None
             job.error_code = None
             job.error_message = None
+            await emit_job_event(
+                job.id,
+                level="info",
+                message="Job started",
+                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
+                session=session,
+            )
             await session.commit()
             return True
 
         _finalize_job_cancelled(job)
+        await emit_job_event(
+            job.id,
+            level="warning",
+            message="Job cancelled",
+            data_json={"status": "cancelled"},
+            session=session,
+        )
         await session.commit()
 
     logger.info("ingest_job_cancelled", job_id=str(job_id))
@@ -188,6 +250,13 @@ async def process_ingest_job(job_id: UUID) -> None:
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
             await session.commit()
             logger.info("ingest_job_cancelled", job_id=str(job_id))
             return
@@ -204,9 +273,17 @@ async def process_ingest_job(job_id: UUID) -> None:
         job.finished_at = _utcnow()
         job.error_code = None
         job.error_message = None
+        await emit_job_event(
+            job.id,
+            level="info",
+            message="Job succeeded",
+            data_json={"status": "succeeded", "attempts": job.attempts},
+            session=session,
+        )
         await session.commit()
 
     logger.info("ingest_job_succeeded", job_id=str(job_id))
+
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:

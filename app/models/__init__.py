@@ -9,4 +9,5 @@ for Alembic autogenerate support. Example:
 
 from . import file as file
 from . import job as job
+from . import job_event as job_event
 from . import project as project
