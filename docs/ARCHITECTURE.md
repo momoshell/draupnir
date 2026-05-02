@@ -116,6 +116,8 @@ Every derived output must point back to:
 - source file
 - drawing revision
 - changeset, if any
+- takeoff, if any
+- estimate, if any
 - job that produced it
 
 ## Storage Interface
@@ -143,6 +145,8 @@ Rules:
   paths to enforce immutability.
 - Generated artifacts use a separate prefix (`artifacts/{artifact_id}/...`) and
   are immutable records/objects once written.
+- Storage backends must reject any attempt to overwrite an existing generated
+  artifact object, even when the payload is byte-identical.
 
 ## Job Pipeline Orchestration
 
@@ -179,11 +183,44 @@ env vars stable so the same configuration can be lifted to a managed runtime.
 
 ## Artifact Lifecycle
 
-- Generated artifacts are written through the storage interface and recorded in
-  `export_artifacts` with checksum, source job, and source revision.
-- An artifact can be regenerated from its source revision and changeset, but
-  regeneration creates a new artifact record/object; clients should never modify
-  an artifact in place.
-- A scheduled cleanup job (post-MVP) removes orphaned artifacts whose source
-  revision has been superseded and which have no active references. MVP keeps
-  everything to simplify debugging.
+Generated artifacts are append-only outputs. Once an artifact row/object is
+written, it is immutable and cannot be replaced in place.
+
+Each artifact record must keep enough lineage to explain exactly what produced
+it and to reproduce it later. Minimum lineage fields:
+
+- source file id
+- drawing revision id
+- changeset id, when the artifact comes from a revision export
+- quantity takeoff id, when the artifact comes from quantity output
+- estimate id, when the artifact comes from estimate output
+- job id
+- generator name
+- generator version
+- generator configuration or options snapshot
+- output checksum
+
+Rules:
+
+- Regeneration or re-export always creates a new artifact row/object with a new
+  artifact id and storage key.
+- A newer artifact may reference an older artifact as its predecessor for
+  lineage, but it must not overwrite or delete the older object as part of the
+  write path.
+- Clients may treat an artifact as superseded, but superseded does not mean
+  mutable.
+- Reproducibility is trace-based: the system must retain the lineage metadata
+  required to rerun the same generator against the same stored source revision
+  and changeset/takeoff/estimate inputs.
+- Original uploads and generated artifacts remain separate immutable classes of
+  stored objects.
+
+Retention/deletion for MVP is manual-first and soft-delete-first:
+
+- By default, MVP keeps original uploads and generated artifacts for debugging,
+  audit, and reproducibility.
+- Deletion is a metadata action first. Artifact rows may be marked deleted or
+  hidden from normal listings before any storage object is physically removed.
+- Physical deletion, if performed during MVP, is manual/administrative and must
+  never target the sole remaining copy needed for trace reproducibility.
+- Automated cleanup of superseded or orphaned artifacts is post-MVP work.

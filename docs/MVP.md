@@ -136,6 +136,16 @@ Original uploads and generated artifacts are immutable once written. If an
 export is regenerated, it must produce a new artifact record/object rather than
 overwrite an existing one.
 
+Generated artifact records must keep lineage back to the producing source file,
+drawing revision, changeset/takeoff/estimate context when applicable, job, and
+generator metadata so the same output can be traced and reproduced later.
+
+MVP retention/deletion is soft-delete/manual-first:
+
+- keep original uploads and generated artifacts by default
+- hide or soft-delete metadata before any physical object removal
+- do not run automatic cleanup of superseded artifacts in MVP
+
 Use this split:
 
 - object/file storage for original files and generated artifacts
