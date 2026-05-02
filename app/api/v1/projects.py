@@ -11,7 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import raise_not_found
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.models.project import Project
 from app.schemas.project import (
@@ -61,13 +62,11 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
     ) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": {
-                    "code": "INVALID_CURSOR",
-                    "message": "Invalid cursor format",
-                    "details": None,
-                }
-            },
+            detail=create_error_response(
+                code=ErrorCode.INVALID_CURSOR,
+                message="Invalid cursor format",
+                details=None,
+            ),
         ) from e
 
 

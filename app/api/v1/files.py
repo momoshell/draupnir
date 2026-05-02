@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
@@ -71,7 +72,7 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=create_error_response(
-                code="INVALID_CURSOR",
+                code=ErrorCode.INVALID_CURSOR,
                 message="Invalid cursor format",
                 details=None,
             ),
@@ -103,7 +104,7 @@ def _unsupported_format_exception() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
         detail=create_error_response(
-            code="INPUT_UNSUPPORTED_FORMAT",
+            code=ErrorCode.INPUT_UNSUPPORTED_FORMAT,
             message=_SUPPORTED_FORMATS_MESSAGE,
             details=None,
         ),
@@ -156,7 +157,7 @@ def _ensure_private_directory(path: Path, *, include_parents_until: Path | None 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=create_error_response(
-                code="STORAGE_WRITE_FAILED",
+                code=ErrorCode.STORAGE_FAILED,
                 message="Failed to persist uploaded file.",
                 details=None,
             ),
@@ -169,7 +170,7 @@ async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: st
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=create_error_response(
-            code="INPUT_INVALID",
+            code=ErrorCode.INPUT_INVALID,
             message=message,
             details=None,
         ),
@@ -189,7 +190,7 @@ def _promote_staged_upload(staging_path: Path, final_path: Path) -> None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=create_error_response(
-                code="STORAGE_CONFLICT",
+                code=ErrorCode.STORAGE_FAILED,
                 message="Storage collision occurred during upload.",
                 details=None,
             ),
@@ -198,7 +199,7 @@ def _promote_staged_upload(staging_path: Path, final_path: Path) -> None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=create_error_response(
-                code="STORAGE_WRITE_FAILED",
+                code=ErrorCode.STORAGE_FAILED,
                 message="Failed to persist uploaded file.",
                 details=None,
             ),
@@ -211,7 +212,7 @@ def _promote_staged_upload(staging_path: Path, final_path: Path) -> None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=create_error_response(
-                code="STORAGE_WRITE_FAILED",
+                code=ErrorCode.STORAGE_FAILED,
                 message="Failed to persist uploaded file.",
                 details=None,
             ),
@@ -278,7 +279,7 @@ async def upload_project_file(
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
-                            code="INPUT_INVALID",
+                            code=ErrorCode.INPUT_INVALID,
                             message="Uploaded file exceeds maximum allowed size.",
                             details=None,
                         ),
@@ -300,7 +301,7 @@ async def upload_project_file(
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
-                            code="INPUT_INVALID",
+                            code=ErrorCode.INPUT_INVALID,
                             message="Uploaded file exceeds maximum allowed size.",
                             details=None,
                         ),
@@ -366,7 +367,7 @@ async def upload_project_file(
         enqueue_ingest_job(ingest_job.id)
     except Exception as exc:
         ingest_job.status = "failed"
-        ingest_job.error_code = None
+        ingest_job.error_code = ErrorCode.INTERNAL_ERROR.value
         ingest_job.error_message = f"Failed to enqueue ingest job: {exc}"
         ingest_job.finished_at = datetime.now(UTC)
         await db.commit()

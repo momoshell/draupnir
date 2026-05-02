@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.errors import ErrorCode
+
 
 class JobRead(BaseModel):
     """Schema for reading a persisted background job."""
@@ -20,7 +22,7 @@ class JobRead(BaseModel):
     attempts: int = Field(..., ge=0, description="Current attempt count")
     max_attempts: int = Field(..., ge=1, description="Maximum retry attempts")
     cancel_requested: bool = Field(..., description="Whether cancellation was requested")
-    error_code: str | None = Field(None, description="Machine-readable error code")
+    error_code: ErrorCode | None = Field(None, description="Machine-readable error code")
     error_message: str | None = Field(None, description="Human-readable error message")
     started_at: datetime | None = Field(None, description="Job start timestamp")
     finished_at: datetime | None = Field(None, description="Job completion timestamp")

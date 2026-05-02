@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse, Response
 from structlog.contextvars import bind_contextvars, clear_contextvars
 
 from app.core.config import settings
+from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response
 
 # Valid request ID pattern: alphanumeric, hyphens, underscores, max 64 chars
@@ -41,7 +42,7 @@ class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     status_code=status.HTTP_411_LENGTH_REQUIRED,
                     content=create_error_response(
-                        code="INPUT_INVALID",
+                        code=ErrorCode.INPUT_INVALID,
                         message=(
                             "Content-Length header is required for upload requests. "
                             "This API enforces max_upload_mb as a maximum request body size "
@@ -57,7 +58,7 @@ class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     content=create_error_response(
-                        code="INPUT_INVALID",
+                        code=ErrorCode.INPUT_INVALID,
                         message="Content-Length header must be a valid integer.",
                         details=None,
                     ),
@@ -71,7 +72,7 @@ class ContentLengthLimitMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                     content=create_error_response(
-                        code="INPUT_INVALID",
+                        code=ErrorCode.INPUT_INVALID,
                         message="Request body exceeds maximum allowed size for uploads.",
                         details=None,
                     ),
