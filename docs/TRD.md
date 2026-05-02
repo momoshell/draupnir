@@ -371,6 +371,151 @@ Required behavior:
 - never write to the original file
 - surface unsupported features as warnings, not silent drops
 
+### Adapter Capability Registry
+
+The system must maintain a capability registry for every configured ingestion
+adapter so the API can report what is installed, usable, and allowed.
+
+Minimum registry fields per adapter:
+
+- `adapter_key` - stable identifier such as `dwg.libredwg` or `pdf.vector.pymupdf`
+- `input_family` - one of `dwg`, `dxf`, `ifc`, `pdf_vector`, `pdf_raster`
+- `adapter_name`
+- `adapter_version`
+- `input_formats` - concrete source formats the adapter can accept
+- `output_formats` - concrete normalized or export formats the adapter can emit
+- `status` - one of `available`, `unavailable`, `degraded`
+- `availability_reason` - nullable enum: `missing_binary`, `missing_license`,
+  `probe_failed`, `disabled_by_config`, `unsupported_platform`
+- `license_state` - one of `present`, `missing`, `not_required`, `unknown`
+- `license_name` - nullable short identifier for the runtime dependency license
+- `can_read`
+- `can_write`
+- `extracts_geometry`
+- `extracts_text`
+- `extracts_layers`
+- `extracts_blocks`
+- `extracts_materials`
+- `supports_exports`
+- `supports_quantity_hints`
+- `supports_layout_selection`
+- `supports_xref_resolution`
+- `experimental` - true for review-first or otherwise non-default capability
+- `confidence_range` - nullable `{ min, max }` range for expected extraction confidence
+- `bounded_probe_ms` - max probe budget for startup/runtime capability checks
+- `last_checked_at`
+- `details` - optional structured diagnostic metadata safe for operators
+
+Rules:
+
+- Missing required adapter binaries or required runtime license material map to
+  `ADAPTER_UNAVAILABLE`.
+- Timeout during adapter invocation or bounded capability/health probing maps to
+  `ADAPTER_TIMEOUT`.
+- Capability checks must be bounded, side-effect free, and must not parse full
+  customer files.
+- `degraded` means the adapter is callable but some optional capability is not
+  working; it must not be used to hide a missing binary or missing license.
+
+### System Capability And Health Endpoints
+
+`/v1/health` remains a shallow liveness endpoint with the existing exact shape:
+
+```json
+{ "status": "ok", "version": "..." }
+```
+
+Dependency-specific detail belongs under `/v1/system/*`.
+
+#### `GET /v1/system/capabilities`
+
+Returns the current adapter capability registry.
+
+Response shape:
+
+```text
+{
+  adapters: [
+    {
+      adapter_key,
+      input_family,
+      adapter_name,
+      adapter_version,
+      input_formats,
+      output_formats,
+      status,
+      availability_reason?,
+      license_state,
+      license_name?,
+      can_read,
+      can_write,
+      extracts_geometry,
+      extracts_text,
+      extracts_layers,
+      extracts_blocks,
+      extracts_materials,
+      supports_exports,
+      supports_quantity_hints,
+      supports_layout_selection,
+      supports_xref_resolution,
+      experimental,
+      confidence_range?,
+      bounded_probe_ms,
+      last_checked_at?,
+      details?
+    }
+  ]
+}
+```
+
+HTTP/status semantics:
+
+- `200` - endpoint itself succeeded, even if some adapters are unavailable or
+  degraded
+- `500` with `INTERNAL_ERROR` - registry cannot be produced at all
+
+#### `GET /v1/system/health`
+
+Returns bounded dependency and adapter health for operators and automation.
+
+Minimum response shape:
+
+```text
+{
+  status,
+  checks: {
+    database: { status, latency_ms? },
+    storage: { status, latency_ms? },
+    broker: { status, latency_ms? },
+    adapters: [
+      { adapter_key, status, error_code?, latency_ms?, details? }
+    ]
+  }
+}
+```
+
+Status semantics:
+
+- top-level `status` is one of `ok`, `degraded`, `down`
+- dependency/check `status` is one of `ok`, `degraded`, `down`, `unknown`
+- adapter `error_code` may be `ADAPTER_UNAVAILABLE`, `ADAPTER_TIMEOUT`, or
+  `ADAPTER_FAILED`
+
+HTTP semantics:
+
+- `200` - overall system status `ok`
+- `503` - overall system status `degraded` or `down`
+- `500` with `INTERNAL_ERROR` - health response itself cannot be assembled
+
+Probe rules:
+
+- Health probes must be bounded by small per-check timeouts and must fail closed
+  rather than hanging the request.
+- Adapter health probes must verify callable readiness only; they must not run
+  full ingestion against production-sized inputs.
+- Expensive checks may use cached probe results when the cache age is explicitly
+  bounded and reported.
+
 ## Coordinate Systems, Units, Encoding
 
 - Adapters must record source units, normalized units, and conversion factor.
@@ -446,6 +591,13 @@ Required behavior:
 - Reject unsupported formats early with `INPUT_UNSUPPORTED_FORMAT`.
 - DXF, IFC, and PDF parsers run with strict resource limits (file handles,
   memory) to mitigate decompression bombs and pathological inputs.
+- Risky parsers and external adapter binaries must run in mandatory isolation
+  boundaries such as dedicated subprocesses or containers, not in-process with
+  the API worker.
+- Isolation boundaries must enforce time budgets/timeouts, memory, file
+  descriptor/file-access limits, per-job tempdir ownership and cleanup, and
+  network disabled by default with explicit allowlisting only when required;
+  adapter stdout/stderr and exit status remain untrusted inputs.
 - Original storage paths are derived from server-controlled IDs, never from the
   client filename, to prevent path traversal.
 - Filenames are stored only as metadata; they are never used as keys.
