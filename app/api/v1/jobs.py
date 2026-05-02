@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
@@ -80,7 +81,7 @@ def _decode_job_events_cursor(cursor: str) -> tuple[datetime, int | None, UUID]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=create_error_response(
-                code="INVALID_CURSOR",
+                code=ErrorCode.INVALID_CURSOR,
                 message="Invalid cursor format",
                 details=None,
             ),
@@ -208,11 +209,18 @@ async def retry_job(
         enqueue_ingest_job(job.id)
     except Exception as exc:
         job.status = "failed"
-        job.error_code = None
+        job.error_code = ErrorCode.INTERNAL_ERROR.value
         job.error_message = f"Failed to enqueue ingest job: {exc}"
         job.finished_at = datetime.now(UTC)
         await db.commit()
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=create_error_response(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Failed to enqueue ingest job",
+                details=None,
+            ),
+        ) from exc
 
     await db.refresh(job)
     return job

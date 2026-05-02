@@ -13,6 +13,7 @@ import app.api.v1.files as files_api
 import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
+from app.core.errors import ErrorCode
 from app.jobs.worker import process_ingest_job, recover_incomplete_ingest_jobs
 from app.models.job import Job
 from app.models.job_event import JobEvent
@@ -187,10 +188,40 @@ class TestJobs:
 
         assert job.status == "failed"
         assert job.attempts == 0
-        assert job.error_code is None
+        assert job.error_code == ErrorCode.INTERNAL_ERROR.value
         assert job.error_message == "Failed to enqueue ingest job: broker unavailable"
         assert job.started_at is None
         assert job.finished_at is not None
+
+    async def test_process_ingest_job_marks_internal_error_code_on_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker failures should persist INTERNAL_ERROR on the job row."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _fail_sleep(_: float) -> None:
+            raise RuntimeError("adapter exploded")
+
+        monkeypatch.setattr(asyncio, "sleep", _fail_sleep)
+
+        with pytest.raises(RuntimeError, match="adapter exploded"):
+            await process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert updated_job.error_message == "adapter exploded"
+        assert updated_job.finished_at is not None
 
     async def test_get_job_returns_persisted_state(
         self,
@@ -792,6 +823,57 @@ class TestJobs:
         updated = await _get_job(job.id)
         assert updated.status == "pending"
 
+    async def test_retry_job_returns_error_envelope_when_enqueue_fails(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should standardize broker enqueue failures and persist job failure."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        def _fail_retry_enqueue(_: uuid.UUID) -> None:
+            raise RuntimeError("broker unavailable")
+
+        monkeypatch.setattr(
+            jobs_api,
+            "enqueue_ingest_job",
+            _fail_retry_enqueue,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_message="previous failure",
+        )
+
+        response = await async_client.post(f"/v1/jobs/{job.id}/retry")
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to enqueue ingest job",
+                "details": None,
+            }
+        }
+        assert "broker unavailable" not in response.text
+
+        updated = await _get_job(job.id)
+        assert updated.status == "failed"
+        assert updated.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert updated.error_message == "Failed to enqueue ingest job: broker unavailable"
+        assert updated.finished_at is not None
+
     async def test_retry_job_noops_when_attempt_limit_reached(
         self,
         async_client: httpx.AsyncClient,
@@ -916,6 +998,7 @@ class TestJobs:
         updated = await _get_job(job.id)
         assert updated.status == "cancelled"
         assert updated.cancel_requested is True
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
         assert updated.finished_at is not None
         assert updated.error_message is None
 
@@ -947,7 +1030,7 @@ class TestJobs:
         assert updated.attempts == 1
         assert updated.cancel_requested is True
         assert updated.finished_at is not None
-        assert updated.error_code == worker_module._JOB_CANCELLED_ERROR_CODE
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
 
     async def test_process_ingest_job_ignores_duplicate_delivery_after_cancelled(
         self,

@@ -168,15 +168,18 @@ Required data:
 `jobs.error_code` and the error envelope share an enumerated taxonomy. Initial
 codes:
 
-- `INPUT_INVALID` - upload rejected by validation
+- `NOT_FOUND` - requested resource does not exist in the addressed scope
+- `INVALID_CURSOR` - cursor token is malformed or cannot be decoded
+- `VALIDATION_ERROR` - request body/path/query validation failed
+- `INPUT_INVALID` - otherwise invalid client-supplied input
 - `INPUT_UNSUPPORTED_FORMAT` - format detected but not handled
 - `ADAPTER_UNAVAILABLE` - adapter binary or license missing
 - `ADAPTER_TIMEOUT` - adapter exceeded configured timeout
 - `ADAPTER_FAILED` - adapter returned non-zero or malformed output
-- `STORAGE_FAILED` - read/write/checksum failure
+- `STORAGE_FAILED` - read/write/link/checksum failure
 - `DB_CONFLICT` - optimistic concurrency or unique violation
 - `JOB_CANCELLED` - cancelled by user before completion
-- `INTERNAL_ERROR` - unhandled exception, must include trace id
+- `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
 
 New codes require a docs change in this file.
 
@@ -283,4 +286,3 @@ Required behavior:
 - Whether geometry validation starts with FreeCAD or direct OCCT bindings.
 - Webhook/SSE event delivery vs polling-only for MVP.
 - Whether materials live in a shared catalog or per-project.
-

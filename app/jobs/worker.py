@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
 from app.models.job import Job
@@ -23,7 +24,7 @@ _INCOMPLETE_JOB_STATUSES = ("pending", "running")
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
-_JOB_CANCELLED_ERROR_CODE = "JOB_CANCELLED"
+_JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
 
 celery_app = Celery(
     "draupnir",
@@ -93,7 +94,12 @@ async def emit_job_event(
         await managed_session.commit()
 
 
-async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
+async def _mark_job_failed(
+    job_id: UUID,
+    *,
+    error_message: str,
+    error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
+) -> None:
     """Persist a failed job state with the supplied message."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -111,16 +117,19 @@ async def _mark_job_failed(job_id: UUID, *, error_message: str) -> None:
                 status=job.status,
             )
             return
-
         job.status = "failed"
-        job.error_code = None
+        job.error_code = error_code.value
         job.error_message = error_message
         job.finished_at = _utcnow()
         await emit_job_event(
             job_id,
             level="error",
             message="Job failed",
-            data_json={"status": "failed", "error_message": error_message},
+            data_json={
+                "status": "failed",
+                "error_code": error_code.value,
+                "error_message": error_message,
+            },
             session=session,
         )
         await session.commit()

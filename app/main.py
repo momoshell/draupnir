@@ -1,7 +1,8 @@
 """FastAPI application factory."""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1 import files_router, health_router, jobs_router, project_router
 from app.core.config import settings
@@ -26,7 +27,7 @@ def create_app() -> FastAPI:
         debug=settings.debug,
     )
 
-    app.add_exception_handler(HTTPException, custom_http_exception_handler)
+    app.add_exception_handler(StarletteHTTPException, custom_http_exception_handler)
     app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
     # Add middleware
