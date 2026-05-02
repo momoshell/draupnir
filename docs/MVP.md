@@ -132,6 +132,10 @@ core endpoint semantics.
 
 Store all extracted entities, not only summaries.
 
+Original uploads and generated artifacts are immutable once written. If an
+export is regenerated, it must produce a new artifact record/object rather than
+overwrite an existing one.
+
 Use this split:
 
 - object/file storage for original files and generated artifacts
