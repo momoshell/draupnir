@@ -56,7 +56,9 @@ expected and must be represented through confidence/provenance fields.
 Raster PDF is important for the product, but it is higher-risk than DWG/vector
 PDF. It is implemented behind an experimental adapter strategy using VTracer,
 centerline extraction, and Tesseract. Initial support may produce trace
-candidates and review items rather than fully trusted quantities.
+candidates and review items rather than fully trusted quantities. Raster-derived
+outputs remain review-first and must not silently become trusted quantity
+inputs.
 
 ### DXF
 
@@ -221,6 +223,9 @@ The quantity engine must compute deterministic quantities from normalized data:
 - entity/layer/block summaries
 
 Every computed quantity must include source entity references and units.
+
+Quantity generation must enforce ingestion review state and confidence policy,
+not just copy confidence metadata through to the output.
 
 ## Estimation Engine
 
@@ -393,6 +398,8 @@ Required behavior:
 - emit progress callbacks the worker can persist as `job_events`
 - never write to the original file
 - surface unsupported features as warnings, not silent drops
+- assign a revision review state from the confidence/review policy before
+  downstream quantity work can auto-proceed
 
 ### Adapter Capability Registry
 
@@ -581,6 +588,44 @@ Probe rules:
   human review.
 - Entities and revisions must persist confidence alongside provenance so review
   workflows can distinguish trusted geometry from review-first extraction.
+- Review state is behavioral, not descriptive metadata only. Every ingested
+  revision must be classified as exactly one of:
+  - `approved` - trusted for downstream quantity generation without additional
+    review gate.
+  - `provisional` - quantity generation may run, but outputs remain explicitly
+    provisional and must not be used as silent source-of-truth inputs for
+    estimate/export flows that require approved quantities.
+  - `review_required` - blocked from trusted quantity generation until human
+    review explicitly approves, rejects, or replaces it.
+  - `rejected` - human-reviewed and not eligible for quantity generation.
+  - `superseded` - replaced by a newer revision and not eligible for quantity
+    generation.
+- Default confidence-to-state thresholds for ingestion outputs:
+  - `>= 0.95` -> `approved`
+  - `0.60` to `< 0.95` -> `provisional`
+  - `< 0.60` -> `review_required`
+- Raster PDF is a hard exception to the generic threshold rule: raster-derived
+  revisions and raster-derived entities remain `review_required` until human
+  review, even when individual heuristics score above the normal provisional
+  band. Raster confidence may guide prioritization, but it cannot auto-approve
+  trusted quantity input.
+- Human review may promote a revision from `review_required` or `provisional` to
+  `approved`, keep it `provisional`, mark it `rejected`, or leave it
+  `review_required` pending more information. A revision replaced by a later
+  revision may be marked `superseded`.
+- Quantity jobs must enforce the review state:
+  - `approved` ingestion output may generate normal quantities.
+  - `provisional` ingestion output may generate provisional quantities only, and
+    those quantities must be labeled and stored as provisional.
+  - `review_required`, `rejected`, and `superseded` ingestion output must not
+    generate quantities; the system returns a review-gated or ineligible
+    outcome instead of silently proceeding.
+- Validation/reporting between ingestion and quantity generation must include:
+  - inherited review state and effective confidence at revision level
+  - whether any source entities were excluded or downgraded due to review policy
+  - raster scale-calibration status when raster-derived geometry is present
+  - warnings explaining why quantity output is blocked, provisional, or fully
+    approved
 - Quantity dedup rules must be documented per quantity type so the same entity
   is not counted twice across length/area/volume aggregates.
 

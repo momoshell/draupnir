@@ -66,6 +66,10 @@ IFC adapter
 
 Adapters must report confidence and provenance.
 
+Ingestion also assigns a review state (`approved`, `provisional`,
+`review_required`, `rejected`, or `superseded`) that downstream quantity work
+must enforce. Confidence affects behavior, not just metadata.
+
 The backend also maintains an adapter capability registry that reports, per
 adapter, installed availability, input/output format support, extraction and
 export features, expected confidence ranges, and experimental/license status.
@@ -108,11 +112,19 @@ Upload
   -> file record
   -> ingestion job
   -> source adapter
-  -> canonical entities
-  -> quantity extraction
+  -> canonical entities + confidence/review state
+  -> quantity extraction or review gate
   -> estimate generation
   -> exports
 ```
+
+Quantity workers must refuse to treat review-gated ingestion output as trusted
+source-of-truth input. Provisional quantity runs are allowed only when the
+upstream revision is marked provisional, and the resulting quantities must stay
+explicitly provisional downstream.
+
+Revisions marked `review_required`, `rejected`, or `superseded` are not eligible
+for quantity generation.
 
 For edits:
 
