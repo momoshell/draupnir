@@ -30,7 +30,20 @@ DWG and PDF support must be adapter-based.
   Autodesk RealDWG, QCAD Professional, or another licensed adapter.
 - Vector PDF extraction is useful but can lose semantic CAD structure.
 - Raster PDF extraction is important, but confidence will be lower and human
-  review may be required.
+  review is required before outputs can become trusted quantity input.
+
+MVP review/confidence workflow:
+
+- ingestion classifies output as `approved`, `provisional`, `review_required`,
+  `rejected`, or `superseded`
+- default thresholds are `>= 0.95` approved, `0.60` to `< 0.95` provisional,
+  and `< 0.60` review-required
+- raster PDF is always review-first until human approval, even if heuristic
+  confidence looks higher
+- `rejected` and `superseded` are non-quantity states: they block quantity
+  generation until a newer eligible revision exists
+- provisional quantity output may exist, but it must stay explicitly
+  provisional and must not silently flow into trusted estimation/export paths
 
 The core system must not depend on one converter being permanently available.
 
