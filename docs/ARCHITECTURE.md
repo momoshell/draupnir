@@ -138,6 +138,56 @@ review-needed findings may still proceed only through the derived gate policy.
 Revisions marked `review_required`, `rejected`, or `superseded` are not eligible
 for quantity generation.
 
+### Visual and Debug Overlay Artifacts
+
+Adapters and downstream QA flows may emit visual/debug overlays as generated
+artifacts when operators need to inspect extraction results against the source
+drawing.
+
+Overlay artifacts follow the normal artifact lifecycle and are never a mutable
+sidecar attached in place to the source upload or drawing revision.
+
+Minimum contract:
+
+- artifact kind: `debug_overlay`
+- artifact name: stable, operator-readable output such as
+  `page-0001-entity-overlay`, `page-0001-quantity-overlay`, or
+  `sheet-a101-review-overlay`
+- MVP formats: SVG when the source/annotation pipeline stays vector-friendly,
+  PNG for raster-first inspection output, and PDF overlay output when a
+  page-faithful review artifact is needed for multi-page or print-oriented QA
+
+Each overlay must preserve enough context for later fixture-based acceptance and
+human review. Required visible content:
+
+- source drawing/page or sheet reference being reviewed
+- extracted entities drawn in registration with the source view when available
+- entity ids or other stable labels that map back to stored extraction records
+- confidence indicators or review cues for uncertain/flagged entities
+- quantity regions, measurement spans, or takeoff highlights when quantities are
+  part of the review target
+
+Each overlay artifact record must also capture lineage back to:
+
+- source file id
+- drawing revision id
+- job id
+- adapter/generator name and version
+- generator options snapshot, including page/sheet selection and any overlay
+  rendering switches that affect review output
+
+When applicable, the overlay lineage should also retain the specific extracted
+entity ids, quantity/takeoff ids, or predecessor artifact id used to assemble
+the rendered review view.
+
+Storage and retention behavior are the same as all generated artifacts:
+
+- overlays are written under the artifact storage prefix, not beside originals
+- overlays are immutable once written and cannot be overwritten in place
+- regeneration or rerendering creates a new artifact id and storage key
+- soft deletion may hide an overlay from normal listings, but MVP retention
+  keeps the stored object and lineage metadata for audit/debug use
+
 For edits:
 
 ```text
