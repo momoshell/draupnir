@@ -117,13 +117,19 @@ AI must not directly write CAD files or compute final quantities/prices.
 ```text
 Upload
   -> file record
-  -> ingestion job
+  -> extraction profile selection/persistence
+  -> ingestion job (file_id + extraction_profile_id)
   -> source adapter
   -> canonical entities + confidence/review state + validation report
   -> quantity extraction or review gate
   -> estimate generation
   -> exports
 ```
+
+Extraction profiles are immutable configuration records that capture the
+extraction contract for a run: unit overrides, layout mode, xref/block
+handling, text/dimension extraction policy, PDF page range, raster calibration,
+and any confidence threshold used to gate the output.
 
 Quantity workers must refuse to treat review-gated ingestion output as trusted
 source-of-truth input. Provisional quantity runs are allowed only when the
@@ -142,12 +148,18 @@ For edits:
 
 ```text
 Existing drawing revision
-  -> user or agent proposed changeset
-  -> validation
+  -> user or agent proposed changeset, or file reprocess request
+  -> validation / adapter execution
   -> new drawing revision
   -> DXF export
   -> later DWG/IFC export
 ```
+
+Reprocessing a file always creates a new drawing revision from the original
+immutable `file_id`; it never overwrites the previous revision. The new revision
+records the adapter version used for the run and the `extraction_profile_id`
+that defined the extraction settings so later jobs and audits can reproduce the
+result.
 
 ## Original File Policy
 
