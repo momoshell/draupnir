@@ -227,6 +227,67 @@ Every computed quantity must include source entity references and units.
 Quantity generation must enforce ingestion review state and confidence policy,
 not just copy confidence metadata through to the output.
 
+Phase 6 quantity policy defaults:
+
+- quantity math runs in normalized internal units with full stored precision
+- tolerance is used for assertions, comparisons, and deterministic test
+  expectations; it must not mutate stored quantity values
+- rounding happens only at presentation/export boundaries and when freezing a
+  finalized estimate snapshot, never during intermediate quantity computation
+- duplicate source entities must be suppressed before aggregate math by stable
+  canonical identity and source-hash checks
+- every quantity item must carry provenance to the source entities that produced
+  it plus its review-gated/provisional status
+
+### Quantity Deduplication, Tolerance, And Rounding
+
+The quantity engine must prevent duplicate counting when the same source entity,
+block expansion, or adapter-emitted record appears more than once in normalized
+input.
+
+- Canonical entity identity must be stable per drawing revision.
+- Deduplication must key on canonical entity identity plus source hash or
+  equivalent immutable source fingerprint.
+- If two normalized records resolve to the same identity/fingerprint pair, they
+  are one quantity contributor, not two.
+- Conflicting duplicates must be surfaced for review or validation rather than
+  summed optimistically.
+
+Type-specific quantity rules:
+
+- counts: one countable canonical entity contributes at most once to the same
+  aggregate scope
+- lengths/perimeters: the same linear edge/path must not be re-summed through
+  duplicate entity rows, repeated block expansion, or overlapping alias records
+- areas: area is measured only from eligible closed geometry; the same closed
+  shape must not contribute twice through duplicate outlines or duplicate block
+  references
+- volumes/mass: volume-bearing solids/profiles contribute once per canonical
+  source entity; mass derives from the accepted volume and material data and
+  inherits the same dedup rule
+
+Numeric policy defaults:
+
+- internal computation uses normalized units and full precision
+- stored quantity values preserve computed precision subject to database/storage
+  capabilities; tolerance is not a storage-rounding mechanism
+- one project-wide tolerance policy must exist so tests can encode the same
+  comparison behavior for unit conversions, aggregate checks, and fixture
+  assertions
+- rounding policy must be explicit per output format or estimate snapshot field
+
+Minimum quantity provenance fields:
+
+- quantity_type
+- value
+- unit
+- source_entity_refs
+- excluded_entity_refs when validation/review policy removed contributors
+- review_state
+- validation_status
+- quantity_gate
+- provisional boolean or equivalent explicit status marker
+
 ### Canonical Validation Report v0.1
 
 Between ingestion and quantity generation, every drawing revision must expose a
@@ -398,6 +459,12 @@ Additional gate rules:
 - Unresolved xrefs, incomplete layer mapping, or adapter warnings that preserve
   usable geometry may downgrade the report to `valid_with_warnings` or
   `needs_review` depending on measurement impact.
+- Quantities that do run under `allowed_provisional` must carry explicit
+  provisional/review-linked metadata down to API responses, exports, and frozen
+  estimate snapshots.
+- `review_gated` revisions may expose why quantities were blocked and which
+  entities/findings caused the block, but they must not publish trusted quantity
+  totals.
 
 ## Estimation Engine
 
@@ -832,6 +899,14 @@ Probe rules:
     approved
 - Quantity dedup rules must be documented per quantity type so the same entity
   is not counted twice across length/area/volume aggregates.
+- Review-gated quantity behavior defaults:
+  - `allowed` revisions may publish normal quantity totals.
+  - `allowed_provisional` revisions may publish quantities only with explicit
+    provisional labeling and provenance.
+  - `review_gated` revisions may publish blockage metadata, but not trusted
+    quantity totals.
+  - entity-level exclusions caused by review/validation findings must remain
+    traceable in provenance rather than silently disappearing.
 
 ## Observability
 

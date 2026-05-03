@@ -101,6 +101,11 @@ Default normalized units:
 - mass: kg
 - currency: GBP
 
+Internal quantity math uses normalized units and full precision. Tolerance is a
+comparison/assertion rule for tests and validation, not a stored-value mutation
+rule. Rounding happens only when presenting/exporting values or freezing a
+finalized estimate snapshot.
+
 ## Quantities
 
 Extract and store all practical quantities available from the input:
@@ -118,6 +123,17 @@ Extract and store all practical quantities available from the input:
 - gross/net quantities where determinable
 
 Every quantity must keep provenance back to source entities.
+
+Default MVP quantity policy:
+
+- suppress duplicate contributors by canonical entity identity plus source hash
+  or equivalent immutable source fingerprint
+- document one shared tolerance policy so tests and fixture assertions compare
+  quantities consistently
+- keep review state and validation status attached to quantity outputs
+- allow provisional quantities only when the revision is quantity-eligible as
+  provisional; `review_required`, `rejected`, and `superseded` revisions do not
+  publish trusted quantity totals
 
 ## Estimation
 
