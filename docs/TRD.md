@@ -332,10 +332,33 @@ New codes require a docs change in this file.
 
 - Default ingestion adapter timeout: 5 minutes. Override per-adapter via config.
 - Default max attempts: 3. Backoff is exponential with jitter.
-- Cancel is cooperative. Workers must check `cancel_requested` between adapter
-  steps and on every persisted progress event.
-- Retries must be safe: workers re-derive output from the source file and the
-  `attempts` counter, not from prior partial state.
+- Cancel is cooperative. Workers must check `cancel_requested` before starting
+  work, between adapter steps, on every persisted progress event, and again
+  before any terminal success commit.
+- Retries must be safe and idempotent. A rerun re-derives output from the
+  immutable source inputs and current attempt context; prior partial attempt
+  output is never treated as committed input for the retry path.
+- Workers may stage attempt-local output while a job is running, but staged
+  output is not visible as the job's final result and must not be published as a
+  committed artifact set.
+- A job has at most one committed final output set. Promotion of staged output,
+  creation of any final artifact rows/objects, and transition to a terminal
+  `succeeded` state must happen atomically under the job lock so clients never
+  observe committed outputs with a non-terminal job or a terminal success with
+  missing outputs.
+- Retry and duplicate-delivery handling must fence stale workers and prevent
+  duplicate finalization. Redelivered messages, overlapping attempts, or stale
+  completions must not create duplicate committed outputs or move the job from a
+  newer terminal state back to an older one.
+- Retry is only for failed work. A retry attempt may replace staged attempt
+  data, but it does not overwrite or mutate already committed artifacts from a
+  different completed job path.
+- Cancellation before finalization produces `cancelled` with no new committed
+  output set. A cancel request after a terminal state is a no-op.
+- `job_events` must capture the operational state machine, including enqueue,
+  start, progress checkpoints, cancel requested, cancel observed, retry
+  scheduled, terminal failure, and terminal success so clients can reconstruct
+  what happened per attempt.
 - Job pipelines may auto-chain (ingestion -> quantity takeoff) when configured;
   default for MVP is manual chaining via the API.
 - All long-running steps must emit `job_events` rows for progress and errors.

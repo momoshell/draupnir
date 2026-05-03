@@ -185,6 +185,24 @@ Workers must:
 - record the parent job id when chaining
 - never silently start downstream work on failure or partial output
 - surface the chain in `job_events` so clients can render a pipeline view
+- treat each attempt as an isolated execution context with any temporary staged
+  output scoped by job and attempt until finalization
+- commit final outputs and terminal success together under the job row lock so a
+  visible artifact set and a `succeeded` job state appear atomically
+- reject stale completion paths from duplicate delivery, worker loss recovery,
+  or overlapping retries so only one final commit path wins
+- observe cancel checkpoints before expensive phases and again before final
+  commit so a requested cancel can stop publication of new outputs
+
+Operationally, this distinguishes retry from regeneration or re-export:
+
+- Retry is recovery for the same job after failure. It may recreate staged
+  attempt-local data, but it must still produce at most one visible committed
+  final output set for that job.
+- Regeneration or re-export is a new job producing new immutable artifacts with
+  new ids and storage keys per the artifact lifecycle rules below.
+- `job_events` are the durable trace for queueing, execution, cancellation,
+  retry scheduling, and terminal outcome transitions across attempts.
 
 ## Deployment Topology
 
