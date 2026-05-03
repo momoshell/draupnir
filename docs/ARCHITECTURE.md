@@ -190,6 +190,40 @@ Rules:
 - Storage backends must reject any attempt to overwrite an existing generated
   artifact object, even when the payload is byte-identical.
 
+## Retention and Soft Deletion
+
+MVP retention is conservative: original uploads, derived revisions, and
+generated artifacts are kept by default so lineage, debugging, and
+reproducibility remain intact.
+
+Soft deletion is a database visibility flag, not a storage mutation.
+
+- `projects.deleted_at` hides the project from normal active listings but does
+  not remove child file, revision, job, or artifact records from audit/history
+  views.
+- `files.deleted_at` marks the uploaded file record as deleted for product
+  behavior, but the original immutable storage object remains in place during
+  MVP.
+- `artifacts.deleted_at` marks an artifact as hidden or no longer active for
+  normal listings/download UX, but does not permit overwrite-in-place and does
+  not remove the immutable stored object during MVP.
+- Where a model supports soft deletion, `deleted_at` must be nullable, set only
+  when the record transitions to a deleted/hidden state, and left unchanged for
+  active records.
+- Soft deletion never rewrites lineage. References from artifacts to source
+  files, drawing revisions, jobs, changesets, takeoffs, or estimates remain
+  intact even when one of those records is hidden from default views.
+
+MVP does not perform automatic physical deletion. In particular:
+
+- original upload objects are never physically removed by background retention
+  jobs in MVP
+- immutable generated artifact objects are never physically removed by automatic
+  cleanup in MVP
+- superseded or soft-deleted artifacts may be filtered from default product
+  views, but they remain restorable from retained metadata/object storage during
+  MVP
+
 ## Job Pipeline Orchestration
 
 Jobs form a small DAG per uploaded file:
@@ -279,8 +313,17 @@ Retention/deletion for MVP is manual-first and soft-delete-first:
 
 - By default, MVP keeps original uploads and generated artifacts for debugging,
   audit, and reproducibility.
-- Deletion is a metadata action first. Artifact rows may be marked deleted or
-  hidden from normal listings before any storage object is physically removed.
-- Physical deletion, if performed during MVP, is manual/administrative and must
-  never target the sole remaining copy needed for trace reproducibility.
-- Automated cleanup of superseded or orphaned artifacts is post-MVP work.
+- Deletion is a metadata action first. Project, file, and artifact rows may be
+  soft-deleted with `deleted_at` and hidden from normal listings before any
+  storage object is considered for removal.
+- During MVP, physical cleanup is manual/administrative only and does not run as
+  an automatic retention path.
+- Any post-MVP physical cleanup flow must first verify all of the following:
+  the target object is not the sole retained source or artifact required for
+  lineage/reproducibility, the row is already soft-deleted or superseded per
+  product rules, no active record still points at the object as its current
+  visible payload, legal/audit retention requirements permit removal, and the
+  cleanup action is recorded as an explicit administrative event.
+- Post-MVP automation may prune eligible superseded or orphaned objects only if
+  those safety checks are enforced before delete and immutable write-path rules
+  remain unchanged.
