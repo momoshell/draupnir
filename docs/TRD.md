@@ -241,6 +241,38 @@ Required data:
 - estimate line items
 - estimate versions
 
+Estimate reproducibility rules:
+
+- Every formula used for estimation must have a stable identifier and version.
+- Formula evaluation must be restricted to a deterministic expression language or
+  equivalent allowlisted evaluator. Raw Python `eval`/`exec` or equivalent
+  unrestricted runtime code execution is explicitly forbidden.
+- The evaluator must operate only on declared inputs, fixed operators,
+  deterministic functions, and explicit unit/rounding rules.
+- Re-running the same estimate version against the same frozen inputs must
+  produce the same estimate output.
+
+Estimate snapshots:
+
+- Finalized estimate versions must persist a frozen snapshot of the exact rates,
+  materials, formulas, assumptions, and quantity inputs used to produce the
+  estimate.
+- The snapshot must also preserve the catalog item identifiers/versions or other
+  lineage needed to trace each frozen value back to its source.
+- Line items must reference the frozen snapshot entries they used, not only live
+  catalog rows.
+
+Catalog scope and mutation rules:
+
+- Catalog data may exist at a global scope and at a project override scope.
+- Project overrides take precedence over global defaults only at estimate
+  creation or recalculation time.
+- Once an estimate version is finalized, its frozen snapshot becomes the source
+  of truth for reproducibility.
+- Later changes to global catalogs or project overrides must not change prior
+  estimates, their line items, or any regenerated estimate artifact derived from
+  that estimate version.
+
 ## API Requirements
 
 - API must be UI-agnostic.
