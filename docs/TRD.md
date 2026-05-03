@@ -819,6 +819,28 @@ Probe rules:
 
 ## Coordinate Systems, Units, Encoding
 
+- Ingestion settings are captured as an immutable `extraction_profile` object so
+  jobs and revisions reference a stable extraction contract instead of ad hoc
+  request flags.
+- `extraction_profile` v0.1 must include at minimum:
+  - `id` - server-generated extraction profile identifier.
+  - `version` - profile schema version, initially `v0.1`.
+  - `units_override` - optional explicit source-unit override when adapter
+    detection is missing or known to be wrong.
+  - `layout_mode` - layout selection policy, with MVP support for `modelspace`
+    by default and explicit alternate layout selection later.
+  - `xref_handling` - how external references and nested blocks are handled,
+    including whether unresolved xrefs are skipped with warnings or hard-fail.
+  - `block_handling` - whether block references stay instanced in provenance,
+    are expanded for canonical extraction, or both.
+  - `text_extraction` - whether text entities are extracted and normalized.
+  - `dimension_extraction` - whether dimensions are extracted as semantic
+    dimensions, raw geometry, or both where supported.
+  - `pdf_page_range` - optional inclusive page selection for PDF inputs.
+  - `raster_calibration` - required scale calibration input for raster-derived
+    geometry; raster extraction without calibration remains review-only.
+  - `confidence_threshold` - optional minimum entity/revision confidence the job
+    should accept before marking output review-gated.
 - Adapters must record source units, normalized units, and conversion factor.
 - Adapters must surface paperspace vs modelspace and which layouts were
   extracted. The MVP extracts modelspace by default; layout selection is
@@ -832,6 +854,24 @@ Probe rules:
 
 ## Provenance And Confidence
 
+- Ingestion and downstream jobs must reference both `file_id` and
+  `extraction_profile_id`. The file identifies the immutable source upload; the
+  extraction profile identifies the normalization/extraction settings used to
+  derive a revision.
+- Reprocessing is not an in-place rerun. Reprocessing creates a new drawing
+  revision from an existing `file_id`, records the `extraction_profile_id` used
+  for the run, and records the adapter name/version that produced the result.
+- The prior revision remains available for lineage, comparison, and audit even
+  when the newer reprocessed revision supersedes it.
+- API direction for future `POST /v1/files/{file_id}/reprocess`:
+  - request body should accept either an existing `extraction_profile_id` or a
+    profile payload to persist as a new extraction profile before job creation
+  - the server creates a new ingestion/reprocessing job bound to `file_id` and
+    the resolved `extraction_profile_id`
+  - successful completion creates a new drawing revision rather than mutating
+    the previous revision in place
+  - the resulting revision must expose adapter version, extraction profile, and
+    predecessor/superseded lineage metadata
 - `provenance_json` is a structured object, not free text. Required keys:
   `origin`, `adapter`, `source_ref`, `source_identity`, `source_hash`,
   `extraction_path`, `notes`.
