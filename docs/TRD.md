@@ -205,6 +205,20 @@ Applying an accepted changeset is append-only. The system creates a new drawing
 revision with lineage back to the base revision and approved changeset; it never
 overwrites the base revision in place.
 
+Database ownership and mutation rules:
+
+- API services create and update request-driven workflow records such as
+  projects, file metadata rows, changesets, cancel requests, and soft-delete
+  markers.
+- Workers create and finalize execution-derived records such as drawing
+  revisions, validation reports, quantity takeoffs, estimate versions, export
+  artifacts, and `job_events`.
+- Approved apply/reprocess paths append a new drawing revision row; they do not
+  rewrite entity payloads or lineage on an existing revision.
+- A revision may transition to `superseded` or another allowed review state for
+  workflow purposes, but its stored canonical payload and provenance remain
+  historical and immutable.
+
 Example operation types:
 
 - annotate entity
@@ -513,6 +527,9 @@ Estimate snapshots:
   lineage needed to trace each frozen value back to its source.
 - Line items must reference the frozen snapshot entries they used, not only live
   catalog rows.
+- Finalized estimate versions are append-only records created by estimate
+  workers; recalculation creates a new version rather than mutating a finalized
+  one in place.
 
 Catalog scope and mutation rules:
 
@@ -572,6 +589,19 @@ Rules:
   the artifact.
 - Original uploads and generated artifacts follow the same immutability rule but
   remain distinct storage classes and records.
+
+Database ownership and append-only policy:
+
+- Original file rows are API-created metadata for immutable uploads; workers may
+  read them, but never replace the original object or rewrite the row as a new
+  source.
+- Drawing revisions, approved quantity takeoffs, finalized estimate versions,
+  export artifacts, and `job_events` are append-only historical records.
+- Mutable workflow/state records include job status, attempt counters, progress,
+  `cancel_requested`, `deleted_at`, and allowed review/supersession state
+  transitions.
+- Mutable state must not be used to rewrite the payload, lineage, checksum, or
+  source references of an already committed append-only record.
 
 ## MVP Retention And Deletion Policy
 
@@ -636,6 +666,9 @@ New codes require a docs change in this file.
   `succeeded` state must happen atomically under the job lock so clients never
   observe committed outputs with a non-terminal job or a terminal success with
   missing outputs.
+- Finalization ownership is worker-only: the worker that wins the job lock is
+  the only writer allowed to convert staged attempt data into committed
+  revision/takeoff/estimate/artifact rows.
 - Retry and duplicate-delivery handling must fence stale workers and prevent
   duplicate finalization. Redelivered messages, overlapping attempts, or stale
   completions must not create duplicate committed outputs or move the job from a
@@ -643,6 +676,10 @@ New codes require a docs change in this file.
 - Retry is only for failed work. A retry attempt may replace staged attempt
   data, but it does not overwrite or mutate already committed artifacts from a
   different completed job path.
+- Attempt-local staging is mutable until commit, but staged rows/objects are not
+  authoritative product records. Only the atomic finalization step may publish
+  new append-only records, and cancellation before that step must leave no new
+  committed output rows visible.
 - Cancellation before finalization produces `cancelled` with no new committed
   output set. A cancel request after a terminal state is a no-op.
 - `job_events` must capture the operational state machine, including enqueue,

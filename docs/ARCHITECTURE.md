@@ -52,6 +52,16 @@ Postgres is the source of truth for:
 - changesets
 - artifacts
 
+Write ownership is split by responsibility:
+
+- API services write user/request workflow records such as projects, file
+  metadata, changesets, cancel flags, and soft-delete markers.
+- Workers write execution-derived records such as drawing revisions, validation
+  outputs, quantity takeoffs, estimate versions, export artifacts, and
+  `job_events`.
+- Append-only records keep their payload and lineage immutable after commit;
+  mutable records are limited to workflow/state transitions.
+
 ### Ingestion Adapters
 
 Format-specific adapters turn source files into canonical drawing data.
@@ -315,6 +325,9 @@ Workers must:
   output scoped by job and attempt until finalization
 - commit final outputs and terminal success together under the job row lock so a
   visible artifact set and a `succeeded` job state appear atomically
+- be the only writers that promote staged execution data into committed drawing
+  revisions, quantity takeoffs, estimate versions, artifact rows, and
+  corresponding `job_events`
 - reject stale completion paths from duplicate delivery, worker loss recovery,
   or overlapping retries so only one final commit path wins
 - observe cancel checkpoints before expensive phases and again before final
@@ -325,6 +338,9 @@ Operationally, this distinguishes retry from regeneration or re-export:
 - Retry is recovery for the same job after failure. It may recreate staged
   attempt-local data, but it must still produce at most one visible committed
   final output set for that job.
+- Attempt-local staging may be rewritten or discarded during retry, but committed
+  append-only records from a prior successful finalization are never updated in
+  place.
 - Regeneration or re-export is a new job producing new immutable artifacts with
   new ids and storage keys per the artifact lifecycle rules below.
 - `job_events` are the durable trace for queueing, execution, cancellation,
@@ -376,6 +392,17 @@ Rules:
   and changeset/takeoff/estimate inputs.
 - Original uploads and generated artifacts remain separate immutable classes of
   stored objects.
+
+Append-only versus mutable record rules:
+
+- Append-only records include original file records, drawing revisions, approved
+  quantity takeoffs, finalized estimate versions, generated artifacts, and
+  `job_events`.
+- Mutable workflow/state fields include job status, progress, retry/cancel
+  control flags, `deleted_at`, and allowed review/supersession markers on
+  records that support those transitions.
+- Mutable workflow changes must never replace the stored payload, checksum,
+  provenance, or lineage of an already committed append-only record.
 
 Retention/deletion for MVP is manual-first and soft-delete-first:
 
