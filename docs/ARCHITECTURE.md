@@ -98,7 +98,12 @@ stdout/stderr and exit status remain untrusted inputs.
 ### CAD Revision Engine
 
 Applies approved changesets to normalized data and exports revised CAD artifacts.
-The first editable export target is DXF. DWG export is a later adapter.
+Changesets are prepared against a `base_revision_id` and applied with an
+optimistic current-revision check. If the addressed drawing has advanced since
+that base, the apply request fails with `REVISION_CONFLICT` rather than
+rewriting or auto-merging in place. Successful apply is append-only: it creates
+a new drawing revision linked to the base revision and changeset. The first
+editable export target is DXF. DWG export is a later adapter.
 
 ### Optional AI Layer
 
@@ -199,6 +204,7 @@ For edits:
 ```text
 Existing drawing revision
   -> user or agent proposed changeset, or file reprocess request
+  -> apply-time current revision check for changesets
   -> validation / adapter execution
   -> new drawing revision
   -> DXF export
