@@ -70,6 +70,13 @@ Ingestion also assigns a review state (`approved`, `provisional`,
 `review_required`, `rejected`, or `superseded`) that downstream quantity work
 must enforce. Confidence affects behavior, not just metadata.
 
+Ingestion and normalization also produce a canonical validation report. This is
+separate from review state and job status: validation status captures technical
+usability (`valid`, `valid_with_warnings`, `needs_review`, `invalid`), review
+state captures trust/approval policy, and job status captures execution state.
+Quantity eligibility is exposed as a derived gate (`allowed`,
+`allowed_provisional`, `review_gated`, `blocked`).
+
 The backend also maintains an adapter capability registry that reports, per
 adapter, installed availability, input/output format support, extraction and
 export features, expected confidence ranges, and experimental/license status.
@@ -112,7 +119,7 @@ Upload
   -> file record
   -> ingestion job
   -> source adapter
-  -> canonical entities + confidence/review state
+  -> canonical entities + confidence/review state + validation report
   -> quantity extraction or review gate
   -> estimate generation
   -> exports
@@ -122,6 +129,11 @@ Quantity workers must refuse to treat review-gated ingestion output as trusted
 source-of-truth input. Provisional quantity runs are allowed only when the
 upstream revision is marked provisional, and the resulting quantities must stay
 explicitly provisional downstream.
+
+Quantity workers evaluate both review state and validation status before
+starting. A technically invalid revision is blocked even if its review state was
+previously approved. Revisions that are technically usable but have warnings or
+review-needed findings may still proceed only through the derived gate policy.
 
 Revisions marked `review_required`, `rejected`, or `superseded` are not eligible
 for quantity generation.

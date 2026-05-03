@@ -227,6 +227,178 @@ Every computed quantity must include source entity references and units.
 Quantity generation must enforce ingestion review state and confidence policy,
 not just copy confidence metadata through to the output.
 
+### Canonical Validation Report v0.1
+
+Between ingestion and quantity generation, every drawing revision must expose a
+canonical validation report using `validation_report_schema_version = "0.1"`.
+
+Validation status is separate from review state and job status. Validation
+answers whether the normalized revision is technically usable; review state
+answers whether the revision is trusted for downstream quantity behavior; job
+status answers whether the ingestion/validation process has completed, failed,
+or been cancelled.
+
+Validation statuses:
+
+- `valid` - no blocking findings and no warnings that require operator review
+- `valid_with_warnings` - technically usable, but warnings must be recorded
+- `needs_review` - technically usable only with explicit operator review or
+  provisional handling
+- `invalid` - not eligible for quantity generation until corrected or replaced
+
+Derived quantity gate values:
+
+- `allowed` - quantity generation may run normally
+- `allowed_provisional` - quantity generation may run, but outputs must remain
+  provisional
+- `review_gated` - quantity generation is blocked pending review
+- `blocked` - quantity generation is not allowed
+
+Minimum validation report fields:
+
+- `validation_report_schema_version` - `0.1`
+- `drawing_revision_id`
+- `source_job_id`
+- `canonical_entity_schema_version`
+- `validation_status`
+- `review_state`
+- `quantity_gate`
+- `effective_confidence`
+- `validator_name`
+- `validator_version`
+- `summary` - counts of checks/findings by severity/status
+- `checks` - per-check results
+- `findings` - normalized finding list with linkage back to source context
+- `adapter_warnings` - adapter-emitted warnings carried forward into the report
+- `generated_at`
+
+Each check record must include:
+
+- `check_key`
+- `status` - `pass`, `warning`, `review_required`, or `fail`
+- `summary_message`
+- `finding_refs`
+- `details` - structured, check-specific metadata
+
+Required MVP checks:
+
+- units presence/normalization
+- coordinate system capture
+- geometry validity
+- closed polygon eligibility for area quantities
+- block transform validity
+- layer mapping completeness
+- xref resolution status
+- PDF scale presence/calibration status where applicable
+- IFC schema support
+
+Each finding must include normalized target and impact fields:
+
+- `target_type` - one of `entity`, `layer`, `layout`, `page`, `block`, `xref`,
+  `ifc_product`, `adapter_warning`, or `revision`
+- `target_ref` - id/ref for the addressed target in that scope
+- `quantity_effect` - one of `none`, `warning_only`, `provisional_only`,
+  `excluded_quantity`, `blocks_quantity`
+- `source` - where the finding came from, such as `validator`,
+  `adapter_warning`, or adapter-native diagnostics
+
+`effective_confidence` is conservative for quantity-gate decisions. It may be
+capped or downgraded by adapter limits, validation findings, raster scale
+status, or quantity-relevant low-confidence entities, but validation must not
+rewrite the historical stored confidence captured on the revision/entities.
+
+Finding severities are `info`, `warning`, `error`, and `critical`. Findings may
+also carry a remediation hint, machine-readable check key, and structured
+context payload for UI/API consumers.
+
+#### Validation Report Endpoint
+
+`GET /v1/revisions/{revision_id}/validation-report`
+
+Returns the canonical validation report for the addressed revision.
+
+Minimum response shape:
+
+```text
+{
+  drawing_revision_id,
+  source_job_id,
+  validation_report_schema_version: "0.1",
+  canonical_entity_schema_version: "0.1",
+  validation_status,
+  review_state,
+  quantity_gate,
+  effective_confidence,
+  validator_name,
+  validator_version,
+  summary: {
+    checks_total,
+    findings_total,
+    warnings_total,
+    errors_total,
+    critical_total
+  },
+  checks: [
+    {
+      check_key,
+      status,
+      summary_message,
+      finding_refs,
+      details?
+    }
+  ],
+  findings: [
+    {
+      finding_id,
+      check_key,
+      severity,
+      message,
+      target_type,
+      target_ref,
+      quantity_effect,
+      source,
+      details?
+    }
+  ],
+  adapter_warnings: [...],
+  generated_at
+}
+```
+
+HTTP/status semantics:
+
+- `200` - report exists for the revision
+- `404` with `NOT_FOUND` - revision or report does not exist in scope
+
+#### Quantity Behavior From Validation And Review State
+
+Quantity eligibility is derived from both `validation_status` and `review_state`.
+Technical validity must not replace the review-state taxonomy.
+
+- `review_state = approved` + `validation_status = valid` or
+  `valid_with_warnings` -> `quantity_gate = allowed`
+- `review_state = provisional` + `validation_status = valid`,
+  `valid_with_warnings`, or `needs_review` -> `quantity_gate = allowed_provisional`
+- `review_state = review_required` + `validation_status != invalid` ->
+  `quantity_gate = review_gated`
+- `review_state = rejected` or `superseded` -> `quantity_gate = blocked`
+- `validation_status = invalid` -> `quantity_gate = blocked` regardless of
+  review state
+
+Additional gate rules:
+
+- Missing/unsupported IFC schema support is `invalid`.
+- Missing PDF scale for scale-dependent PDF quantities is at least
+  `needs_review`; if no safe manual calibration exists yet, treat as `invalid`
+  for quantity generation.
+- Geometry that prevents deterministic measurement is `invalid` for affected
+  quantities and may block the full run when the scope cannot be isolated.
+- Open polylines or unclosed polygons may still support length/count quantities,
+  but they must not silently produce area quantities.
+- Unresolved xrefs, incomplete layer mapping, or adapter warnings that preserve
+  usable geometry may downgrade the report to `valid_with_warnings` or
+  `needs_review` depending on measurement impact.
+
 ## Estimation Engine
 
 The estimation engine must be deterministic and auditable.
