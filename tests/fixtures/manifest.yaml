@@ -5,6 +5,7 @@
 fixtures:
   - filename: dxf/simple-line.dxf
     format: DXF
+    tier: tiny_synthetic
     source: generated
     license: CC0-1.0
     allowed_in_git: true
@@ -12,6 +13,34 @@ fixtures:
     expected_extraction_notes: |
       Single LINE entity from (0,0,0) to (10,0,0) on layer 0.
       Header sets $INSUNITS to 6 (meters).
+    expected_review_state: approved
+    expected_validation_status: valid
     expected_quantities:
       line_count: 1
       total_length: 10.0
+    acceptance_checks:
+      format:
+        entity_types:
+          - LINE
+        layer_names:
+          - "0"
+        unit_system: meters
+      quantities:
+        line_count:
+          expected: 1
+          comparison: exact
+          provenance_required: true
+          source_entity_refs:
+            - entities.LINE:0
+        total_length:
+          expected: 10.0
+          comparison: exact
+          rounding:
+            stage: none
+          provenance_required: true
+          source_entity_refs:
+            - entities.LINE:0
+          expected_review_state: approved
+      notes: |
+        This fixture is a deterministic geometry smoke test.
+        Future global tolerance values may be defined in #61.
