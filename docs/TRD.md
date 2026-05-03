@@ -196,6 +196,15 @@ trustworthy without explicit scale context.
 Agents and users do not directly mutate CAD files. They create proposed
 changesets.
 
+Each changeset must declare the `base_revision_id` it was prepared against.
+Apply-time execution must re-check the current revision for the drawing. If the
+current revision no longer matches the declared base, the system must reject the
+apply request instead of merging implicitly.
+
+Applying an accepted changeset is append-only. The system creates a new drawing
+revision with lineage back to the base revision and approved changeset; it never
+overwrites the base revision in place.
+
 Example operation types:
 
 - annotate entity
@@ -208,6 +217,10 @@ Example operation types:
 - flag for review
 
 Changesets must be validated before export.
+
+Stale-base apply attempts must return `REVISION_CONFLICT`. Minimum error details
+must include the requested `base_revision_id`, the current revision id at apply
+time, and the conflicting changeset or apply target when available.
 
 ## Quantity Engine
 
@@ -599,6 +612,7 @@ codes:
 - `ADAPTER_FAILED` - adapter returned non-zero or malformed output
 - `STORAGE_FAILED` - read/write/link/checksum failure
 - `DB_CONFLICT` - optimistic concurrency or unique violation
+- `REVISION_CONFLICT` - changeset base revision is stale at apply time
 - `JOB_CANCELLED` - cancelled by user before completion
 - `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
 
