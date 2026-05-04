@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.session import get_db
 from app.main import app as fastapi_app
+from app.storage.dependencies import _get_default_storage
 
 # Marker for tests that require a running database
 requires_database = pytest.mark.skipif(
@@ -47,10 +48,13 @@ def isolate_upload_storage(
 ) -> Generator[None, None, None]:
     """Use a per-test temporary upload root and clean up only that root."""
     upload_root = (tmp_path / "uploads").resolve()
+    _get_default_storage.cache_clear()
     monkeypatch.setattr(settings, "upload_storage_root", str(upload_root))
+    _get_default_storage.cache_clear()
 
     yield
 
+    _get_default_storage.cache_clear()
     if upload_root.exists():
         shutil.rmtree(upload_root)
 

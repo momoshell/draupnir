@@ -7,13 +7,13 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.storage.base import Storage
-from app.storage.local import LocalStorage
+from app.storage.local import LocalFilesystemStorage
 
 
 @lru_cache(maxsize=1)
 def _get_default_storage() -> Storage:
     """Return the default local storage backend."""
-    return LocalStorage(Path(settings.upload_storage_root).resolve())
+    return LocalFilesystemStorage(Path(settings.storage_local_root).resolve())
 
 
 def get_storage() -> Storage:
