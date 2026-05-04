@@ -192,8 +192,8 @@ class TestProjectFiles:
         )
         assert stored_path.read_bytes() == payload
         mode = stored_path.stat().st_mode & 0o777
-        assert mode == 0o400
-        assert (mode & 0o077) == 0
+        assert mode == 0o444
+        assert (mode & 0o333) == 0
         assert str(stored_path).startswith(str(Path(settings.upload_storage_root).resolve()))
 
         assert job is not None
@@ -803,7 +803,14 @@ class TestProjectFiles:
             app.dependency_overrides.pop(session_module.get_db, None)
 
         upload_root = Path(settings.upload_storage_root).resolve()
-        assert not upload_root.exists() or not any(upload_root.iterdir())
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+
+        stored_files = list((upload_root / "originals").rglob("*"))
+        stored_payloads = [path for path in stored_files if path.is_file()]
+        assert len(stored_payloads) == 1
+        assert stored_payloads[0].read_bytes() == b"%PDF-1.7\npayload"
+        assert (stored_payloads[0].stat().st_mode & 0o200) == 0
 
     async def test_upload_file_commit_cancelled_error_cleans_written_bytes(
         self,
@@ -841,4 +848,11 @@ class TestProjectFiles:
             app.dependency_overrides.pop(session_module.get_db, None)
 
         upload_root = Path(settings.upload_storage_root).resolve()
-        assert not upload_root.exists() or not any(upload_root.iterdir())
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+
+        stored_files = list((upload_root / "originals").rglob("*"))
+        stored_payloads = [path for path in stored_files if path.is_file()]
+        assert len(stored_payloads) == 1
+        assert stored_payloads[0].read_bytes() == b"%PDF-1.7\npayload"
+        assert (stored_payloads[0].stat().st_mode & 0o200) == 0

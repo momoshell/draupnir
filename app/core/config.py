@@ -1,6 +1,6 @@
 """Application configuration via pydantic-settings."""
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
@@ -27,7 +27,10 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 50
-    upload_storage_root: str = "var/uploads"
+    storage_local_root: str = Field(
+        default="var/uploads",
+        validation_alias=AliasChoices("storage_local_root", "upload_storage_root"),
+    )
 
     @field_validator("api_prefix")
     @classmethod
@@ -45,12 +48,21 @@ class Settings(BaseSettings):
             raise ValueError("max_upload_mb must be positive")
         return value
 
-    @field_validator("upload_storage_root")
+    @field_validator("storage_local_root")
     @classmethod
-    def validate_upload_storage_root(cls, value: str) -> str:
+    def validate_storage_local_root(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("upload_storage_root must not be empty")
+            raise ValueError("storage_local_root must not be empty")
         return value
+
+    @property
+    def upload_storage_root(self) -> str:
+        """Backward-compatible alias for the canonical local storage root."""
+        return self.storage_local_root
+
+    @upload_storage_root.setter
+    def upload_storage_root(self, value: str) -> None:
+        self.storage_local_root = value
 
     model_config = SettingsConfigDict(
         env_file=".env",

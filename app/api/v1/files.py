@@ -113,8 +113,12 @@ def _unsupported_format_exception() -> HTTPException:
 
 def _staging_path(file_id: UUID) -> Path:
     """Build a temporary staging path for upload bytes before promotion."""
-    upload_root = Path(settings.upload_storage_root).resolve()
-    return upload_root / ".staging" / f"{file_id}.{uuid.uuid4().hex}.part"
+    return _upload_root() / ".staging" / f"{file_id}.{uuid.uuid4().hex}.part"
+
+
+def _upload_root() -> Path:
+    """Return the canonical local storage root for uploads and artifacts."""
+    return Path(settings.storage_local_root).resolve()
 
 
 def _storage_key(file_id: UUID, checksum: str) -> str:
@@ -124,7 +128,7 @@ def _storage_key(file_id: UUID, checksum: str) -> str:
 
 def _cleanup_uploaded_path(storage_path: Path) -> None:
     """Best-effort cleanup of a partially or fully written upload path."""
-    upload_root = Path(settings.upload_storage_root).resolve()
+    upload_root = _upload_root()
     with suppress(OSError):
         storage_path.unlink(missing_ok=True)
 
@@ -163,16 +167,7 @@ def _ensure_private_directory(path: Path, *, include_parents_until: Path | None 
 
 async def _cleanup_persisted_upload(storage: Storage, storage_key: str, storage_uri: str) -> None:
     """Best-effort cleanup for a persisted upload after downstream failure."""
-    if storage_uri.startswith("file://"):
-        upload_root = Path(settings.upload_storage_root).resolve()
-        stored_path = Path(storage_uri.removeprefix("file://")).resolve()
-        try:
-            stored_path.relative_to(upload_root)
-        except ValueError:
-            pass
-        else:
-            _cleanup_uploaded_path(stored_path)
-            return
+    _ = storage_uri
 
     with suppress(Exception):
         await storage.delete(storage_key)
@@ -226,7 +221,7 @@ async def upload_project_file(
     storage_key: str | None = None
     storage_uri: str | None = None
     detected_format: str | None = None
-    upload_root = Path(settings.upload_storage_root).resolve()
+    upload_root = _upload_root()
     _ensure_private_directory(upload_root)
     _ensure_private_directory(staging_path.parent)
 

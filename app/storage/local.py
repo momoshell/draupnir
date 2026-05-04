@@ -6,12 +6,15 @@ import asyncio
 import os
 import uuid
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from app.storage.base import StoragePayload, StoredObject, StoredObjectMeta
 
+_COPY_CHUNK_SIZE_BYTES = 1024 * 1024
 
-class LocalStorage:
+
+class LocalFilesystemStorage:
     """Persist objects beneath a configured local root."""
 
     def __init__(self, root: Path) -> None:
@@ -57,23 +60,15 @@ class LocalStorage:
     def _put_sync(self, key: str, data: StoragePayload, immutable: bool) -> StoredObjectMeta:
         final_path = self._path_for_key(key)
         self._ensure_private_directory(final_path.parent, include_parents_until=self.root)
-
-        cleanup_path: Path | None = None
-        source_path: Path
-        if isinstance(data, bytes):
-            temp_dir = self.root / ".tmp"
-            self._ensure_private_directory(temp_dir, include_parents_until=self.root)
-            source_path = temp_dir / f"{uuid.uuid4().hex}.part"
-            source_path.write_bytes(data)
-            cleanup_path = source_path
-        else:
-            source_path = Path(data)
+        temp_path = final_path.parent / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
 
         final_path_created = False
         try:
-            os.link(source_path, final_path)
+            self._write_temp_file(temp_path, data)
+            temp_path.chmod(self._target_mode(immutable))
+            os.link(temp_path, final_path)
             final_path_created = True
-            final_path.chmod(0o400 if immutable else 0o600)
+            self._fsync_directory(final_path.parent)
             return StoredObjectMeta(
                 key=key,
                 storage_uri=f"file://{final_path}",
@@ -84,8 +79,9 @@ class LocalStorage:
                 self._cleanup_uploaded_path(final_path)
             raise
         finally:
-            if cleanup_path is not None:
-                self._cleanup_uploaded_path(cleanup_path)
+            self._cleanup_uploaded_path(temp_path)
+            if final_path_created:
+                self._fsync_directory(final_path.parent)
 
     def _get_sync(self, key: str) -> StoredObject:
         path = self._path_for_key(key)
@@ -116,9 +112,52 @@ class LocalStorage:
     def _exists_sync(self, key: str) -> bool:
         return self._path_for_key(key).exists()
 
+    def _write_temp_file(self, temp_path: Path, data: StoragePayload) -> None:
+        with temp_path.open("xb") as stream:
+            temp_path.chmod(0o600)
+            if isinstance(data, bytes):
+                stream.write(data)
+            else:
+                with Path(data).open("rb") as source_stream:
+                    self._copy_stream(source_stream, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _copy_stream(self, source_stream: BinaryIO, destination_stream: BinaryIO) -> None:
+        while chunk := source_stream.read(_COPY_CHUNK_SIZE_BYTES):
+            destination_stream.write(chunk)
+
+    def _fsync_directory(self, path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _target_mode(self, immutable: bool) -> int:
+        return 0o444 if immutable else 0o600
+
     def _path_for_key(self, key: str) -> Path:
-        path = (self.root / key).resolve()
-        path.relative_to(self.root)
+        if key == "":
+            raise ValueError("Storage key must not be empty.")
+
+        key_path = PurePosixPath(key)
+        if key_path.is_absolute():
+            raise ValueError("Storage key must be relative.")
+        if key_path == PurePosixPath("."):
+            raise ValueError("Storage key must not resolve to the storage root.")
+        if any(part == ".." for part in key_path.parts):
+            raise ValueError("Storage key must not contain parent traversal segments.")
+
+        path = self.root.joinpath(*key_path.parts).resolve()
+        if path == self.root:
+            raise ValueError("Storage key must not resolve to the storage root.")
+
+        try:
+            path.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError("Storage key must resolve under the storage root.") from exc
+
         return path
 
     def _cleanup_uploaded_path(self, storage_path: Path) -> None:
@@ -152,3 +191,6 @@ class LocalStorage:
 
         for target in targets:
             target.chmod(0o700)
+
+
+LocalStorage = LocalFilesystemStorage
