@@ -4,7 +4,6 @@ import base64
 import binascii
 import hashlib
 import json
-import os
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -26,6 +25,7 @@ from app.models.file import File as FileModel
 from app.models.job import Job
 from app.models.project import Project
 from app.schemas.file import FileListResponse, FileRead
+from app.storage import Storage, get_storage
 
 files_router = APIRouter()
 _UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
@@ -111,18 +111,15 @@ def _unsupported_format_exception() -> HTTPException:
     )
 
 
-def _storage_path(file_id: UUID, detected_format: str | None) -> Path:
-    """Build a server-derived immutable local storage path for an uploaded file."""
-    extension = detected_format or "bin"
-    filename = f"{file_id}.{extension}"
-    upload_root = Path(settings.upload_storage_root).resolve()
-    return upload_root / file_id.hex[:2] / file_id.hex[2:4] / filename
-
-
 def _staging_path(file_id: UUID) -> Path:
     """Build a temporary staging path for upload bytes before promotion."""
     upload_root = Path(settings.upload_storage_root).resolve()
     return upload_root / ".staging" / f"{file_id}.{uuid.uuid4().hex}.part"
+
+
+def _storage_key(file_id: UUID, checksum: str) -> str:
+    """Build the server-derived immutable storage key for an uploaded file."""
+    return f"originals/{file_id}/{checksum}"
 
 
 def _cleanup_uploaded_path(storage_path: Path) -> None:
@@ -164,6 +161,23 @@ def _ensure_private_directory(path: Path, *, include_parents_until: Path | None 
         ) from exc
 
 
+async def _cleanup_persisted_upload(storage: Storage, storage_key: str, storage_uri: str) -> None:
+    """Best-effort cleanup for a persisted upload after downstream failure."""
+    if storage_uri.startswith("file://"):
+        upload_root = Path(settings.upload_storage_root).resolve()
+        stored_path = Path(storage_uri.removeprefix("file://")).resolve()
+        try:
+            stored_path.relative_to(upload_root)
+        except ValueError:
+            pass
+        else:
+            _cleanup_uploaded_path(stored_path)
+            return
+
+    with suppress(Exception):
+        await storage.delete(storage_key)
+
+
 async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: str) -> None:
     """Close upload and raise standardized client validation error envelope."""
     await file.close()
@@ -177,50 +191,6 @@ async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: st
     )
 
 
-def _promote_staged_upload(staging_path: Path, final_path: Path) -> None:
-    """Promote a staged upload to final immutable path without overwriting."""
-    _ensure_private_directory(
-        final_path.parent,
-        include_parents_until=Path(settings.upload_storage_root).resolve(),
-    )
-
-    try:
-        os.link(staging_path, final_path)
-    except FileExistsError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.STORAGE_FAILED,
-                message="Storage collision occurred during upload.",
-                details=None,
-            ),
-        ) from exc
-    except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.STORAGE_FAILED,
-                message="Failed to persist uploaded file.",
-                details=None,
-            ),
-        ) from exc
-
-    try:
-        final_path.chmod(0o400)
-    except OSError as exc:
-        _cleanup_uploaded_path(final_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.STORAGE_FAILED,
-                message="Failed to persist uploaded file.",
-                details=None,
-            ),
-        ) from exc
-    finally:
-        _cleanup_uploaded_path(staging_path)
-
-
 @files_router.post(
     "/projects/{project_id}/files",
     response_model=FileRead,
@@ -230,6 +200,7 @@ async def upload_project_file(
     project_id: UUID,
     file: Annotated[UploadFile, FilePart(...)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    storage: Annotated[Storage, Depends(get_storage)],
 ) -> FileModel:
     """Upload immutable source file bytes for a project and create ingest job."""
     project = await db.get(Project, project_id)
@@ -252,7 +223,8 @@ async def upload_project_file(
 
     file_id = uuid.uuid4()
     staging_path = _staging_path(file_id)
-    storage_path: Path | None = None
+    storage_key: str | None = None
+    storage_uri: str | None = None
     detected_format: str | None = None
     upload_root = Path(settings.upload_storage_root).resolve()
     _ensure_private_directory(upload_root)
@@ -269,13 +241,10 @@ async def upload_project_file(
                 _cleanup_uploaded_path(staging_path)
                 raise _unsupported_format_exception()
             detected_format = sniffed_format
-            storage_path = _storage_path(file_id, detected_format)
 
             if initial_bytes:
                 if len(initial_bytes) > max_upload_bytes:
                     _cleanup_uploaded_path(staging_path)
-                    if storage_path is not None:
-                        _cleanup_uploaded_path(storage_path)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
@@ -296,8 +265,6 @@ async def upload_project_file(
                 next_total = total_bytes + len(chunk)
                 if next_total > max_upload_bytes:
                     _cleanup_uploaded_path(staging_path)
-                    if storage_path is not None:
-                        _cleanup_uploaded_path(storage_path)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
@@ -311,22 +278,43 @@ async def upload_project_file(
                 checksum_builder.update(chunk)
                 total_bytes = next_total
 
-        assert storage_path is not None
-        _promote_staged_upload(staging_path=staging_path, final_path=storage_path)
+        checksum = checksum_builder.hexdigest()
+        storage_key = _storage_key(file_id, checksum)
+
+        try:
+            stored_object = await storage.put(storage_key, staging_path, immutable=True)
+            storage_uri = stored_object.storage_uri
+        except FileExistsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=create_error_response(
+                    code=ErrorCode.STORAGE_FAILED,
+                    message="Storage collision occurred during upload.",
+                    details=None,
+                ),
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=create_error_response(
+                    code=ErrorCode.STORAGE_FAILED,
+                    message="Failed to persist uploaded file.",
+                    details=None,
+                ),
+            ) from exc
     except HTTPException:
         _cleanup_uploaded_path(staging_path)
         raise
     except BaseException:
         _cleanup_uploaded_path(staging_path)
-        if storage_path is not None:
-            _cleanup_uploaded_path(storage_path)
         raise
     finally:
+        _cleanup_uploaded_path(staging_path)
         await file.close()
 
     assert detected_format is not None
-    assert storage_path is not None
-    checksum = checksum_builder.hexdigest()
+    assert storage_key is not None
+    assert storage_uri is not None
 
     file_row = FileModel(
         id=file_id,
@@ -334,7 +322,7 @@ async def upload_project_file(
         original_filename=original_filename,
         media_type=media_type,
         detected_format=detected_format,
-        storage_uri=f"file://{storage_path}",
+        storage_uri=storage_uri,
         size_bytes=total_bytes,
         checksum_sha256=checksum,
         immutable=True,
@@ -355,9 +343,9 @@ async def upload_project_file(
     try:
         await db.commit()
     except BaseException:
-        _cleanup_uploaded_path(staging_path)
-        if storage_path is not None:
-            _cleanup_uploaded_path(storage_path)
+        assert storage_key is not None
+        assert storage_uri is not None
+        await _cleanup_persisted_upload(storage, storage_key, storage_uri)
         raise
 
     await db.refresh(file_row)

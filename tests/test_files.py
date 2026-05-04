@@ -18,6 +18,7 @@ import app.db.session as session_module
 from app.core.config import settings
 from app.models.file import File as FileModel
 from app.models.job import Job
+from app.storage import StoredObjectMeta, get_storage
 from tests.conftest import requires_database
 
 
@@ -75,6 +76,57 @@ def _make_get_db_override_with_commit_error(
             await session.close()
 
     return _override_get_db
+
+
+class RecordingStorage:
+    """Test double that records upload persistence inputs."""
+
+    def __init__(self) -> None:
+        self.put_calls: list[tuple[str, Path, bytes, bool]] = []
+
+    async def put(
+        self,
+        key: str,
+        data: bytes | Path,
+        *,
+        immutable: bool = False,
+    ) -> StoredObjectMeta:
+        """Record put calls and return deterministic metadata."""
+        assert isinstance(data, Path)
+        body = data.read_bytes()
+        self.put_calls.append((key, data, body, immutable))
+        return StoredObjectMeta(
+            key=key,
+            storage_uri=f"memory://{key}",
+            size_bytes=len(body),
+        )
+
+    async def get(self, key: str) -> Any:
+        """Unused protocol method for test double completeness."""
+        raise NotImplementedError(key)
+
+    async def stat(self, key: str) -> StoredObjectMeta:
+        """Unused protocol method for test double completeness."""
+        raise NotImplementedError(key)
+
+    async def exists(self, key: str) -> bool:
+        """Unused protocol method for test double completeness."""
+        raise NotImplementedError(key)
+
+    async def delete(self, key: str) -> None:
+        """Unused protocol method for test double completeness."""
+        raise NotImplementedError(key)
+
+    async def presign(
+        self,
+        key: str,
+        *,
+        method: str = "GET",
+        expires_in_seconds: int = 3600,
+    ) -> str | None:
+        """Unused protocol method for test double completeness."""
+        _ = (key, method, expires_in_seconds)
+        return None
 
 
 @requires_database
@@ -135,7 +187,9 @@ class TestProjectFiles:
         assert storage_uri.startswith("file://")
         stored_path = Path(storage_uri.removeprefix("file://"))
         assert stored_path.exists()
-        assert stored_path.name != "plan.pdf"
+        assert stored_path.relative_to(Path(settings.upload_storage_root).resolve()).as_posix() == (
+            f"originals/{uploaded['id']}/{uploaded['checksum_sha256']}"
+        )
         assert stored_path.read_bytes() == payload
         mode = stored_path.stat().st_mode & 0o777
         assert mode == 0o400
@@ -181,6 +235,50 @@ class TestProjectFiles:
         assert response.status_code == 200
         listed = response.json()
         assert len(listed["items"]) == 2
+
+    async def test_upload_file_persists_through_storage_dependency_put(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+    ) -> None:
+        """POST should hand final persistence to the injected storage backend."""
+        _ = self
+        payload = b"%PDF-1.7\nstorage-spy"
+        storage = RecordingStorage()
+        app.dependency_overrides[get_storage] = lambda: storage
+        try:
+            uploaded = await _upload_file(
+                async_client=async_client,
+                project_id=created_project["id"],
+                filename="client-name.pdf",
+                content=payload,
+                media_type="application/pdf",
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage, None)
+
+        expected_key = (
+            f"originals/{uploaded['id']}/{hashlib.sha256(payload).hexdigest()}"
+        )
+        assert len(storage.put_calls) == 1
+        put_key, put_path, put_body, put_immutable = storage.put_calls[0]
+        assert put_key == expected_key
+        assert put_body == payload
+        assert put_immutable is True
+        assert put_path.name.endswith(".part")
+        assert ".staging" in put_path.parts
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            file_result = await session.execute(
+                select(FileModel).where(FileModel.id == uuid.UUID(str(uploaded["id"])))
+            )
+            file_row = file_result.scalar_one_or_none()
+
+        assert file_row is not None
+        assert file_row.storage_uri == f"memory://{expected_key}"
 
     async def test_list_project_files_success(
         self,
