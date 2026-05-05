@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import uuid
 from collections.abc import AsyncGenerator, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -208,6 +209,8 @@ class TestProjectFiles:
         assert uploaded["size_bytes"] == len(payload)
         assert uploaded["checksum_sha256"] == hashlib.sha256(payload).hexdigest()
         assert uploaded["immutable"] is True
+        assert "initial_job_id" in uploaded
+        assert "initial_extraction_profile_id" in uploaded
         assert "created_at" in uploaded
         assert "storage_uri" not in uploaded
 
@@ -241,6 +244,11 @@ class TestProjectFiles:
         assert job is not None
         assert job.project_id == uuid.UUID(str(created_project["id"]))
         assert job.file_id == uuid.UUID(str(uploaded["id"]))
+        assert job.extraction_profile_id is not None
+        assert file_row.initial_job_id == job.id
+        assert file_row.initial_extraction_profile_id == job.extraction_profile_id
+        assert uploaded["initial_job_id"] == str(job.id)
+        assert uploaded["initial_extraction_profile_id"] == str(job.extraction_profile_id)
         assert job.job_type == "ingest"
         assert job.status == "pending"
         assert job.attempts == 0
@@ -406,6 +414,69 @@ class TestProjectFiles:
         returned_ids = {item["id"] for item in data["items"]}
         assert returned_ids == {first["id"], second["id"]}
 
+    async def test_list_project_files_includes_initial_upload_metadata_after_reprocess(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """GET list should read durable initial ingest identifiers from the file row."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="initial.pdf",
+            content=b"%PDF-1.7\ninitial",
+            media_type="application/pdf",
+        )
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",
+            json={
+                "extraction_profile": {
+                    "profile_version": "v0.1",
+                    "units_override": "imperial",
+                    "layout_mode": "paper_space",
+                    "xref_handling": "detach",
+                    "block_handling": "preserve",
+                    "text_extraction": False,
+                    "dimension_extraction": True,
+                    "pdf_page_range": "2-4",
+                    "raster_calibration": {"scale": 48, "unit": "inch"},
+                    "confidence_threshold": 0.95,
+                }
+            },
+        )
+        assert response.status_code == 202
+        reprocess_job = response.json()
+        assert reprocess_job["id"] != uploaded["initial_job_id"]
+        assert reprocess_job["extraction_profile_id"] != uploaded["initial_extraction_profile_id"]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            initial_job = await session.get(Job, uuid.UUID(str(uploaded["initial_job_id"])))
+            latest_job = await session.get(Job, uuid.UUID(str(reprocess_job["id"])))
+            file_row = await session.get(FileModel, uuid.UUID(str(uploaded["id"])))
+
+            assert initial_job is not None
+            assert latest_job is not None
+            assert file_row is not None
+
+            latest_created_at = latest_job.created_at or datetime.now(UTC)
+            initial_job.created_at = latest_created_at + timedelta(seconds=1)
+            await session.commit()
+
+            assert file_row.initial_job_id == initial_job.id
+            assert file_row.initial_extraction_profile_id == initial_job.extraction_profile_id
+
+        list_response = await async_client.get(f"/v1/projects/{created_project['id']}/files")
+        assert list_response.status_code == 200
+
+        item = list_response.json()["items"][0]
+        assert item["id"] == uploaded["id"]
+        assert item["initial_job_id"] == uploaded["initial_job_id"]
+        assert item["initial_extraction_profile_id"] == uploaded["initial_extraction_profile_id"]
+
     async def test_list_project_files_pagination(
         self,
         async_client: httpx.AsyncClient,
@@ -503,6 +574,53 @@ class TestProjectFiles:
         assert data["id"] == uploaded["id"]
         assert data["project_id"] == created_project["id"]
         assert data["original_filename"] == "detail.ifc"
+
+    async def test_get_project_file_detail_includes_initial_upload_metadata_after_reprocess(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """GET detail should preserve earliest ingest identifiers after reprocessing."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="detail.pdf",
+            content=b"%PDF-1.7\ndetail",
+            media_type="application/pdf",
+        )
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",
+            json={
+                "extraction_profile": {
+                    "profile_version": "v0.1",
+                    "units_override": "metric",
+                    "layout_mode": "paper_space",
+                    "xref_handling": "detach",
+                    "block_handling": "preserve",
+                    "text_extraction": True,
+                    "dimension_extraction": False,
+                    "pdf_page_range": "1",
+                    "raster_calibration": None,
+                    "confidence_threshold": 0.75,
+                }
+            },
+        )
+        assert response.status_code == 202
+        reprocess_job = response.json()
+        assert reprocess_job["id"] != uploaded["initial_job_id"]
+        assert reprocess_job["extraction_profile_id"] != uploaded["initial_extraction_profile_id"]
+
+        detail_response = await async_client.get(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}"
+        )
+        assert detail_response.status_code == 200
+
+        data = detail_response.json()
+        assert data["id"] == uploaded["id"]
+        assert data["initial_job_id"] == uploaded["initial_job_id"]
+        assert data["initial_extraction_profile_id"] == uploaded["initial_extraction_profile_id"]
 
     async def test_get_project_file_not_found(
         self,

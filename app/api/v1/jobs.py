@@ -23,6 +23,8 @@ jobs_router = APIRouter()
 
 _DEFAULT_EVENTS_LIMIT = 50
 _MAX_EVENTS_LIMIT = 200
+_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH = 255
+_PUBLIC_ENQUEUE_FAILURE_MESSAGE = "Failed to enqueue ingest job"
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 
 
@@ -210,7 +212,7 @@ async def retry_job(
     except Exception as exc:
         job.status = "failed"
         job.error_code = ErrorCode.INTERNAL_ERROR.value
-        job.error_message = f"Failed to enqueue ingest job: {exc}"
+        job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
         job.finished_at = datetime.now(UTC)
         await db.commit()
         raise HTTPException(

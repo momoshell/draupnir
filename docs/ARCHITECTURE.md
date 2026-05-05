@@ -132,6 +132,7 @@ AI must not directly write CAD files or compute final quantities/prices.
 ```text
 Upload
   -> file record
+     (durable `initial_job_id` + `initial_extraction_profile_id` lineage)
   -> extraction profile selection/persistence
   -> ingestion job (file_id + extraction_profile_id)
   -> source adapter

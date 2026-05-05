@@ -25,6 +25,7 @@ _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
+_ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
 
 celery_app = Celery(
     "draupnir",
@@ -133,6 +134,17 @@ async def _mark_job_failed(
             session=session,
         )
         await session.commit()
+
+
+async def _mark_recovery_enqueue_failed(job_id: UUID) -> None:
+    """Persist and log a sanitized worker-recovery enqueue failure."""
+    await _mark_job_failed(job_id, error_message=_ENQUEUE_INGEST_JOB_ERROR_MESSAGE)
+    logger.error(
+        "ingest_job_recovery_enqueue_failed",
+        job_id=str(job_id),
+        error_code=ErrorCode.INTERNAL_ERROR.value,
+        recovery_action="mark_failed",
+    )
 
 
 def _finalize_job_cancelled(job: Job) -> None:
@@ -332,14 +344,8 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
     for job_id in recovered_job_ids:
         try:
             enqueue_ingest_job(job_id)
-        except Exception as exc:
-            await _mark_job_failed(job_id, error_message=f"Failed to enqueue ingest job: {exc}")
-            logger.error(
-                "ingest_job_recovery_enqueue_failed",
-                job_id=str(job_id),
-                error=str(exc),
-                exc_info=True,
-            )
+        except Exception:
+            await _mark_recovery_enqueue_failed(job_id)
         else:
             enqueued_job_ids.append(job_id)
 

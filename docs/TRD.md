@@ -594,7 +594,8 @@ Database ownership and append-only policy:
 
 - Original file rows are API-created metadata for immutable uploads; workers may
   read them, but never replace the original object or rewrite the row as a new
-  source.
+  source. Upload responses and file-read responses must expose the durable
+  initial lineage fields `initial_job_id` and `initial_extraction_profile_id`.
 - Drawing revisions, approved quantity takeoffs, finalized estimate versions,
   export artifacts, and `job_events` are append-only historical records.
 - Mutable workflow/state records include job status, attempt counters, progress,
@@ -626,6 +627,10 @@ prior one.
 - Ids are opaque ULIDs or UUIDs; clients must not parse them.
 - Idempotent mutating endpoints accept `Idempotency-Key` headers and return the
   prior response on replay within a documented retention window.
+- When job enqueue fails after durable records are created, the public error must
+  stay sanitized and may include only safe identifiers already assigned by the
+  system, such as `file_id`, `job_id`, or `extraction_profile_id` where
+  applicable.
 
 ## Error Taxonomy
 
@@ -914,15 +919,18 @@ Probe rules:
   for the run, and records the adapter name/version that produced the result.
 - The prior revision remains available for lineage, comparison, and audit even
   when the newer reprocessed revision supersedes it.
-- API direction for future `POST /v1/files/{file_id}/reprocess`:
-  - request body should accept either an existing `extraction_profile_id` or a
-    profile payload to persist as a new extraction profile before job creation
-  - the server creates a new ingestion/reprocessing job bound to `file_id` and
-    the resolved `extraction_profile_id`
+- Reprocess API contract: `POST /v1/projects/{project_id}/files/{file_id}/reprocess`
+  - request body accepts exactly one of an existing `extraction_profile_id` or a
+    new extraction profile payload to persist before job creation
+  - the server creates a new ingestion/reprocessing job bound to `project_id`,
+    `file_id`, and the resolved `extraction_profile_id`
   - successful completion creates a new drawing revision rather than mutating
     the previous revision in place
   - the resulting revision must expose adapter version, extraction profile, and
     predecessor/superseded lineage metadata
+  - during the expand/rollback window for this contract, `jobs.extraction_profile_id`
+    may remain nullable even though file initial lineage and resolved reprocess
+    lineage are durable
 - `provenance_json` is a structured object, not free text. Required keys:
   `origin`, `adapter`, `source_ref`, `source_identity`, `source_hash`,
   `extraction_path`, `notes`.

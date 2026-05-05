@@ -28,6 +28,12 @@ class Job(Base):
             ondelete="CASCADE",
             name="fk_jobs_file_id_project_id_files",
         ),
+        ForeignKeyConstraint(
+            ["extraction_profile_id", "project_id"],
+            ["extraction_profiles.id", "extraction_profiles.project_id"],
+            ondelete="CASCADE",
+            name="fk_jobs_extraction_profile_id_project_id_extraction_profiles",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -45,6 +51,14 @@ class Job(Base):
         nullable=False,
         index=True,
         comment="Associated file identifier",
+    )
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+        comment=(
+            "Immutable extraction profile identifier. Nullable only during the "
+            "expand/rollback window; a future contract migration can enforce NOT NULL."
+        ),
     )
     job_type: Mapped[str] = mapped_column(
         String(64),
