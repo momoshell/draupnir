@@ -870,6 +870,27 @@ class TestProjectFiles:
 
         assert uploaded["detected_format"] == "dxf"
 
+    async def test_upload_file_accepts_binary_dxf_with_octet_stream_media_type(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST should accept binary DXF bytes even when clients send generic metadata."""
+        _ = self
+
+        payload = b"AutoCAD Binary DXF\r\n\x1a\x00\x00\x00binary-dxf-body"
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="plan.dxf",
+            content=payload,
+            media_type="application/octet-stream",
+        )
+
+        assert uploaded["original_filename"] == "plan.dxf"
+        assert uploaded["media_type"] == "application/octet-stream"
+        assert uploaded["detected_format"] == "dxf"
+
     async def test_upload_file_rejects_dxf_with_binary_prefix_before_header(
         self,
         async_client: httpx.AsyncClient,
@@ -885,6 +906,34 @@ class TestProjectFiles:
                     "plan.dxf",
                     b"\x00\x01\t\n0\nSECTION\n2\nHEADER\n0\nENDSEC\n0\nEOF\n",
                     "application/dxf",
+                )
+            },
+        )
+
+        assert response.status_code == 415
+        assert response.json() == {
+            "error": {
+                "code": "INPUT_UNSUPPORTED_FORMAT",
+                "message": "Unsupported file format. Supported formats: pdf, dwg, dxf, ifc.",
+                "details": None,
+            }
+        }
+
+    async def test_upload_file_rejects_png_bytes_renamed_as_dxf(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST should reject unsupported bytes despite a .dxf filename."""
+        _ = self
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files",
+            files={
+                "file": (
+                    "plan.dxf",
+                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+                    "application/octet-stream",
                 )
             },
         )
