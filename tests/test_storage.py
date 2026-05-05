@@ -1,10 +1,16 @@
 """Unit tests for storage backends."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from app.storage import LocalFilesystemStorage, LocalStorage, MemoryStorage
+from app.storage import (
+    LocalFilesystemStorage,
+    LocalStorage,
+    MemoryStorage,
+)
+from app.storage.base import StorageChecksumMismatchError
 
 
 @pytest.mark.asyncio
@@ -18,6 +24,7 @@ async def test_memory_storage_round_trip_with_bytes() -> None:
     assert meta.key == "originals/file-1/checksum-1"
     assert meta.storage_uri == "memory://originals/file-1/checksum-1"
     assert meta.size_bytes == 7
+    assert meta.checksum_sha256 == hashlib.sha256(b"payload").hexdigest()
     assert stored.meta == meta
     assert stored.body == b"payload"
 
@@ -32,6 +39,7 @@ async def test_memory_storage_round_trip_with_path(tmp_path: Path) -> None:
     meta = await storage.put("originals/file-2/checksum-2", staged_path, immutable=True)
 
     assert meta.size_bytes == len(b"from-path")
+    assert meta.checksum_sha256 == hashlib.sha256(b"from-path").hexdigest()
     assert await storage.exists("originals/file-2/checksum-2") is True
     assert (await storage.get("originals/file-2/checksum-2")).body == b"from-path"
 
@@ -43,7 +51,10 @@ async def test_memory_storage_stat_and_presign_stub() -> None:
     key = "originals/file-3/checksum-3"
     await storage.put(key, b"abc", immutable=True)
 
-    assert (await storage.stat(key)).size_bytes == 3
+    stat = await storage.stat(key)
+
+    assert stat.size_bytes == 3
+    assert stat.checksum_sha256 == hashlib.sha256(b"abc").hexdigest()
     assert await storage.presign(key) is None
 
 
@@ -81,6 +92,18 @@ async def test_memory_storage_rejects_overwrite_and_delete_for_immutable_keys() 
 
 
 @pytest.mark.asyncio
+async def test_memory_storage_allows_failed_put_cleanup_for_immutable_keys() -> None:
+    """Memory storage should allow pre-commit cleanup for immutable writes."""
+    storage = MemoryStorage()
+    key = "originals/file-4/checksum-4"
+    meta = await storage.put(key, b"abc", immutable=True)
+
+    await storage.delete_failed_put(key, storage_uri=meta.storage_uri)
+
+    assert await storage.exists(key) is False
+
+
+@pytest.mark.asyncio
 async def test_memory_storage_allows_delete_for_mutable_keys() -> None:
     """Memory storage should allow deleting mutable objects."""
     storage = MemoryStorage()
@@ -104,6 +127,7 @@ async def test_local_storage_round_trip_and_cleanup(tmp_path: Path) -> None:
     assert meta.key == key
     assert meta.storage_uri == f"file://{(tmp_path / key).resolve()}"
     assert meta.size_bytes == 7
+    assert meta.checksum_sha256 == hashlib.sha256(b"payload").hexdigest()
     assert stored.meta == meta
     assert stored.body == b"payload"
     assert await storage.exists(key) is True
@@ -117,6 +141,19 @@ async def test_local_storage_round_trip_and_cleanup(tmp_path: Path) -> None:
 
     assert await storage.exists(key) is True
     assert list((tmp_path / "originals" / "file-4").glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_local_storage_allows_failed_put_cleanup_for_immutable_keys(tmp_path: Path) -> None:
+    """Local storage should allow pre-commit cleanup for immutable writes."""
+    storage = LocalFilesystemStorage(tmp_path)
+    key = "originals/file-cleanup/checksum-cleanup"
+    meta = await storage.put(key, b"payload", immutable=True)
+
+    await storage.delete_failed_put(key, storage_uri=meta.storage_uri)
+
+    assert await storage.exists(key) is False
+    assert not (tmp_path / "originals").exists()
 
 
 @pytest.mark.asyncio
@@ -233,3 +270,38 @@ async def test_local_storage_allows_same_artifact_name_under_new_artifact_id(
     assert second.key == second_key
     assert (await storage.get(first_key)).body == payload
     assert (await storage.get(second_key)).body == payload
+
+
+@pytest.mark.asyncio
+async def test_local_storage_put_from_path_returns_checksum_metadata(tmp_path: Path) -> None:
+    """Local storage should hash staged path payloads while copying."""
+    storage = LocalFilesystemStorage(tmp_path)
+    key = "originals/file-8/checksum-8"
+    staged_path = tmp_path / "upload.part"
+    payload = b"from-path"
+    staged_path.write_bytes(payload)
+
+    meta = await storage.put(key, staged_path, immutable=True)
+    stat = await storage.stat(key, expected_checksum_sha256=hashlib.sha256(payload).hexdigest())
+
+    assert meta.size_bytes == len(payload)
+    assert meta.checksum_sha256 == hashlib.sha256(payload).hexdigest()
+    assert stat == meta
+
+
+@pytest.mark.asyncio
+async def test_local_storage_detects_checksum_tampering_on_get_and_stat(tmp_path: Path) -> None:
+    """Local storage should detect checksum mismatches for tampered files."""
+    storage = LocalFilesystemStorage(tmp_path)
+    key = "originals/file-9/checksum-9"
+    original_payload = b"payload"
+    meta = await storage.put(key, original_payload, immutable=True)
+    stored_path = tmp_path / key
+    stored_path.chmod(0o600)
+    stored_path.write_bytes(b"tampered")
+
+    with pytest.raises(StorageChecksumMismatchError):
+        await storage.get(key, expected_checksum_sha256=meta.checksum_sha256)
+
+    with pytest.raises(StorageChecksumMismatchError):
+        await storage.stat(key, expected_checksum_sha256=meta.checksum_sha256)

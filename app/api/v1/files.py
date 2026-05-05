@@ -167,10 +167,8 @@ def _ensure_private_directory(path: Path, *, include_parents_until: Path | None 
 
 async def _cleanup_persisted_upload(storage: Storage, storage_key: str, storage_uri: str) -> None:
     """Best-effort cleanup for a persisted upload after downstream failure."""
-    _ = storage_uri
-
     with suppress(Exception):
-        await storage.delete(storage_key)
+        await storage.delete_failed_put(storage_key, storage_uri=storage_uri)
 
 
 async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: str) -> None:
@@ -278,6 +276,16 @@ async def upload_project_file(
 
         try:
             stored_object = await storage.put(storage_key, staging_path, immutable=True)
+            if stored_object.checksum_sha256 != checksum:
+                await _cleanup_persisted_upload(storage, storage_key, stored_object.storage_uri)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=create_error_response(
+                        code=ErrorCode.STORAGE_FAILED,
+                        message="Stored file checksum mismatch detected.",
+                        details=None,
+                    ),
+                )
             storage_uri = stored_object.storage_uri
         except FileExistsError as exc:
             raise HTTPException(
@@ -335,13 +343,7 @@ async def upload_project_file(
     )
     db.add(ingest_job)
 
-    try:
-        await db.commit()
-    except BaseException:
-        assert storage_key is not None
-        assert storage_uri is not None
-        await _cleanup_persisted_upload(storage, storage_key, storage_uri)
-        raise
+    await db.commit()
 
     await db.refresh(file_row)
     await db.refresh(ingest_job)

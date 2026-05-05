@@ -18,7 +18,7 @@ import app.db.session as session_module
 from app.core.config import settings
 from app.models.file import File as FileModel
 from app.models.job import Job
-from app.storage import StoredObjectMeta, get_storage
+from app.storage import LocalFilesystemStorage, StoredObjectMeta, get_storage
 from tests.conftest import requires_database
 
 
@@ -81,8 +81,10 @@ def _make_get_db_override_with_commit_error(
 class RecordingStorage:
     """Test double that records upload persistence inputs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, returned_checksum_sha256: str | None = None) -> None:
         self.put_calls: list[tuple[str, Path, bytes, bool]] = []
+        self.delete_calls: list[str] = []
+        self.returned_checksum_sha256 = returned_checksum_sha256
 
     async def put(
         self,
@@ -99,14 +101,29 @@ class RecordingStorage:
             key=key,
             storage_uri=f"memory://{key}",
             size_bytes=len(body),
+            checksum_sha256=(
+                self.returned_checksum_sha256 or hashlib.sha256(body).hexdigest()
+            ),
         )
 
-    async def get(self, key: str) -> Any:
+    async def get(
+        self,
+        key: str,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> Any:
         """Unused protocol method for test double completeness."""
+        _ = expected_checksum_sha256
         raise NotImplementedError(key)
 
-    async def stat(self, key: str) -> StoredObjectMeta:
+    async def stat(
+        self,
+        key: str,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObjectMeta:
         """Unused protocol method for test double completeness."""
+        _ = expected_checksum_sha256
         raise NotImplementedError(key)
 
     async def exists(self, key: str) -> bool:
@@ -115,7 +132,12 @@ class RecordingStorage:
 
     async def delete(self, key: str) -> None:
         """Unused protocol method for test double completeness."""
-        raise NotImplementedError(key)
+        self.delete_calls.append(key)
+
+    async def delete_failed_put(self, key: str, *, storage_uri: str) -> None:
+        """Record failed-put cleanup requests for protocol parity."""
+        _ = storage_uri
+        self.delete_calls.append(key)
 
     async def presign(
         self,
@@ -127,6 +149,26 @@ class RecordingStorage:
         """Unused protocol method for test double completeness."""
         _ = (key, method, expires_in_seconds)
         return None
+
+
+class LocalChecksumMismatchStorage(LocalFilesystemStorage):
+    """Local storage backend that reports the wrong checksum after writing."""
+
+    async def put(
+        self,
+        key: str,
+        data: bytes | Path,
+        *,
+        immutable: bool = False,
+    ) -> StoredObjectMeta:
+        """Persist bytes, then report intentionally mismatched checksum metadata."""
+        meta = await super().put(key, data, immutable=immutable)
+        return StoredObjectMeta(
+            key=meta.key,
+            storage_uri=meta.storage_uri,
+            size_bytes=meta.size_bytes,
+            checksum_sha256="0" * 64,
+        )
 
 
 @requires_database
@@ -279,6 +321,56 @@ class TestProjectFiles:
 
         assert file_row is not None
         assert file_row.storage_uri == f"memory://{expected_key}"
+
+    async def test_upload_file_rejects_storage_checksum_mismatch_and_cleans_persisted_upload(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+    ) -> None:
+        """POST should cleanup real local-storage writes on checksum mismatch before DB commit."""
+        _ = self
+        payload = b"%PDF-1.7\nchecksum-mismatch"
+        upload_root = Path(settings.upload_storage_root).resolve()
+        storage = LocalChecksumMismatchStorage(upload_root)
+        app.dependency_overrides[get_storage] = lambda: storage
+        try:
+            response = await async_client.post(
+                f"/v1/projects/{created_project['id']}/files",
+                files={"file": ("mismatch.pdf", payload, "application/pdf")},
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage, None)
+
+        assert response.status_code == 500
+        assert response.json() == {
+            "error": {
+                "code": "STORAGE_FAILED",
+                "message": "Stored file checksum mismatch detected.",
+                "details": None,
+            }
+        }
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+        originals_root = upload_root / "originals"
+        assert not originals_root.exists() or not any(
+            path.is_file() for path in originals_root.rglob("*")
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            file_result = await session.execute(
+                select(FileModel).where(
+                    FileModel.project_id == uuid.UUID(str(created_project["id"]))
+                )
+            )
+            job_result = await session.execute(
+                select(Job).where(Job.project_id == uuid.UUID(str(created_project["id"])))
+            )
+
+        assert file_result.scalars().all() == []
+        assert job_result.scalars().all() == []
 
     async def test_list_project_files_success(
         self,
@@ -781,14 +873,15 @@ class TestProjectFiles:
             }
         }
 
-    async def test_upload_file_commit_failure_cleans_written_bytes(
+    async def test_upload_file_commit_failure_retains_written_bytes_conservatively(
         self,
         async_client: httpx.AsyncClient,
         created_project: dict[str, Any],
         app: FastAPI,
     ) -> None:
-        """POST should cleanup persisted bytes when DB commit raises RuntimeError."""
+        """POST should retain persisted bytes when DB commit raises RuntimeError."""
         _ = self
+        payload = b"%PDF-1.7\npayload"
 
         app.dependency_overrides[session_module.get_db] = (
             _make_get_db_override_with_commit_error(RuntimeError("forced commit failure"))
@@ -797,7 +890,7 @@ class TestProjectFiles:
             with pytest.raises(RuntimeError, match="forced commit failure"):
                 await async_client.post(
                     f"/v1/projects/{created_project['id']}/files",
-                    files={"file": ("commit-fail.pdf", b"%PDF-1.7\npayload", "application/pdf")},
+                    files={"file": ("commit-fail.pdf", payload, "application/pdf")},
                 )
         finally:
             app.dependency_overrides.pop(session_module.get_db, None)
@@ -806,20 +899,20 @@ class TestProjectFiles:
         staging_root = upload_root / ".staging"
         assert not staging_root.exists() or not any(staging_root.iterdir())
 
-        stored_files = list((upload_root / "originals").rglob("*"))
-        stored_payloads = [path for path in stored_files if path.is_file()]
-        assert len(stored_payloads) == 1
-        assert stored_payloads[0].read_bytes() == b"%PDF-1.7\npayload"
-        assert (stored_payloads[0].stat().st_mode & 0o200) == 0
+        originals_root = upload_root / "originals"
+        persisted_paths = [path for path in originals_root.rglob("*") if path.is_file()]
+        assert len(persisted_paths) == 1
+        assert persisted_paths[0].read_bytes() == payload
 
-    async def test_upload_file_commit_cancelled_error_cleans_written_bytes(
+    async def test_upload_file_commit_cancelled_error_retains_written_bytes_conservatively(
         self,
         async_client: httpx.AsyncClient,
         created_project: dict[str, Any],
         app: FastAPI,
     ) -> None:
-        """POST should cleanup persisted bytes when DB commit raises CancelledError."""
+        """POST should retain persisted bytes when DB commit raises CancelledError."""
         _ = self
+        payload = b"%PDF-1.7\npayload"
 
         app.dependency_overrides[session_module.get_db] = (
             _make_get_db_override_with_commit_error(asyncio.CancelledError())
@@ -832,7 +925,7 @@ class TestProjectFiles:
                     files={
                         "file": (
                             "commit-cancelled.pdf",
-                            b"%PDF-1.7\npayload",
+                            payload,
                             "application/pdf",
                         )
                     },
@@ -851,8 +944,7 @@ class TestProjectFiles:
         staging_root = upload_root / ".staging"
         assert not staging_root.exists() or not any(staging_root.iterdir())
 
-        stored_files = list((upload_root / "originals").rglob("*"))
-        stored_payloads = [path for path in stored_files if path.is_file()]
-        assert len(stored_payloads) == 1
-        assert stored_payloads[0].read_bytes() == b"%PDF-1.7\npayload"
-        assert (stored_payloads[0].stat().st_mode & 0o200) == 0
+        originals_root = upload_root / "originals"
+        persisted_paths = [path for path in originals_root.rglob("*") if path.is_file()]
+        assert len(persisted_paths) == 1
+        assert persisted_paths[0].read_bytes() == payload
