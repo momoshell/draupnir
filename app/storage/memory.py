@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
-from app.storage.base import StoragePayload, StoredObject, StoredObjectMeta
+from app.storage.base import (
+    StorageChecksumMismatchError,
+    StoragePayload,
+    StoredObject,
+    StoredObjectMeta,
+)
+
+_MEMORY_READ_CHUNK_SIZE_BYTES = 1024 * 1024
 
 
 class MemoryStorage:
@@ -21,7 +29,8 @@ class MemoryStorage:
         immutable: bool = False,
     ) -> StoredObjectMeta:
         """Store bytes at a key without overwriting existing keys."""
-        body = data if isinstance(data, bytes) else Path(data).read_bytes()
+        body = data if isinstance(data, bytes) else self._read_path_bytes(Path(data))
+        checksum_sha256 = hashlib.sha256(body).hexdigest()
         existing = self._objects.get(key)
         if existing is not None:
             raise FileExistsError(key)
@@ -31,27 +40,44 @@ class MemoryStorage:
             key=key,
             storage_uri=f"memory://{key}",
             size_bytes=len(body),
+            checksum_sha256=checksum_sha256,
         )
 
-    async def get(self, key: str) -> StoredObject:
+    async def get(
+        self,
+        key: str,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObject:
         """Return object bytes and metadata."""
         body, _ = self._objects[key]
+        checksum_sha256 = hashlib.sha256(body).hexdigest()
+        self._verify_checksum(key, expected_checksum_sha256, checksum_sha256)
         return StoredObject(
             meta=StoredObjectMeta(
                 key=key,
                 storage_uri=f"memory://{key}",
                 size_bytes=len(body),
+                checksum_sha256=checksum_sha256,
             ),
             body=body,
         )
 
-    async def stat(self, key: str) -> StoredObjectMeta:
+    async def stat(
+        self,
+        key: str,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObjectMeta:
         """Return metadata for a stored object."""
         body, _ = self._objects[key]
+        checksum_sha256 = hashlib.sha256(body).hexdigest()
+        self._verify_checksum(key, expected_checksum_sha256, checksum_sha256)
         return StoredObjectMeta(
             key=key,
             storage_uri=f"memory://{key}",
             size_bytes=len(body),
+            checksum_sha256=checksum_sha256,
         )
 
     async def exists(self, key: str) -> bool:
@@ -68,6 +94,14 @@ class MemoryStorage:
 
         self._objects.pop(key, None)
 
+    async def delete_failed_put(self, key: str, *, storage_uri: str) -> None:
+        """Delete a just-written object before immutable upload lineage is committed."""
+        expected_storage_uri = f"memory://{key}"
+        if storage_uri != expected_storage_uri:
+            raise ValueError("Storage URI does not match key for failed-put cleanup.")
+
+        self._objects.pop(key, None)
+
     async def presign(
         self,
         key: str,
@@ -78,3 +112,26 @@ class MemoryStorage:
         """Stub presign support for interface parity."""
         _ = (key, method, expires_in_seconds)
         return None
+
+    def _read_path_bytes(self, path: Path) -> bytes:
+        body = bytearray()
+        with path.open("rb") as stream:
+            while chunk := stream.read(_MEMORY_READ_CHUNK_SIZE_BYTES):
+                body.extend(chunk)
+        return bytes(body)
+
+    def _verify_checksum(
+        self,
+        key: str,
+        expected_checksum_sha256: str | None,
+        actual_checksum_sha256: str,
+    ) -> None:
+        if (
+            expected_checksum_sha256 is not None
+            and actual_checksum_sha256 != expected_checksum_sha256
+        ):
+            raise StorageChecksumMismatchError(
+                key=key,
+                expected=expected_checksum_sha256,
+                actual=actual_checksum_sha256,
+            )
