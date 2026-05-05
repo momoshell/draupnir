@@ -111,6 +111,11 @@ def _unsupported_format_exception() -> HTTPException:
     )
 
 
+def _upload_size_limit_message(max_upload_mb: int) -> str:
+    """Build an upload-size validation message that includes configured cap."""
+    return f"Uploaded file exceeds maximum allowed size of {max_upload_mb} MB."
+
+
 def _staging_path(file_id: UUID) -> Path:
     """Build a temporary staging path for upload bytes before promotion."""
     return _upload_root() / ".staging" / f"{file_id}.{uuid.uuid4().hex}.part"
@@ -242,7 +247,7 @@ async def upload_project_file(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
                             code=ErrorCode.INPUT_INVALID,
-                            message="Uploaded file exceeds maximum allowed size.",
+                            message=_upload_size_limit_message(settings.max_upload_mb),
                             details=None,
                         ),
                     )
@@ -262,7 +267,7 @@ async def upload_project_file(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=create_error_response(
                             code=ErrorCode.INPUT_INVALID,
-                            message="Uploaded file exceeds maximum allowed size.",
+                            message=_upload_size_limit_message(settings.max_upload_mb),
                             details=None,
                         ),
                     )

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     broker_url: str = "amqp://guest:guest@localhost:5672//"
 
     # Application settings
-    max_upload_mb: int = 50
+    max_upload_mb: int = 200
     storage_local_root: str = Field(
         default="var/uploads",
         validation_alias=AliasChoices("storage_local_root", "upload_storage_root"),

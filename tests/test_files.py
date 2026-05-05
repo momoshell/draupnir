@@ -600,10 +600,12 @@ class TestProjectFiles:
         created_project: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """POST should reject oversize payloads with a 413 error envelope."""
+        """POST should reject payloads one byte over cap with a 413 envelope."""
         _ = self
         monkeypatch.setattr(settings, "max_upload_mb", 1)
-        payload = b"%PDF-1.7\n" + (b"x" * ((1024 * 1024) + 1))
+        cap_bytes = settings.max_upload_mb * 1024 * 1024
+        header = b"%PDF-1.7\n"
+        payload = header + (b"x" * ((cap_bytes - len(header)) + 1))
 
         response = await async_client.post(
             f"/v1/projects/{created_project['id']}/files",
@@ -614,7 +616,7 @@ class TestProjectFiles:
         assert data["error"]["code"] == "INPUT_INVALID"
         assert (
             data["error"]["message"]
-            == "Uploaded file exceeds maximum allowed size."
+            == f"Uploaded file exceeds maximum allowed size of {settings.max_upload_mb} MB."
         )
         assert data["error"]["details"] is None
 
@@ -635,6 +637,29 @@ class TestProjectFiles:
 
         assert file_result.scalars().all() == []
         assert job_result.scalars().all() == []
+
+    async def test_upload_file_accepts_payload_exactly_at_size_limit(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST should accept payloads exactly at the configured size limit."""
+        _ = self
+        monkeypatch.setattr(settings, "max_upload_mb", 1)
+        cap_bytes = settings.max_upload_mb * 1024 * 1024
+        header = b"%PDF-1.7\n"
+        payload = header + (b"x" * (cap_bytes - len(header)))
+
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="at-limit.pdf",
+            content=payload,
+            media_type="application/pdf",
+        )
+
+        assert uploaded["size_bytes"] == cap_bytes
 
     async def test_upload_file_rejects_unsupported_format_before_writing(
         self,
