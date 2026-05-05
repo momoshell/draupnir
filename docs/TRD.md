@@ -1025,7 +1025,9 @@ Probe rules:
 
 - Upload size enforced server-side via `MAX_UPLOAD_MB` and streaming chunk
   validation.
-- Content-type detection by magic bytes, not by filename or client header.
+- Content-type detection by magic bytes, not by filename or client header; the
+  supported signature list is maintained in `app/api/v1/files.py` under
+  `UPLOAD_FORMAT_SIGNATURES` and documented in the adjacent code comment block.
 - Reject unsupported formats early with `INPUT_UNSUPPORTED_FORMAT`.
 - DXF, IFC, and PDF parsers run with strict resource limits (file handles,
   memory) to mitigate decompression bombs and pathological inputs.

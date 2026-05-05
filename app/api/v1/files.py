@@ -30,6 +30,16 @@ from app.storage import Storage, get_storage
 files_router = APIRouter()
 _UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 _UPLOAD_SNIFF_BYTES = 4096
+# UPLOAD_FORMAT_SIGNATURES:
+# _sniff_format accepts these leading-byte signatures for upload detection:
+# - PDF: b"%PDF-"
+# - DWG: b"AC10"
+# - IFC: b"ISO-10303-21"
+# - Binary DXF: b"AutoCAD Binary DXF\r\n\x1a\x00"
+# - Text DXF: optional UTF-8 BOM, then optional ASCII whitespace, then the
+#   DXF group header for group code 0 and SECTION (b"0\nSECTION" or
+#   b"0\r\nSECTION").
+_BINARY_DXF_SENTINEL = b"AutoCAD Binary DXF\r\n\x1a\x00"
 _UTF8_BOM = b"\xef\xbb\xbf"
 _SUPPORTED_FORMATS_MESSAGE = "Unsupported file format. Supported formats: pdf, dwg, dxf, ifc."
 _MAX_ORIGINAL_FILENAME_LENGTH = 512
@@ -87,6 +97,8 @@ def _sniff_format(initial_bytes: bytes) -> str | None:
         return "dwg"
     if initial_bytes.startswith(b"ISO-10303-21"):
         return "ifc"
+    if initial_bytes.startswith(_BINARY_DXF_SENTINEL):
+        return "dxf"
 
     dxf_probe = initial_bytes
     if dxf_probe.startswith(_UTF8_BOM):
