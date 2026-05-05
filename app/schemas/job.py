@@ -17,6 +17,14 @@ class JobRead(BaseModel):
     id: uuid.UUID = Field(..., description="Unique job identifier (UUID)")
     project_id: uuid.UUID = Field(..., description="Owning project identifier")
     file_id: uuid.UUID = Field(..., description="Associated file identifier")
+    extraction_profile_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Immutable extraction profile identifier. Nullable for historical jobs "
+            "during the migration rollback window; future contract migration can "
+            "enforce non-null."
+        ),
+    )
     job_type: str = Field(..., description="Job type")
     status: str = Field(..., description="Job status")
     attempts: int = Field(..., ge=0, description="Current attempt count")

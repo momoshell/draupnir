@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import json
 import uuid
+from collections.abc import Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,15 +22,20 @@ from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
+from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File as FileModel
 from app.models.job import Job
 from app.models.project import Project
+from app.schemas.extraction_profile import ExtractionProfileCreate, FileReprocessRequest
 from app.schemas.file import FileListResponse, FileRead
+from app.schemas.job import JobRead
 from app.storage import Storage, get_storage
 
 files_router = APIRouter()
 _UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 _UPLOAD_SNIFF_BYTES = 4096
+_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH = 255
+_PUBLIC_ENQUEUE_FAILURE_MESSAGE = "Failed to enqueue ingest job"
 # UPLOAD_FORMAT_SIGNATURES:
 # _sniff_format accepts these leading-byte signatures for upload detection:
 # - PDF: b"%PDF-"
@@ -201,6 +207,98 @@ async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: st
     )
 
 
+def _build_extraction_profile(
+    project_id: UUID,
+    profile: ExtractionProfileCreate | None = None,
+) -> ExtractionProfile:
+    """Construct an immutable extraction profile row."""
+    profile_input = profile or ExtractionProfileCreate()
+    return ExtractionProfile(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        **profile_input.model_dump(),
+    )
+
+
+async def _get_project_file_or_404(
+    db: AsyncSession,
+    project_id: UUID,
+    file_id: UUID,
+) -> FileModel:
+    """Return a project-scoped file row or raise not found."""
+    query = select(FileModel).where(
+        (FileModel.project_id == project_id) & (FileModel.id == file_id)
+    )
+    file_row = (await db.execute(query)).scalar_one_or_none()
+    if file_row is None:
+        raise_not_found("File", str(file_id))
+    assert file_row is not None
+    return file_row
+
+
+async def _resolve_project_extraction_profile(
+    db: AsyncSession,
+    project_id: UUID,
+    request: FileReprocessRequest,
+) -> ExtractionProfile:
+    """Return an existing project profile or stage a new immutable one."""
+    if request.extraction_profile_id is not None:
+        query = select(ExtractionProfile).where(
+            (ExtractionProfile.project_id == project_id)
+            & (ExtractionProfile.id == request.extraction_profile_id)
+        )
+        profile_row = (await db.execute(query)).scalar_one_or_none()
+        if profile_row is None:
+            raise_not_found("ExtractionProfile", str(request.extraction_profile_id))
+        assert profile_row is not None
+        return profile_row
+
+    assert request.extraction_profile is not None
+    profile_row = _build_extraction_profile(project_id, request.extraction_profile)
+    db.add(profile_row)
+    return profile_row
+
+
+async def _mark_job_enqueue_failed(db: AsyncSession, job: Job, exc: Exception) -> None:
+    """Persist a visible failed job after enqueue publish errors."""
+    _ = exc
+    job.status = "failed"
+    job.error_code = ErrorCode.INTERNAL_ERROR.value
+    job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
+    job.finished_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(job)
+
+
+def _enqueue_failure_details(job: Job) -> dict[str, str]:
+    """Return safe durable identifiers for a failed enqueue response."""
+    assert job.extraction_profile_id is not None
+    return {
+        "job_id": str(job.id),
+        "extraction_profile_id": str(job.extraction_profile_id),
+    }
+
+
+def _attach_initial_upload_metadata(file_row: FileModel) -> FileModel:
+    """Attach durable initial-ingest metadata fields for response serialization."""
+    response_file = cast(Any, file_row)
+    response_file.initial_job_id = file_row.initial_job_id
+    response_file.initial_extraction_profile_id = file_row.initial_extraction_profile_id
+    return file_row
+
+
+async def _attach_initial_upload_metadata_for_files(
+    db: AsyncSession,
+    file_rows: Sequence[FileModel],
+) -> list[FileModel]:
+    """Attach durable initial ingest identifiers for file responses."""
+    _ = db
+    if not file_rows:
+        return []
+
+    return [_attach_initial_upload_metadata(file_row) for file_row in file_rows]
+
+
 @files_router.post(
     "/projects/{project_id}/files",
     response_model=FileRead,
@@ -336,6 +434,21 @@ async def upload_project_file(
     assert storage_key is not None
     assert storage_uri is not None
 
+    extraction_profile = _build_extraction_profile(project_id)
+    db.add(extraction_profile)
+
+    ingest_job = Job(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        file_id=file_id,
+        extraction_profile_id=extraction_profile.id,
+        job_type="ingest",
+        status="pending",
+        attempts=0,
+        max_attempts=3,
+        cancel_requested=False,
+    )
+
     file_row = FileModel(
         id=file_id,
         project_id=project_id,
@@ -346,18 +459,10 @@ async def upload_project_file(
         size_bytes=total_bytes,
         checksum_sha256=checksum,
         immutable=True,
+        initial_job_id=ingest_job.id,
+        initial_extraction_profile_id=extraction_profile.id,
     )
     db.add(file_row)
-
-    ingest_job = Job(
-        project_id=project_id,
-        file_id=file_id,
-        job_type="ingest",
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        cancel_requested=False,
-    )
     db.add(ingest_job)
 
     await db.commit()
@@ -368,13 +473,58 @@ async def upload_project_file(
     try:
         enqueue_ingest_job(ingest_job.id)
     except Exception as exc:
-        ingest_job.status = "failed"
-        ingest_job.error_code = ErrorCode.INTERNAL_ERROR.value
-        ingest_job.error_message = f"Failed to enqueue ingest job: {exc}"
-        ingest_job.finished_at = datetime.now(UTC)
-        await db.commit()
+        await _mark_job_enqueue_failed(db, ingest_job, exc)
 
-    return file_row
+    return _attach_initial_upload_metadata(file_row)
+
+
+@files_router.post(
+    "/projects/{project_id}/files/{file_id}/reprocess",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reprocess_project_file(
+    project_id: UUID,
+    file_id: UUID,
+    request: FileReprocessRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Job:
+    """Create a new pending ingest job for an existing file and profile selection."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise_not_found("Project", str(project_id))
+
+    await _get_project_file_or_404(db, project_id, file_id)
+    extraction_profile = await _resolve_project_extraction_profile(db, project_id, request)
+
+    ingest_job = Job(
+        project_id=project_id,
+        file_id=file_id,
+        extraction_profile_id=extraction_profile.id,
+        job_type="ingest",
+        status="pending",
+        attempts=0,
+        max_attempts=3,
+        cancel_requested=False,
+    )
+    db.add(ingest_job)
+    await db.commit()
+    await db.refresh(ingest_job)
+
+    try:
+        enqueue_ingest_job(ingest_job.id)
+    except Exception as exc:
+        await _mark_job_enqueue_failed(db, ingest_job, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=create_error_response(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
+                details=_enqueue_failure_details(ingest_job),
+            ),
+        ) from exc
+
+    return ingest_job
 
 
 @files_router.get(
@@ -418,7 +568,10 @@ async def list_project_files(
         last_item = rows[-1]
         next_cursor = _encode_cursor(last_item.created_at, last_item.id)
 
-    items = [FileRead.model_validate(row) for row in rows]
+    items = [
+        FileRead.model_validate(row)
+        for row in await _attach_initial_upload_metadata_for_files(db, rows)
+    ]
     return FileListResponse(items=items, next_cursor=next_cursor)
 
 
@@ -432,11 +585,6 @@ async def get_project_file(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> FileModel:
     """Get a single file by id within a project scope."""
-    query = select(FileModel).where(
-        (FileModel.project_id == project_id) & (FileModel.id == file_id)
-    )
-    file_row = (await db.execute(query)).scalar_one_or_none()
-    if file_row is None:
-        raise_not_found("File", str(file_id))
-    assert file_row is not None
+    file_row = await _get_project_file_or_404(db, project_id, file_id)
+    await _attach_initial_upload_metadata_for_files(db, [file_row])
     return file_row

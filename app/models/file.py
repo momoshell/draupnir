@@ -80,6 +80,14 @@ class File(Base):
         nullable=False,
         comment="Whether the original upload is immutable",
     )
+    initial_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Initial ingest job identifier created during upload",
+    )
+    initial_extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Initial extraction profile identifier created during upload",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=func.now(),

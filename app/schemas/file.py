@@ -19,6 +19,14 @@ class FileRead(BaseModel):
     size_bytes: int = Field(..., ge=0, description="Uploaded file size in bytes")
     checksum_sha256: str = Field(..., min_length=64, max_length=64, description="SHA-256 checksum")
     immutable: bool = Field(..., description="Whether original upload is immutable")
+    initial_job_id: uuid.UUID | None = Field(
+        None,
+        description="Initial ingest job identifier created during upload",
+    )
+    initial_extraction_profile_id: uuid.UUID | None = Field(
+        None,
+        description="Initial extraction profile identifier created during upload",
+    )
     created_at: datetime = Field(..., description="File creation timestamp")
 
 

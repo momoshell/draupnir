@@ -145,6 +145,45 @@ def enqueued_job_ids(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return recorded_job_ids
 
 
+async def test_mark_recovery_enqueue_failed_logs_only_safe_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery enqueue failure logging should exclude exception text and traceback."""
+    job_id = uuid.uuid4()
+    logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+    marked_failed_job_ids: list[uuid.UUID] = []
+
+    async def _fake_mark_job_failed(
+        failed_job_id: uuid.UUID,
+        *,
+        error_message: str,
+        error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
+    ) -> None:
+        marked_failed_job_ids.append(failed_job_id)
+        assert error_message == "Failed to enqueue ingest job"
+        assert error_code == ErrorCode.INTERNAL_ERROR
+
+    def _capture_logger_error(event: str, **kwargs: Any) -> None:
+        logger_error_calls.append((event, kwargs))
+
+    monkeypatch.setattr(worker_module, "_mark_job_failed", _fake_mark_job_failed)
+    monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+    await worker_module._mark_recovery_enqueue_failed(job_id)
+
+    assert marked_failed_job_ids == [job_id]
+    assert logger_error_calls == [
+        (
+            "ingest_job_recovery_enqueue_failed",
+            {
+                "job_id": str(job_id),
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "recovery_action": "mark_failed",
+            },
+        )
+    ]
+
+
 @requires_database
 class TestJobs:
     """Tests for job status retrieval and worker state transitions."""
@@ -189,7 +228,9 @@ class TestJobs:
         assert job.status == "failed"
         assert job.attempts == 0
         assert job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert job.error_message == "Failed to enqueue ingest job: broker unavailable"
+        assert job.error_message == "Failed to enqueue ingest job"
+        assert "broker unavailable" not in job.error_message
+        assert len(job.error_message) <= 255
         assert job.started_at is None
         assert job.finished_at is not None
 
@@ -245,6 +286,7 @@ class TestJobs:
         assert data["id"] == str(job.id)
         assert data["project_id"] == project["id"]
         assert data["file_id"] == uploaded["id"]
+        assert data["extraction_profile_id"] == str(job.extraction_profile_id)
         assert data["job_type"] == "ingest"
         assert data["status"] == "pending"
         assert data["attempts"] == 0
@@ -683,6 +725,68 @@ class TestJobs:
         assert unchanged_job.attempts == 1
         assert unchanged_job.started_at is not None
 
+    async def test_recover_incomplete_ingest_jobs_sanitizes_enqueue_failure_details(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker startup recovery should not persist raw enqueue exception text."""
+        _ = self
+        _ = cleanup_projects
+
+        secret_broker_text = "amqp://user:super-secret-password@broker/vhost timed out"
+        logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def _fail_recovery_enqueue(_: uuid.UUID) -> None:
+            raise RuntimeError(secret_broker_text)
+
+        def _capture_logger_error(event: str, **kwargs: Any) -> None:
+            logger_error_calls.append((event, kwargs))
+
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fail_recovery_enqueue)
+        monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        enqueued_job_ids.clear()
+
+        requeued = await recover_incomplete_ingest_jobs()
+
+        assert requeued == []
+
+        failed_job = await _get_job(job.id)
+        assert failed_job.status == "failed"
+        assert failed_job.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert failed_job.error_message == "Failed to enqueue ingest job"
+        assert secret_broker_text not in failed_job.error_message
+        assert len(failed_job.error_message) <= 255
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == ["Job failed"]
+        assert data["items"][0]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.INTERNAL_ERROR.value,
+            "error_message": "Failed to enqueue ingest job",
+        }
+        assert secret_broker_text not in str(data["items"][0]["data_json"])
+        assert data["next_cursor"] is None
+
+        assert logger_error_calls == [
+            (
+                "ingest_job_recovery_enqueue_failed",
+                {
+                    "job_id": str(job.id),
+                    "error_code": ErrorCode.INTERNAL_ERROR.value,
+                    "recovery_action": "mark_failed",
+                },
+            )
+        ]
+
     async def test_process_ingest_job_ignores_duplicate_delivery_after_success(
         self,
         async_client: httpx.AsyncClient,
@@ -871,7 +975,9 @@ class TestJobs:
         updated = await _get_job(job.id)
         assert updated.status == "failed"
         assert updated.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert updated.error_message == "Failed to enqueue ingest job: broker unavailable"
+        assert updated.error_message == "Failed to enqueue ingest job"
+        assert "broker unavailable" not in updated.error_message
+        assert len(updated.error_message) <= 255
         assert updated.finished_at is not None
 
     async def test_retry_job_noops_when_attempt_limit_reached(

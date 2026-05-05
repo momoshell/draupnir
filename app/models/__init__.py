@@ -7,6 +7,7 @@ for Alembic autogenerate support. Example:
 
 """
 
+from . import extraction_profile as extraction_profile
 from . import file as file
 from . import job as job
 from . import job_event as job_event
