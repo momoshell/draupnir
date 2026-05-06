@@ -1,0 +1,3 @@
+This fixture is a synthetic placeholder for DWG adapter-wrapper smoke coverage.
+It intentionally does not contain proprietary DWG geometry.
+Use this metadata fixture to validate registry/contract wiring only.
