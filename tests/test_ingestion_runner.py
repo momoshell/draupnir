@@ -165,10 +165,11 @@ async def test_run_ingestion_falls_back_to_next_candidate_and_is_deterministic(
     assert payload_one.adapter_version == "test-1.0"
     assert payload_one.input_family == InputFamily.PDF_RASTER.value
     assert payload_one.revision_kind == "ingest"
-    assert payload_one.review_state == "provisional"
-    assert payload_one.validation_status == "valid"
-    assert payload_one.quantity_gate == "allowed_provisional"
+    assert payload_one.review_state == "review_required"
+    assert payload_one.validation_status == "needs_review"
+    assert payload_one.quantity_gate == "review_gated"
     assert payload_one.confidence_score == 0.61
+    assert payload_one.report_json["checks"]
     assert payload_one.result_checksum_sha256 == payload_two.result_checksum_sha256
     assert payload_one.canonical_json["canonical_entity_schema_version"] == "0.1"
     assert payload_one.report_json["summary"]["entity_counts"] == {

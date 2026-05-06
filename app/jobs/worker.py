@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -242,6 +243,66 @@ def _assert_revision_invariants(
         )
 
 
+def _build_persisted_validation_report_json(
+    payload: IngestFinalizationPayload,
+    *,
+    drawing_revision_id: UUID,
+    source_job_id: UUID,
+    validation_report_id: UUID,
+) -> dict[str, Any]:
+    """Copy the canonical report JSON and enrich it with persisted identities."""
+    report_json = deepcopy(payload.report_json)
+
+    validator_json = report_json.get("validator")
+    validator = dict(validator_json) if isinstance(validator_json, dict) else {}
+    validator["name"] = payload.validator_name
+    validator["version"] = payload.validator_version
+
+    confidence = dict(payload.confidence_json)
+    confidence["effective_confidence"] = payload.effective_confidence
+    confidence["review_state"] = payload.review_state
+    confidence["review_required"] = payload.review_state == "review_required"
+
+    summary_json = report_json.get("summary")
+    summary = dict(summary_json) if isinstance(summary_json, dict) else {}
+    summary["validation_status"] = payload.validation_status
+    summary["review_state"] = payload.review_state
+    summary["quantity_gate"] = payload.quantity_gate
+    summary["effective_confidence"] = payload.effective_confidence
+
+    checks_json = report_json.get("checks")
+    checks = list(checks_json) if isinstance(checks_json, list) else []
+    if not checks:
+        checks.append(
+            {
+                "code": "validation_report_persisted",
+                "status": "passed",
+                "message": (
+                    "Persisted validation report columns are attached to the "
+                    "canonical payload."
+                ),
+            }
+        )
+
+    report_json["validation_report_id"] = str(validation_report_id)
+    report_json["drawing_revision_id"] = str(drawing_revision_id)
+    report_json["source_job_id"] = str(source_job_id)
+    report_json["validation_report_schema_version"] = payload.validation_report_schema_version
+    report_json["canonical_entity_schema_version"] = payload.canonical_entity_schema_version
+    report_json["validation_status"] = payload.validation_status
+    report_json["review_state"] = payload.review_state
+    report_json["quantity_gate"] = payload.quantity_gate
+    report_json["effective_confidence"] = payload.effective_confidence
+    report_json["validator"] = validator
+    report_json["confidence"] = confidence
+    report_json["provenance"] = deepcopy(payload.provenance_json)
+    report_json["generated_at"] = payload.generated_at.isoformat()
+    report_json["summary"] = summary
+    report_json["checks"] = checks
+
+    return report_json
+
+
 async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
     """Load persisted job and file metadata for the ingestion runner."""
     session_maker = get_session_maker()
@@ -411,7 +472,12 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
                 effective_confidence=payload.effective_confidence,
                 validator_name=payload.validator_name,
                 validator_version=payload.validator_version,
-                report_json=payload.report_json,
+                report_json=_build_persisted_validation_report_json(
+                    payload,
+                    drawing_revision_id=drawing_revision_id,
+                    source_job_id=job.id,
+                    validation_report_id=validation_report_id,
+                ),
                 generated_at=payload.generated_at,
             )
         )
