@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import types
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -16,13 +17,14 @@ import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
-from app.ingestion.contracts import ProgressUpdate
-from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
-from app.ingestion.runner import (
+from app.ingestion.contracts import (
     AdapterFailureKind,
-    IngestionRunnerError,
-    IngestionRunRequest,
+    CancellationHandle,
+    ProgressCallback,
+    ProgressUpdate,
 )
+from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
+from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
 from app.ingestion.runner import (
     run_ingestion as real_run_ingestion,
 )
@@ -42,6 +44,14 @@ _FAKE_RUNNER_QUANTITY_GATE = "allowed_provisional"
 _FAKE_RUNNER_VALIDATOR_NAME = "tests.fake_ingestion_runner"
 _FAKE_RUNNER_VALIDATOR_VERSION = "1.0"
 _TEST_UPLOAD_BODY = b"%PDF-1.7\njob-test\n"
+
+
+class _AdapterModule(types.ModuleType):
+    create_adapter: Callable[[], object]
+
+    def __init__(self, name: str, create_adapter: Callable[[], object]) -> None:
+        super().__init__(name)
+        self.create_adapter = create_adapter
 
 
 async def _create_project(async_client: httpx.AsyncClient) -> dict[str, Any]:
@@ -539,8 +549,7 @@ class TestJobs:
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
             logger_error_calls.append((event, kwargs))
 
-        module = types.ModuleType("available_vector_adapter_module")
-        module.create_adapter = lambda: object()
+        module = _AdapterModule("available_vector_adapter_module", lambda: object())
 
         def fake_import_module(module_name: str) -> types.ModuleType:
             if module_name == "app.ingestion.adapters.pymupdf":
@@ -614,8 +623,7 @@ class TestJobs:
         def _fail_write_bytes(self: Any, _: bytes) -> int:
             raise OSError(f"{secret_temp_marker}: {self}")
 
-        module = types.ModuleType("available_stage_vector_adapter_module")
-        module.create_adapter = lambda: object()
+        module = _AdapterModule("available_stage_vector_adapter_module", lambda: object())
 
         def fake_import_module(module_name: str) -> types.ModuleType:
             if module_name == "app.ingestion.adapters.pymupdf":
@@ -959,7 +967,7 @@ class TestJobs:
         async def _run_with_progress(
             request: IngestionRunRequest,
             *,
-            on_progress=None,
+            on_progress: ProgressCallback | None = None,
             **_: Any,
         ) -> IngestFinalizationPayload:
             assert on_progress is not None
@@ -1078,7 +1086,7 @@ class TestJobs:
         async def _run_with_progress_then_fail(
             _: IngestionRunRequest,
             *,
-            on_progress=None,
+            on_progress: ProgressCallback | None = None,
             **__: Any,
         ) -> IngestFinalizationPayload:
             assert on_progress is not None
@@ -1178,30 +1186,26 @@ class TestJobs:
         async def _cancel_run(
             _: IngestionRunRequest,
             *,
-            cancellation=None,
-            on_progress=None,
+            cancellation: CancellationHandle | None = None,
+            on_progress: ProgressCallback | None = None,
             **__: Any,
         ) -> IngestFinalizationPayload:
             assert cancellation is not None
             assert on_progress is not None
             on_progress(ProgressUpdate(stage="source", message="Staged original"))
             await _update_job(job.id, cancel_requested=True)
-            for _attempt in range(50):
-                if cancellation.is_cancelled():
-                    break
+            cancellation_deadline = asyncio.get_running_loop().time() + 1
+            while not cancellation.is_cancelled():
+                if asyncio.get_running_loop().time() >= cancellation_deadline:
+                    raise AssertionError("Expected cancellation flag within 1 second")
                 await asyncio.sleep(0.01)
-            else:
-                raise AssertionError("Worker cancellation handle was not updated")
 
-            raise IngestionRunnerError(
-                error_code=ErrorCode.JOB_CANCELLED,
-                failure_kind=AdapterFailureKind.CANCELLED,
-                message="Adapter execution was cancelled.",
-            )
+            await asyncio.sleep(1)
+            raise AssertionError("Worker cancellation should interrupt the runner task")
 
         monkeypatch.setattr(worker_module, "run_ingestion", _cancel_run)
 
-        with pytest.raises(IngestionRunnerError, match="Adapter execution was cancelled"):
+        with pytest.raises(asyncio.CancelledError):
             await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)

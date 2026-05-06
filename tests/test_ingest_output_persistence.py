@@ -10,6 +10,8 @@ from sqlalchemy import select
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
+from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
@@ -541,7 +543,9 @@ class TestIngestOutputPersistence:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        async def _cancel_during_work(request) -> object:
+        async def _cancel_during_work(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
             await _update_job(job.id, cancel_requested=True)
             return _build_fake_ingest_payload(request)
 

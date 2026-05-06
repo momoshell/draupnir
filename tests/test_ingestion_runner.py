@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import types
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -55,6 +56,14 @@ class _FakeAdapter:
             ),
             confidence=ConfidenceSummary(score=0.61, review_required=False, basis="raster"),
         )
+
+
+class _AdapterModule(types.ModuleType):
+    create_adapter: Callable[[], object]
+
+    def __init__(self, name: str, create_adapter: Callable[[], object]) -> None:
+        super().__init__(name)
+        self.create_adapter = create_adapter
 
 
 @pytest.mark.asyncio
@@ -113,8 +122,10 @@ async def test_run_ingestion_falls_back_to_next_candidate_and_is_deterministic(
     await storage.put(key, body, immutable=True)
     seen_paths: list[Path] = []
 
-    raster_module = types.ModuleType("fake_raster_module")
-    raster_module.create_adapter = lambda: _FakeAdapter(seen_paths=seen_paths)
+    raster_module = _AdapterModule(
+        "fake_raster_module",
+        lambda: _FakeAdapter(seen_paths=seen_paths),
+    )
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.pymupdf":
@@ -298,8 +309,7 @@ async def test_run_ingestion_passes_progress_and_cancellation_to_adapter(
                 confidence=ConfidenceSummary(score=0.98, review_required=False, basis="vector"),
             )
 
-    module = types.ModuleType("recording_adapter_module")
-    module.create_adapter = lambda: _RecordingAdapter()
+    module = _AdapterModule("recording_adapter_module", lambda: _RecordingAdapter())
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":
@@ -342,8 +352,10 @@ async def test_run_ingestion_passes_progress_and_cancellation_to_adapter(
 async def test_run_ingestion_maps_storage_read_errors_to_storage_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = types.ModuleType("storage_failure_adapter_module")
-    module.create_adapter = lambda: _FakeAdapter(seen_paths=[])
+    module = _AdapterModule(
+        "storage_failure_adapter_module",
+        lambda: _FakeAdapter(seen_paths=[]),
+    )
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":
@@ -383,8 +395,10 @@ async def test_run_ingestion_maps_storage_checksum_mismatch_to_storage_failed(
     key = build_original_storage_key(file_id, expected_checksum)
     await storage.put(key, actual_body, immutable=True)
 
-    module = types.ModuleType("storage_checksum_mismatch_adapter_module")
-    module.create_adapter = lambda: _FakeAdapter(seen_paths=[])
+    module = _AdapterModule(
+        "storage_checksum_mismatch_adapter_module",
+        lambda: _FakeAdapter(seen_paths=[]),
+    )
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":
@@ -445,10 +459,14 @@ async def test_run_ingestion_does_not_fall_through_after_runtime_failure(
             _ = (source, options)
             raise AssertionError("Runner should not fall through after runtime failure")
 
-    vector_module = types.ModuleType("failing_vector_adapter_module")
-    vector_module.create_adapter = lambda: _FailingVectorAdapter()
-    raster_module = types.ModuleType("unexpected_raster_adapter_module")
-    raster_module.create_adapter = lambda: _UnexpectedRasterAdapter()
+    vector_module = _AdapterModule(
+        "failing_vector_adapter_module",
+        lambda: _FailingVectorAdapter(),
+    )
+    raster_module = _AdapterModule(
+        "unexpected_raster_adapter_module",
+        lambda: _UnexpectedRasterAdapter(),
+    )
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.pymupdf":
@@ -511,10 +529,14 @@ async def test_run_ingestion_maps_vector_execute_timeout_without_importing_raste
             _ = (source, options)
             raise AssertionError("Runner should not import or run raster fallback after timeout")
 
-    vector_module = types.ModuleType("slow_vector_adapter_module")
-    vector_module.create_adapter = lambda: _SlowVectorAdapter()
-    raster_module = types.ModuleType("unexpected_raster_timeout_adapter_module")
-    raster_module.create_adapter = lambda: _UnexpectedRasterAdapter()
+    vector_module = _AdapterModule(
+        "slow_vector_adapter_module",
+        lambda: _SlowVectorAdapter(),
+    )
+    raster_module = _AdapterModule(
+        "unexpected_raster_timeout_adapter_module",
+        lambda: _UnexpectedRasterAdapter(),
+    )
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         imported_modules.append(module_name)
@@ -555,8 +577,7 @@ async def test_run_ingestion_maps_vector_execute_timeout_without_importing_raste
 async def test_run_ingestion_enforces_source_timeout_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = types.ModuleType("timeout_adapter_module")
-    module.create_adapter = lambda: _FakeAdapter(seen_paths=[])
+    module = _AdapterModule("timeout_adapter_module", lambda: _FakeAdapter(seen_paths=[]))
 
     class _SlowMemoryStorage(MemoryStorage):
         async def get(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -616,8 +637,7 @@ async def test_run_ingestion_cleans_up_staged_source_after_adapter_execution_fai
             _ = options
             raise RuntimeError("adapter exploded")
 
-    module = types.ModuleType("failing_cleanup_adapter_module")
-    module.create_adapter = lambda: _FailingAdapter()
+    module = _AdapterModule("failing_cleanup_adapter_module", lambda: _FailingAdapter())
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":
@@ -675,8 +695,7 @@ async def test_run_ingestion_enforces_cancellation_checkpoint_before_execute(
             _ = (source, options)
             raise AssertionError("Adapter ingest should not start after cancellation checkpoint")
 
-    module = types.ModuleType("cancelled_adapter_module")
-    module.create_adapter = lambda: _UnexpectedAdapter()
+    module = _AdapterModule("cancelled_adapter_module", lambda: _UnexpectedAdapter())
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":
