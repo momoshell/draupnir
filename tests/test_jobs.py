@@ -1,7 +1,10 @@
 """Integration tests for persisted job status and worker transitions."""
 
 import asyncio
+import hashlib
+import types
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -14,10 +17,41 @@ import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
-from app.jobs.worker import process_ingest_job, recover_incomplete_ingest_jobs
+from app.ingestion.contracts import (
+    AdapterFailureKind,
+    CancellationHandle,
+    ProgressCallback,
+    ProgressUpdate,
+)
+from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
+from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
+from app.ingestion.runner import (
+    run_ingestion as real_run_ingestion,
+)
+from app.models.file import File
 from app.models.job import Job
 from app.models.job_event import JobEvent
 from tests.conftest import requires_database
+
+_FAKE_RUNNER_ADAPTER_KEY = "tests.fake_ingestion_runner"
+_FAKE_RUNNER_ADAPTER_VERSION = "1.0"
+_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION = "0.1"
+_FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION = "0.1"
+_FAKE_RUNNER_CONFIDENCE_SCORE = 0.75
+_FAKE_RUNNER_REVIEW_STATE = "provisional"
+_FAKE_RUNNER_VALIDATION_STATUS = "valid"
+_FAKE_RUNNER_QUANTITY_GATE = "allowed_provisional"
+_FAKE_RUNNER_VALIDATOR_NAME = "tests.fake_ingestion_runner"
+_FAKE_RUNNER_VALIDATOR_VERSION = "1.0"
+_TEST_UPLOAD_BODY = b"%PDF-1.7\njob-test\n"
+
+
+class _AdapterModule(types.ModuleType):
+    create_adapter: Callable[[], object]
+
+    def __init__(self, name: str, create_adapter: Callable[[], object]) -> None:
+        super().__init__(name)
+        self.create_adapter = create_adapter
 
 
 async def _create_project(async_client: httpx.AsyncClient) -> dict[str, Any]:
@@ -40,10 +74,141 @@ async def _upload_file(
     """Upload a supported file and return its payload."""
     response = await async_client.post(
         f"/v1/projects/{project_id}/files",
-        files={"file": ("plan.pdf", b"%PDF-1.7\njob-test\n", "application/pdf")},
+        files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
+
+
+def _resolve_fake_revision_kind(request: IngestionRunRequest) -> str:
+    """Match ingest vs reprocess semantics for fake runner payloads."""
+    if request.initial_job_id == request.job_id:
+        return "ingest"
+
+    return "reprocess"
+
+
+def _resolve_fake_input_family(request: IngestionRunRequest) -> str:
+    """Return a stable runner-like input family for tests."""
+    if request.detected_format == "pdf" and request.media_type == "application/pdf":
+        return "pdf_vector"
+
+    if request.detected_format is not None:
+        return request.detected_format
+
+    return "unknown"
+
+
+def _build_fake_ingest_payload(
+    request: IngestionRunRequest,
+    *,
+    generated_at: datetime | None = None,
+) -> IngestFinalizationPayload:
+    """Build a deterministic fake finalization payload for worker tests."""
+    normalized_generated_at = generated_at or datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    revision_kind = _resolve_fake_revision_kind(request)
+    input_family = _resolve_fake_input_family(request)
+    entity_counts = {
+        "layouts": 1,
+        "layers": 1,
+        "blocks": 0,
+        "entities": 1,
+    }
+    canonical_json = {
+        "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "layouts": [{"name": "Model"}],
+        "layers": [{"name": "A-WALL"}],
+        "blocks": [],
+        "entities": [{"kind": "line", "layer": "A-WALL"}],
+        "entity_counts": entity_counts,
+    }
+    provenance_json = {
+        "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "bridge": "tests.fake_ingestion_runner",
+        "adapter": {
+            "key": _FAKE_RUNNER_ADAPTER_KEY,
+            "version": _FAKE_RUNNER_ADAPTER_VERSION,
+        },
+        "source": {
+            "file_id": str(request.file_id),
+            "job_id": str(request.job_id),
+            "extraction_profile_id": (
+                str(request.extraction_profile_id)
+                if request.extraction_profile_id is not None
+                else None
+            ),
+            "input_family": input_family,
+            "revision_kind": revision_kind,
+            "original_name": request.original_name,
+        },
+        "generated_at": normalized_generated_at.isoformat(),
+    }
+    confidence_json = {
+        "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+        "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
+        "review_state": _FAKE_RUNNER_REVIEW_STATE,
+    }
+    warnings_json: list[Any] = []
+    diagnostics_json = {
+        "runner": "tests.fake_ingestion_runner",
+        "detected_format": request.detected_format,
+    }
+    report_json = {
+        "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
+        "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "validator": {
+            "name": _FAKE_RUNNER_VALIDATOR_NAME,
+            "version": _FAKE_RUNNER_VALIDATOR_VERSION,
+        },
+        "summary": {
+            "validation_status": _FAKE_RUNNER_VALIDATION_STATUS,
+            "review_state": _FAKE_RUNNER_REVIEW_STATE,
+            "quantity_gate": _FAKE_RUNNER_QUANTITY_GATE,
+            "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
+            "entity_counts": entity_counts,
+        },
+        "checks": [],
+        "findings": [],
+        "adapter_warnings": warnings_json,
+        "provenance": provenance_json,
+    }
+    result_envelope = {
+        "adapter_key": _FAKE_RUNNER_ADAPTER_KEY,
+        "adapter_version": _FAKE_RUNNER_ADAPTER_VERSION,
+        "input_family": input_family,
+        "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "canonical_json": canonical_json,
+        "provenance_json": provenance_json,
+        "confidence_json": confidence_json,
+        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+        "warnings_json": warnings_json,
+        "diagnostics_json": diagnostics_json,
+    }
+
+    return IngestFinalizationPayload(
+        revision_kind=revision_kind,
+        adapter_key=_FAKE_RUNNER_ADAPTER_KEY,
+        adapter_version=_FAKE_RUNNER_ADAPTER_VERSION,
+        input_family=input_family,
+        canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        canonical_json=canonical_json,
+        provenance_json=provenance_json,
+        confidence_json=confidence_json,
+        confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+        warnings_json=warnings_json,
+        diagnostics_json=diagnostics_json,
+        result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
+        validation_report_schema_version=_FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
+        validation_status=_FAKE_RUNNER_VALIDATION_STATUS,
+        review_state=_FAKE_RUNNER_REVIEW_STATE,
+        quantity_gate=_FAKE_RUNNER_QUANTITY_GATE,
+        effective_confidence=_FAKE_RUNNER_CONFIDENCE_SCORE,
+        validator_name=_FAKE_RUNNER_VALIDATOR_NAME,
+        validator_version=_FAKE_RUNNER_VALIDATOR_VERSION,
+        report_json=report_json,
+        generated_at=normalized_generated_at,
+    )
 
 
 async def _get_job_for_file(file_id: str) -> Job:
@@ -105,6 +270,30 @@ async def _update_job(
     return await _get_job(job_id)
 
 
+async def _update_source_file(
+    file_id: uuid.UUID,
+    *,
+    checksum_sha256: str | None = None,
+    original_filename: str | None = None,
+) -> File:
+    """Update and return a persisted source file for test setup."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        source_file = await session.get(File, file_id)
+        assert source_file is not None
+
+        if checksum_sha256 is not None:
+            source_file.checksum_sha256 = checksum_sha256
+        if original_filename is not None:
+            source_file.original_filename = original_filename
+
+        await session.commit()
+
+    return source_file
+
+
 async def _create_job_event(
     job_id: uuid.UUID,
     *,
@@ -143,6 +332,21 @@ def enqueued_job_ids(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr(files_api, "enqueue_ingest_job", _fake_enqueue)
     return recorded_job_ids
+
+
+@pytest.fixture(autouse=True)
+def fake_ingestion_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[IngestionRunRequest]:
+    """Patch worker ingestion with a deterministic fake runner payload."""
+    recorded_requests: list[IngestionRunRequest] = []
+
+    async def _fake_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+        recorded_requests.append(request)
+        return _build_fake_ingest_payload(request)
+
+    monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
+    return recorded_requests
 
 
 async def test_mark_recovery_enqueue_failed_logs_only_safe_fields(
@@ -250,19 +454,225 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        async def _fail_sleep(_: float) -> None:
+        async def _fail_run_ingestion(_: IngestionRunRequest) -> IngestFinalizationPayload:
             raise RuntimeError("adapter exploded")
 
-        monkeypatch.setattr(asyncio, "sleep", _fail_sleep)
+        monkeypatch.setattr(worker_module, "run_ingestion", _fail_run_ingestion)
 
         with pytest.raises(RuntimeError, match="adapter exploded"):
-            await process_ingest_job(job.id)
+            await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert updated_job.error_message == "adapter exploded"
+        assert updated_job.error_message == "Ingest job failed unexpectedly."
+        assert "adapter exploded" not in updated_job.error_message
         assert updated_job.finished_at is not None
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"][-1]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.INTERNAL_ERROR.value,
+            "error_message": "Ingest job failed unexpectedly.",
+        }
+        assert "adapter exploded" not in str(data["items"][-1]["data_json"])
+
+    async def test_process_ingest_job_marks_expected_runner_failure_with_sanitized_code(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Expected runner failures should persist their sanitized code and message."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_logger_error(event: str, **kwargs: Any) -> None:
+            logger_error_calls.append((event, kwargs))
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _fail_run_ingestion(_: IngestionRunRequest) -> IngestFinalizationPayload:
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_UNAVAILABLE,
+                failure_kind=AdapterFailureKind.UNAVAILABLE,
+                message="Adapter could not be loaded.",
+                details={"stderr": "super-secret adapter detail"},
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _fail_run_ingestion)
+        monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+        with pytest.raises(IngestionRunnerError, match="Adapter could not be loaded"):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.ADAPTER_UNAVAILABLE.value
+        assert updated_job.error_message == "Adapter could not be loaded."
+        assert "super-secret adapter detail" not in updated_job.error_message
+        assert updated_job.finished_at is not None
+        assert logger_error_calls == [
+            (
+                "ingest_job_failed",
+                {
+                    "job_id": str(job.id),
+                    "error_code": ErrorCode.ADAPTER_UNAVAILABLE.value,
+                    "failure_kind": AdapterFailureKind.UNAVAILABLE.value,
+                    "error_message": "Adapter could not be loaded.",
+                },
+            )
+        ]
+
+    async def test_process_ingest_job_persists_sanitized_real_runner_storage_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Real runner storage failures should persist and log only sanitized fields."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        secret_checksum = "f" * 64
+        logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_logger_error(event: str, **kwargs: Any) -> None:
+            logger_error_calls.append((event, kwargs))
+
+        module = _AdapterModule("available_vector_adapter_module", lambda: object())
+
+        def fake_import_module(module_name: str) -> types.ModuleType:
+            if module_name == "app.ingestion.adapters.pymupdf":
+                return module
+            raise AssertionError(f"Unexpected module import: {module_name}")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
+        monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+        monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_source_file(uuid.UUID(uploaded["id"]), checksum_sha256=secret_checksum)
+
+        with pytest.raises(
+            IngestionRunnerError,
+            match="Failed to read original source from storage",
+        ):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.STORAGE_FAILED.value
+        assert updated_job.error_message == "Failed to read original source from storage."
+        assert secret_checksum not in updated_job.error_message
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"][-1]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.STORAGE_FAILED.value,
+            "error_message": "Failed to read original source from storage.",
+        }
+        assert secret_checksum not in str(data["items"][-1]["data_json"])
+        assert secret_checksum not in str(logger_error_calls)
+        assert logger_error_calls == [
+            (
+                "ingest_job_failed",
+                {
+                    "job_id": str(job.id),
+                    "error_code": ErrorCode.STORAGE_FAILED.value,
+                    "failure_kind": AdapterFailureKind.FAILED.value,
+                    "error_message": "Failed to read original source from storage.",
+                    "adapter_key": "pymupdf",
+                    "input_family": "pdf_vector",
+                    "reason": "not_found",
+                },
+            )
+        ]
+
+    async def test_process_ingest_job_persists_sanitized_real_runner_staging_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Real runner staging failures should not leak temp paths or exception text."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        secret_temp_marker = "temp-path-leak"
+        logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_logger_error(event: str, **kwargs: Any) -> None:
+            logger_error_calls.append((event, kwargs))
+
+        def _fail_write_bytes(self: Any, _: bytes) -> int:
+            raise OSError(f"{secret_temp_marker}: {self}")
+
+        module = _AdapterModule("available_stage_vector_adapter_module", lambda: object())
+
+        def fake_import_module(module_name: str) -> types.ModuleType:
+            if module_name == "app.ingestion.adapters.pymupdf":
+                return module
+            raise AssertionError(f"Unexpected module import: {module_name}")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
+        monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+        monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_source_file(uuid.UUID(uploaded["id"]), original_filename="..")
+        monkeypatch.setattr("app.ingestion.source.Path.write_bytes", _fail_write_bytes)
+
+        with pytest.raises(IngestionRunnerError, match="Failed to stage original source"):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.STORAGE_FAILED.value
+        assert updated_job.error_message == "Failed to stage original source."
+        assert secret_temp_marker not in updated_job.error_message
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"][-1]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.STORAGE_FAILED.value,
+            "error_message": "Failed to stage original source.",
+        }
+        assert secret_temp_marker not in str(data["items"][-1]["data_json"])
+        assert secret_temp_marker not in str(logger_error_calls)
+        assert logger_error_calls == [
+            (
+                "ingest_job_failed",
+                {
+                    "job_id": str(job.id),
+                    "error_code": ErrorCode.STORAGE_FAILED.value,
+                    "failure_kind": AdapterFailureKind.FAILED.value,
+                    "error_message": "Failed to stage original source.",
+                    "adapter_key": "pymupdf",
+                    "input_family": "pdf_vector",
+                    "reason": "stage_failed",
+                },
+            )
+        ]
 
     async def test_get_job_returns_persisted_state(
         self,
@@ -522,7 +932,7 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         response = await async_client.get(f"/v1/jobs/{job.id}/events")
         assert response.status_code == 200
@@ -538,11 +948,94 @@ class TestJobs:
         ]
         assert data["next_cursor"] is None
 
+    async def test_process_ingest_job_flushes_progress_events_before_success(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker should persist queued progress updates before terminal success."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_with_progress(
+            request: IngestionRunRequest,
+            *,
+            on_progress: ProgressCallback | None = None,
+            **_: Any,
+        ) -> IngestFinalizationPayload:
+            assert on_progress is not None
+            on_progress(
+                ProgressUpdate(
+                    stage="source",
+                    message="Staged original",
+                    completed=1,
+                    total=3,
+                    percent=1 / 3,
+                )
+            )
+            on_progress(
+                ProgressUpdate(
+                    stage="extract",
+                    message="Extracted entities",
+                    completed=2,
+                    total=3,
+                    percent=2 / 3,
+                )
+            )
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_with_progress)
+
+        await worker_module.process_ingest_job(job.id)
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == [
+            "Job started",
+            "Staged original",
+            "Extracted entities",
+            "Job succeeded",
+        ]
+        assert [event["data_json"]["status"] for event in data["items"]] == [
+            "running",
+            "running",
+            "running",
+            "succeeded",
+        ]
+        assert data["items"][1]["data_json"] == {
+            "status": "running",
+            "event": "progress",
+            "stage": "source",
+            "detail": "Staged original",
+            "completed": 1,
+            "total": 3,
+            "percent": 1 / 3,
+        }
+        assert data["items"][2]["data_json"] == {
+            "status": "running",
+            "event": "progress",
+            "stage": "extract",
+            "detail": "Extracted entities",
+            "completed": 2,
+            "total": 3,
+            "percent": 2 / 3,
+        }
+        assert data["next_cursor"] is None
+
     async def test_process_ingest_job_transitions_to_succeeded(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        fake_ingestion_runner: list[IngestionRunRequest],
     ) -> None:
         """Worker processing should persist running and succeeded state transitions."""
         _ = self
@@ -553,9 +1046,11 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job_for_file(str(uploaded["id"]))
+        assert len(fake_ingestion_runner) == 1
+        request = fake_ingestion_runner[0]
         assert updated_job.status == "succeeded"
         assert updated_job.attempts == 1
         assert updated_job.started_at is not None
@@ -563,6 +1058,176 @@ class TestJobs:
         assert updated_job.finished_at >= updated_job.started_at
         assert updated_job.error_code is None
         assert updated_job.error_message is None
+        assert request.job_id == job.id
+        assert request.file_id == job.file_id
+        assert request.checksum_sha256 == hashlib.sha256(_TEST_UPLOAD_BODY).hexdigest()
+        assert request.detected_format == "pdf"
+        assert request.media_type == "application/pdf"
+        assert request.original_name == "plan.pdf"
+        assert request.extraction_profile_id == job.extraction_profile_id
+        assert request.initial_job_id == job.id
+
+    async def test_process_ingest_job_flushes_progress_events_before_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker should persist queued progress updates before terminal failure."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_with_progress_then_fail(
+            _: IngestionRunRequest,
+            *,
+            on_progress: ProgressCallback | None = None,
+            **__: Any,
+        ) -> IngestFinalizationPayload:
+            assert on_progress is not None
+            on_progress(
+                ProgressUpdate(
+                    stage="source",
+                    message="Staged original",
+                    completed=1,
+                    total=3,
+                    percent=1 / 3,
+                )
+            )
+            on_progress(
+                ProgressUpdate(
+                    stage="extract",
+                    message="Extracted entities",
+                    completed=2,
+                    total=3,
+                    percent=2 / 3,
+                )
+            )
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_FAILED,
+                failure_kind=AdapterFailureKind.FAILED,
+                message="Adapter execution failed.",
+                details={"stderr": "super-secret adapter detail"},
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_with_progress_then_fail)
+
+        with pytest.raises(IngestionRunnerError, match="Adapter execution failed"):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.ADAPTER_FAILED.value
+        assert updated_job.error_message == "Adapter execution failed."
+        assert "super-secret adapter detail" not in updated_job.error_message
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == [
+            "Job started",
+            "Staged original",
+            "Extracted entities",
+            "Job failed",
+        ]
+        assert [event["data_json"]["status"] for event in data["items"]] == [
+            "running",
+            "running",
+            "running",
+            "failed",
+        ]
+        assert data["items"][1]["data_json"] == {
+            "status": "running",
+            "event": "progress",
+            "stage": "source",
+            "detail": "Staged original",
+            "completed": 1,
+            "total": 3,
+            "percent": 1 / 3,
+        }
+        assert data["items"][2]["data_json"] == {
+            "status": "running",
+            "event": "progress",
+            "stage": "extract",
+            "detail": "Extracted entities",
+            "completed": 2,
+            "total": 3,
+            "percent": 2 / 3,
+        }
+        assert data["items"][3]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.ADAPTER_FAILED.value,
+            "error_message": "Adapter execution failed.",
+        }
+        assert "super-secret adapter detail" not in str(data["items"][3]["data_json"])
+        assert data["next_cursor"] is None
+
+    async def test_process_ingest_job_marks_runner_cancellation_as_cancelled(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Runner cancellation should flush progress and persist a cancelled terminal state."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _cancel_run(
+            _: IngestionRunRequest,
+            *,
+            cancellation: CancellationHandle | None = None,
+            on_progress: ProgressCallback | None = None,
+            **__: Any,
+        ) -> IngestFinalizationPayload:
+            assert cancellation is not None
+            assert on_progress is not None
+            on_progress(ProgressUpdate(stage="source", message="Staged original"))
+            await _update_job(job.id, cancel_requested=True)
+            cancellation_deadline = asyncio.get_running_loop().time() + 1
+            while not cancellation.is_cancelled():
+                if asyncio.get_running_loop().time() >= cancellation_deadline:
+                    raise AssertionError("Expected cancellation flag within 1 second")
+                await asyncio.sleep(0.01)
+
+            await asyncio.sleep(1)
+            raise AssertionError("Worker cancellation should interrupt the runner task")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _cancel_run)
+
+        with pytest.raises(asyncio.CancelledError):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.cancel_requested is True
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.error_message is None
+        assert updated_job.finished_at is not None
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == [
+            "Job started",
+            "Staged original",
+            "Job cancelled",
+        ]
+        assert [event["data_json"]["status"] for event in data["items"]] == [
+            "running",
+            "running",
+            "cancelled",
+        ]
 
     async def test_process_ingest_job_continues_redelivered_running_job(
         self,
@@ -589,7 +1254,7 @@ class TestJobs:
             persisted_job.started_at = datetime.now(UTC)
             await session.commit()
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "succeeded"
@@ -620,7 +1285,7 @@ class TestJobs:
         job = await _get_job_for_file(str(uploaded["id"]))
         enqueued_job_ids.clear()
 
-        requeued = await recover_incomplete_ingest_jobs()
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
 
         assert recovered_job_ids == [str(job.id)]
         assert requeued == [job.id]
@@ -665,7 +1330,7 @@ class TestJobs:
             )
             await session.commit()
 
-        requeued = await recover_incomplete_ingest_jobs()
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
 
         assert recovered_job_ids == [str(job.id)]
         assert requeued == [job.id]
@@ -676,7 +1341,7 @@ class TestJobs:
         assert recovered_job.started_at is None
         assert recovered_job.finished_at is None
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "succeeded"
@@ -715,7 +1380,7 @@ class TestJobs:
             persisted_job.started_at = datetime.now(UTC)
             await session.commit()
 
-        requeued = await recover_incomplete_ingest_jobs()
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
 
         assert recovered_job_ids == []
         assert requeued == []
@@ -753,7 +1418,7 @@ class TestJobs:
         job = await _get_job_for_file(str(uploaded["id"]))
         enqueued_job_ids.clear()
 
-        requeued = await recover_incomplete_ingest_jobs()
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
 
         assert requeued == []
 
@@ -802,12 +1467,12 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
         first_completion = await _get_job(job.id)
         assert first_completion.status == "succeeded"
         assert first_completion.attempts == 1
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "succeeded"
@@ -872,7 +1537,7 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
         completed = await _get_job(job.id)
         assert completed.status == "succeeded"
         assert completed.cancel_requested is False
@@ -1099,7 +1764,7 @@ class TestJobs:
         job = await _get_job_for_file(str(uploaded["id"]))
         await _update_job(job.id, status="pending", cancel_requested=True)
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated = await _get_job(job.id)
         assert updated.status == "cancelled"
@@ -1124,12 +1789,13 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        async def _cancel_during_work(_: float) -> None:
+        async def _cancel_during_work(request: IngestionRunRequest) -> IngestFinalizationPayload:
             await _update_job(job.id, cancel_requested=True)
+            return _build_fake_ingest_payload(request)
 
-        monkeypatch.setattr(asyncio, "sleep", _cancel_during_work)
+        monkeypatch.setattr(worker_module, "run_ingestion", _cancel_during_work)
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         updated = await _get_job(job.id)
         assert updated.status == "cancelled"
@@ -1157,7 +1823,7 @@ class TestJobs:
         before = await _get_job(job.id)
         before_finished_at = before.finished_at
 
-        await process_ingest_job(job.id)
+        await worker_module.process_ingest_job(job.id)
 
         after = await _get_job(job.id)
         assert after.status == "cancelled"
