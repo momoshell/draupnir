@@ -5,6 +5,7 @@ import hashlib
 import types
 import uuid
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -1795,7 +1796,8 @@ class TestJobs:
 
         monkeypatch.setattr(worker_module, "run_ingestion", _cancel_during_work)
 
-        await worker_module.process_ingest_job(job.id)
+        with suppress(asyncio.CancelledError):
+            await worker_module.process_ingest_job(job.id)
 
         updated = await _get_job(job.id)
         assert updated.status == "cancelled"

@@ -11,13 +11,14 @@ from typing import Any
 from uuid import UUID
 
 from app.ingestion.contracts import AdapterResult, InputFamily
+from app.ingestion.validation import (
+    VALIDATION_REPORT_SCHEMA_VERSION,
+    build_validation_outcome,
+)
 
 _CANONICAL_ENTITY_SCHEMA_VERSION = "0.1"
-_VALIDATION_REPORT_SCHEMA_VERSION = "0.1"
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
-_RUNNER_VALIDATOR_NAME = "ingestion.runner"
-_RUNNER_VALIDATOR_VERSION = "0.1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,23 +96,16 @@ def build_ingest_finalization_payload(
     canonical_entity_schema_version = _resolve_canonical_schema_version(canonical_json)
     revision_kind = resolve_revision_kind(context.job_id, initial_job_id=context.initial_job_id)
     provenance_records = [_json_compatible(record) for record in result.provenance]
-    warnings_json = [_json_compatible(warning) for warning in result.warnings]
     diagnostics = [_json_compatible(diagnostic) for diagnostic in result.diagnostics]
-    confidence_score = _confidence_score(result)
-    review_state, validation_status, quantity_gate = _derive_review_outcome(
-        confidence_score=confidence_score,
-        review_required=(
-            result.confidence.review_required if result.confidence is not None else True
-        ),
-        has_warnings=bool(warnings_json),
+    validation_outcome = build_validation_outcome(
+        input_family=context.input_family,
+        canonical_json=canonical_json,
+        canonical_entity_schema_version=canonical_entity_schema_version,
+        result=result,
+        generated_at=emitted_at,
     )
-    confidence_json = {
-        "score": result.confidence.score if result.confidence is not None else None,
-        "effective_confidence": confidence_score,
-        "review_state": review_state,
-        "review_required": review_state == "review_required",
-        "basis": result.confidence.basis if result.confidence is not None else None,
-    }
+    warnings_json = validation_outcome.adapter_warnings_json
+    confidence_json = validation_outcome.confidence_json
     provenance_json = {
         "schema_version": canonical_entity_schema_version,
         "adapter": {
@@ -137,25 +131,7 @@ def build_ingest_finalization_payload(
         "adapter_version": context.adapter_version,
         "diagnostics": diagnostics,
     }
-    report_json = {
-        "validation_report_schema_version": _VALIDATION_REPORT_SCHEMA_VERSION,
-        "canonical_entity_schema_version": canonical_entity_schema_version,
-        "validator": {
-            "name": _RUNNER_VALIDATOR_NAME,
-            "version": _RUNNER_VALIDATOR_VERSION,
-        },
-        "summary": {
-            "validation_status": validation_status,
-            "review_state": review_state,
-            "quantity_gate": quantity_gate,
-            "effective_confidence": confidence_score,
-            "entity_counts": _entity_counts(canonical_json),
-        },
-        "checks": [],
-        "findings": warnings_json,
-        "adapter_warnings": warnings_json,
-        "provenance": provenance_json,
-    }
+    report_json = validation_outcome.report_json
     result_envelope = {
         "adapter_key": context.adapter_key,
         "adapter_version": context.adapter_version,
@@ -164,7 +140,7 @@ def build_ingest_finalization_payload(
         "canonical_json": canonical_json,
         "provenance_json": provenance_json,
         "confidence_json": confidence_json,
-        "confidence_score": confidence_score,
+        "confidence_score": validation_outcome.confidence_score,
         "warnings_json": warnings_json,
         "diagnostics_json": diagnostics_json,
     }
@@ -178,17 +154,17 @@ def build_ingest_finalization_payload(
         canonical_json=canonical_json,
         provenance_json=provenance_json,
         confidence_json=confidence_json,
-        confidence_score=confidence_score,
+        confidence_score=validation_outcome.confidence_score,
         warnings_json=warnings_json,
         diagnostics_json=diagnostics_json,
         result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
-        validation_report_schema_version=_VALIDATION_REPORT_SCHEMA_VERSION,
-        validation_status=validation_status,
-        review_state=review_state,
-        quantity_gate=quantity_gate,
-        effective_confidence=confidence_score,
-        validator_name=_RUNNER_VALIDATOR_NAME,
-        validator_version=_RUNNER_VALIDATOR_VERSION,
+        validation_report_schema_version=VALIDATION_REPORT_SCHEMA_VERSION,
+        validation_status=validation_outcome.validation_status,
+        review_state=validation_outcome.review_state,
+        quantity_gate=validation_outcome.quantity_gate,
+        effective_confidence=validation_outcome.effective_confidence,
+        validator_name=validation_outcome.validator_name,
+        validator_version=validation_outcome.validator_version,
         report_json=report_json,
         generated_at=emitted_at,
     )
@@ -214,48 +190,6 @@ def _resolve_canonical_schema_version(canonical_json: dict[str, Any]) -> str:
     canonical_json["canonical_entity_schema_version"] = _CANONICAL_ENTITY_SCHEMA_VERSION
     canonical_json.setdefault("schema_version", _CANONICAL_ENTITY_SCHEMA_VERSION)
     return _CANONICAL_ENTITY_SCHEMA_VERSION
-
-
-def _confidence_score(result: AdapterResult) -> float:
-    if result.confidence is None or result.confidence.score is None:
-        return 0.0
-
-    return float(result.confidence.score)
-
-
-def _derive_review_outcome(
-    *,
-    confidence_score: float,
-    review_required: bool,
-    has_warnings: bool,
-) -> tuple[str, str, str]:
-    if review_required or confidence_score < 0.60:
-        return ("review_required", "needs_review", "review_gated")
-
-    if confidence_score < 0.95:
-        validation_status = "valid_with_warnings" if has_warnings else "valid"
-        return ("provisional", validation_status, "allowed_provisional")
-
-    validation_status = "valid_with_warnings" if has_warnings else "valid"
-    return ("approved", validation_status, "allowed")
-
-
-def _entity_counts(canonical_json: Mapping[str, Any]) -> dict[str, int]:
-    return {
-        "layouts": _sequence_length(canonical_json.get("layouts")),
-        "layers": _sequence_length(canonical_json.get("layers")),
-        "blocks": _sequence_length(canonical_json.get("blocks")),
-        "entities": _sequence_length(canonical_json.get("entities")),
-    }
-
-
-def _sequence_length(value: Any) -> int:
-    if isinstance(value, (list, tuple)):
-        return len(value)
-
-    return 0
-
-
 def _json_compatible(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return _json_compatible(asdict(value))

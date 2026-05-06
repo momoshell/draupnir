@@ -2,6 +2,7 @@
 
 import asyncio
 import uuid
+from contextlib import suppress
 
 import httpx
 import pytest
@@ -29,8 +30,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_REVIEW_STATE,
     _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
     _FAKE_RUNNER_VALIDATION_STATUS,
-    _FAKE_RUNNER_VALIDATOR_NAME,
-    _FAKE_RUNNER_VALIDATOR_VERSION,
     _build_fake_ingest_payload,
     _create_project,
     _get_job,
@@ -48,6 +47,38 @@ def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:
         return value
 
     return uuid.UUID(value)
+
+
+def _assert_validation_report_json_matches_columns(report: ValidationReport) -> None:
+    """Assert canonical report JSON matches authoritative validation columns."""
+    report_json = report.report_json
+
+    assert report_json["validation_report_id"] == str(report.id)
+    assert report_json["drawing_revision_id"] == str(report.drawing_revision_id)
+    assert report_json["source_job_id"] == str(report.source_job_id)
+    assert (
+        report_json["validation_report_schema_version"] == report.validation_report_schema_version
+    )
+    assert report_json["canonical_entity_schema_version"] == report.canonical_entity_schema_version
+    assert report_json["validation_status"] == report.validation_status
+    assert report_json["review_state"] == report.review_state
+    assert report_json["quantity_gate"] == report.quantity_gate
+    assert report_json["effective_confidence"] == report.effective_confidence
+    assert report_json["validator"] == {
+        "name": report.validator_name,
+        "version": report.validator_version,
+    }
+    assert report_json["confidence"]["effective_confidence"] == report.effective_confidence
+    assert report_json["confidence"]["review_state"] == report.review_state
+    assert report_json["confidence"]["review_required"] == (
+        report.review_state == "review_required"
+    )
+    assert report_json["generated_at"] == report.generated_at.isoformat()
+    assert report_json["summary"]["validation_status"] == report.validation_status
+    assert report_json["summary"]["review_state"] == report.review_state
+    assert report_json["summary"]["quantity_gate"] == report.quantity_gate
+    assert report_json["summary"]["effective_confidence"] == report.effective_confidence
+    assert report_json["checks"]
 
 
 async def _load_project_outputs(
@@ -160,9 +191,12 @@ class TestIngestOutputPersistence:
 
         await process_ingest_job(job.id)
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
 
         assert len(adapter_outputs) == 1
         assert len(drawing_revisions) == 1
@@ -181,8 +215,7 @@ class TestIngestOutputPersistence:
         assert adapter_output.adapter_version == _FAKE_RUNNER_ADAPTER_VERSION
         assert adapter_output.input_family == "pdf_vector"
         assert (
-            adapter_output.canonical_entity_schema_version
-            == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+            adapter_output.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
         assert adapter_output.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
         assert adapter_output.canonical_json == {
@@ -247,30 +280,81 @@ class TestIngestOutputPersistence:
         assert validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
         assert validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
         assert validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
-        assert validation_report.report_json == {
-            "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
-            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-            "validator": {
-                "name": _FAKE_RUNNER_VALIDATOR_NAME,
-                "version": _FAKE_RUNNER_VALIDATOR_VERSION,
-            },
-            "summary": {
-                "validation_status": _FAKE_RUNNER_VALIDATION_STATUS,
-                "review_state": _FAKE_RUNNER_REVIEW_STATE,
-                "quantity_gate": _FAKE_RUNNER_QUANTITY_GATE,
-                "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
-                "entity_counts": {
-                    "layouts": 1,
-                    "layers": 1,
-                    "blocks": 0,
-                    "entities": 1,
-                },
-            },
-            "checks": [],
-            "findings": [],
-            "adapter_warnings": [],
-            "provenance": adapter_output.provenance_json,
+        _assert_validation_report_json_matches_columns(validation_report)
+        assert validation_report.report_json["summary"]["entity_counts"] == {
+            "layouts": 1,
+            "layers": 1,
+            "blocks": 0,
+            "entities": 1,
         }
+        assert validation_report.report_json["findings"] == []
+        assert validation_report.report_json["adapter_warnings"] == []
+        assert validation_report.report_json["provenance"] == adapter_output.provenance_json
+
+    async def test_process_ingest_job_persists_payload_provenance_and_confidence_precedence(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Finalization should persist payload provenance and authoritative confidence fields."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        captured_payloads: list[IngestFinalizationPayload] = []
+
+        async def _run_ingestion_with_stale_report(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            payload.report_json.pop("provenance", None)
+            payload.report_json["confidence"] = {
+                "score": payload.confidence_score,
+                "effective_confidence": 0.01,
+                "review_state": "approved",
+                "review_required": False,
+                "basis": "stale",
+            }
+            captured_payloads.append(payload)
+            return payload
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion_with_stale_report)
+
+        await process_ingest_job(job.id)
+
+        (
+            adapter_outputs,
+            _drawing_revisions,
+            validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        adapter_output = adapter_outputs[0]
+        validation_report = validation_reports[0]
+
+        assert captured_payloads[0].provenance_json == adapter_output.provenance_json
+        assert validation_report.report_json["provenance"] == adapter_output.provenance_json
+        assert validation_report.report_json["confidence"]["score"] == captured_payloads[
+            0
+        ].confidence_json.get("score")
+        assert (
+            validation_report.report_json["confidence"]["effective_confidence"]
+            == validation_report.effective_confidence
+        )
+        assert (
+            validation_report.report_json["confidence"]["review_state"]
+            == validation_report.review_state
+        )
+        assert validation_report.report_json["confidence"]["review_required"] == (
+            validation_report.review_state == "review_required"
+        )
+        assert validation_report.report_json["confidence"].get("basis") == captured_payloads[
+            0
+        ].confidence_json.get("basis")
 
     async def test_reprocess_creates_second_revision_with_predecessor(
         self,
@@ -301,9 +385,12 @@ class TestIngestOutputPersistence:
 
         await process_ingest_job(second_job.id)
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
 
         assert len(adapter_outputs) == 2
         assert len(drawing_revisions) == 2
@@ -370,9 +457,12 @@ class TestIngestOutputPersistence:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, _drawing_revisions, validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            _drawing_revisions,
+            validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         validation_report = validation_reports[0]
 
         session_maker = session_module.AsyncSessionLocal
@@ -385,9 +475,12 @@ class TestIngestOutputPersistence:
             persisted_validation_report.quantity_gate = "allowed_provisional"
             await session.commit()
 
-        _adapter_outputs, _drawing_revisions, updated_validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            _drawing_revisions,
+            updated_validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         updated_validation_report = updated_validation_reports[0]
 
         assert updated_validation_report.validation_status == "valid_with_warnings"
@@ -430,9 +523,12 @@ class TestIngestOutputPersistence:
             process_ingest_job(third_job.id),
         )
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
 
         assert len(adapter_outputs) == 3
         assert len(drawing_revisions) == 3
@@ -500,13 +596,15 @@ class TestIngestOutputPersistence:
         assert failed_reprocess_job.status == "failed"
         assert failed_reprocess_job.error_code == ErrorCode.INTERNAL_ERROR.value
         assert (
-            failed_reprocess_job.error_message
-            == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
+            failed_reprocess_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
         )
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         assert adapter_outputs == []
         assert drawing_revisions == []
         assert validation_reports == []
@@ -514,9 +612,12 @@ class TestIngestOutputPersistence:
 
         await process_ingest_job(initial_job.id)
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         assert len(adapter_outputs) == 1
         assert len(drawing_revisions) == 1
         assert len(validation_reports) == 1
@@ -551,15 +652,19 @@ class TestIngestOutputPersistence:
 
         monkeypatch.setattr(worker_module, "run_ingestion", _cancel_during_work)
 
-        await process_ingest_job(job.id)
+        with suppress(asyncio.CancelledError):
+            await process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "cancelled"
         assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
 
         assert adapter_outputs == []
         assert drawing_revisions == []
@@ -629,9 +734,12 @@ class TestIngestOutputPersistence:
             "error_message": worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE,
         }
 
-        adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
 
         assert adapter_outputs == []
         assert drawing_revisions == []
