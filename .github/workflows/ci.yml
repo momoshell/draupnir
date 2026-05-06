@@ -28,7 +28,7 @@ jobs:
           version: "0.11.8"
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
       - name: Run ruff
         run: uv run ruff check app tests
@@ -51,7 +51,7 @@ jobs:
           version: "0.11.8"
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
       - name: Run mypy
         run: uv run mypy app tests
@@ -89,7 +89,7 @@ jobs:
           version: "0.11.8"
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
       - name: Run Alembic migrations
         run: uv run alembic upgrade head

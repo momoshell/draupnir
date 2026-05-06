@@ -158,6 +158,12 @@ async def run_ingestion(
             reason = "factory_invalid"
             last_unavailable_error = _adapter_load_error(candidate, reason=reason)
             continue
+        except RuntimeError as exc:
+            wrapped_load_error = _wrapped_adapter_load_error(candidate, exc)
+            if wrapped_load_error is None:
+                raise
+            last_unavailable_error = wrapped_load_error
+            continue
 
         materialization = OriginalSourceMaterialization(
             file_id=request.file_id,
@@ -281,6 +287,27 @@ def _adapter_load_error(candidate: AdapterCandidate, *, reason: str) -> Ingestio
             "reason": reason,
         },
     )
+
+
+def _wrapped_adapter_load_error(
+    candidate: AdapterCandidate,
+    exc: RuntimeError,
+) -> IngestionRunnerError | None:
+    cause = exc.__cause__
+    if isinstance(cause, ModuleNotFoundError):
+        return _adapter_load_error(
+            candidate,
+            reason=(
+                "module_missing"
+                if cause.name in {None, candidate.descriptor.module}
+                else "dependency_missing"
+            ),
+        )
+    if isinstance(cause, AttributeError):
+        return _adapter_load_error(candidate, reason="factory_missing")
+    if isinstance(cause, TypeError):
+        return _adapter_load_error(candidate, reason="factory_invalid")
+    return None
 
 
 def _storage_error(
