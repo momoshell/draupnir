@@ -8,8 +8,10 @@ import types
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
+import ezdxf
 import pytest
 
 from app.core.errors import ErrorCode
@@ -29,6 +31,8 @@ from app.ingestion.selection import select_adapter_candidates
 from app.ingestion.source import OriginalSourceMaterialization, materialize_original_source
 from app.storage.keys import build_original_storage_key
 from app.storage.memory import MemoryStorage
+
+_DXF_SMOKE_FIXTURE = Path(__file__).parent / "fixtures" / "dxf" / "simple-line.dxf"
 
 
 class _FakeAdapter:
@@ -243,6 +247,42 @@ async def test_run_ingestion_maps_missing_dependency_to_sanitized_error(
 
 
 @pytest.mark.asyncio
+async def test_run_ingestion_maps_wrapped_runtime_dependency_failure_to_sanitized_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def create_adapter() -> object:
+        raise RuntimeError("DXF adapter runtime could not be loaded.") from ModuleNotFoundError(
+            name="ezdxf"
+        )
+
+    wrapped_module = _AdapterModule("wrapped_runtime_failure_module", create_adapter)
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        if module_name == "app.ingestion.adapters.ezdxf":
+            return wrapped_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=uuid4(),
+        checksum_sha256="deadbeef",
+        detected_format="dxf",
+        media_type="application/dxf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=MemoryStorage())
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_UNAVAILABLE
+    assert error.failure_kind.value == "unavailable"
+    assert error.message == "Adapter could not be loaded."
+    assert error.details["reason"] == "dependency_missing"
+
+
+@pytest.mark.asyncio
 async def test_run_ingestion_maps_unsupported_format_to_typed_error() -> None:
     request = IngestionRunRequest(
         job_id=uuid4(),
@@ -426,6 +466,178 @@ async def test_run_ingestion_maps_storage_checksum_mismatch_to_storage_failed(
     assert error.details["reason"] == "checksum_mismatch"
     assert expected_checksum not in str(error.details)
     assert actual_checksum not in str(error.details)
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_smoke_uses_real_ezdxf_adapter(tmp_path: Path) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    job_id = uuid4()
+    body = _DXF_SMOKE_FIXTURE.read_bytes()
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    progress_updates: list[ProgressUpdate] = []
+
+    request = IngestionRunRequest(
+        job_id=job_id,
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="dxf",
+        media_type="application/dxf",
+        original_name="simple-line.dxf",
+        initial_job_id=job_id,
+    )
+
+    payload = await run_ingestion(
+        request,
+        storage=storage,
+        temp_root=tmp_path,
+        on_progress=progress_updates.append,
+    )
+
+    assert payload.adapter_key == "ezdxf"
+    assert payload.adapter_version != "unknown"
+    assert payload.input_family == InputFamily.DXF.value
+    assert payload.revision_kind == "ingest"
+    assert payload.review_state == "approved"
+    assert payload.validation_status == "valid"
+    assert payload.quantity_gate == "allowed"
+    assert payload.confidence_score >= 0.95
+    assert payload.canonical_json["canonical_entity_schema_version"] == "0.1"
+    assert payload.canonical_json["units"] == {
+        "normalized": "meter",
+        "source": "$INSUNITS",
+        "source_value": 6,
+        "conversion_target": "meter",
+        "conversion_factor": 1.0,
+    }
+    assert payload.canonical_json["layers"] == [
+        {"name": "0", "color": 7, "linetype": "Continuous"}
+    ]
+    assert payload.canonical_json["blocks"] == []
+    assert payload.canonical_json["xrefs"] == []
+    assert payload.report_json["summary"]["entity_counts"] == {
+        "layouts": 2,
+        "layers": 1,
+        "blocks": 0,
+        "entities": 1,
+    }
+    assert progress_updates[-1] == ProgressUpdate(
+        stage="finalize",
+        message="Preparing canonical DXF payload.",
+        completed=1,
+        total=1,
+        percent=1.0,
+    )
+
+    entity = payload.canonical_json["entities"][0]
+    assert entity["entity_id"] == "dxf:1"
+    assert entity["kind"] == "line"
+    assert entity["entity_type"] == "line"
+    assert entity["entity_schema_version"] == "0.1"
+    assert entity["handle"] == "1"
+    assert entity["layer"] == "0"
+    assert entity["layout"] == "Model"
+    assert entity["layout_ref"] == "Model"
+    assert entity["layer_ref"] == "0"
+    assert entity["block_ref"] is None
+    assert entity["parent_entity_ref"] is None
+    assert entity["start"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert entity["end"] == {"x": 10.0, "y": 0.0, "z": 0.0}
+    assert entity["length"] == 10.0
+    assert entity["geometry"] == {
+        "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "end": {"x": 10.0, "y": 0.0, "z": 0.0},
+        "bbox": {
+            "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "max": {"x": 10.0, "y": 0.0, "z": 0.0},
+        },
+        "units": payload.canonical_json["units"],
+        "geometry_summary": {
+            "kind": "line_segment",
+            "length": 10.0,
+            "vertex_count": 2,
+        },
+    }
+    assert entity["properties"]["source_type"] == "LINE"
+    assert entity["properties"]["source_handle"] == "1"
+    assert entity["properties"]["quantity_hints"] == {"length": 10.0, "count": 1.0}
+    assert entity["provenance"]["dxf_handle"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_review_gates_unitless_dxf_quantities(tmp_path: Path) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    job_id = uuid4()
+    source_path = tmp_path / "unitless-line.dxf"
+    dxf_document = cast(Any, ezdxf).new(units=0)
+    dxf_document.modelspace().add_line((0.0, 0.0, 0.0), (10.0, 0.0, 0.0))
+    dxf_document.saveas(source_path)
+
+    body = source_path.read_bytes()
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+
+    request = IngestionRunRequest(
+        job_id=job_id,
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="dxf",
+        media_type="application/dxf",
+        original_name=source_path.name,
+        initial_job_id=job_id,
+    )
+
+    payload = await run_ingestion(
+        request,
+        storage=storage,
+        temp_root=tmp_path,
+    )
+
+    assert payload.review_state == "review_required"
+    assert payload.validation_status == "needs_review"
+    assert payload.quantity_gate == "review_gated"
+    assert payload.canonical_json["units"] == {
+        "normalized": "unitless",
+        "source": "$INSUNITS",
+        "source_value": 0,
+        "conversion_target": "meter",
+        "conversion_factor": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_malformed_dxf_to_sanitized_adapter_failure(
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"not a dxf at all\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="dxf",
+        media_type="application/dxf",
+        original_name="broken.dxf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_FAILED
+    assert error.failure_kind.value == "failed"
+    assert error.message == "Adapter execution failed."
+    assert error.details == {"adapter_key": "ezdxf"}
+    assert "not a dxf" not in str(error)
 
 
 @pytest.mark.asyncio
