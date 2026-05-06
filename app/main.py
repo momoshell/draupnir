@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.v1 import files_router, health_router, jobs_router, project_router
+from app.api.v1 import files_router, health_router, jobs_router, project_router, system_router
 from app.core.config import settings
 from app.core.exceptions import custom_http_exception_handler, request_validation_exception_handler
 from app.core.logging import configure_logging, get_logger
@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health_router, prefix=settings.api_prefix)
+    app.include_router(system_router, prefix=settings.api_prefix)
     app.include_router(project_router, prefix=f"{settings.api_prefix}/projects")
     app.include_router(files_router, prefix=settings.api_prefix)
     app.include_router(jobs_router, prefix=settings.api_prefix)
