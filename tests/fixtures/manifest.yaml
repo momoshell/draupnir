@@ -44,3 +44,115 @@ fixtures:
       notes: |
         This fixture is a deterministic geometry smoke test.
         Future global tolerance values may be defined in #61.
+
+  - filename: ifc/smoke-minimal.ifc
+    format: IFC
+    tier: tiny_synthetic
+    source: generated
+    license: CC0-1.0
+    allowed_in_git: true
+    units: meters
+    expected_extraction_notes: |
+      Minimal IFC STEP header + IfcProject shell for adapter wiring smoke checks.
+      Uses IFC4 schema metadata and should preserve schema provenance in canonical output.
+    expected_review_state: review_required
+    expected_validation_status: needs_review
+    expected_quantities:
+      entity_count: 0
+    acceptance_checks:
+      format:
+        expected_schema: IFC4
+        object_scope:
+          - IfcProject
+      quantities:
+        entity_count:
+          expected: 0
+          comparison: review_gated
+          provenance_required: true
+          expected_review_state: review_required
+      notes: |
+        This is a contract smoke fixture, not a semantic BIM completeness fixture.
+
+  - filename: pdf/vector-smoke.pdf
+    format: PDF
+    tier: tiny_synthetic
+    source: generated
+    license: CC0-1.0
+    allowed_in_git: true
+    units: unknown
+    expected_extraction_notes: |
+      Single-page vector PDF with simple stroke geometry and inline text marker.
+      Intended for vector-adapter smoke coverage with explicit scale metadata expected.
+    expected_review_state: provisional
+    expected_validation_status: valid
+    expected_quantities:
+      page_count: 1
+      linework_hint_count: 1
+    acceptance_checks:
+      format:
+        page_count: 1
+        geometry_mode: vector
+        text_expected: true
+      quantities:
+        linework_hint_count:
+          expected: 1
+          comparison: review_gated
+          provenance_required: true
+          expected_review_state: provisional
+      notes: |
+        Vector PDF extraction should not be forced into raster review policy.
+
+  - filename: pdf/raster-smoke.pdf
+    format: PDF
+    tier: tiny_synthetic
+    source: generated
+    license: CC0-1.0
+    allowed_in_git: true
+    units: unknown
+    expected_extraction_notes: |
+      Single-page PDF placeholder used for raster adapter wiring and review-first checks.
+      Outputs are expected to remain review-gated even when confidence is high.
+    expected_review_state: review_required
+    expected_validation_status: needs_review
+    expected_quantities:
+      page_count: 1
+    acceptance_checks:
+      format:
+        page_count: 1
+        geometry_mode: raster
+        ocr_expected: true
+      quantities:
+        page_count:
+          expected: 1
+          comparison: review_gated
+          provenance_required: true
+          expected_review_state: review_required
+      notes: |
+        Raster ingestion is review-first by policy and should keep quantity gates closed.
+
+  - filename: dwg/libredwg-wrapper-smoke.txt
+    format: DWG
+    tier: tiny_synthetic
+    source: generated
+    license: CC0-1.0
+    allowed_in_git: true
+    units: unknown
+    expected_extraction_notes: |
+      Text placeholder for DWG adapter-wrapper contract metadata smoke checks.
+      This fixture intentionally avoids committing real/proprietary DWG binaries.
+    expected_review_state: review_required
+    expected_validation_status: needs_review
+    expected_quantities:
+      entity_count: 0
+    acceptance_checks:
+      format:
+        wrapper_smoke_only: true
+        binary_in_repo: false
+      quantities:
+        entity_count:
+          expected: 0
+          comparison: review_gated
+          provenance_required: true
+          expected_review_state: review_required
+      notes: |
+        Maintains phase coverage beyond DXF while keeping fixture licensing risk low.

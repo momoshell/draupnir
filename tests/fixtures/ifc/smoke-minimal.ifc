@@ -1,0 +1,14 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView_V2.0]'),'2;1');
+FILE_NAME('smoke-minimal.ifc','2026-01-02T03:04:05',('Draupnir'),('Draupnir'),'opencode','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0vL7Q$8f95x9M5fCB5M7qf',$,'SmokeProject',$,$,$,$,(#2),#3);
+#2=IFCUNITASSIGNMENT(());
+#3=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-05,#4,$);
+#4=IFCAXIS2PLACEMENT3D(#5,$,$);
+#5=IFCCARTESIANPOINT((0.,0.,0.));
+ENDSEC;
+END-ISO-10303-21;
