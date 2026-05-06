@@ -30,6 +30,7 @@ from app.schemas.extraction_profile import ExtractionProfileCreate, FileReproces
 from app.schemas.file import FileListResponse, FileRead
 from app.schemas.job import JobRead
 from app.storage import Storage, get_storage
+from app.storage.keys import build_original_storage_key
 
 files_router = APIRouter()
 _UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
@@ -142,11 +143,6 @@ def _staging_path(file_id: UUID) -> Path:
 def _upload_root() -> Path:
     """Return the canonical local storage root for uploads and artifacts."""
     return Path(settings.storage_local_root).resolve()
-
-
-def _storage_key(file_id: UUID, checksum: str) -> str:
-    """Build the server-derived immutable storage key for an uploaded file."""
-    return f"originals/{file_id}/{checksum}"
 
 
 def _cleanup_uploaded_path(storage_path: Path) -> None:
@@ -387,7 +383,7 @@ async def upload_project_file(
                 total_bytes = next_total
 
         checksum = checksum_builder.hexdigest()
-        storage_key = _storage_key(file_id, checksum)
+        storage_key = build_original_storage_key(file_id, checksum)
 
         try:
             stored_object = await storage.put(storage_key, staging_path, immutable=True)

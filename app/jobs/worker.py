@@ -1,8 +1,7 @@
 """Celery worker application and persisted job handlers."""
 
 import asyncio
-import hashlib
-import json
+import inspect
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -18,6 +17,9 @@ from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
+from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
+from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
@@ -27,26 +29,97 @@ from app.models.validation_report import ValidationReport
 
 logger = get_logger(__name__)
 
-_INGEST_NOOP_DELAY_SECONDS = 0.01
 _INCOMPLETE_JOB_STATUSES = ("pending", "running")
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
+_JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
 _ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
-_NOOP_ADAPTER_KEY = "noop.ingest"
-_NOOP_ADAPTER_VERSION = "0.1"
-_CANONICAL_ENTITY_SCHEMA_VERSION = "0.1"
-_VALIDATION_REPORT_SCHEMA_VERSION = "0.1"
-_NOOP_REVIEW_STATE = "review_required"
-_NOOP_VALIDATION_STATUS = "needs_review"
-_NOOP_QUANTITY_GATE = "review_gated"
-_NOOP_CONFIDENCE_SCORE = 0.0
+_PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
-_NOOP_VALIDATOR_NAME = "noop.ingest"
-_NOOP_VALIDATOR_VERSION = "0.1"
+_SAFE_RUNNER_ERROR_DETAIL_KEYS = (
+    "adapter_key",
+    "input_family",
+    "reason",
+    "stage",
+    "detected_format",
+    "media_type",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedJobEvent:
+    """Buffered job event persisted by the progress drain."""
+
+    level: str
+    message: str
+    data_json: dict[str, Any]
+
+
+class _PersistedJobCancellationHandle:
+    """Cancellation handle backed by worker polling."""
+
+    def __init__(self) -> None:
+        self._cancel_requested = False
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested
+
+    def mark_cancelled(self) -> None:
+        self._cancel_requested = True
+
+
+class _JobProgressEventBridge:
+    """Synchronous progress callback with async DB draining."""
+
+    _STOP = object()
+
+    def __init__(self, job_id: UUID) -> None:
+        self._job_id = job_id
+        self._queue: asyncio.Queue[_QueuedJobEvent | object] = asyncio.Queue()
+        self._drain_task = asyncio.create_task(self._drain())
+        self._closed = False
+
+    def callback(self, update: ProgressUpdate) -> None:
+        if self._closed:
+            raise RuntimeError("Progress callback received update after bridge closed.")
+
+        self._queue.put_nowait(
+            _QueuedJobEvent(
+                level="info",
+                message=update.message or f"Job progress: {update.stage}",
+                data_json=_progress_event_data(update),
+            )
+        )
+
+    async def flush(self) -> None:
+        if self._closed:
+            await self._drain_task
+            return
+
+        self._closed = True
+        self._queue.put_nowait(self._STOP)
+        await self._drain_task
+
+    async def _drain(self) -> None:
+        while True:
+            queued = await self._queue.get()
+            try:
+                if queued is self._STOP:
+                    return
+
+                assert isinstance(queued, _QueuedJobEvent)
+                await emit_job_event(
+                    self._job_id,
+                    level=queued.level,
+                    message=queued.message,
+                    data_json=queued.data_json,
+                )
+            finally:
+                self._queue.task_done()
 
 celery_app = Celery(
     "draupnir",
@@ -68,44 +141,6 @@ celery_app.autodiscover_tasks(["app.jobs"], force=True)
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(UTC)
-
-
-@dataclass(frozen=True, slots=True)
-class NoopIngestPayloadSource:
-    """Immutable source snapshot used to build no-op ingest payloads."""
-
-    file_id: UUID
-    extraction_profile_id: UUID | None
-    initial_job_id: UUID | None
-    detected_format: str | None
-    media_type: str
-
-
-@dataclass(frozen=True, slots=True)
-class NoopIngestOutputPayload:
-    """Prepared no-op ingest payload inserted during finalization."""
-
-    revision_kind: str
-    adapter_key: str
-    adapter_version: str
-    input_family: str
-    canonical_entity_schema_version: str
-    canonical_json: dict[str, Any]
-    provenance_json: dict[str, Any]
-    confidence_json: dict[str, Any]
-    confidence_score: float
-    warnings_json: list[Any]
-    diagnostics_json: dict[str, Any]
-    result_checksum_sha256: str
-    validation_report_schema_version: str
-    validation_status: str
-    review_state: str
-    quantity_gate: str
-    effective_confidence: float
-    validator_name: str
-    validator_version: str
-    report_json: dict[str, Any]
-    generated_at: datetime
 
 
 def _is_stale_running_job(job: Job, *, now: datetime) -> bool:
@@ -173,47 +208,12 @@ async def _get_latest_drawing_revision(
     return result.scalar_one_or_none()
 
 
-def _normalize_input_family(source: NoopIngestPayloadSource) -> str:
-    """Map immutable file metadata to a stable no-op input family."""
-    if source.detected_format is not None:
-        return source.detected_format.lower()
-
-    media_type = source.media_type.lower()
-    if media_type == "application/pdf":
-        return "pdf"
-
-    return "unknown"
-
-
-def _compute_adapter_result_checksum(result_envelope: dict[str, Any]) -> str:
-    """Return a stable SHA-256 checksum for a committed result envelope."""
-    payload = json.dumps(result_envelope, sort_keys=True, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _resolve_revision_kind(job_id: UUID, *, initial_job_id: UUID | None) -> str:
     """Map file linkage to the correct ingest revision kind."""
     if initial_job_id == job_id:
         return _INITIAL_INGEST_REVISION_KIND
 
     return _REPROCESS_REVISION_KIND
-
-
-def _resolve_noop_revision_kind(job_id: UUID, *, source: NoopIngestPayloadSource) -> str:
-    """Map the source file linkage to the correct ingest revision kind."""
-    return _resolve_revision_kind(job_id, initial_job_id=source.initial_job_id)
-
-
-def _build_noop_entity_counts() -> dict[str, int]:
-    """Return stable empty entity counts for no-op payloads."""
-    return {
-        "layouts": 0,
-        "layers": 0,
-        "blocks": 0,
-        "entities": 0,
-    }
 
 
 def _assert_revision_invariants(
@@ -242,8 +242,8 @@ def _assert_revision_invariants(
         )
 
 
-async def _load_noop_ingest_payload_source(job_id: UUID) -> NoopIngestPayloadSource:
-    """Load immutable file metadata needed for no-op payload construction."""
+async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
+    """Load persisted job and file metadata for the ingestion runner."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -264,130 +264,20 @@ async def _load_noop_ingest_payload_source(job_id: UUID) -> NoopIngestPayloadSou
                 f"File with identifier '{job.file_id}' for job '{job_id}' not found"
             )
 
-        return NoopIngestPayloadSource(
+        return IngestionRunRequest(
+            job_id=job.id,
             file_id=source_file.id,
-            extraction_profile_id=job.extraction_profile_id,
-            initial_job_id=source_file.initial_job_id,
+            checksum_sha256=source_file.checksum_sha256,
             detected_format=source_file.detected_format,
             media_type=source_file.media_type,
+            original_name=source_file.original_filename,
+            extraction_profile_id=job.extraction_profile_id,
+            initial_job_id=source_file.initial_job_id,
         )
 
 
-def _build_noop_ingest_output_payload(
-    job_id: UUID,
-    *,
-    source: NoopIngestPayloadSource,
-) -> NoopIngestOutputPayload:
-    """Construct the immutable no-op ingest payload outside finalization."""
-    generated_at = _utcnow()
-    input_family = _normalize_input_family(source)
-    revision_kind = _resolve_noop_revision_kind(job_id, source=source)
-    entity_counts = _build_noop_entity_counts()
-    canonical_json: dict[str, Any] = {
-        "canonical_entity_schema_version": _CANONICAL_ENTITY_SCHEMA_VERSION,
-        "schema_version": _CANONICAL_ENTITY_SCHEMA_VERSION,
-        "layouts": [],
-        "layers": [],
-        "blocks": [],
-        "entities": [],
-        "entity_counts": entity_counts,
-    }
-    provenance_json = {
-        "schema_version": _CANONICAL_ENTITY_SCHEMA_VERSION,
-        "bridge": "noop_ingest",
-        "adapter": {
-            "key": _NOOP_ADAPTER_KEY,
-            "version": _NOOP_ADAPTER_VERSION,
-        },
-        "source": {
-            "file_id": str(source.file_id),
-            "job_id": str(job_id),
-            "extraction_profile_id": (
-                str(source.extraction_profile_id)
-                if source.extraction_profile_id is not None
-                else None
-            ),
-            "input_family": input_family,
-            "revision_kind": revision_kind,
-        },
-        "generated_at": generated_at.isoformat(),
-    }
-    noop_warning = {
-        "code": "NOOP_INGEST_BRIDGE",
-        "severity": "warning",
-        "message": "No real adapter executed; review is required.",
-    }
-    confidence_json = {
-        "score": _NOOP_CONFIDENCE_SCORE,
-        "effective_confidence": _NOOP_CONFIDENCE_SCORE,
-        "review_state": _NOOP_REVIEW_STATE,
-    }
-    warnings_json: list[Any] = [noop_warning]
-    diagnostics_json = {
-        "adapter": _NOOP_ADAPTER_KEY,
-        "adapter_version": _NOOP_ADAPTER_VERSION,
-        "bridge": "noop_ingest",
-        "timing": {"sleep_seconds": _INGEST_NOOP_DELAY_SECONDS},
-    }
-    report_json = {
-        "validation_report_schema_version": _VALIDATION_REPORT_SCHEMA_VERSION,
-        "canonical_entity_schema_version": _CANONICAL_ENTITY_SCHEMA_VERSION,
-        "validator": {
-            "name": _NOOP_VALIDATOR_NAME,
-            "version": _NOOP_VALIDATOR_VERSION,
-        },
-        "summary": {
-            "validation_status": _NOOP_VALIDATION_STATUS,
-            "review_state": _NOOP_REVIEW_STATE,
-            "quantity_gate": _NOOP_QUANTITY_GATE,
-            "effective_confidence": _NOOP_CONFIDENCE_SCORE,
-            "entity_counts": entity_counts,
-        },
-        "checks": [],
-        "findings": [noop_warning],
-        "adapter_warnings": warnings_json,
-        "provenance": provenance_json,
-    }
-    result_envelope = {
-        "adapter_key": _NOOP_ADAPTER_KEY,
-        "adapter_version": _NOOP_ADAPTER_VERSION,
-        "input_family": input_family,
-        "canonical_entity_schema_version": _CANONICAL_ENTITY_SCHEMA_VERSION,
-        "canonical_json": canonical_json,
-        "provenance_json": provenance_json,
-        "confidence_json": confidence_json,
-        "confidence_score": _NOOP_CONFIDENCE_SCORE,
-        "warnings_json": warnings_json,
-        "diagnostics_json": diagnostics_json,
-    }
-
-    return NoopIngestOutputPayload(
-        revision_kind=revision_kind,
-        adapter_key=_NOOP_ADAPTER_KEY,
-        adapter_version=_NOOP_ADAPTER_VERSION,
-        input_family=input_family,
-        canonical_entity_schema_version=_CANONICAL_ENTITY_SCHEMA_VERSION,
-        canonical_json=canonical_json,
-        provenance_json=provenance_json,
-        confidence_json=confidence_json,
-        confidence_score=_NOOP_CONFIDENCE_SCORE,
-        warnings_json=warnings_json,
-        diagnostics_json=diagnostics_json,
-        result_checksum_sha256=_compute_adapter_result_checksum(result_envelope),
-        validation_report_schema_version=_VALIDATION_REPORT_SCHEMA_VERSION,
-        validation_status=_NOOP_VALIDATION_STATUS,
-        review_state=_NOOP_REVIEW_STATE,
-        quantity_gate=_NOOP_QUANTITY_GATE,
-        effective_confidence=_NOOP_CONFIDENCE_SCORE,
-        validator_name=_NOOP_VALIDATOR_NAME,
-        validator_version=_NOOP_VALIDATOR_VERSION,
-        report_json=report_json,
-        generated_at=generated_at,
-    )
-
-
-async def _finalize_ingest_job(job_id: UUID, *, payload: NoopIngestOutputPayload) -> bool:
-    """Atomically publish durable no-op outputs and terminal job success."""
+async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPayload) -> bool:
+    """Atomically publish durable ingest outputs and terminal job success."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -576,6 +466,113 @@ async def emit_job_event(
         await managed_session.commit()
 
 
+def _progress_event_data(update: ProgressUpdate) -> dict[str, Any]:
+    """Build a stable persisted progress event payload."""
+    data_json: dict[str, Any] = {
+        "status": "running",
+        "event": "progress",
+        "stage": update.stage,
+    }
+    if update.message is not None:
+        data_json["detail"] = update.message
+    if update.completed is not None:
+        data_json["completed"] = update.completed
+    if update.total is not None:
+        data_json["total"] = update.total
+    if update.percent is not None:
+        data_json["percent"] = update.percent
+    return data_json
+
+
+def _runner_error_log_fields(exc: IngestionRunnerError) -> dict[str, Any]:
+    """Return whitelisted structured fields for expected runner failures."""
+    data_json: dict[str, Any] = {
+        "error_code": exc.error_code.value,
+        "failure_kind": exc.failure_kind.value,
+        "error_message": exc.message,
+    }
+    for key in _SAFE_RUNNER_ERROR_DETAIL_KEYS:
+        value = exc.details.get(key)
+        if value is not None:
+            data_json[key] = value
+    return data_json
+
+
+def _runner_supports_keyword(runner: Any, keyword: str) -> bool:
+    """Return whether a runner callable accepts a given keyword."""
+    signature = inspect.signature(runner)
+    parameters = signature.parameters.values()
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return True
+    return keyword in signature.parameters
+
+
+async def _invoke_ingestion_runner(
+    request: IngestionRunRequest,
+    *,
+    timeout: AdapterTimeout,
+    cancellation: _PersistedJobCancellationHandle,
+    on_progress: Any,
+) -> IngestFinalizationPayload:
+    """Call the runner while remaining compatible with patched test doubles."""
+    kwargs: dict[str, Any] = {}
+    if _runner_supports_keyword(run_ingestion, "timeout"):
+        kwargs["timeout"] = timeout
+    if _runner_supports_keyword(run_ingestion, "cancellation"):
+        kwargs["cancellation"] = cancellation
+    if _runner_supports_keyword(run_ingestion, "on_progress"):
+        kwargs["on_progress"] = on_progress
+    return await run_ingestion(request, **kwargs)
+
+
+async def _poll_job_cancellation(
+    job_id: UUID,
+    *,
+    cancellation: _PersistedJobCancellationHandle,
+    run_task: asyncio.Task[IngestFinalizationPayload],
+    stop_event: asyncio.Event,
+) -> None:
+    """Poll persisted cancellation without holding DB locks during execution."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    while not stop_event.is_set() and not cancellation.is_cancelled():
+        async with session_maker() as session:
+            result = await session.execute(select(Job.cancel_requested).where(Job.id == job_id))
+            cancel_requested = result.scalar_one_or_none()
+
+        if cancel_requested is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if cancel_requested:
+            cancellation.mark_cancelled()
+            run_task.cancel()
+            return
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=_JOB_CANCELLATION_POLL_INTERVAL_SECONDS,
+            )
+        except TimeoutError:
+            continue
+
+
+async def _stop_job_execution_monitor(
+    *,
+    progress_bridge: _JobProgressEventBridge,
+    stop_event: asyncio.Event,
+    cancellation_task: asyncio.Task[None],
+) -> None:
+    """Flush queued progress and stop background execution monitors."""
+    stop_event.set()
+    try:
+        await cancellation_task
+    finally:
+        await progress_bridge.flush()
+
+
 async def _mark_job_failed(
     job_id: UUID,
     *,
@@ -612,6 +609,36 @@ async def _mark_job_failed(
                 "error_code": error_code.value,
                 "error_message": error_message,
             },
+            session=session,
+        )
+        await session.commit()
+
+
+async def _mark_job_cancelled(job_id: UUID) -> None:
+    """Persist a cancelled job state."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await _get_job_for_update(session, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "ingest_job_cancel_mark_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return
+
+        _finalize_job_cancelled(job)
+        await emit_job_event(
+            job_id,
+            level="warning",
+            message="Job cancelled",
+            data_json={"status": "cancelled"},
             session=session,
         )
         await session.commit()
@@ -722,7 +749,7 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
 
 
 async def process_ingest_job(job_id: UUID) -> None:
-    """Load a persisted ingest job, perform a no-op, and persist state transitions."""
+    """Load a persisted ingest job, run ingestion, and persist state transitions."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -731,15 +758,62 @@ async def process_ingest_job(job_id: UUID) -> None:
         return
 
     try:
-        await asyncio.sleep(_INGEST_NOOP_DELAY_SECONDS)
-    except Exception as exc:
-        await _mark_job_failed(job_id, error_message=str(exc))
-        logger.error("ingest_job_failed", job_id=str(job_id), error=str(exc), exc_info=True)
+        request = await _build_ingestion_run_request(job_id)
+        progress_bridge = _JobProgressEventBridge(job_id)
+        cancellation = _PersistedJobCancellationHandle()
+        stop_event = asyncio.Event()
+        run_task = asyncio.create_task(
+            _invoke_ingestion_runner(
+                request,
+                timeout=AdapterTimeout(seconds=_DEFAULT_ADAPTER_TIMEOUT.total_seconds()),
+                cancellation=cancellation,
+                on_progress=progress_bridge.callback,
+            )
+        )
+        cancellation_task = asyncio.create_task(
+            _poll_job_cancellation(
+                job_id,
+                cancellation=cancellation,
+                run_task=run_task,
+                stop_event=stop_event,
+            )
+        )
+        try:
+            payload = await run_task
+        finally:
+            await _stop_job_execution_monitor(
+                progress_bridge=progress_bridge,
+                stop_event=stop_event,
+                cancellation_task=cancellation_task,
+            )
+    except IngestionRunnerError as exc:
+        if exc.error_code is ErrorCode.JOB_CANCELLED:
+            await _mark_job_cancelled(job_id)
+            logger.info(
+                "ingest_job_cancelled_during_execution",
+                job_id=str(job_id),
+                error_code=exc.error_code.value,
+            )
+        else:
+            await _mark_job_failed(job_id, error_message=exc.message, error_code=exc.error_code)
+            logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
+        raise
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id)
+        logger.info("ingest_job_cancelled_during_execution", job_id=str(job_id))
+        raise
+    except Exception:
+        await _mark_job_failed(job_id, error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE)
+        logger.error(
+            "ingest_job_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
+            exc_info=True,
+        )
         raise
 
     try:
-        payload_source = await _load_noop_ingest_payload_source(job_id)
-        payload = _build_noop_ingest_output_payload(job_id, source=payload_source)
         finalized = await _finalize_ingest_job(job_id, payload=payload)
     except Exception as exc:
         await _mark_job_failed(job_id, error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE)

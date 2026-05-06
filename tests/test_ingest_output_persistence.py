@@ -19,6 +19,17 @@ from app.models.job_event import JobEvent
 from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
 from tests.test_jobs import (
+    _FAKE_RUNNER_ADAPTER_KEY,
+    _FAKE_RUNNER_ADAPTER_VERSION,
+    _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+    _FAKE_RUNNER_CONFIDENCE_SCORE,
+    _FAKE_RUNNER_QUANTITY_GATE,
+    _FAKE_RUNNER_REVIEW_STATE,
+    _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
+    _FAKE_RUNNER_VALIDATION_STATUS,
+    _FAKE_RUNNER_VALIDATOR_NAME,
+    _FAKE_RUNNER_VALIDATOR_VERSION,
+    _build_fake_ingest_payload,
     _create_project,
     _get_job,
     _get_job_for_file,
@@ -130,13 +141,13 @@ async def _set_job_extraction_profile_id(
 class TestIngestOutputPersistence:
     """Tests for durable ingest output persistence and finalization guards."""
 
-    async def test_process_ingest_job_persists_single_noop_output_set(
+    async def test_process_ingest_job_persists_single_runner_output_set(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
     ) -> None:
-        """Successful ingest should atomically persist one no-op output set."""
+        """Successful ingest should atomically persist one runner output set."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -164,35 +175,42 @@ class TestIngestOutputPersistence:
         assert adapter_output.source_file_id == job.file_id
         assert adapter_output.source_job_id == job.id
         assert adapter_output.extraction_profile_id == job.extraction_profile_id
-        assert adapter_output.adapter_key == "noop.ingest"
-        assert adapter_output.adapter_version == "0.1"
-        assert adapter_output.input_family == "pdf"
-        assert adapter_output.canonical_entity_schema_version == "0.1"
-        assert adapter_output.confidence_score == 0.0
+        assert adapter_output.adapter_key == _FAKE_RUNNER_ADAPTER_KEY
+        assert adapter_output.adapter_version == _FAKE_RUNNER_ADAPTER_VERSION
+        assert adapter_output.input_family == "pdf_vector"
+        assert (
+            adapter_output.canonical_entity_schema_version
+            == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        )
+        assert adapter_output.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
         assert adapter_output.canonical_json == {
-            "canonical_entity_schema_version": "0.1",
-            "schema_version": "0.1",
-            "layouts": [],
-            "layers": [],
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "layouts": [{"name": "Model"}],
+            "layers": [{"name": "A-WALL"}],
             "blocks": [],
-            "entities": [],
+            "entities": [{"kind": "line", "layer": "A-WALL"}],
             "entity_counts": {
-                "layouts": 0,
-                "layers": 0,
+                "layouts": 1,
+                "layers": 1,
                 "blocks": 0,
-                "entities": 0,
+                "entities": 1,
             },
         }
         assert adapter_output.provenance_json == {
-            "schema_version": "0.1",
-            "bridge": "noop_ingest",
-            "adapter": {"key": "noop.ingest", "version": "0.1"},
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "bridge": "tests.fake_ingestion_runner",
+            "adapter": {
+                "key": _FAKE_RUNNER_ADAPTER_KEY,
+                "version": _FAKE_RUNNER_ADAPTER_VERSION,
+            },
             "source": {
                 "file_id": str(job.file_id),
                 "job_id": str(job.id),
                 "extraction_profile_id": str(job.extraction_profile_id),
-                "input_family": "pdf",
+                "input_family": "pdf_vector",
                 "revision_kind": "ingest",
+                "original_name": "plan.pdf",
             },
             "generated_at": adapter_output.provenance_json["generated_at"],
         }
@@ -205,50 +223,50 @@ class TestIngestOutputPersistence:
         assert drawing_revision.predecessor_revision_id is None
         assert drawing_revision.revision_sequence == 1
         assert drawing_revision.revision_kind == "ingest"
-        assert drawing_revision.review_state == "review_required"
-        assert drawing_revision.canonical_entity_schema_version == "0.1"
-        assert drawing_revision.confidence_score == 0.0
+        assert drawing_revision.review_state == _FAKE_RUNNER_REVIEW_STATE
+        assert (
+            drawing_revision.canonical_entity_schema_version
+            == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        )
+        assert drawing_revision.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
 
         assert validation_report.project_id == job.project_id
         assert validation_report.drawing_revision_id == drawing_revision.id
         assert validation_report.source_job_id == job.id
-        assert validation_report.validation_report_schema_version == "0.1"
-        assert validation_report.canonical_entity_schema_version == "0.1"
-        assert validation_report.validation_status == "needs_review"
-        assert validation_report.review_state == "review_required"
-        assert validation_report.quantity_gate == "review_gated"
-        assert validation_report.effective_confidence == 0.0
+        assert (
+            validation_report.validation_report_schema_version
+            == _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION
+        )
+        assert (
+            validation_report.canonical_entity_schema_version
+            == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        )
+        assert validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
+        assert validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
+        assert validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
+        assert validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
         assert validation_report.report_json == {
-            "validation_report_schema_version": "0.1",
-            "canonical_entity_schema_version": "0.1",
-            "validator": {"name": "noop.ingest", "version": "0.1"},
+            "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "validator": {
+                "name": _FAKE_RUNNER_VALIDATOR_NAME,
+                "version": _FAKE_RUNNER_VALIDATOR_VERSION,
+            },
             "summary": {
-                "validation_status": "needs_review",
-                "review_state": "review_required",
-                "quantity_gate": "review_gated",
-                "effective_confidence": 0.0,
+                "validation_status": _FAKE_RUNNER_VALIDATION_STATUS,
+                "review_state": _FAKE_RUNNER_REVIEW_STATE,
+                "quantity_gate": _FAKE_RUNNER_QUANTITY_GATE,
+                "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
                 "entity_counts": {
-                    "layouts": 0,
-                    "layers": 0,
+                    "layouts": 1,
+                    "layers": 1,
                     "blocks": 0,
-                    "entities": 0,
+                    "entities": 1,
                 },
             },
             "checks": [],
-            "findings": [
-                {
-                    "code": "NOOP_INGEST_BRIDGE",
-                    "severity": "warning",
-                    "message": "No real adapter executed; review is required.",
-                }
-            ],
-            "adapter_warnings": [
-                {
-                    "code": "NOOP_INGEST_BRIDGE",
-                    "severity": "warning",
-                    "message": "No real adapter executed; review is required.",
-                }
-            ],
+            "findings": [],
+            "adapter_warnings": [],
             "provenance": adapter_output.provenance_json,
         }
 
@@ -314,7 +332,7 @@ class TestIngestOutputPersistence:
         assert second_adapter_output.source_file_id == first_job.file_id
         assert second_adapter_output.source_job_id == second_job.id
         assert second_adapter_output.extraction_profile_id == second_job.extraction_profile_id
-        assert second_adapter_output.adapter_key == "noop.ingest"
+        assert second_adapter_output.adapter_key == _FAKE_RUNNER_ADAPTER_KEY
 
         assert second_revision.project_id == first_job.project_id
         assert second_revision.source_file_id == first_job.file_id
@@ -328,10 +346,10 @@ class TestIngestOutputPersistence:
         assert second_validation_report.project_id == first_job.project_id
         assert second_validation_report.source_job_id == second_job.id
         assert second_validation_report.drawing_revision_id == second_revision.id
-        assert second_validation_report.validation_status == "needs_review"
-        assert second_validation_report.review_state == "review_required"
-        assert second_validation_report.quantity_gate == "review_gated"
-        assert second_validation_report.effective_confidence == 0.0
+        assert second_validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
+        assert second_validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
+        assert second_validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
+        assert second_validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
 
     async def test_validation_report_allows_trd_status_and_gate_values(
         self,
@@ -523,10 +541,11 @@ class TestIngestOutputPersistence:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        async def _cancel_during_work(_: float) -> None:
+        async def _cancel_during_work(request) -> object:
             await _update_job(job.id, cancel_requested=True)
+            return _build_fake_ingest_payload(request)
 
-        monkeypatch.setattr(asyncio, "sleep", _cancel_during_work)
+        monkeypatch.setattr(worker_module, "run_ingestion", _cancel_during_work)
 
         await process_ingest_job(job.id)
 
