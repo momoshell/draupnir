@@ -17,6 +17,7 @@ import pytest
 
 from app.core.errors import ErrorCode
 from app.ingestion.adapters import ifcopenshell as ifcopenshell_adapter_module
+from app.ingestion.adapters import pymupdf as pymupdf_adapter_module
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterResult,
@@ -79,6 +80,55 @@ class _AdapterModule(types.ModuleType):
     def __init__(self, name: str, create_adapter: Callable[[], object]) -> None:
         super().__init__(name)
         self.create_adapter = create_adapter
+
+
+class _FakePyMuPDFPoint:
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+
+
+class _FakePyMuPDFRect:
+    def __init__(self, x0: float, y0: float, x1: float, y1: float) -> None:
+        self.x0 = x0
+        self.y0 = y0
+        self.x1 = x1
+        self.y1 = y1
+        self.width = x1 - x0
+        self.height = y1 - y0
+
+
+class _FakePyMuPDFPage:
+    def __init__(
+        self,
+        *,
+        drawings: list[dict[str, Any]] | None = None,
+        text_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._drawings = drawings or []
+        self._text_payload = text_payload or {"blocks": []}
+        self.rect = _FakePyMuPDFRect(0.0, 0.0, 100.0, 100.0)
+        self.mediabox = self.rect
+        self.rotation = 0
+
+    def get_drawings(self) -> list[dict[str, Any]]:
+        return self._drawings
+
+    def get_text(self, kind: str) -> dict[str, Any]:
+        assert kind == "dict"
+        return self._text_payload
+
+
+class _FakePyMuPDFDocument:
+    def __init__(self, pages: list[_FakePyMuPDFPage]) -> None:
+        self._pages = pages
+        self.page_count = len(pages)
+
+    def load_page(self, page_index: int) -> _FakePyMuPDFPage:
+        return self._pages[page_index]
+
+    def close(self) -> None:
+        return None
 
 
 def _ifcopenshell_module_spec() -> importlib.machinery.ModuleSpec:
@@ -833,6 +883,156 @@ async def test_run_ingestion_does_not_fall_through_after_runtime_failure(
 
 
 @pytest.mark.asyncio
+async def test_run_ingestion_maps_pymupdf_execute_dependency_missing_without_raster_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    attempted_adapters: list[str] = []
+    imported_modules: list[str] = []
+
+    class _MissingRuntimeVectorAdapter:
+        def probe(self) -> AdapterAvailability:
+            return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+        async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+            attempted_adapters.append("pymupdf")
+            assert source.file_path.exists()
+            _ = options
+            raise ModuleNotFoundError(name="fitz")
+
+    class _UnexpectedRasterAdapter:
+        def probe(self) -> AdapterAvailability:
+            return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+        async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+            attempted_adapters.append("vtracer_tesseract")
+            _ = (source, options)
+            raise AssertionError("Runner should not import or run raster fallback")
+
+    vector_module = _AdapterModule(
+        "missing_runtime_vector_adapter_module",
+        lambda: _MissingRuntimeVectorAdapter(),
+    )
+    raster_module = _AdapterModule(
+        "unexpected_raster_dependency_adapter_module",
+        lambda: _UnexpectedRasterAdapter(),
+    )
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return vector_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            return raster_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_UNAVAILABLE
+    assert error.failure_kind.value == "unavailable"
+    assert error.message == "Adapter execution dependency was unavailable."
+    assert error.details == {
+        "adapter_key": "pymupdf",
+        "stage": "execute",
+        "reason": "dependency_missing",
+        "dependency": "fitz",
+    }
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+    assert attempted_adapters == ["pymupdf"]
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_pymupdf_missing_license_without_raster_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    imported_modules: list[str] = []
+    process_attempted = False
+
+    class _UnexpectedRasterAdapter:
+        def probe(self) -> AdapterAvailability:
+            return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+        async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+            _ = (source, options)
+            raise AssertionError("Runner should not import or run raster fallback")
+
+    raster_module = _AdapterModule(
+        "unexpected_raster_missing_license_module",
+        lambda: _UnexpectedRasterAdapter(),
+    )
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return pymupdf_adapter_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            return raster_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    async def _extract_with_process(source, options) -> tuple[dict[str, Any], list[Any]]:  # type: ignore[no-untyped-def]
+        nonlocal process_attempted
+        process_attempted = True
+        _ = (source, options)
+        raise AssertionError("process extraction should not be attempted")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_extract_with_process", _extract_with_process)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_UNAVAILABLE
+    assert error.failure_kind.value == "unavailable"
+    assert error.message == "Adapter preflight reported unavailable."
+    assert error.details == {
+        "adapter_key": "pymupdf",
+        "stage": "execute",
+        "reason": "missing_license",
+    }
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+    assert process_attempted is False
+
+
+@pytest.mark.asyncio
 async def test_run_ingestion_maps_vector_execute_timeout_without_importing_raster_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -906,6 +1106,187 @@ async def test_run_ingestion_maps_vector_execute_timeout_without_importing_raste
     assert error.error_code is ErrorCode.ADAPTER_TIMEOUT
     assert error.failure_kind.value == "timeout"
     assert error.details["stage"] == "execute"
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+    assert attempted_adapters == ["pymupdf"]
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_pymupdf_internal_timeout_without_raster_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    imported_modules: list[str] = []
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return pymupdf_adapter_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            raise AssertionError("Raster fallback should not be imported after vector timeout")
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    async def _extract_with_process(source, options) -> tuple[dict[str, Any], list[Any]]:  # type: ignore[no-untyped-def]
+        _ = (source, options)
+        raise TimeoutError("PyMuPDF extraction timed out.")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(pymupdf_adapter_module, "_license_unacknowledged", lambda: True)
+    monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_extract_with_process", _extract_with_process)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(
+            request,
+            storage=storage,
+            temp_root=tmp_path,
+            timeout=AdapterTimeout(seconds=0.005),
+        )
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_TIMEOUT
+    assert error.failure_kind.value == "timeout"
+    assert error.details == {"adapter_key": "pymupdf", "stage": "execute"}
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_keeps_pymupdf_cap_failure_without_raster_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    imported_modules: list[str] = []
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return pymupdf_adapter_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            raise AssertionError("Raster fallback should not be imported after vector cap failure")
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    async def _extract_with_process(source, options) -> tuple[dict[str, Any], list[Any]]:  # type: ignore[no-untyped-def]
+        _ = (source, options)
+        raise pymupdf_adapter_module.PyMuPDFExtractionLimitError(
+            "PyMuPDF extraction exceeded entity limit."
+        )
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(pymupdf_adapter_module, "_license_unacknowledged", lambda: True)
+    monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_extract_with_process", _extract_with_process)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_FAILED
+    assert error.failure_kind.value == "failed"
+    assert error.details == {"adapter_key": "pymupdf"}
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_keeps_pymupdf_no_vector_result_without_raster_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    attempted_adapters: list[str] = []
+    imported_modules: list[str] = []
+
+    class _NoVectorAdapter:
+        version = "vector-no-entities-1.0"
+
+        def probe(self) -> AdapterAvailability:
+            return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+        async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+            attempted_adapters.append("pymupdf")
+            assert source.file_path.exists()
+            _ = options
+            return AdapterResult(
+                canonical={"entities": ()},
+                provenance=(
+                    ProvenanceRecord(
+                        stage="extract",
+                        adapter_key="pymupdf",
+                        source_ref="originals/source.pdf",
+                    ),
+                ),
+                confidence=ConfidenceSummary(score=0.59, review_required=True, basis="vector"),
+                warnings=cast(Any, ("No vector drawing entities were extracted.",)),
+            )
+
+    vector_module = _AdapterModule("no_vector_adapter_module", lambda: _NoVectorAdapter())
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return vector_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            raise AssertionError("Raster fallback should not be imported for no-vector result")
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    payload = await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    assert payload.adapter_key == "pymupdf"
+    assert payload.input_family == InputFamily.PDF_VECTOR.value
+    assert payload.review_state == "review_required"
+    assert payload.validation_status == "needs_review"
+    assert payload.quantity_gate == "review_gated"
+    assert payload.canonical_json["entities"] == []
+    assert payload.report_json["summary"]["entity_counts"]["entities"] == 0
+    assert payload.report_json["checks"]
     assert imported_modules == ["app.ingestion.adapters.pymupdf"]
     assert attempted_adapters == ["pymupdf"]
 
