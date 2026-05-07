@@ -102,15 +102,15 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
         key="ifcopenshell",
         family=InputFamily.IFC,
         upload_formats=(UploadFormat.IFC,),
-        display_name="IfcOpenShell",
+        display_name="IfcOpenShell semantic IFC adapter",
         module="app.ingestion.adapters.ifcopenshell",
         license_name="LGPL-3.0-or-later",
         capabilities=AdapterCapabilities(
-            extracts_geometry=True,
             extracts_materials=True,
-            extracts_text=True,
+            extracts_layers=True,
+            supports_quantity_hints=True,
         ),
-        confidence_range=(0.95, 1.0),
+        confidence_range=(0.2, 0.55),
         probes=(
             ProbeRequirement(
                 kind=ProbeKind.PYTHON_PACKAGE,
@@ -119,6 +119,7 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
                 detail="The IfcOpenShell package is required to process IFC sources.",
             ),
         ),
+        notes=("Semantic-only IFC extraction; tessellation and shape creation are disabled.",),
     ),
     AdapterDescriptor(
         key="pymupdf",

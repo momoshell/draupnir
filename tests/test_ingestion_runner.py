@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.machinery
 import types
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ import ezdxf
 import pytest
 
 from app.core.errors import ErrorCode
+from app.ingestion.adapters import ifcopenshell as ifcopenshell_adapter_module
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterResult,
@@ -33,6 +35,15 @@ from app.storage.keys import build_original_storage_key
 from app.storage.memory import MemoryStorage
 
 _DXF_SMOKE_FIXTURE = Path(__file__).parent / "fixtures" / "dxf" / "simple-line.dxf"
+_IFC_SMOKE_BODY = (
+    b"ISO-10303-21;\n"
+    b"HEADER;\n"
+    b"FILE_SCHEMA(('IFC4'));\n"
+    b"ENDSEC;\n"
+    b"DATA;\n"
+    b"ENDSEC;\n"
+    b"END-ISO-10303-21;\n"
+)
 
 
 class _FakeAdapter:
@@ -68,6 +79,10 @@ class _AdapterModule(types.ModuleType):
     def __init__(self, name: str, create_adapter: Callable[[], object]) -> None:
         super().__init__(name)
         self.create_adapter = create_adapter
+
+
+def _ifcopenshell_module_spec() -> importlib.machinery.ModuleSpec:
+    return importlib.machinery.ModuleSpec(name="ifcopenshell", loader=None)
 
 
 @pytest.mark.asyncio
@@ -244,6 +259,63 @@ async def test_run_ingestion_maps_missing_dependency_to_sanitized_error(
     assert error.failure_kind.value == "unavailable"
     assert error.message == "Adapter could not be loaded."
     assert error.details["reason"] == "dependency_missing"
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_ifcopenshell_runtime_missing_during_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    checksum = hashlib.sha256(_IFC_SMOKE_BODY).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, _IFC_SMOKE_BODY, immutable=True)
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        if module_name == "app.ingestion.adapters.ifcopenshell":
+            return ifcopenshell_adapter_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(
+        ifcopenshell_adapter_module,
+        "_find_runtime_spec",
+        _ifcopenshell_module_spec,
+    )
+    monkeypatch.setattr(ifcopenshell_adapter_module, "_package_version", lambda: "0.8.5")
+
+    def _raise_missing_runtime() -> object:
+        raise ModuleNotFoundError(name="ifcopenshell")
+
+    monkeypatch.setattr(
+        ifcopenshell_adapter_module,
+        "_load_runtime_module",
+        _raise_missing_runtime,
+    )
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="ifc",
+        media_type="application/step",
+        original_name="nested/broken.ifc",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_UNAVAILABLE
+    assert error.failure_kind.value == "unavailable"
+    assert error.message == "Adapter execution dependency was unavailable."
+    assert error.details == {
+        "adapter_key": "ifcopenshell",
+        "stage": "execute",
+        "reason": "dependency_missing",
+        "dependency": "ifcopenshell",
+    }
 
 
 @pytest.mark.asyncio
@@ -638,6 +710,58 @@ async def test_run_ingestion_maps_malformed_dxf_to_sanitized_adapter_failure(
     assert error.message == "Adapter execution failed."
     assert error.details == {"adapter_key": "ezdxf"}
     assert "not a dxf" not in str(error)
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_sanitizes_ifcopenshell_native_parse_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    binary_body = b"\x00\xff\x00\x01 not a step payload"
+    checksum = hashlib.sha256(binary_body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, binary_body, immutable=True)
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        if module_name == "app.ingestion.adapters.ifcopenshell":
+            return ifcopenshell_adapter_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    def _raise_native_parse_failure(path: str) -> object:
+        raise RuntimeError(f"native parse failed for {path}: broken STEP payload")
+
+    runtime = types.SimpleNamespace(open=_raise_native_parse_failure)
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(
+        ifcopenshell_adapter_module,
+        "_find_runtime_spec",
+        _ifcopenshell_module_spec,
+    )
+    monkeypatch.setattr(ifcopenshell_adapter_module, "_package_version", lambda: "0.8.5")
+    monkeypatch.setattr(ifcopenshell_adapter_module, "_load_runtime_module", lambda: runtime)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="ifc",
+        media_type="application/step",
+        original_name="broken.ifc",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_FAILED
+    assert error.failure_kind.value == "failed"
+    assert error.message == "Adapter execution failed."
+    assert error.details == {"adapter_key": "ifcopenshell"}
+    assert "broken STEP payload" not in str(error)
+    assert "source.ifc" not in str(error)
 
 
 @pytest.mark.asyncio
