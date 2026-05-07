@@ -112,6 +112,21 @@ def test_registry_is_static_and_covers_every_family() -> None:
     assert pdf_raster_binary_probe.failure_status is AdapterStatus.DEGRADED
 
 
+def test_ifc_registry_metadata_stays_semantic_only() -> None:
+    descriptor = get_registry()[InputFamily.IFC]
+
+    assert descriptor.display_name == "IfcOpenShell semantic IFC adapter"
+    assert descriptor.capabilities.extracts_geometry is False
+    assert descriptor.capabilities.extracts_materials is True
+    assert descriptor.capabilities.extracts_layers is True
+    assert descriptor.capabilities.supports_quantity_hints is True
+    assert descriptor.capabilities.extracts_text is False
+    assert descriptor.confidence_range == (0.2, 0.55)
+    assert descriptor.notes == (
+        "Semantic-only IFC extraction; tessellation and shape creation are disabled.",
+    )
+
+
 def test_registry_rejects_mutation_and_preserves_cached_metadata() -> None:
     registry = get_registry()
     mutable_registry = cast(Any, registry)

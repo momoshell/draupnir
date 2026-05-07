@@ -267,6 +267,25 @@ async def _execute_adapter(
             message="Adapter execution was cancelled.",
             details={"adapter_key": adapter_key, "stage": "execute"},
         ) from exc
+    except ModuleNotFoundError as exc:
+        if adapter_key == "ifcopenshell" and exc.name == "ifcopenshell":
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_UNAVAILABLE,
+                failure_kind=AdapterFailureKind.UNAVAILABLE,
+                message="Adapter execution dependency was unavailable.",
+                details={
+                    "adapter_key": adapter_key,
+                    "stage": "execute",
+                    "reason": "dependency_missing",
+                    "dependency": "ifcopenshell",
+                },
+            ) from exc
+        raise IngestionRunnerError(
+            error_code=ErrorCode.ADAPTER_FAILED,
+            failure_kind=AdapterFailureKind.FAILED,
+            message="Adapter execution failed.",
+            details={"adapter_key": adapter_key},
+        ) from exc
     except Exception as exc:
         raise IngestionRunnerError(
             error_code=ErrorCode.ADAPTER_FAILED,

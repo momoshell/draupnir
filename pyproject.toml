@@ -10,11 +10,11 @@
 #   This allows swapping tools (e.g. LibreDWG → ODA, PyMuPDF → pdfplumber)
 #   without touching the core application code.
 #
-# System-level dependencies (NOT on PyPI):
+# System-level dependencies and adapter install notes:
 #   - LibreDWG (GPL-3.0+): required for DWG ingestion (ADR-0006).
 #     Install via system package manager (brew/apt) or conda.
-#   - IfcOpenShell: required for IFC ingestion.
-#     Install via conda-forge or platform-specific wheels.
+#   - IfcOpenShell: declared in the optional [ingestion] extra for IFC parsing.
+#     Platform-specific wheels or conda-forge may still be needed per environment.
 #   - Tesseract OCR: required by pytesseract (ADR-0008).
 #     Install via system package manager (brew/apt).
 # =============================================================================
@@ -86,10 +86,13 @@ jobs = [
 ]
 
 # Ingestion adapters — isolated behind the adapter contract (ADR-0006/0007/0008).
-# NOTE: LibreDWG and IfcOpenShell are NOT pip-installable; see top comments.
+# NOTE: LibreDWG still requires a system install; IfcOpenShell remains optional here.
 ingestion = [
     # DXF handling
     "ezdxf>=1.2",
+
+    # IFC semantic parsing (runtime-optional)
+    "ifcopenshell>=0.8",
 
     # Vector PDF adapter (ADR-0007) — PyMuPDF/MuPDF is AGPL or commercial;
     # pdfplumber (MIT) is the designated fallback if licensing becomes an issue.
