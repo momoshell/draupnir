@@ -82,9 +82,9 @@ fixtures:
     units: unknown
     expected_extraction_notes: |
       Single-page vector PDF with simple stroke geometry and inline text marker.
-      Intended for vector-adapter smoke coverage with explicit scale metadata expected.
-    expected_review_state: provisional
-    expected_validation_status: valid
+      Intended for vector-adapter smoke coverage with explicit unconfirmed scale metadata expected.
+    expected_review_state: review_required
+    expected_validation_status: needs_review
     expected_quantities:
       page_count: 1
       linework_hint_count: 1
@@ -98,9 +98,9 @@ fixtures:
           expected: 1
           comparison: review_gated
           provenance_required: true
-          expected_review_state: provisional
+          expected_review_state: review_required
       notes: |
-        Vector PDF extraction should not be forced into raster review policy.
+        Vector PDF extraction stays safety-first until real-world scale is confirmed.
 
   - filename: pdf/raster-smoke.pdf
     format: PDF

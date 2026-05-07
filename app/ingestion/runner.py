@@ -18,6 +18,7 @@ from app.ingestion.contracts import (
     AdapterResult,
     AdapterSource,
     AdapterTimeout,
+    AvailabilityReason,
     CancellationHandle,
     IngestionAdapter,
     ProgressCallback,
@@ -38,6 +39,10 @@ from app.ingestion.source import (
 from app.storage import Storage
 
 _DEFAULT_ADAPTER_TIMEOUT = AdapterTimeout(seconds=300)
+_EXECUTE_TIME_DEPENDENCIES: dict[str, str] = {
+    "ifcopenshell": "ifcopenshell",
+    "pymupdf": "fitz",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,18 +273,9 @@ async def _execute_adapter(
             details={"adapter_key": adapter_key, "stage": "execute"},
         ) from exc
     except ModuleNotFoundError as exc:
-        if adapter_key == "ifcopenshell" and exc.name == "ifcopenshell":
-            raise IngestionRunnerError(
-                error_code=ErrorCode.ADAPTER_UNAVAILABLE,
-                failure_kind=AdapterFailureKind.UNAVAILABLE,
-                message="Adapter execution dependency was unavailable.",
-                details={
-                    "adapter_key": adapter_key,
-                    "stage": "execute",
-                    "reason": "dependency_missing",
-                    "dependency": "ifcopenshell",
-                },
-            ) from exc
+        dependency_error = _execute_dependency_missing_error(adapter_key, exc)
+        if dependency_error is not None:
+            raise dependency_error from exc
         raise IngestionRunnerError(
             error_code=ErrorCode.ADAPTER_FAILED,
             failure_kind=AdapterFailureKind.FAILED,
@@ -287,6 +283,9 @@ async def _execute_adapter(
             details={"adapter_key": adapter_key},
         ) from exc
     except Exception as exc:
+        unavailable_error = _execute_preflight_unavailable_error(adapter_key, exc)
+        if unavailable_error is not None:
+            raise unavailable_error from exc
         raise IngestionRunnerError(
             error_code=ErrorCode.ADAPTER_FAILED,
             failure_kind=AdapterFailureKind.FAILED,
@@ -304,6 +303,53 @@ def _adapter_load_error(candidate: AdapterCandidate, *, reason: str) -> Ingestio
             "adapter_key": candidate.descriptor.key,
             "input_family": candidate.input_family.value,
             "reason": reason,
+        },
+    )
+
+
+def _execute_dependency_missing_error(
+    adapter_key: str,
+    exc: ModuleNotFoundError,
+) -> IngestionRunnerError | None:
+    dependency = _EXECUTE_TIME_DEPENDENCIES.get(adapter_key)
+    if dependency is None or exc.name != dependency:
+        return None
+
+    return IngestionRunnerError(
+        error_code=ErrorCode.ADAPTER_UNAVAILABLE,
+        failure_kind=AdapterFailureKind.UNAVAILABLE,
+        message="Adapter execution dependency was unavailable.",
+        details={
+            "adapter_key": adapter_key,
+            "stage": "execute",
+            "reason": "dependency_missing",
+            "dependency": dependency,
+        },
+    )
+
+
+def _execute_preflight_unavailable_error(
+    adapter_key: str,
+    exc: Exception,
+) -> IngestionRunnerError | None:
+    if adapter_key != "pymupdf":
+        return None
+
+    availability_reason = getattr(exc, "availability_reason", None)
+    if availability_reason not in {
+        AvailabilityReason.MISSING_LICENSE,
+        AvailabilityReason.PROBE_FAILED,
+    }:
+        return None
+
+    return IngestionRunnerError(
+        error_code=ErrorCode.ADAPTER_UNAVAILABLE,
+        failure_kind=AdapterFailureKind.UNAVAILABLE,
+        message="Adapter preflight reported unavailable.",
+        details={
+            "adapter_key": adapter_key,
+            "stage": "execute",
+            "reason": availability_reason.value,
         },
     )
 

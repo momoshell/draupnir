@@ -264,7 +264,7 @@ def test_fixture_manifest_has_multi_format_smoke_contract_coverage() -> None:
     expected = {
         "dxf/simple-line.dxf": ("approved", "valid", "total_length"),
         "ifc/smoke-minimal.ifc": ("review_required", "needs_review", "entity_count"),
-        "pdf/vector-smoke.pdf": ("provisional", "valid", "linework_hint_count"),
+        "pdf/vector-smoke.pdf": ("review_required", "needs_review", "linework_hint_count"),
         "pdf/raster-smoke.pdf": ("review_required", "needs_review", "page_count"),
         "dwg/libredwg-wrapper-smoke.txt": (
             "review_required",
