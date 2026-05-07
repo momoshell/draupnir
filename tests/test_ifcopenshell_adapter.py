@@ -110,6 +110,39 @@ def _write_ifc(path: Path, *, schema_line: str) -> None:
     )
 
 
+def _write_ifc_with_capped_header(path: Path) -> None:
+    oversized_description = "X" * adapter_module._HEADER_READ_LIMIT_BYTES
+    path.write_text(
+        "ISO-10303-21;\n"
+        "HEADER;\n"
+        "FILE_DESCRIPTION(('" + oversized_description + "'),'2;1');\n"
+        "FILE_SCHEMA(('IFC4'));\n"
+        "ENDSEC;\n"
+        "DATA;\n"
+        "ENDSEC;\n"
+        "END-ISO-10303-21;\n",
+        encoding="utf-8",
+    )
+
+
+def _write_ifc_with_capped_fake_header_terminator(
+    path: Path, *, fake_terminator_line: str
+) -> None:
+    oversized_description = "X" * adapter_module._HEADER_READ_LIMIT_BYTES
+    path.write_text(
+        "ISO-10303-21;\n"
+        "HEADER;\n"
+        f"{fake_terminator_line}\n"
+        "FILE_DESCRIPTION(('" + oversized_description + "'),'2;1');\n"
+        "FILE_SCHEMA(('IFC4'));\n"
+        "ENDSEC;\n"
+        "DATA;\n"
+        "ENDSEC;\n"
+        "END-ISO-10303-21;\n",
+        encoding="utf-8",
+    )
+
+
 def _build_runtime(model: _FakeModel, *, util_element: object | None = None) -> object:
     helper = util_element or SimpleNamespace(
         get_psets=lambda product, **_: product.qtos if _.get("qtos_only") else product.psets,
@@ -571,6 +604,119 @@ async def test_ifcopenshell_adapter_short_circuits_invalid_schema_through_valida
         assert canonical["ifc_schema"] == expected_schema
         assert canonical["metadata"]["ifc_schema"] == expected_schema
     assert canonical["entities"] == []
+
+
+@pytest.mark.asyncio
+async def test_ifcopenshell_adapter_capped_incomplete_header_continues_to_native_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path = tmp_path / "capped-header.ifc"
+    _write_ifc_with_capped_header(fixture_path)
+
+    sniff = adapter_module._sniff_step_header(fixture_path)
+    assert sniff.schema is None
+    assert sniff.readable is True
+    assert sniff.supported is False
+    assert sniff.header_complete is False
+
+    runtime_called = False
+
+    def _open_runtime(path: str) -> _FakeModel:
+        nonlocal runtime_called
+        runtime_called = True
+        _ = path
+        return _FakeModel(schema="IFC4", project=None, products=[])
+
+    runtime = SimpleNamespace(open=_open_runtime)
+    monkeypatch.setattr(adapter_module, "_load_runtime_module", lambda: runtime)
+
+    result = await adapter_module.create_adapter().ingest(
+        build_contract_source(
+            file_path=fixture_path,
+            upload_format=UploadFormat.IFC,
+            input_family=InputFamily.IFC,
+            media_type="application/step",
+            original_name="capped-header.ifc",
+        ),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert runtime_called is True
+    assert result.diagnostics[0].details == {
+        "ifc_schema": None,
+        "readable": True,
+        "supported": False,
+    }
+    assert "ifc.schema_missing" not in {warning.code for warning in result.warnings}
+    assert result.canonical["ifc_schema"] == "IFC4"
+
+
+@pytest.mark.parametrize(
+    "fake_terminator_line",
+    [
+        "FILE_NAME('quoted ENDSEC; marker','2026-01-01T00:00:00');",
+        "/* comment ENDSEC; marker */",
+    ],
+)
+def test_sniff_step_header_ignores_embedded_endsec_before_real_header_end(
+    tmp_path: Path,
+    fake_terminator_line: str,
+) -> None:
+    fixture_path = tmp_path / "embedded-endsec.ifc"
+    _write_ifc_with_capped_fake_header_terminator(
+        fixture_path, fake_terminator_line=fake_terminator_line
+    )
+
+    sniff = adapter_module._sniff_step_header(fixture_path)
+
+    assert sniff.schema is None
+    assert sniff.readable is True
+    assert sniff.supported is False
+    assert sniff.header_complete is False
+
+
+@pytest.mark.asyncio
+async def test_ifcopenshell_adapter_quoted_endsec_in_capped_header_continues_native_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_path = tmp_path / "quoted-endsec-capped-header.ifc"
+    _write_ifc_with_capped_fake_header_terminator(
+        fixture_path,
+        fake_terminator_line="FILE_NAME('quoted ENDSEC; marker','2026-01-01T00:00:00');",
+    )
+
+    runtime_called = False
+
+    def _open_runtime(path: str) -> _FakeModel:
+        nonlocal runtime_called
+        runtime_called = True
+        _ = path
+        return _FakeModel(schema="IFC4", project=None, products=[])
+
+    runtime = SimpleNamespace(open=_open_runtime)
+    monkeypatch.setattr(adapter_module, "_load_runtime_module", lambda: runtime)
+
+    result = await adapter_module.create_adapter().ingest(
+        build_contract_source(
+            file_path=fixture_path,
+            upload_format=UploadFormat.IFC,
+            input_family=InputFamily.IFC,
+            media_type="application/step",
+            original_name="quoted-endsec-capped-header.ifc",
+        ),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert runtime_called is True
+    assert result.diagnostics[0].details == {
+        "ifc_schema": None,
+        "readable": True,
+        "supported": False,
+    }
+    assert "ifc.schema_missing" not in {warning.code for warning in result.warnings}
+    assert result.canonical["ifc_schema"] == "IFC4"
 
 
 @pytest.mark.asyncio
