@@ -262,6 +262,7 @@ class TestIngestWorkflowSmoke:
         """Run one ingest happy path and verify persisted output visibility."""
         generated_at = datetime(2026, 1, 1, tzinfo=UTC)
         payload = _fake_ingest_payload(generated_at=generated_at)
+        enqueued_job_ids: list[UUID] = []
 
         async def _fake_run_ingestion(
             *args: object, **kwargs: object
@@ -269,7 +270,11 @@ class TestIngestWorkflowSmoke:
             del args, kwargs
             return payload
 
+        def _fake_enqueue_ingest_job(job_id: UUID) -> None:
+            enqueued_job_ids.append(job_id)
+
         monkeypatch.setattr("app.jobs.worker.run_ingestion", _fake_run_ingestion)
+        monkeypatch.setattr("app.api.v1.files.enqueue_ingest_job", _fake_enqueue_ingest_job)
 
         project_response = await async_client.post(
             "/v1/projects",
@@ -289,6 +294,8 @@ class TestIngestWorkflowSmoke:
         assert upload_data["initial_extraction_profile_id"] is not None
 
         job_id = UUID(upload_data["initial_job_id"])
+        assert enqueued_job_ids == [job_id]
+
         await process_ingest_job(job_id)
 
         job_response = await async_client.get(f"/v1/jobs/{job_id}")
