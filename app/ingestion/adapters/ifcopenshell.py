@@ -94,6 +94,7 @@ class _SchemaSniff:
     schema: str | None
     readable: bool
     supported: bool
+    header_complete: bool
 
 
 @dataclass(slots=True)
@@ -222,7 +223,10 @@ class IfcOpenShellAdapter(IngestionAdapter):
             )
         )
 
-        if sniff.readable and (sniff.schema is None or not sniff.supported):
+        if sniff.readable and (
+            (sniff.schema is None and sniff.header_complete)
+            or (sniff.schema is not None and not sniff.supported)
+        ):
             warnings.extend(_schema_warnings(sniff))
             diagnostics.append(
                 AdapterDiagnostic(
@@ -419,23 +423,88 @@ def _sniff_step_header(file_path: Path) -> _SchemaSniff:
         with file_path.open("rb") as stream:
             header_bytes = stream.read(_HEADER_READ_LIMIT_BYTES)
     except OSError:
-        return _SchemaSniff(schema=None, readable=False, supported=False)
+        return _SchemaSniff(
+            schema=None,
+            readable=False,
+            supported=False,
+            header_complete=False,
+        )
 
     header_text = header_bytes.decode("utf-8", errors="ignore")
     upper_header = header_text.upper()
     if not all(marker in upper_header for marker in _STEP_HEADER_MARKERS):
-        return _SchemaSniff(schema=None, readable=False, supported=False)
+        return _SchemaSniff(
+            schema=None,
+            readable=False,
+            supported=False,
+            header_complete=False,
+        )
 
-    match = _SCHEMA_PATTERN.search(header_text)
+    header_start = upper_header.find("HEADER;")
+    header_end = _find_step_header_terminator(header_text, header_start)
+    header_complete = header_end != -1
+    header_section = (
+        header_text[header_start : header_end + len("ENDSEC;")]
+        if header_complete
+        else header_text[header_start:]
+    )
+
+    match = _SCHEMA_PATTERN.search(header_section)
     if match is None:
-        return _SchemaSniff(schema=None, readable=True, supported=False)
+        return _SchemaSniff(
+            schema=None,
+            readable=True,
+            supported=False,
+            header_complete=header_complete,
+        )
 
     schema = _normalize_schema(match.group(1))
     return _SchemaSniff(
         schema=schema,
         readable=True,
         supported=schema in _SUPPORTED_SCHEMAS,
+        header_complete=header_complete,
     )
+
+
+def _find_step_header_terminator(header_text: str, header_start: int) -> int:
+    upper_header = header_text.upper()
+    in_comment = False
+    in_string = False
+    index = header_start + len("HEADER;")
+
+    while index < len(header_text):
+        if in_comment:
+            if header_text.startswith("*/", index):
+                in_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+
+        character = header_text[index]
+        if in_string:
+            if character == "'":
+                if index + 1 < len(header_text) and header_text[index + 1] == "'":
+                    index += 2
+                    continue
+                in_string = False
+            index += 1
+            continue
+
+        if header_text.startswith("/*", index):
+            in_comment = True
+            index += 2
+            continue
+        if character == "'":
+            in_string = True
+            index += 1
+            continue
+        if upper_header.startswith("ENDSEC;", index):
+            return index
+        index += 1
+
+    return -1
 
 
 def _schema_warnings(sniff: _SchemaSniff) -> list[AdapterWarning]:
