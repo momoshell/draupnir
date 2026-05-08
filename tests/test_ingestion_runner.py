@@ -23,6 +23,8 @@ from app.ingestion.contracts import (
     AdapterResult,
     AdapterStatus,
     AdapterTimeout,
+    AdapterUnavailableError,
+    AvailabilityReason,
     ConfidenceSummary,
     InputFamily,
     ProgressUpdate,
@@ -365,6 +367,65 @@ async def test_run_ingestion_maps_ifcopenshell_runtime_missing_during_execute(
         "stage": "execute",
         "reason": "dependency_missing",
         "dependency": "ifcopenshell",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_shared_adapter_availability_error_during_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    checksum = hashlib.sha256(_IFC_SMOKE_BODY).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, _IFC_SMOKE_BODY, immutable=True)
+
+    class _UnavailableIfcAdapter:
+        def probe(self) -> AdapterAvailability:
+            return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+        async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+            assert source.file_path.exists()
+            _ = options
+            raise AdapterUnavailableError(
+                AvailabilityReason.PROBE_FAILED,
+                detail="ifc runtime preflight failed",
+            )
+
+    unavailable_module = _AdapterModule(
+        "unavailable_ifc_adapter_module",
+        lambda: _UnavailableIfcAdapter(),
+    )
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        if module_name == "app.ingestion.adapters.ifcopenshell":
+            return unavailable_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="ifc",
+        media_type="application/step",
+        original_name="nested/unavailable.ifc",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_UNAVAILABLE
+    assert error.failure_kind.value == "unavailable"
+    assert error.message == "Adapter preflight reported unavailable."
+    assert error.details == {
+        "adapter_key": "ifcopenshell",
+        "stage": "execute",
+        "reason": "probe_failed",
+        "detail": "ifc runtime preflight failed",
     }
 
 

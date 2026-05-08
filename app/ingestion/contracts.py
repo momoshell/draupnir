@@ -97,6 +97,20 @@ class AdapterFailureKind(StrEnum):
     INTERNAL = "internal"
 
 
+class AdapterUnavailableError(Exception):
+    """Sanitized availability failure adapters can raise during preflight/execute."""
+
+    def __init__(
+        self,
+        availability_reason: AvailabilityReason,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__("Adapter reported unavailable.")
+        self.availability_reason = availability_reason
+        self.detail = detail
+
+
 def input_families_for_upload_format(upload_format: UploadFormat) -> tuple[InputFamily, ...]:
     """Return the normalized families that can satisfy an upload format."""
 
