@@ -301,7 +301,7 @@ class TestIngestWorkflowSmoke:
         job_response = await async_client.get(f"/v1/jobs/{job_id}")
         assert job_response.status_code == 200
         job_data = job_response.json()
-        assert job_data["status"] == "completed"
+        assert job_data["status"] == "succeeded"
         assert job_data["finished_at"] is not None
 
         assert AsyncSessionLocal is not None
