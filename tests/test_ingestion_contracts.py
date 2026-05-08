@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 import app.ingestion.adapters.pymupdf as pymupdf_adapter
+import app.ingestion.adapters.vtracer_tesseract as vtracer_tesseract_adapter
 from app.core.errors import ErrorCode
 from app.ingestion.contracts import (
     AdapterAvailability,
@@ -24,6 +25,8 @@ from app.ingestion.contracts import (
     AdapterSource,
     AdapterStatus,
     AdapterTimeout,
+    AdapterUnavailableError,
+    AdapterWarning,
     AvailabilityReason,
     ConfidenceSummary,
     InputFamily,
@@ -326,6 +329,270 @@ def test_pymupdf_create_adapter_returns_vector_pdf_adapter() -> None:
 
     assert adapter.descriptor.key == "pymupdf"
     assert adapter.descriptor.family is InputFamily.PDF_VECTOR
+
+
+def test_vtracer_tesseract_create_adapter_returns_raster_pdf_adapter() -> None:
+    adapter = vtracer_tesseract_adapter.create_adapter()
+
+    assert adapter.descriptor.key == "vtracer_tesseract"
+    assert adapter.descriptor.family is InputFamily.PDF_RASTER
+
+
+def test_vtracer_tesseract_probe_is_degraded_when_optional_tesseract_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_vtracer_available", lambda: True)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_tesseract_binary_path", lambda: None)
+
+    availability = vtracer_tesseract_adapter.create_adapter().probe()
+
+    assert availability.status is AdapterStatus.DEGRADED
+    assert availability.availability_reason is AvailabilityReason.MISSING_BINARY
+
+
+def test_vtracer_tesseract_probe_is_unavailable_when_vtracer_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_vtracer_available", lambda: False)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_tesseract_binary_path", lambda: None)
+
+    availability = vtracer_tesseract_adapter.create_adapter().probe()
+
+    assert availability.status is AdapterStatus.UNAVAILABLE
+    assert availability.availability_reason is AvailabilityReason.PROBE_FAILED
+
+
+@pytest.mark.asyncio
+async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "raster.pdf"
+    source_path.write_bytes(
+        b"%PDF-1.4\n"
+        b"1 0 obj << /Type /Page >> endobj\n"
+        b"2 0 obj << /Type /Page >> endobj\n"
+        b"%%EOF\n"
+    )
+    adapter = vtracer_tesseract_adapter.create_adapter()
+
+    monkeypatch.setattr(adapter, "_runtime_for_ingest", lambda: object())
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_vtracer_available", lambda: True)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_tesseract_binary_path", lambda: None)
+
+    result = await adapter.ingest(
+        AdapterSource(
+            file_path=source_path,
+            upload_format=UploadFormat.PDF,
+            input_family=InputFamily.PDF_RASTER,
+            original_name="raster.pdf",
+        ),
+        AdapterExecutionOptions(),
+    )
+
+    assert result.canonical == {
+        "schema_version": "0.1",
+        "canonical_entity_schema_version": "0.1",
+        "units": {"normalized": "unknown"},
+        "coordinate_system": {
+            "name": "pdf_page_space_unrotated",
+            "origin": "top_left",
+            "x_axis": "right",
+            "y_axis": "down",
+        },
+        "layouts": (
+            {"name": "page-1", "page_number": 1},
+            {"name": "page-2", "page_number": 2},
+        ),
+        "layers": ({"name": "default"},),
+        "blocks": (),
+        "entities": (),
+        "xrefs": (),
+        "metadata": {
+            "source_format": "pdf",
+            "geometry_mode": "raster",
+            "page_count": 2,
+            "default_layer": "default",
+            "text_blocks": [],
+            "pdf_scale": {
+                "status": "unconfirmed",
+                "coordinate_space": "pdf_page_space_unrotated",
+                "unit": "point",
+                "real_world_units": False,
+                "calibration": {
+                    "provided": False,
+                    "source": "not_supported_in_adapter_options",
+                    "requires_extraction_profile_pass_through": True,
+                },
+            },
+        },
+    }
+    assert result.provenance == (
+        ProvenanceRecord(
+            stage="extract",
+            adapter_key="vtracer_tesseract",
+            source_ref="originals/raster.pdf",
+            details={
+                "geometry_mode": "raster",
+                "page_count": 2,
+                "scaffold_only": True,
+            },
+        ),
+    )
+    assert result.confidence == ConfidenceSummary(
+        score=0.3,
+        review_required=True,
+        basis="raster_scaffold",
+    )
+    assert result.warnings == (
+        AdapterWarning(
+            code="RASTER_SCAFFOLD_ONLY",
+            message="Raster PDF ingestion currently returns scaffold metadata only.",
+        ),
+        AdapterWarning(
+            code="RASTER_SCALE_UNCONFIRMED",
+            message="Raster PDF scale is unconfirmed and requires downstream review.",
+        ),
+        AdapterWarning(
+            code="RASTER_GEOMETRY_REVIEW_REQUIRED",
+            message="Raster PDF geometry remains review-required until vectorization ships.",
+        ),
+        AdapterWarning(
+            code="RASTER_OCR_DEFERRED",
+            message="Raster PDF OCR extraction is deferred in this scaffold adapter.",
+        ),
+    )
+    assert result.diagnostics == (
+        AdapterDiagnostic(
+            code="raster_scaffold_created",
+            message="Created raster scaffold canonical payload.",
+            details={"page_count": 2},
+        ),
+        AdapterDiagnostic(
+            code="raster_dependency_probe",
+            message="Captured raster dependency availability for scaffold execution.",
+            details={
+                "vtracer_available": True,
+                "tesseract_available": False,
+            },
+        ),
+        AdapterDiagnostic(
+            code="raster_vectorization_deferred",
+            message="Raster vectorization is deferred in the experimental scaffold.",
+        ),
+        AdapterDiagnostic(
+            code="raster_ocr_deferred",
+            message="Raster OCR extraction is deferred in the experimental scaffold.",
+        ),
+        AdapterDiagnostic(
+            code="raster_scale_unconfirmed",
+            message="Raster PDF scale remains unconfirmed in scaffold output.",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_vtracer_tesseract_ingest_raises_shared_unavailable_error_when_runtime_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "raster.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    adapter = vtracer_tesseract_adapter.create_adapter()
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_load_vtracer_runtime", lambda: None)
+
+    with pytest.raises(AdapterUnavailableError) as exc_info:
+        await adapter.ingest(
+            AdapterSource(
+                file_path=source_path,
+                upload_format=UploadFormat.PDF,
+                input_family=InputFamily.PDF_RASTER,
+            ),
+            AdapterExecutionOptions(),
+        )
+
+    assert exc_info.value.availability_reason is AvailabilityReason.PROBE_FAILED
+
+
+def test_vtracer_tesseract_detect_page_count_counts_boundary_split_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "boundary.pdf"
+    source_path.write_bytes(b"%PDF-1.4abcd/Type" + b" /Page >>\n%%EOF\n")
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_CHUNK_SIZE", 16)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_OVERLAP", 8)
+
+    assert (
+        vtracer_tesseract_adapter._detect_page_count(
+            source_path,
+            page_cap=vtracer_tesseract_adapter._MAX_PAGES,
+            cancellation=None,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_vtracer_tesseract_ingest_respects_cancellation_during_page_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "raster.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF\n")
+    adapter = vtracer_tesseract_adapter.create_adapter()
+
+    class _CancellationHandle:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_cancelled(self) -> bool:
+            self.calls += 1
+            return self.calls >= 4
+
+    cancellation = _CancellationHandle()
+
+    monkeypatch.setattr(adapter, "_runtime_for_ingest", lambda: object())
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.ingest(
+            AdapterSource(
+                file_path=source_path,
+                upload_format=UploadFormat.PDF,
+                input_family=InputFamily.PDF_RASTER,
+            ),
+            AdapterExecutionOptions(cancellation=cancellation),
+        )
+
+
+@pytest.mark.asyncio
+async def test_vtracer_tesseract_ingest_enforces_page_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "raster.pdf"
+    source_path.write_bytes(
+        b"%PDF-1.4\n"
+        b"1 0 obj << /Type /Page >> endobj\n"
+        b"2 0 obj << /Type /Page >> endobj\n"
+        b"%%EOF\n"
+    )
+    adapter = vtracer_tesseract_adapter.create_adapter()
+
+    monkeypatch.setattr(adapter, "_runtime_for_ingest", lambda: object())
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_MAX_PAGES", 1)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await adapter.ingest(
+            AdapterSource(
+                file_path=source_path,
+                upload_format=UploadFormat.PDF,
+                input_family=InputFamily.PDF_RASTER,
+            ),
+            AdapterExecutionOptions(),
+        )
+
+    assert str(exc_info.value) == "Raster PDF scaffold exceeded page limit."
 
 
 def test_pymupdf_probe_is_unavailable_when_package_missing(
