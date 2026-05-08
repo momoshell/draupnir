@@ -19,14 +19,18 @@ from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
 from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
+from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
+from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
 from app.models.validation_report import ValidationReport
+from app.storage import get_storage
+from app.storage.keys import build_generated_artifact_storage_key
 
 logger = get_logger(__name__)
 
@@ -41,6 +45,10 @@ _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
+_DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
+_DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
+_DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
+_DEBUG_OVERLAY_GENERATOR_VERSION = "1"
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -209,6 +217,27 @@ async def _get_latest_drawing_revision(
     return result.scalar_one_or_none()
 
 
+async def _get_generated_artifact_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    drawing_revision_id: UUID,
+    artifact_kind: str,
+) -> GeneratedArtifact | None:
+    """Load a committed artifact of a given kind for a drawing revision."""
+    result = await session.execute(
+        select(GeneratedArtifact)
+        .where(
+            (GeneratedArtifact.project_id == project_id)
+            & (GeneratedArtifact.drawing_revision_id == drawing_revision_id)
+            & (GeneratedArtifact.artifact_kind == artifact_kind)
+            & (GeneratedArtifact.deleted_at.is_(None))
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 def _resolve_revision_kind(job_id: UUID, *, initial_job_id: UUID | None) -> str:
     """Map file linkage to the correct ingest revision kind."""
     if initial_job_id == job_id:
@@ -301,6 +330,99 @@ def _build_persisted_validation_report_json(
     report_json["checks"] = checks
 
     return report_json
+
+
+def _build_debug_overlay_generator_config(
+    *,
+    title: str,
+    source_label: str,
+    review_state: str,
+    confidence_score: float,
+) -> dict[str, Any]:
+    """Build persisted generator settings for the debug overlay artifact."""
+    return {
+        "title": title,
+        "source_label": source_label,
+        "review_state": review_state,
+        "confidence_score": confidence_score,
+    }
+
+
+def _build_debug_overlay_lineage_json(
+    *,
+    source_file: File,
+    job: Job,
+    payload: IngestFinalizationPayload,
+    drawing_revision_id: UUID,
+    revision_sequence: int,
+    predecessor_revision_id: UUID | None,
+    adapter_run_output_id: UUID,
+) -> dict[str, Any]:
+    """Build lineage metadata for a persisted debug overlay artifact."""
+    entity_counts_json = payload.canonical_json.get("entity_counts")
+    entity_counts = deepcopy(entity_counts_json) if isinstance(entity_counts_json, dict) else {}
+
+    entities_json = payload.canonical_json.get("entities")
+    entity_total = len(entities_json) if isinstance(entities_json, list) else None
+
+    options_json = payload.provenance_json.get("options")
+    options = deepcopy(options_json) if isinstance(options_json, dict) else {}
+
+    return {
+        "source_file": {
+            "id": str(source_file.id),
+            "original_filename": source_file.original_filename,
+            "detected_format": source_file.detected_format,
+            "media_type": source_file.media_type,
+            "checksum_sha256": source_file.checksum_sha256,
+        },
+        "job": {
+            "id": str(job.id),
+            "extraction_profile_id": str(job.extraction_profile_id),
+            "attempts": job.attempts,
+        },
+        "drawing_revision": {
+            "id": str(drawing_revision_id),
+            "revision_sequence": revision_sequence,
+            "revision_kind": payload.revision_kind,
+            "predecessor_revision_id": (
+                str(predecessor_revision_id) if predecessor_revision_id is not None else None
+            ),
+        },
+        "adapter": {
+            "id": str(adapter_run_output_id),
+            "key": payload.adapter_key,
+            "version": payload.adapter_version,
+            "input_family": payload.input_family,
+            "result_checksum_sha256": payload.result_checksum_sha256,
+        },
+        "entities": {
+            "schema_version": payload.canonical_entity_schema_version,
+            "counts": entity_counts,
+            "total": entity_total,
+        },
+        "options": options,
+    }
+
+
+async def _cleanup_failed_storage_writes(
+    storage: Any,
+    writes: list[tuple[str, str]],
+    *,
+    job_id: UUID,
+) -> None:
+    """Best-effort cleanup for pre-commit immutable storage writes."""
+    for key, storage_uri in reversed(writes):
+        try:
+            await storage.delete_failed_put(key, storage_uri=storage_uri)
+        except Exception:
+            logger.warning(
+                "generated_artifact_cleanup_failed",
+                job_id=str(job_id),
+                storage_key=key,
+                storage_uri=storage_uri,
+                exc_info=True,
+            )
 
 
 async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
@@ -417,89 +539,185 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
             revision_sequence = predecessor_revision.revision_sequence + 1
             predecessor_revision_id = predecessor_revision.id
 
+        predecessor_debug_overlay = None
+        if predecessor_revision_id is not None:
+            predecessor_debug_overlay = await _get_generated_artifact_for_revision(
+                session,
+                project_id=job.project_id,
+                drawing_revision_id=predecessor_revision_id,
+                artifact_kind=_DEBUG_OVERLAY_ARTIFACT_KIND,
+            )
+
         adapter_run_output_id = uuid.uuid4()
         drawing_revision_id = uuid.uuid4()
         validation_report_id = uuid.uuid4()
+        debug_overlay_artifact_id = uuid.uuid4()
         finished_at = _utcnow()
+        overlay_source_label = source_file.original_filename
+        overlay_title = f"{overlay_source_label} revision {revision_sequence}"
+        overlay_plan = plan_svg_debug_overlay(
+            payload.canonical_json,
+            title=overlay_title,
+            source_label=overlay_source_label,
+            review_state=payload.review_state,
+            confidence_score=payload.confidence_score,
+        )
+        overlay_storage_key = build_generated_artifact_storage_key(
+            debug_overlay_artifact_id,
+            overlay_plan.filename,
+        )
+        overlay_generator_config = _build_debug_overlay_generator_config(
+            title=overlay_title,
+            source_label=overlay_source_label,
+            review_state=payload.review_state,
+            confidence_score=payload.confidence_score,
+        )
+        overlay_lineage_json = _build_debug_overlay_lineage_json(
+            source_file=source_file,
+            job=job,
+            payload=payload,
+            drawing_revision_id=drawing_revision_id,
+            revision_sequence=revision_sequence,
+            predecessor_revision_id=predecessor_revision_id,
+            adapter_run_output_id=adapter_run_output_id,
+        )
+        storage = get_storage()
+        written_storage_objects: list[tuple[str, str]] = []
+        commit_started = False
 
-        session.add(
-            AdapterRunOutput(
-                id=adapter_run_output_id,
-                project_id=job.project_id,
-                source_file_id=source_file.id,
-                extraction_profile_id=job.extraction_profile_id,
-                source_job_id=job.id,
-                adapter_key=payload.adapter_key,
-                adapter_version=payload.adapter_version,
-                input_family=payload.input_family,
-                canonical_entity_schema_version=payload.canonical_entity_schema_version,
-                canonical_json=payload.canonical_json,
-                provenance_json=payload.provenance_json,
-                confidence_json=payload.confidence_json,
-                confidence_score=payload.confidence_score,
-                warnings_json=payload.warnings_json,
-                diagnostics_json=payload.diagnostics_json,
-                result_checksum_sha256=payload.result_checksum_sha256,
+        try:
+            stored_overlay = await storage.put(
+                overlay_storage_key,
+                overlay_plan.payload,
+                immutable=True,
             )
-        )
-        session.add(
-            DrawingRevision(
-                id=drawing_revision_id,
-                project_id=job.project_id,
-                source_file_id=source_file.id,
-                extraction_profile_id=job.extraction_profile_id,
-                source_job_id=job.id,
-                adapter_run_output_id=adapter_run_output_id,
-                predecessor_revision_id=predecessor_revision_id,
-                revision_sequence=revision_sequence,
-                revision_kind=payload.revision_kind,
-                review_state=payload.review_state,
-                canonical_entity_schema_version=payload.canonical_entity_schema_version,
-                confidence_score=payload.confidence_score,
+            written_storage_objects.append((stored_overlay.key, stored_overlay.storage_uri))
+
+            session.add(
+                AdapterRunOutput(
+                    id=adapter_run_output_id,
+                    project_id=job.project_id,
+                    source_file_id=source_file.id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_key=payload.adapter_key,
+                    adapter_version=payload.adapter_version,
+                    input_family=payload.input_family,
+                    canonical_entity_schema_version=payload.canonical_entity_schema_version,
+                    canonical_json=payload.canonical_json,
+                    provenance_json=payload.provenance_json,
+                    confidence_json=payload.confidence_json,
+                    confidence_score=payload.confidence_score,
+                    warnings_json=payload.warnings_json,
+                    diagnostics_json=payload.diagnostics_json,
+                    result_checksum_sha256=payload.result_checksum_sha256,
+                )
             )
-        )
-        session.add(
-            ValidationReport(
-                id=validation_report_id,
-                project_id=job.project_id,
-                drawing_revision_id=drawing_revision_id,
-                source_job_id=job.id,
-                validation_report_schema_version=payload.validation_report_schema_version,
-                canonical_entity_schema_version=payload.canonical_entity_schema_version,
-                validation_status=payload.validation_status,
-                review_state=payload.review_state,
-                quantity_gate=payload.quantity_gate,
-                effective_confidence=payload.effective_confidence,
-                validator_name=payload.validator_name,
-                validator_version=payload.validator_version,
-                report_json=_build_persisted_validation_report_json(
-                    payload,
+            session.add(
+                DrawingRevision(
+                    id=drawing_revision_id,
+                    project_id=job.project_id,
+                    source_file_id=source_file.id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_run_output_id=adapter_run_output_id,
+                    predecessor_revision_id=predecessor_revision_id,
+                    revision_sequence=revision_sequence,
+                    revision_kind=payload.revision_kind,
+                    review_state=payload.review_state,
+                    canonical_entity_schema_version=payload.canonical_entity_schema_version,
+                    confidence_score=payload.confidence_score,
+                )
+            )
+            session.add(
+                ValidationReport(
+                    id=validation_report_id,
+                    project_id=job.project_id,
                     drawing_revision_id=drawing_revision_id,
                     source_job_id=job.id,
-                    validation_report_id=validation_report_id,
-                ),
-                generated_at=payload.generated_at,
+                    validation_report_schema_version=payload.validation_report_schema_version,
+                    canonical_entity_schema_version=payload.canonical_entity_schema_version,
+                    validation_status=payload.validation_status,
+                    review_state=payload.review_state,
+                    quantity_gate=payload.quantity_gate,
+                    effective_confidence=payload.effective_confidence,
+                    validator_name=payload.validator_name,
+                    validator_version=payload.validator_version,
+                    report_json=_build_persisted_validation_report_json(
+                        payload,
+                        drawing_revision_id=drawing_revision_id,
+                        source_job_id=job.id,
+                        validation_report_id=validation_report_id,
+                    ),
+                    generated_at=payload.generated_at,
+                )
             )
-        )
+            session.add(
+                GeneratedArtifact(
+                    id=debug_overlay_artifact_id,
+                    project_id=job.project_id,
+                    source_file_id=source_file.id,
+                    job_id=job.id,
+                    drawing_revision_id=drawing_revision_id,
+                    adapter_run_output_id=adapter_run_output_id,
+                    artifact_kind=_DEBUG_OVERLAY_ARTIFACT_KIND,
+                    name=overlay_plan.filename,
+                    format=_DEBUG_OVERLAY_ARTIFACT_FORMAT,
+                    media_type=overlay_plan.media_type,
+                    size_bytes=stored_overlay.size_bytes,
+                    checksum_sha256=stored_overlay.checksum_sha256,
+                    generator_name=_DEBUG_OVERLAY_GENERATOR_NAME,
+                    generator_version=_DEBUG_OVERLAY_GENERATOR_VERSION,
+                    generator_config_json=overlay_generator_config,
+                    storage_key=stored_overlay.key,
+                    storage_uri=stored_overlay.storage_uri,
+                    lineage_json=overlay_lineage_json,
+                    predecessor_artifact_id=(
+                        predecessor_debug_overlay.id
+                        if predecessor_debug_overlay is not None
+                        else None
+                    ),
+                )
+            )
 
-        job.status = "succeeded"
-        job.finished_at = finished_at
-        job.error_code = None
-        job.error_message = None
-        await emit_job_event(
-            job.id,
-            level="info",
-            message="Job succeeded",
-            data_json={
-                "status": "succeeded",
-                "attempts": job.attempts,
-                "adapter_run_output_id": str(adapter_run_output_id),
-                "drawing_revision_id": str(drawing_revision_id),
-                "validation_report_id": str(validation_report_id),
-            },
-            session=session,
-        )
-        await session.commit()
+            job.status = "succeeded"
+            job.finished_at = finished_at
+            job.error_code = None
+            job.error_message = None
+            await emit_job_event(
+                job.id,
+                level="info",
+                message="Job succeeded",
+                data_json={
+                    "status": "succeeded",
+                    "attempts": job.attempts,
+                    "adapter_run_output_id": str(adapter_run_output_id),
+                    "drawing_revision_id": str(drawing_revision_id),
+                    "validation_report_id": str(validation_report_id),
+                    "generated_artifact_id": str(debug_overlay_artifact_id),
+                },
+                session=session,
+            )
+            commit_started = True
+            await session.commit()
+        except asyncio.CancelledError:
+            if not commit_started:
+                await session.rollback()
+                await _cleanup_failed_storage_writes(
+                    storage,
+                    written_storage_objects,
+                    job_id=job_id,
+                )
+            raise
+        except Exception:
+            if not commit_started:
+                await session.rollback()
+                await _cleanup_failed_storage_writes(
+                    storage,
+                    written_storage_objects,
+                    job_id=job_id,
+                )
+            raise
 
     return True
 
@@ -881,6 +1099,10 @@ async def process_ingest_job(job_id: UUID) -> None:
 
     try:
         finalized = await _finalize_ingest_job(job_id, payload=payload)
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id)
+        logger.info("ingest_job_cancelled_during_finalization", job_id=str(job_id))
+        raise
     except Exception as exc:
         await _mark_job_failed(job_id, error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE)
         logger.error(

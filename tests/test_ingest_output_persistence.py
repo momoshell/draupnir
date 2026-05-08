@@ -3,6 +3,8 @@
 import asyncio
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -20,6 +22,7 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
 from app.models.validation_report import ValidationReport
+from app.storage.keys import build_generated_artifact_storage_key
 from tests.conftest import requires_database
 from tests.test_jobs import (
     _FAKE_RUNNER_ADAPTER_KEY,
@@ -79,6 +82,75 @@ def _assert_validation_report_json_matches_columns(report: ValidationReport) -> 
     assert report_json["summary"]["quantity_gate"] == report.quantity_gate
     assert report_json["summary"]["effective_confidence"] == report.effective_confidence
     assert report_json["checks"]
+
+
+def _assert_debug_overlay_artifact(
+    artifact: GeneratedArtifact,
+    *,
+    job: Job,
+    drawing_revision: DrawingRevision,
+    adapter_output: AdapterRunOutput,
+    predecessor_artifact_id: uuid.UUID | None,
+) -> None:
+    """Assert persisted SVG debug overlay artifact metadata and lineage."""
+    assert artifact.project_id == job.project_id
+    assert artifact.source_file_id == job.file_id
+    assert artifact.job_id == job.id
+    assert artifact.drawing_revision_id == drawing_revision.id
+    assert artifact.adapter_run_output_id == adapter_output.id
+    assert artifact.artifact_kind == "debug_overlay"
+    assert artifact.name == "debug-overlay.svg"
+    assert artifact.format == "svg"
+    assert artifact.media_type == "image/svg+xml"
+    assert artifact.size_bytes > 0
+    assert len(artifact.checksum_sha256) == 64
+    assert artifact.generator_name == "app.ingestion.debug_overlay"
+    assert artifact.generator_version == "1"
+    assert artifact.generator_config_json == {
+        "title": f"plan.pdf revision {drawing_revision.revision_sequence}",
+        "source_label": "plan.pdf",
+        "review_state": drawing_revision.review_state,
+        "confidence_score": drawing_revision.confidence_score,
+    }
+    assert artifact.storage_key == build_generated_artifact_storage_key(artifact.id, artifact.name)
+    assert artifact.storage_uri
+    assert artifact.predecessor_artifact_id == predecessor_artifact_id
+
+    lineage = cast(dict[str, Any], artifact.lineage_json)
+    source_file_lineage = cast(dict[str, Any], lineage["source_file"])
+    assert source_file_lineage["id"] == str(job.file_id)
+    assert source_file_lineage["original_filename"] == "plan.pdf"
+    assert source_file_lineage["detected_format"] == "pdf"
+    assert source_file_lineage["media_type"] == "application/pdf"
+    assert source_file_lineage["checksum_sha256"]
+    assert lineage["job"] == {
+        "id": str(job.id),
+        "extraction_profile_id": str(job.extraction_profile_id),
+        "attempts": job.attempts,
+    }
+    assert lineage["drawing_revision"] == {
+        "id": str(drawing_revision.id),
+        "revision_sequence": drawing_revision.revision_sequence,
+        "revision_kind": drawing_revision.revision_kind,
+        "predecessor_revision_id": (
+            str(drawing_revision.predecessor_revision_id)
+            if drawing_revision.predecessor_revision_id is not None
+            else None
+        ),
+    }
+    assert lineage["adapter"] == {
+        "id": str(adapter_output.id),
+        "key": adapter_output.adapter_key,
+        "version": adapter_output.adapter_version,
+        "input_family": adapter_output.input_family,
+        "result_checksum_sha256": adapter_output.result_checksum_sha256,
+    }
+    assert lineage["entities"] == {
+        "schema_version": adapter_output.canonical_entity_schema_version,
+        "counts": adapter_output.canonical_json["entity_counts"],
+        "total": len(adapter_output.canonical_json["entities"]),
+    }
+    assert lineage["options"] == {}
 
 
 async def _load_project_outputs(
@@ -190,6 +262,7 @@ class TestIngestOutputPersistence:
         job = await _get_job_for_file(str(uploaded["id"]))
 
         await process_ingest_job(job.id)
+        job = await _get_job(job.id)
 
         (
             adapter_outputs,
@@ -201,11 +274,12 @@ class TestIngestOutputPersistence:
         assert len(adapter_outputs) == 1
         assert len(drawing_revisions) == 1
         assert len(validation_reports) == 1
-        assert generated_artifacts == []
+        assert len(generated_artifacts) == 1
 
         adapter_output = adapter_outputs[0]
         drawing_revision = drawing_revisions[0]
         validation_report = validation_reports[0]
+        generated_artifact = generated_artifacts[0]
 
         assert adapter_output.project_id == job.project_id
         assert adapter_output.source_file_id == job.file_id
@@ -290,6 +364,13 @@ class TestIngestOutputPersistence:
         assert validation_report.report_json["findings"] == []
         assert validation_report.report_json["adapter_warnings"] == []
         assert validation_report.report_json["provenance"] == adapter_output.provenance_json
+        _assert_debug_overlay_artifact(
+            generated_artifact,
+            job=job,
+            drawing_revision=drawing_revision,
+            adapter_output=adapter_output,
+            predecessor_artifact_id=None,
+        )
 
     async def test_process_ingest_job_persists_payload_provenance_and_confidence_precedence(
         self,
@@ -371,6 +452,7 @@ class TestIngestOutputPersistence:
         first_job = await _get_job_for_file(str(uploaded["id"]))
 
         await process_ingest_job(first_job.id)
+        first_job = await _get_job(first_job.id)
 
         reprocess_response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
@@ -384,6 +466,7 @@ class TestIngestOutputPersistence:
         assert enqueued_job_ids == [str(first_job.id), str(second_job.id)]
 
         await process_ingest_job(second_job.id)
+        second_job = await _get_job(second_job.id)
 
         (
             adapter_outputs,
@@ -395,7 +478,7 @@ class TestIngestOutputPersistence:
         assert len(adapter_outputs) == 2
         assert len(drawing_revisions) == 2
         assert len(validation_reports) == 2
-        assert generated_artifacts == []
+        assert len(generated_artifacts) == 2
 
         first_revision, second_revision = drawing_revisions
         first_adapter_output = next(
@@ -409,6 +492,12 @@ class TestIngestOutputPersistence:
         )
         second_validation_report = next(
             report for report in validation_reports if report.source_job_id == second_job.id
+        )
+        first_generated_artifact = next(
+            artifact for artifact in generated_artifacts if artifact.job_id == first_job.id
+        )
+        second_generated_artifact = next(
+            artifact for artifact in generated_artifacts if artifact.job_id == second_job.id
         )
 
         assert first_revision.revision_sequence == 1
@@ -439,6 +528,20 @@ class TestIngestOutputPersistence:
         assert second_validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
         assert second_validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
         assert second_validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
+        _assert_debug_overlay_artifact(
+            first_generated_artifact,
+            job=first_job,
+            drawing_revision=first_revision,
+            adapter_output=first_adapter_output,
+            predecessor_artifact_id=None,
+        )
+        _assert_debug_overlay_artifact(
+            second_generated_artifact,
+            job=second_job,
+            drawing_revision=second_revision,
+            adapter_output=second_adapter_output,
+            predecessor_artifact_id=first_generated_artifact.id,
+        )
 
     async def test_validation_report_allows_trd_status_and_gate_values(
         self,
@@ -533,9 +636,15 @@ class TestIngestOutputPersistence:
         assert len(adapter_outputs) == 3
         assert len(drawing_revisions) == 3
         assert len(validation_reports) == 3
-        assert generated_artifacts == []
+        assert len(generated_artifacts) == 3
 
         first_revision, second_revision, _third_revision = drawing_revisions
+        artifacts_by_revision_id = {
+            artifact.drawing_revision_id: artifact for artifact in generated_artifacts
+        }
+        first_artifact = artifacts_by_revision_id[first_revision.id]
+        second_artifact = artifacts_by_revision_id[second_revision.id]
+        third_artifact = artifacts_by_revision_id[drawing_revisions[2].id]
         assert [revision.revision_sequence for revision in drawing_revisions] == [1, 2, 3]
         assert [revision.predecessor_revision_id for revision in drawing_revisions] == [
             None,
@@ -551,6 +660,10 @@ class TestIngestOutputPersistence:
         expected_job_ids = {first_job.id, second_job.id, third_job.id}
         assert {output.source_job_id for output in adapter_outputs} == expected_job_ids
         assert {report.source_job_id for report in validation_reports} == expected_job_ids
+        assert {artifact.job_id for artifact in generated_artifacts} == expected_job_ids
+        assert first_artifact.predecessor_artifact_id is None
+        assert second_artifact.predecessor_artifact_id == first_artifact.id
+        assert third_artifact.predecessor_artifact_id == second_artifact.id
 
     async def test_reprocess_before_initial_finalization_fails_without_outputs(
         self,
@@ -611,6 +724,7 @@ class TestIngestOutputPersistence:
         assert generated_artifacts == []
 
         await process_ingest_job(initial_job.id)
+        initial_job = await _get_job(initial_job.id)
 
         (
             adapter_outputs,
@@ -621,12 +735,19 @@ class TestIngestOutputPersistence:
         assert len(adapter_outputs) == 1
         assert len(drawing_revisions) == 1
         assert len(validation_reports) == 1
-        assert generated_artifacts == []
+        assert len(generated_artifacts) == 1
         assert adapter_outputs[0].source_job_id == initial_job.id
         assert drawing_revisions[0].source_job_id == initial_job.id
         assert drawing_revisions[0].revision_sequence == 1
         assert drawing_revisions[0].predecessor_revision_id is None
         assert drawing_revisions[0].revision_kind == "ingest"
+        _assert_debug_overlay_artifact(
+            generated_artifacts[0],
+            job=initial_job,
+            drawing_revision=drawing_revisions[0],
+            adapter_output=adapter_outputs[0],
+            predecessor_artifact_id=None,
+        )
 
     async def test_process_ingest_job_cancelled_before_finalization_creates_no_outputs(
         self,
@@ -695,10 +816,11 @@ class TestIngestOutputPersistence:
         assert len(second_outputs[0]) == 1
         assert len(second_outputs[1]) == 1
         assert len(second_outputs[2]) == 1
-        assert second_outputs[3] == []
+        assert len(second_outputs[3]) == 1
         assert [row.id for row in second_outputs[0]] == [row.id for row in first_outputs[0]]
         assert [row.id for row in second_outputs[1]] == [row.id for row in first_outputs[1]]
         assert [row.id for row in second_outputs[2]] == [row.id for row in first_outputs[2]]
+        assert [row.id for row in second_outputs[3]] == [row.id for row in first_outputs[3]]
 
     async def test_process_ingest_job_missing_profile_fails_without_outputs(
         self,
@@ -733,6 +855,164 @@ class TestIngestOutputPersistence:
             "error_code": ErrorCode.INTERNAL_ERROR.value,
             "error_message": worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE,
         }
+
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+
+        assert adapter_outputs == []
+        assert drawing_revisions == []
+        assert validation_reports == []
+        assert generated_artifacts == []
+
+    async def test_process_ingest_job_precommit_overlay_failure_cleans_storage_without_outputs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A pre-commit overlay failure should clean storage and persist no outputs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        @dataclass(frozen=True, slots=True)
+        class _StoredOverlay:
+            key: str
+            storage_uri: str
+            size_bytes: int
+            checksum_sha256: str
+
+        class _RecordingStorage:
+            def __init__(self) -> None:
+                self.put_calls: list[str] = []
+                self.delete_calls: list[tuple[str, str]] = []
+
+            async def put(self, key: str, payload: bytes, *, immutable: bool) -> _StoredOverlay:
+                assert immutable is True
+                self.put_calls.append(key)
+                return _StoredOverlay(
+                    key=key,
+                    storage_uri=f"memory://{key}",
+                    size_bytes=len(payload),
+                    checksum_sha256="0" * 64,
+                )
+
+            async def delete_failed_put(self, key: str, *, storage_uri: str) -> None:
+                self.delete_calls.append((key, storage_uri))
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        storage = _RecordingStorage()
+        original_emit_job_event = worker_module.emit_job_event
+
+        async def _run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            return _build_fake_ingest_payload(request)
+
+        async def _fail_success_event(*args: Any, **kwargs: Any) -> None:
+            if kwargs.get("message") == "Job succeeded":
+                raise RuntimeError("forced overlay finalization failure")
+            await original_emit_job_event(*args, **kwargs)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion)
+        monkeypatch.setattr(worker_module, "get_storage", lambda: storage)
+        monkeypatch.setattr(worker_module, "emit_job_event", _fail_success_event)
+
+        with pytest.raises(RuntimeError, match="forced overlay finalization failure"):
+            await process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert updated_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
+        assert len(storage.put_calls) == 1
+        assert storage.delete_calls == [
+            (storage.put_calls[0], f"memory://{storage.put_calls[0]}")
+        ]
+
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+
+        assert adapter_outputs == []
+        assert drawing_revisions == []
+        assert validation_reports == []
+        assert generated_artifacts == []
+
+    async def test_process_ingest_job_precommit_cancellation_cleans_storage_without_outputs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A pre-commit cancellation should clean storage and persist no outputs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        @dataclass(frozen=True, slots=True)
+        class _StoredOverlay:
+            key: str
+            storage_uri: str
+            size_bytes: int
+            checksum_sha256: str
+
+        class _RecordingStorage:
+            def __init__(self) -> None:
+                self.put_calls: list[str] = []
+                self.delete_calls: list[tuple[str, str]] = []
+
+            async def put(self, key: str, payload: bytes, *, immutable: bool) -> _StoredOverlay:
+                assert immutable is True
+                self.put_calls.append(key)
+                return _StoredOverlay(
+                    key=key,
+                    storage_uri=f"memory://{key}",
+                    size_bytes=len(payload),
+                    checksum_sha256="0" * 64,
+                )
+
+            async def delete_failed_put(self, key: str, *, storage_uri: str) -> None:
+                self.delete_calls.append((key, storage_uri))
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        storage = _RecordingStorage()
+        original_emit_job_event = worker_module.emit_job_event
+
+        async def _run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            return _build_fake_ingest_payload(request)
+
+        async def _cancel_success_event(*args: Any, **kwargs: Any) -> None:
+            if kwargs.get("message") == "Job succeeded":
+                raise asyncio.CancelledError()
+            await original_emit_job_event(*args, **kwargs)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion)
+        monkeypatch.setattr(worker_module, "get_storage", lambda: storage)
+        monkeypatch.setattr(worker_module, "emit_job_event", _cancel_success_event)
+
+        with suppress(asyncio.CancelledError):
+            await process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.error_message is None
+        assert len(storage.put_calls) == 1
+        assert storage.delete_calls == [
+            (storage.put_calls[0], f"memory://{storage.put_calls[0]}")
+        ]
 
         (
             adapter_outputs,
