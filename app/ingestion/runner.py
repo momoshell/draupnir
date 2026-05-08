@@ -18,6 +18,7 @@ from app.ingestion.contracts import (
     AdapterResult,
     AdapterSource,
     AdapterTimeout,
+    AdapterUnavailableError,
     AvailabilityReason,
     CancellationHandle,
     IngestionAdapter,
@@ -332,6 +333,22 @@ def _execute_preflight_unavailable_error(
     adapter_key: str,
     exc: Exception,
 ) -> IngestionRunnerError | None:
+    if isinstance(exc, AdapterUnavailableError):
+        details: dict[str, Any] = {
+            "adapter_key": adapter_key,
+            "stage": "execute",
+            "reason": exc.availability_reason.value,
+        }
+        if exc.detail is not None:
+            details["detail"] = exc.detail
+
+        return IngestionRunnerError(
+            error_code=ErrorCode.ADAPTER_UNAVAILABLE,
+            failure_kind=AdapterFailureKind.UNAVAILABLE,
+            message="Adapter preflight reported unavailable.",
+            details=details,
+        )
+
     if adapter_key != "pymupdf":
         return None
 
