@@ -519,9 +519,17 @@ def test_vtracer_tesseract_detect_page_count_counts_boundary_split_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_path = tmp_path / "boundary.pdf"
-    source_path.write_bytes(b"%PDF-1.4abcd/Type" + b" /Page >>\n%%EOF\n")
-    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_CHUNK_SIZE", 16)
-    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_OVERLAP", 8)
+    chunk_size = 16
+    marker_prefix = b"/Type"
+    marker_suffix = b" /Page"
+
+    payload = b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n"
+    pad_len = (chunk_size - ((len(payload) + len(marker_prefix)) % chunk_size)) % chunk_size
+    payload += (b"x" * pad_len) + marker_prefix + marker_suffix + b" >>\n%%EOF\n"
+    source_path.write_bytes(payload)
+
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_CHUNK_SIZE", chunk_size)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_PAGE_SCAN_OVERLAP", len(marker_prefix))
 
     assert (
         vtracer_tesseract_adapter._detect_page_count(
@@ -529,7 +537,7 @@ def test_vtracer_tesseract_detect_page_count_counts_boundary_split_marker(
             page_cap=vtracer_tesseract_adapter._MAX_PAGES,
             cancellation=None,
         )
-        == 1
+        == 2
     )
 
 
