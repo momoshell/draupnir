@@ -27,8 +27,10 @@ COPY app/ ./app/
 # Install project and runtime extras into the project environment
 RUN uv sync --locked --no-dev --extra db --extra jobs
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Create non-root user and shared upload root
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /app/var/uploads \
+    && chown -R appuser:appuser /app
 USER appuser
 
 # Expose port
