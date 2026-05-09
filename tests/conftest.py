@@ -13,6 +13,8 @@ from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.api.v1.files as files_api
+import app.jobs.worker as worker_module
 from app.core.config import settings
 from app.db.session import get_db
 from app.main import app as fastapi_app
@@ -112,3 +114,16 @@ async def cleanup_projects() -> AsyncGenerator[None, None]:
     async with session_maker() as session:
         await session.execute(text("TRUNCATE TABLE projects CASCADE"))
         await session.commit()
+
+
+@pytest.fixture
+def enqueued_job_ids(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture enqueue calls without requiring a live broker."""
+    recorded_job_ids: list[str] = []
+
+    def _fake_enqueue(job_id: object) -> None:
+        recorded_job_ids.append(str(job_id))
+
+    monkeypatch.setattr(files_api, "enqueue_ingest_job", _fake_enqueue)
+    monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_enqueue)
+    return recorded_job_ids

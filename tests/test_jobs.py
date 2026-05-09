@@ -323,18 +323,6 @@ async def _create_job_event(
     return event
 
 
-@pytest.fixture
-def enqueued_job_ids(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Capture enqueue calls without requiring a live broker."""
-    recorded_job_ids: list[str] = []
-
-    def _fake_enqueue(job_id: uuid.UUID) -> None:
-        recorded_job_ids.append(str(job_id))
-
-    monkeypatch.setattr(files_api, "enqueue_ingest_job", _fake_enqueue)
-    return recorded_job_ids
-
-
 @pytest.fixture(autouse=True)
 def fake_ingestion_runner(
     monkeypatch: pytest.MonkeyPatch,
