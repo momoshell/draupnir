@@ -4,8 +4,11 @@ import io
 import json
 import logging
 import os
+import subprocess
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import httpx
@@ -346,13 +349,100 @@ class TestIngestWorkflowSmoke:
         assert upload_response.status_code == 422
 
 
-# Skip unless SMOKE_BASE_URL is set (for compose-stack testing)
+# Skip unless compose smoke is explicitly enabled.
+COMPOSE_SMOKE = os.environ.get("COMPOSE_SMOKE") == "1"
 SMOKE_BASE_URL = os.environ.get("SMOKE_BASE_URL", "")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+WORKER_STORAGE_READ_SCRIPT = """
+import asyncio
+import hashlib
+import inspect
+import json
+import os
+
+from app.storage.dependencies import get_storage
+
+
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+async def main():
+    storage = get_storage()
+    storage_key = os.environ["STORAGE_KEY"]
+    expected_sha256 = os.environ["EXPECTED_SHA256"]
+
+    metadata = await _maybe_await(
+        storage.stat(storage_key, expected_checksum_sha256=expected_sha256)
+    )
+    stored_object = await _maybe_await(
+        storage.get(storage_key, expected_checksum_sha256=expected_sha256)
+    )
+    content = stored_object.body
+    if hasattr(content, "read"):
+        content = await _maybe_await(content.read())
+
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != expected_sha256:
+        raise AssertionError(f"sha256 mismatch: {digest} != {expected_sha256}")
+
+    print(
+        json.dumps(
+            {
+                "path": storage_key,
+                "sha256": digest,
+                "size": metadata.size_bytes,
+            }
+        )
+    )
+
+
+asyncio.run(main())
+"""
+
+
+def _read_original_from_worker_storage(
+    *, storage_key: str, expected_sha256: str
+) -> dict[str, object]:
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "-e",
+            f"STORAGE_KEY={storage_key}",
+            "-e",
+            f"EXPECTED_SHA256={expected_sha256}",
+            "worker",
+            "python",
+            "-c",
+            WORKER_STORAGE_READ_SCRIPT,
+        ],
+        check=False,
+        capture_output=True,
+        cwd=REPO_ROOT,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+    stdout_lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert stdout_lines, "worker storage probe produced no stdout"
+
+    payload: object = json.loads(stdout_lines[-1])
+    assert isinstance(payload, dict), "worker storage probe returned non-object JSON"
+    assert all(
+        isinstance(key, str) for key in payload
+    ), "worker storage probe returned non-string keys"
+
+    return cast(dict[str, object], payload)
 
 
 @pytest.mark.skipif(
-    not SMOKE_BASE_URL,
-    reason="SMOKE_BASE_URL not set (set to run against real server)",
+    not (COMPOSE_SMOKE and SMOKE_BASE_URL),
+    reason="COMPOSE_SMOKE=1 and SMOKE_BASE_URL must be set for compose smoke",
 )
 class TestHealthEndpointRealServer:
     """Smoke tests against a real running server (compose stack)."""
@@ -371,8 +461,7 @@ class TestHealthEndpointRealServer:
         """Test that GET /v1/health returns 200 against real server.
 
         Success case: Real server responds with 200 and correct JSON shape.
-        This test only runs when SMOKE_BASE_URL environment variable is set,
-        allowing CI to test against the compose stack after `docker compose up`.
+        This test only runs when compose smoke is explicitly enabled.
         """
         response = await real_async_client.get("/v1/health")
 
@@ -395,3 +484,40 @@ class TestHealthEndpointRealServer:
         # Assert request ID length is within bounds
         assert len(request_id) <= 64
         assert len(request_id) > 0
+
+    async def test_upload_original_is_readable_from_worker_storage(
+        self,
+        real_async_client: httpx.AsyncClient,
+    ) -> None:
+        """Compose stack shares immutable upload storage between API and worker."""
+        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+
+        project_response = await real_async_client.post(
+            "/v1/projects",
+            json={"name": "compose-smoke-project"},
+        )
+        assert project_response.status_code == 201
+        project_id = project_response.json()["id"]
+
+        upload_response = await real_async_client.post(
+            f"/v1/projects/{project_id}/files",
+            files={"file": ("compose-smoke.pdf", pdf_bytes, "application/pdf")},
+        )
+        assert upload_response.status_code == 201
+
+        upload_data = upload_response.json()
+        file_id = upload_data["id"]
+        UUID(file_id)
+        checksum_sha256 = upload_data["checksum_sha256"]
+        storage_key = f"originals/{file_id}/{checksum_sha256}"
+
+        worker_data = _read_original_from_worker_storage(
+            storage_key=storage_key,
+            expected_sha256=checksum_sha256,
+        )
+
+        assert worker_data == {
+            "path": storage_key,
+            "sha256": checksum_sha256,
+            "size": len(pdf_bytes),
+        }

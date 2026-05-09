@@ -15,6 +15,7 @@ services:
       - LOG_LEVEL=info
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-api
+      - STORAGE_LOCAL_ROOT=/app/var/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,6 +34,7 @@ services:
       - ./app:/app/app
       - ./alembic.ini:/app/alembic.ini
       - ./alembic:/app/alembic
+      - upload_storage:/app/var/uploads:rw
 
   worker:
     build: .
@@ -43,6 +45,7 @@ services:
       - LOG_LEVEL=info
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-worker
+      - STORAGE_LOCAL_ROOT=/app/var/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,6 +62,8 @@ services:
     restart: unless-stopped
     networks:
       - draupnir-network
+    volumes:
+      - upload_storage:/app/var/uploads:rw
 
   postgres:
     image: postgres:17-alpine
@@ -115,6 +120,7 @@ services:
 
 volumes:
   postgres_data:
+  upload_storage:
 
 networks:
   draupnir-network:
