@@ -43,8 +43,9 @@ Docker Compose development stack is available. See "Local Development" below for
    ```
 
 5. **View RabbitMQ management UI**:
-   - Open http://localhost:15672 in your browser
-   - Login: guest / guest
+    - Open http://localhost:15672 in your browser
+    - Login: guest / guest
+    - AMQP is also exposed on localhost:5672 for host-side clients only
 
 6. **View logs**:
    ```bash
@@ -64,9 +65,12 @@ Docker Compose development stack is available. See "Local Development" below for
 |-----------|----------------------|--------------------------------|
 | api       | 8000                 | FastAPI application            |
 | worker    | —                    | Celery background worker       |
-| postgres  | 5432                 | PostgreSQL database            |
-| rabbitmq  | 5672, 15672          | RabbitMQ message broker        |
-| flower    | 5555                 | Celery dashboard (optional)    |
+| postgres  | localhost:5432       | PostgreSQL database            |
+| rabbitmq  | localhost:5672, localhost:15672 | RabbitMQ message broker |
+| flower    | localhost:5555       | Celery dashboard (optional)    |
+
+Postgres, RabbitMQ, and Flower host ports bind to `127.0.0.1` only. Containers
+still reach RabbitMQ over the internal Docker network at `rabbitmq:5672`.
 
 ### Useful Commands
 

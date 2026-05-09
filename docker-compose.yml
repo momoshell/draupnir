@@ -1,7 +1,7 @@
 # Local development stack only. Do not use in production.
 #
-# Internal services (postgres, rabbitmq management, flower) bind to 127.0.0.1
-# to avoid exposing data-plane and admin ports on shared hosts.
+# Internal services (postgres, rabbitmq AMQP/management, flower) bind to
+# 127.0.0.1 to avoid exposing data-plane and admin ports on shared hosts.
 
 services:
   api:
@@ -86,7 +86,7 @@ services:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     ports:
-      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_HOST_PORT:-5672}:5672"
       - "127.0.0.1:${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
     healthcheck:
       test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
