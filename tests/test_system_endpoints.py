@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -27,6 +28,8 @@ from app.schemas.system import (
     DependencyHealthCheck,
     SystemCheckStatus,
 )
+from app.storage import LocalFilesystemStorage
+from app.storage.base import StorageHealthReport
 
 
 @pytest.fixture
@@ -416,3 +419,49 @@ async def test_probe_descriptor_availability_reuses_inflight_thread_probe_on_tim
         await asyncio.sleep(0.01)
 
     assert descriptor.adapter_key not in system_api._INFLIGHT_ADAPTER_PROBE_TASKS
+
+
+@pytest.mark.asyncio
+async def test_probe_storage_check_uses_storage_health_abstraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storage health should come from the storage protocol, not backend internals."""
+
+    class SlotBackedStorage:
+        __slots__ = ()
+
+        async def healthcheck(self) -> StorageHealthReport:
+            return StorageHealthReport(
+                ok=True,
+                details={"backend": "slot_storage", "reachable": True},
+            )
+
+    monkeypatch.setattr(system_api, "get_storage", lambda: SlotBackedStorage())
+
+    result = await system_api._probe_storage_check()
+
+    assert result.status is SystemCheckStatus.OK
+    assert result.details == {"backend": "slot_storage", "reachable": True}
+
+
+@pytest.mark.asyncio
+async def test_probe_storage_check_surfaces_local_storage_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local storage health should surface operator-useful backend details."""
+
+    storage = LocalFilesystemStorage(tmp_path / "storage-root")
+    monkeypatch.setattr(system_api, "get_storage", lambda: storage)
+
+    result = await system_api._probe_storage_check()
+
+    assert result.status is SystemCheckStatus.OK
+    assert result.details == {
+        "backend": "local_filesystem",
+        "reachable": True,
+        "root_configured": True,
+        "root_exists": False,
+    }
+    assert "root" not in result.details
+    assert "nearest_existing_ancestor" not in result.details

@@ -12,6 +12,7 @@ from typing import BinaryIO
 
 from app.storage.base import (
     StorageChecksumMismatchError,
+    StorageHealthReport,
     StoragePayload,
     StoredObject,
     StoredObjectMeta,
@@ -76,6 +77,10 @@ class LocalFilesystemStorage:
         """Stub presign support for local storage."""
         _ = (key, method, expires_in_seconds)
         return None
+
+    async def healthcheck(self) -> StorageHealthReport:
+        """Report whether the configured local storage root is reachable."""
+        return await asyncio.to_thread(self._healthcheck_sync)
 
     def _put_sync(self, key: str, data: StoragePayload, immutable: bool) -> StoredObjectMeta:
         final_path = self._path_for_key(key)
@@ -153,6 +158,23 @@ class LocalFilesystemStorage:
     def _exists_sync(self, key: str) -> bool:
         return self._path_for_key(key).exists()
 
+    def _healthcheck_sync(self) -> StorageHealthReport:
+        existing = self._nearest_existing_ancestor(self.root)
+        root_exists = self.root.exists()
+        details: dict[str, object] = {
+            "backend": "local_filesystem",
+            "root_configured": True,
+            "root_exists": root_exists,
+        }
+
+        reachable = (
+            existing is not None
+            and existing.is_dir()
+            and os.access(existing, os.R_OK | os.W_OK | os.X_OK)
+        )
+        details["reachable"] = reachable
+        return StorageHealthReport(ok=reachable, details=details)
+
     def _write_temp_file(self, temp_path: Path, data: StoragePayload) -> tuple[int, str]:
         with temp_path.open("xb") as stream:
             temp_path.chmod(0o600)
@@ -223,6 +245,12 @@ class LocalFilesystemStorage:
 
     def _target_mode(self, immutable: bool) -> int:
         return 0o444 if immutable else 0o600
+
+    def _nearest_existing_ancestor(self, path: Path) -> Path | None:
+        for candidate in (path, *path.parents):
+            if candidate.exists():
+                return candidate
+        return None
 
     def _path_for_key(self, key: str) -> Path:
         if key == "":

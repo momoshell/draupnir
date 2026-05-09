@@ -59,6 +59,17 @@ async def test_memory_storage_stat_and_presign_stub() -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_storage_healthcheck_reports_backend_details() -> None:
+    """Memory storage should expose health through the shared abstraction."""
+    storage = MemoryStorage()
+
+    report = await storage.healthcheck()
+
+    assert report.ok is True
+    assert report.details == {"backend": "memory", "reachable": True}
+
+
+@pytest.mark.asyncio
 async def test_memory_storage_rejects_overwrite_for_mutable_keys() -> None:
     """Memory storage should refuse overwrite operations for mutable keys."""
     storage = MemoryStorage()
@@ -141,6 +152,28 @@ async def test_local_storage_round_trip_and_cleanup(tmp_path: Path) -> None:
 
     assert await storage.exists(key) is True
     assert list((tmp_path / "originals" / "file-4").glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_local_storage_healthcheck_reports_root_details_without_creating_root(
+    tmp_path: Path,
+) -> None:
+    """Local storage health should describe the configured root without side effects."""
+    root = tmp_path / "storage-root"
+    storage = LocalFilesystemStorage(root)
+
+    report = await storage.healthcheck()
+
+    assert report.ok is True
+    assert report.details == {
+        "backend": "local_filesystem",
+        "reachable": True,
+        "root_configured": True,
+        "root_exists": False,
+    }
+    assert "root" not in report.details
+    assert "nearest_existing_ancestor" not in report.details
+    assert root.exists() is False
 
 
 @pytest.mark.asyncio
