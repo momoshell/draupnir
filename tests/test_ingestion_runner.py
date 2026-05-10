@@ -9,7 +9,7 @@ import types
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, Literal, cast
 from uuid import uuid4
 
 import ezdxf
@@ -33,8 +33,14 @@ from app.ingestion.contracts import (
 )
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.ingestion.selection import select_adapter_candidates
-from app.ingestion.source import OriginalSourceMaterialization, materialize_original_source
+from app.ingestion.source import (
+    OriginalSourceMaterialization,
+    OriginalSourceReadError,
+    OriginalSourceStageError,
+    materialize_original_source,
+)
 from app.storage.keys import build_original_storage_key
+from app.storage.local import LocalFilesystemStorage
 from app.storage.memory import MemoryStorage
 
 _DXF_SMOKE_FIXTURE = Path(__file__).parent / "fixtures" / "dxf" / "simple-line.dxf"
@@ -167,6 +173,152 @@ async def test_materialize_original_source_stages_and_cleans_up(tmp_path: Path) 
         assert source.original_name == "../drawing.pdf"
 
     assert not staged_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_materialize_original_source_uses_copy_to_path_when_get_is_broken(
+    tmp_path: Path,
+) -> None:
+    class _CopyOnlyMemoryStorage(MemoryStorage):
+        async def get(self, *_args: object, **_kwargs: object) -> Any:
+            raise AssertionError("get should not be used for staging")
+
+    storage = _CopyOnlyMemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+
+    materialization = OriginalSourceMaterialization(
+        file_id=file_id,
+        checksum_sha256=checksum,
+        upload_format=UploadFormat.PDF,
+        input_family=InputFamily.PDF_VECTOR,
+        media_type="application/pdf",
+    )
+
+    async with materialize_original_source(
+        materialization,
+        storage=storage,
+        temp_root=tmp_path,
+    ) as source:
+        assert source.file_path.read_bytes() == body
+
+
+@pytest.mark.asyncio
+async def test_materialize_original_source_maps_local_source_read_oserror_to_read_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = LocalFilesystemStorage(tmp_path / "storage")
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+
+    class _BrokenSourceStream:
+        def __enter__(self) -> _BrokenSourceStream:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
+            return False
+
+        def read(self, _size: int) -> bytes:
+            raise OSError("source read failed")
+
+        def close(self) -> None:
+            return None
+
+    def _open_copy_source(_source_path: Path, _key: str) -> BinaryIO:
+        return cast(BinaryIO, _BrokenSourceStream())
+
+    monkeypatch.setattr(storage, "_open_copy_source", _open_copy_source)
+
+    materialization = OriginalSourceMaterialization(
+        file_id=file_id,
+        checksum_sha256=checksum,
+        upload_format=UploadFormat.PDF,
+        input_family=InputFamily.PDF_VECTOR,
+        media_type="application/pdf",
+    )
+
+    with pytest.raises(OriginalSourceReadError) as exc_info:
+        async with materialize_original_source(
+            materialization,
+            storage=storage,
+            temp_root=temp_root,
+        ):
+            pytest.fail("materialization should fail before yielding")
+
+    assert exc_info.value.reason == "read_failed"
+    assert exc_info.value.storage_key == key
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_materialize_original_source_maps_destination_write_oserror_to_stage_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = LocalFilesystemStorage(tmp_path / "storage")
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+
+    class _BrokenDestinationStream:
+        def __init__(self, stream: BinaryIO) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> _BrokenDestinationStream:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
+            self._stream.close()
+            return False
+
+        def write(self, _chunk: bytes) -> int:
+            raise OSError("destination write failed")
+
+        def flush(self) -> None:
+            self._stream.flush()
+
+        def fileno(self) -> int:
+            return self._stream.fileno()
+
+        def close(self) -> None:
+            self._stream.close()
+
+    def _open_copy_destination(destination: Path, _key: str) -> BinaryIO:
+        return cast(BinaryIO, _BrokenDestinationStream(destination.open("xb")))
+
+    monkeypatch.setattr(storage, "_open_copy_destination", _open_copy_destination)
+
+    materialization = OriginalSourceMaterialization(
+        file_id=file_id,
+        checksum_sha256=checksum,
+        upload_format=UploadFormat.PDF,
+        input_family=InputFamily.PDF_VECTOR,
+        media_type="application/pdf",
+    )
+
+    with pytest.raises(OriginalSourceStageError) as exc_info:
+        async with materialize_original_source(
+            materialization,
+            storage=storage,
+            temp_root=temp_root,
+        ):
+            pytest.fail("materialization should fail before yielding")
+
+    assert exc_info.value.reason == "stage_failed"
+    assert list(temp_root.iterdir()) == []
 
 
 def test_select_adapter_candidates_keeps_pdf_vector_then_raster_order() -> None:
@@ -1359,9 +1511,9 @@ async def test_run_ingestion_enforces_source_timeout_checkpoint(
     module = _AdapterModule("timeout_adapter_module", lambda: _FakeAdapter(seen_paths=[]))
 
     class _SlowMemoryStorage(MemoryStorage):
-        async def get(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        async def copy_to_path(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             await asyncio.sleep(0.02)
-            return await super().get(*args, **kwargs)
+            return await super().copy_to_path(*args, **kwargs)
 
     def fake_import_module(module_name: str) -> types.ModuleType:
         if module_name == "app.ingestion.adapters.ezdxf":

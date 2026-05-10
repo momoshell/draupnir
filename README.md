@@ -7,11 +7,17 @@ focuses on accepting common real-world drawing inputs, extracting structured
 geometry and semantic data, producing deterministic quantities and estimates,
 and exposing everything through a UI-agnostic API.
 
+The MVP product surface is API-only. Future clients may include a web UI, TUI,
+CLI, or other services, but this repository does not imply that a product CLI
+exists today.
+
 ## Current Status
 
 Docker Compose development stack is available. See "Local Development" below for setup instructions.
 
 ## Local Development
+
+Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
 
 ### Prerequisites
 
@@ -19,6 +25,21 @@ Docker Compose development stack is available. See "Local Development" below for
 - uv
 
 ### Quick Start with Docker
+
+> [!WARNING]
+> Docker Compose now runs PostgreSQL 18. Existing local Docker volumes created
+> for PostgreSQL 17 will not boot as-is under PostgreSQL 18.
+> 
+> - If the data matters, dump it from PostgreSQL 17 first and restore it into a
+>   fresh PostgreSQL 18 volume.
+> - If the data does not matter, reset the local stack destructively with:
+>   ```bash
+>   make down -v
+>   # or: docker compose down -v
+>   ```
+> - Rollback note: after you migrate or reset to PostgreSQL 18, you cannot
+>   reuse that data directory with PostgreSQL 17; rolling back requires
+>   restoring a PostgreSQL 17 backup into a fresh PostgreSQL 17 volume.
 
 1. **Copy environment file**:
    ```bash
@@ -65,7 +86,7 @@ Docker Compose development stack is available. See "Local Development" below for
 |-----------|----------------------|--------------------------------|
 | api       | 8000                 | FastAPI application            |
 | worker    | —                    | Celery background worker       |
-| postgres  | localhost:5432       | PostgreSQL database            |
+| postgres  | localhost:5432       | PostgreSQL 18 database         |
 | rabbitmq  | localhost:5672, localhost:15672 | RabbitMQ message broker |
 | flower    | localhost:5555       | Celery dashboard (optional)    |
 
@@ -82,6 +103,19 @@ make down -v        # Stop and remove volumes (destructive)
 ```
 
 ### Local Development (without Docker)
+
+Prerequisite: use PostgreSQL 18 for host-side database development, or point
+your host tools at the Docker Compose PostgreSQL 18 instance on
+`postgresql://postgres:postgres@localhost:5432/draupnir`.
+
+Check your local PostgreSQL client/server major version before using a host-side
+database:
+
+```bash
+psql --version
+```
+
+The reported version should be PostgreSQL 18.x.
 
 1. **Install dependencies**:
    ```bash
@@ -143,7 +177,8 @@ shapes.
 
 ## MVP Direction
 
-- Backend API that any web UI, TUI, CLI, or service can consume.
+- API-only MVP product surface.
+- Backend API that future web UIs, TUIs, CLIs, or services can consume.
 - Primary starting inputs: DWG, vector PDF, and raster PDF.
 - Direct normalized/open inputs: DXF and IFC where available.
 - Outputs: JSON, CSV, PDF estimate/report, and editable CAD revisions.

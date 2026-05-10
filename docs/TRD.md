@@ -3,8 +3,13 @@
 ## System Overview
 
 Draupnir is a backend service for CAD/BIM ingestion, quantity extraction,
-estimation, and revision generation. It exposes a stable API for multiple future
-clients, including web apps, TUIs, CLIs, and other backend services.
+estimation, and revision generation. MVP delivery is API-only. It exposes a
+stable API for future clients, including web apps, TUIs, CLIs, and other
+backend services.
+
+The MVP must not require or imply a separate product CLI. Command-line usage in
+development is operational only (for example, local server, worker, or
+migration commands), not an end-user product surface.
 
 ## Architecture Principles
 
@@ -34,6 +39,9 @@ Reports:        JSON/CSV first, PDF report after estimate model stabilizes
 AI gateway:     LiteLLM later
 Agent layer:    Pydantic AI later, optional
 ```
+
+Local Docker Compose development and GitHub Actions CI must run PostgreSQL 18 to
+match the MVP database contract.
 
 ## Input Handling
 
@@ -628,9 +636,9 @@ prior one.
 - Idempotent mutating endpoints accept `Idempotency-Key` headers and return the
   prior response on replay within a documented retention window.
 - When job enqueue fails after durable records are created, the public error must
-  stay sanitized and may include only safe identifiers already assigned by the
-  system, such as `file_id`, `job_id`, or `extraction_profile_id` where
-  applicable.
+  stay sanitized and may include only safe system-assigned identifiers and
+  workflow metadata, such as `file_id`, `job_id`, `extraction_profile_id`, or
+  `status` where applicable.
 
 ## Error Taxonomy
 

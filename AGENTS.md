@@ -11,6 +11,8 @@ service.
 
 ## Current MVP Scope
 
+- Product surface is API-only for MVP. Do not assume or document a shipped
+  product CLI, TUI, or web UI unless a scoped task explicitly adds one.
 - Accept DWG, vector PDF, and raster PDF inputs.
 - Treat DXF and IFC as first-class normalized/open inputs where available.
 - Preserve original uploads immutably.

@@ -88,6 +88,7 @@ class VTracerTesseractAdapter(IngestionAdapter):
                 "geometry_mode": "raster",
                 "page_count": page_count,
                 "default_layer": _DEFAULT_LAYER,
+                "empty_entities_reason": "raster_vectorization_deferred",
                 "text_blocks": [],
                 "pdf_scale": {
                     "status": "unconfirmed",

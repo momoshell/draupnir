@@ -12,6 +12,7 @@ from typing import Any, cast
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 import app.api.v1.files as files_api
 import app.api.v1.jobs as jobs_api
@@ -429,7 +430,7 @@ class TestJobs:
         cleanup_projects: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Uploading should leave a visible failed job when broker publish fails."""
+        """Uploading should expose safe failed-job identifiers when broker publish fails."""
         _ = self
         _ = cleanup_projects
 
@@ -439,8 +440,27 @@ class TestJobs:
         monkeypatch.setattr(files_api, "enqueue_ingest_job", _fail_enqueue)
 
         project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
-        job = await _get_job_for_file(str(uploaded["id"]))
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files",
+            files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+        )
+
+        assert response.status_code == 500
+        payload = response.json()
+        assert payload["error"]["code"] == "INTERNAL_ERROR"
+        assert payload["error"]["message"] == "Failed to enqueue ingest job"
+        assert payload["error"]["details"] is not None
+        assert "broker unavailable" not in response.text
+
+        details = cast(dict[str, str], payload["error"]["details"])
+        job = await _get_job_for_file(details["file_id"])
+
+        assert details == {
+            "file_id": str(job.file_id),
+            "job_id": str(job.id),
+            "extraction_profile_id": str(job.extraction_profile_id),
+            "status": "failed",
+        }
 
         assert job.status == "failed"
         assert job.attempts == 0
@@ -633,8 +653,8 @@ class TestJobs:
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
             logger_error_calls.append((event, kwargs))
 
-        def _fail_write_bytes(self: Any, _: bytes) -> int:
-            raise OSError(f"{secret_temp_marker}: {self}")
+        async def _fail_copy_to_path(*args: Any, **kwargs: Any) -> Any:
+            raise OSError(f"{secret_temp_marker}: staging")
 
         module = _AdapterModule("available_stage_vector_adapter_module", lambda: object())
 
@@ -651,7 +671,11 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
         await _update_source_file(uuid.UUID(uploaded["id"]), original_filename="..")
-        monkeypatch.setattr("app.ingestion.source.Path.write_bytes", _fail_write_bytes)
+        monkeypatch.setattr("app.storage.memory.MemoryStorage.copy_to_path", _fail_copy_to_path)
+        monkeypatch.setattr(
+            "app.storage.local.LocalFilesystemStorage.copy_to_path",
+            _fail_copy_to_path,
+        )
 
         with pytest.raises(IngestionRunnerError, match="Failed to stage original source"):
             await worker_module.process_ingest_job(job.id)
@@ -1305,6 +1329,49 @@ class TestJobs:
         updated_job = await _get_job(job.id)
         assert updated_job.status == "pending"
         assert updated_job.attempts == 0
+
+    async def test_recover_incomplete_ingest_jobs_requeues_pending_reprocess_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker startup recovery should requeue pending reprocess jobs."""
+        _ = self
+        _ = cleanup_projects
+
+        recovered_job_ids: list[str] = []
+
+        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+            recovered_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        enqueued_job_ids.clear()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.job_type = "reprocess"
+            await session.commit()
+
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
+
+        assert recovered_job_ids == [str(job.id)]
+        assert requeued == [job.id]
+
+        await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.job_type == "reprocess"
+        assert updated_job.status == "succeeded"
+        assert updated_job.attempts == 1
 
     async def test_recover_incomplete_ingest_jobs_requeues_orphaned_running_jobs(
         self,
@@ -1986,3 +2053,108 @@ class TestJobs:
         assert after.attempts == 1
         assert after.cancel_requested is True
         assert after.finished_at == before_finished_at
+
+    async def test_job_constraints_accept_valid_type_status_error_writes(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Valid constrained job writes should still commit."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+
+            persisted_job.job_type = "reprocess"
+            persisted_job.status = "failed"
+            persisted_job.error_code = ErrorCode.ADAPTER_FAILED.value
+            persisted_job.error_message = "Adapter execution failed."
+
+            await session.commit()
+
+        updated = await _get_job(job.id)
+        assert updated.job_type == "reprocess"
+        assert updated.status == "failed"
+        assert updated.error_code == ErrorCode.ADAPTER_FAILED.value
+
+    @pytest.mark.parametrize(
+        ("field_name", "invalid_value"),
+        [
+            ("job_type", "not-a-job-type"),
+            ("status", "queued"),
+            ("error_code", "NOT_A_REAL_ERROR_CODE"),
+        ],
+    )
+    async def test_job_constraints_reject_invalid_string_writes(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        field_name: str,
+        invalid_value: str,
+    ) -> None:
+        """Invalid constrained string writes should fail at the database."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+
+            setattr(persisted_job, field_name, invalid_value)
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()
+
+    @pytest.mark.parametrize("job_type", ["ingest", "reprocess"])
+    async def test_job_constraints_reject_profile_required_job_without_extraction_profile(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        job_type: str,
+    ) -> None:
+        """Persisted ingest/reprocess jobs must retain an extraction profile identifier."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+
+            persisted_job.job_type = job_type
+            persisted_job.extraction_profile_id = None
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()

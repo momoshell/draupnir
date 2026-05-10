@@ -47,6 +47,11 @@ from app.ingestion.registry import (
     get_registry,
     list_descriptors,
 )
+from tests.ingestion_contract_harness import (
+    ContractFinalizationExpectation,
+    build_contract_source,
+    exercise_adapter_contract,
+)
 
 
 class _FakePoint:
@@ -413,6 +418,7 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
             "geometry_mode": "raster",
             "page_count": 2,
             "default_layer": "default",
+            "empty_entities_reason": "raster_vectorization_deferred",
             "text_blocks": [],
             "pdf_scale": {
                 "status": "unconfirmed",
@@ -488,6 +494,59 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
             code="raster_scale_unconfirmed",
             message="Raster PDF scale remains unconfirmed in scaffold output.",
         ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_vtracer_tesseract_adapter_passes_shared_contract_harness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "raster.pdf"
+    source_path.write_bytes(
+        b"%PDF-1.4\n"
+        b"1 0 obj << /Type /Page >> endobj\n"
+        b"2 0 obj << /Type /Page >> endobj\n"
+        b"%%EOF\n"
+    )
+    adapter = vtracer_tesseract_adapter.create_adapter()
+
+    monkeypatch.setattr(adapter, "_runtime_for_ingest", lambda: object())
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_vtracer_available", lambda: True)
+    monkeypatch.setattr(vtracer_tesseract_adapter, "_tesseract_binary_path", lambda: None)
+
+    payload = await exercise_adapter_contract(
+        adapter,
+        source=build_contract_source(
+            file_path=source_path,
+            upload_format=UploadFormat.PDF,
+            input_family=InputFamily.PDF_RASTER,
+            original_name="raster.pdf",
+        ),
+        input_family=InputFamily.PDF_RASTER,
+        adapter_key="vtracer_tesseract",
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            warning_codes=(
+                "RASTER_SCAFFOLD_ONLY",
+                "RASTER_SCALE_UNCONFIRMED",
+                "RASTER_GEOMETRY_REVIEW_REQUIRED",
+                "RASTER_OCR_DEFERRED",
+            ),
+            diagnostic_codes=(
+                "raster_scaffold_created",
+                "raster_dependency_probe",
+                "raster_vectorization_deferred",
+                "raster_ocr_deferred",
+                "raster_scale_unconfirmed",
+            ),
+        ),
+    )
+
+    assert payload.canonical_json["metadata"]["empty_entities_reason"] == (
+        "raster_vectorization_deferred"
     )
 
 
@@ -792,17 +851,30 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
         pytest.skip("PyMuPDF runtime not installed for vector PDF smoke test.")
 
     fixture_path = Path(__file__).parent / "fixtures" / "pdf" / "vector-smoke.pdf"
-    result = await adapter.ingest(
-        AdapterSource(
-            file_path=fixture_path,
-            upload_format=UploadFormat.PDF,
-            input_family=InputFamily.PDF_VECTOR,
-        ),
-        AdapterExecutionOptions(),
+    source = build_contract_source(
+        file_path=fixture_path,
+        upload_format=UploadFormat.PDF,
+        input_family=InputFamily.PDF_VECTOR,
+        original_name=fixture_path.name,
     )
+    payload = await exercise_adapter_contract(
+        adapter,
+        source=source,
+        input_family=InputFamily.PDF_VECTOR,
+        adapter_key="pymupdf",
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            diagnostic_codes=("pymupdf.extract",),
+        ),
+        timeout=AdapterTimeout(seconds=5),
+    )
+    result = await adapter.ingest(source, AdapterExecutionOptions())
 
     assert result.confidence is not None
     assert result.confidence.review_required is True
+    assert payload.canonical_json["canonical_entity_schema_version"] == "0.1"
     assert result.canonical["schema_version"] == "0.1"
     assert result.canonical["canonical_entity_schema_version"] == "0.1"
     assert result.canonical["blocks"] == ()
@@ -830,6 +902,12 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
     assert entity["kind"] == "polyline"
     assert entity["layout"] == "page-1"
     assert entity["layer"] == "default"
+    assert entity["drawing_revision_id"] is None
+    assert entity["source_file_id"] is None
+    assert entity["layout_ref"] == "page-1"
+    assert entity["layer_ref"] == "default"
+    assert entity["block_ref"] is None
+    assert entity["parent_entity_ref"] is None
     assert entity["points"] == (
         {"x": 10.0, "y": 90.0},
         {"x": 90.0, "y": 90.0},
@@ -890,8 +968,14 @@ async def test_pymupdf_ingest_uses_process_hook_instead_of_parent_parser_calls(
 ) -> None:
     source_path = tmp_path / "vector.pdf"
     source_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
-    adapter = cast(pymupdf_adapter.PyMuPDFAdapter, pymupdf_adapter.create_adapter())
+    adapter = cast(
+        pymupdf_adapter.PyMuPDFAdapter,
+        pymupdf_adapter.create_adapter(license_acknowledged=lambda: True),
+    )
 
+    monkeypatch.setattr(pymupdf_adapter, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter, "_runtime_version", lambda _runtime: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter, "_package_version", lambda: "1.26.0")
     monkeypatch.setattr(adapter, "_runtime_for_ingest", lambda: None)
     monkeypatch.setattr(
         pymupdf_adapter,
@@ -927,6 +1011,7 @@ async def test_pymupdf_ingest_uses_process_hook_instead_of_parent_parser_calls(
                     "geometry_mode": "vector",
                     "page_count": 0,
                     "default_layer": "default",
+                    "empty_entities_reason": "no_vector_entities_detected",
                     "pdf_scale": {
                         "status": "unconfirmed",
                         "coordinate_space": "pdf_page_space_unrotated",
@@ -941,16 +1026,28 @@ async def test_pymupdf_ingest_uses_process_hook_instead_of_parent_parser_calls(
 
     monkeypatch.setattr(pymupdf_adapter, "_extract_with_process", _extract_with_process)
 
-    result = await adapter.ingest(
-        AdapterSource(
+    payload = await exercise_adapter_contract(
+        adapter,
+        source=build_contract_source(
             file_path=source_path,
             upload_format=UploadFormat.PDF,
             input_family=InputFamily.PDF_VECTOR,
+            original_name=source_path.name,
         ),
-        AdapterExecutionOptions(),
+        input_family=InputFamily.PDF_VECTOR,
+        adapter_key="pymupdf",
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            diagnostic_codes=("pymupdf.extract",),
+        ),
     )
 
-    assert result.canonical["entities"] == ()
+    assert payload.canonical_json["entities"] == []
+    assert payload.canonical_json["metadata"]["empty_entities_reason"] == (
+        "no_vector_entities_detected"
+    )
 
 
 @pytest.mark.asyncio
