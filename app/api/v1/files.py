@@ -1,9 +1,6 @@
 """Project-scoped file upload and retrieval endpoints."""
 
-import base64
-import binascii
 import hashlib
-import json
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
@@ -17,6 +14,11 @@ from fastapi import File as FilePart
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.pagination import (
+    decode_cursor_payload,
+    encode_cursor_payload,
+    raise_invalid_cursor,
+)
 from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
@@ -55,45 +57,23 @@ _MAX_MEDIA_TYPE_LENGTH = 255
 
 def _encode_cursor(created_at: datetime, file_id: UUID) -> str:
     """Encode cursor from created_at and file_id."""
-    cursor_data = {
-        "created_at": created_at.isoformat(),
-        "id": str(file_id),
-    }
-    return base64.urlsafe_b64encode(json.dumps(cursor_data).encode()).decode().rstrip("=")
+    return encode_cursor_payload(
+        {
+            "created_at": created_at.isoformat(),
+            "id": str(file_id),
+        }
+    )
 
 
-def _decode_cursor(cursor: str) -> dict[str, Any]:
-    """Decode cursor to dict with created_at and id."""
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    """Decode cursor to typed created_at and id values."""
     try:
-        padding = 4 - (len(cursor) % 4)
-        if padding != 4:
-            cursor += "=" * padding
-
-        decoded = base64.urlsafe_b64decode(cursor)
-        cursor_data_raw = json.loads(decoded.decode("utf-8"))
-        if not isinstance(cursor_data_raw, dict):
-            raise TypeError("Cursor payload must be a JSON object")
-        cursor_data = cast(dict[str, Any], cursor_data_raw)
-
-        _ = datetime.fromisoformat(str(cursor_data["created_at"]))
-        _ = UUID(str(cursor_data["id"]))
-        return cursor_data
-    except (
-        binascii.Error,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=create_error_response(
-                code=ErrorCode.INVALID_CURSOR,
-                message="Invalid cursor format",
-                details=None,
-            ),
-        ) from e
+        cursor_data = decode_cursor_payload(cursor)
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
+            str(cursor_data["id"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
 
 
 def _sniff_format(initial_bytes: bytes) -> str | None:
@@ -591,9 +571,7 @@ async def list_project_files(
     )
 
     if cursor:
-        cursor_data = _decode_cursor(cursor)
-        created_at = datetime.fromisoformat(str(cursor_data["created_at"]))
-        file_id = UUID(str(cursor_data["id"]))
+        created_at, file_id = _decode_cursor(cursor)
         query = query.filter(
             (FileModel.created_at < created_at)
             | ((FileModel.created_at == created_at) & (FileModel.id < file_id))
