@@ -288,6 +288,10 @@ class EzdxfAdapter:
             "entities": tuple(canonical_entities),
             "xrefs": xrefs,
         }
+        if not canonical_entities:
+            canonical["metadata"] = {
+                "empty_entities_reason": "dxf_modelspace_empty",
+            }
 
         review_required = (
             unsupported_entities > 0
@@ -625,9 +629,12 @@ def _unknown_entity_payload(
         "geometry": {
             "bbox": None,
             "units": dict(units),
+            "status": "absent",
+            "reason": "unsupported_or_invalid_geometry",
             "geometry_summary": {
                 "kind": "unknown",
                 "source_type": native_type,
+                "reason": "unsupported_or_invalid_geometry",
             },
         },
         "properties": {

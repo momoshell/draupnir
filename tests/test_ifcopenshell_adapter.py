@@ -262,12 +262,18 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
     canonical = payload.canonical_json
     assert canonical["ifc_schema"] == "IFC4"
     assert canonical["metadata"]["ifc_schema"] == "IFC4"
+    assert canonical["canonical_entity_schema_version"] == "0.1"
     assert canonical["project"]["name"] == "Demo Project"
     assert canonical["metadata"]["project"]["global_id"] == "PROJECT-1"
 
     entities = canonical["entities"]
     assert [entity["id"] for entity in entities] == ["DUPLICATE", "DUPLICATE-2", "#42"]
+    assert [entity["entity_id"] for entity in entities] == ["DUPLICATE", "DUPLICATE-2", "#42"]
     assert [entity["ifc_type"] for entity in entities] == ["IfcWall", "IfcWall", "IfcDoor"]
+    assert entities[0]["entity_type"] == "ifc_product"
+    assert entities[0]["entity_schema_version"] == "0.1"
+    assert entities[0]["geometry"]["reason"] == "semantic_metadata_only"
+    assert entities[0]["provenance"]["source_entity_ref"] == "entities.DUPLICATE"
     assert entities[0]["psets"][0]["name"] == "Pset_WallCommon"
     assert entities[0]["qtos"][0]["name"] == "Qto_WallBaseQuantities"
     assert entities[0]["material_refs"][0]["name"] == "Concrete"
@@ -604,6 +610,7 @@ async def test_ifcopenshell_adapter_short_circuits_invalid_schema_through_valida
         assert canonical["ifc_schema"] == expected_schema
         assert canonical["metadata"]["ifc_schema"] == expected_schema
     assert canonical["entities"] == []
+    assert canonical["metadata"]["empty_entities_reason"] == "semantic_extract_skipped"
 
 
 @pytest.mark.asyncio
@@ -630,6 +637,7 @@ async def test_ifcopenshell_adapter_capped_incomplete_header_continues_to_native
 
     runtime = SimpleNamespace(open=_open_runtime)
     monkeypatch.setattr(adapter_module, "_load_runtime_module", lambda: runtime)
+    monkeypatch.setattr(adapter_module, "_resolve_element_module", lambda _runtime: None)
 
     result = await adapter_module.create_adapter().ingest(
         build_contract_source(

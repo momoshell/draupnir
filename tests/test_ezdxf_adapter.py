@@ -615,6 +615,31 @@ async def test_ezdxf_adapter_passes_shared_contract_harness_for_smoke_fixture() 
 
 
 @pytest.mark.asyncio
+async def test_ezdxf_adapter_empty_modelspace_passes_shared_contract_harness(
+    tmp_path: Path,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "empty-modelspace.dxf"
+    cast(Any, ezdxf).new(units=6).saveas(source_path)
+
+    payload = await exercise_adapter_contract(
+        adapter,
+        source=build_contract_source(file_path=source_path, original_name=source_path.name),
+        input_family=input_family(),
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            diagnostic_codes=("dxf_document_loaded", "dxf_entities_extracted"),
+        ),
+        adapter_key="ezdxf",
+    )
+
+    assert payload.canonical_json["entities"] == []
+    assert payload.canonical_json["metadata"]["empty_entities_reason"] == "dxf_modelspace_empty"
+
+
+@pytest.mark.asyncio
 async def test_ezdxf_adapter_retains_unsupported_entities_as_unknown_with_warning(
     tmp_path: Path,
 ) -> None:
@@ -653,9 +678,11 @@ async def test_ezdxf_adapter_retains_unsupported_entities_as_unknown_with_warnin
     assert entity["entity_type"] == "unknown"
     assert entity["layer"] == "0"
     assert _mapping(entity["properties"])["source_type"] == "CIRCLE"
+    assert _mapping(entity["geometry"])["reason"] == "unsupported_or_invalid_geometry"
     assert _mapping(entity["geometry"])["geometry_summary"] == {
         "kind": "unknown",
         "source_type": "CIRCLE",
+        "reason": "unsupported_or_invalid_geometry",
     }
     assert result.warnings[0].details == {
         "entity_type": "CIRCLE",

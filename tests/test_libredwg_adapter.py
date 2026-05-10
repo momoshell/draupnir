@@ -250,6 +250,9 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     assert output_path.parent != _FIXTURE_PATH.parent
     assert payload.canonical_json["entities"] == []
     assert payload.canonical_json["metadata"]["adapter_mode"] == "placeholder"
+    assert payload.canonical_json["metadata"]["empty_entities_reason"] == (
+        "placeholder_canonical_no_entity_mapping"
+    )
 
     result = await adapter.ingest(
         source,

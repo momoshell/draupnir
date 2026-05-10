@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml  # type: ignore[import-untyped]
@@ -196,6 +196,124 @@ async def test_contract_harness_rejects_missing_entities_key(tmp_path: Path) -> 
     )
 
     with pytest.raises(AssertionError):
+        await exercise_adapter_contract(
+            adapter,
+            source=source,
+            input_family=InputFamily.DXF,
+            adapter_key=adapter_key,
+            expectation=ContractFinalizationExpectation(
+                validation_status="valid",
+                review_state="approved",
+                quantity_gate="allowed",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_contract_harness_rejects_missing_entity_envelope_fields(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.dxf"
+    source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
+    source = build_contract_source(file_path=source_path)
+    adapter_key = "fake-dxf"
+    canonical = build_complete_canonical()
+    canonical["entities"] = (
+        {
+            "kind": "line",
+            "layer": "A-WALL",
+            "start": {"x": 0.0, "y": 0.0},
+            "end": {"x": 10.0, "y": 0.0},
+        },
+    )
+    adapter = _ResultAdapter(
+        result=build_result(
+            adapter_key=adapter_key,
+            score=0.97,
+            canonical=canonical,
+        ),
+        family=InputFamily.DXF,
+        key=adapter_key,
+    )
+
+    with pytest.raises(AssertionError, match="entity_id"):
+        await exercise_adapter_contract(
+            adapter,
+            source=source,
+            input_family=InputFamily.DXF,
+            adapter_key=adapter_key,
+            expectation=ContractFinalizationExpectation(
+                validation_status="valid",
+                review_state="approved",
+                quantity_gate="allowed",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_contract_harness_rejects_empty_entities_without_explicit_reason(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.dxf"
+    source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
+    source = build_contract_source(file_path=source_path)
+    adapter_key = "fake-dxf"
+    canonical = build_complete_canonical()
+    canonical["entities"] = ()
+    adapter = _ResultAdapter(
+        result=build_result(
+            adapter_key=adapter_key,
+            score=0.97,
+            canonical=canonical,
+        ),
+        family=InputFamily.DXF,
+        key=adapter_key,
+    )
+
+    with pytest.raises(AssertionError, match="metadata with a reason"):
+        await exercise_adapter_contract(
+            adapter,
+            source=source,
+            input_family=InputFamily.DXF,
+            adapter_key=adapter_key,
+            expectation=ContractFinalizationExpectation(
+                validation_status="valid",
+                review_state="approved",
+                quantity_gate="allowed",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_contract_harness_rejects_absent_geometry_without_explicit_reason(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.dxf"
+    source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
+    source = build_contract_source(file_path=source_path)
+    adapter_key = "fake-dxf"
+    canonical = build_complete_canonical()
+    entity = cast(tuple[dict[str, Any], ...], canonical["entities"])[0]
+    canonical["entities"] = (
+        {
+            **entity,
+            "geometry": {
+                "bbox": None,
+                "units": {"normalized": "meter"},
+                "status": "absent",
+                "geometry_summary": {"kind": "line_segment"},
+            },
+        },
+    )
+    adapter = _ResultAdapter(
+        result=build_result(
+            adapter_key=adapter_key,
+            score=0.97,
+            canonical=canonical,
+        ),
+        family=InputFamily.DXF,
+        key=adapter_key,
+    )
+
+    with pytest.raises(AssertionError, match="geometry reason"):
         await exercise_adapter_contract(
             adapter,
             source=source,
