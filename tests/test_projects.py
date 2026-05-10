@@ -7,8 +7,12 @@ import uuid
 from typing import Any
 
 import httpx
+import pytest
 import pytest_asyncio
+from sqlalchemy.exc import IntegrityError
 
+from app.db.session import AsyncSessionLocal
+from app.models.project import Project
 from tests.conftest import requires_database
 
 
@@ -129,6 +133,48 @@ class TestCreateProject:
         assert response.status_code == 422
         data = response.json()
 
+        assert "error" in data
+        assert data["error"]["code"] == "VALIDATION_ERROR"
+        assert data["error"]["message"] == "Request validation failed"
+        assert isinstance(data["error"]["details"], list)
+
+    async def test_create_project_validation_error_invalid_unit_system(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        """Should reject unsupported default unit systems."""
+        _ = self
+        _ = cleanup_projects
+
+        response = await async_client.post(
+            "/v1/projects",
+            json={"name": "Bad Unit", "default_unit_system": "si"},
+        )
+
+        assert response.status_code == 422
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == "VALIDATION_ERROR"
+        assert data["error"]["message"] == "Request validation failed"
+        assert isinstance(data["error"]["details"], list)
+
+    async def test_create_project_validation_error_invalid_currency(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        """Should reject malformed default currency codes."""
+        _ = self
+        _ = cleanup_projects
+
+        response = await async_client.post(
+            "/v1/projects",
+            json={"name": "Bad Currency", "default_currency": "usd"},
+        )
+
+        assert response.status_code == 422
+        data = response.json()
         assert "error" in data
         assert data["error"]["code"] == "VALIDATION_ERROR"
         assert data["error"]["message"] == "Request validation failed"
@@ -487,6 +533,76 @@ class TestUpdateProject:
         assert data["name"] == update_data["name"]
         assert data["description"] == original_description  # Unchanged
 
+    async def test_update_project_accepts_valid_defaults_and_nulls(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """Should allow valid default values and clearing them back to null."""
+        _ = self
+
+        project_id = created_project["id"]
+
+        set_defaults_response = await async_client.patch(
+            f"/v1/projects/{project_id}",
+            json={"default_unit_system": "imperial", "default_currency": "EUR"},
+        )
+
+        assert set_defaults_response.status_code == 200
+        set_defaults_data = set_defaults_response.json()
+        assert set_defaults_data["default_unit_system"] == "imperial"
+        assert set_defaults_data["default_currency"] == "EUR"
+
+        clear_defaults_response = await async_client.patch(
+            f"/v1/projects/{project_id}",
+            json={"default_unit_system": None, "default_currency": None},
+        )
+
+        assert clear_defaults_response.status_code == 200
+        clear_defaults_data = clear_defaults_response.json()
+        assert clear_defaults_data["default_unit_system"] is None
+        assert clear_defaults_data["default_currency"] is None
+
+    async def test_update_project_validation_error_invalid_unit_system(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """Should reject unsupported unit systems on update."""
+        _ = self
+
+        response = await async_client.patch(
+            f"/v1/projects/{created_project['id']}",
+            json={"default_unit_system": "meters"},
+        )
+
+        assert response.status_code == 422
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == "VALIDATION_ERROR"
+        assert data["error"]["message"] == "Request validation failed"
+        assert isinstance(data["error"]["details"], list)
+
+    async def test_update_project_validation_error_invalid_currency(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """Should reject malformed currency codes on update."""
+        _ = self
+
+        response = await async_client.patch(
+            f"/v1/projects/{created_project['id']}",
+            json={"default_currency": "US1"},
+        )
+
+        assert response.status_code == 422
+        data = response.json()
+        assert "error" in data
+        assert data["error"]["code"] == "VALIDATION_ERROR"
+        assert data["error"]["message"] == "Request validation failed"
+        assert isinstance(data["error"]["details"], list)
+
     async def test_update_project_not_found(
         self,
         async_client: httpx.AsyncClient,
@@ -569,3 +685,105 @@ class TestDeleteProject:
 
         assert "error" in data
         assert data["error"]["code"] == "NOT_FOUND"
+
+
+def test_project_model_defines_default_value_check_constraints() -> None:
+    """Project ORM metadata should include DB-level default value constraints."""
+    project_table = typing.cast(Any, Project.__table__)
+    check_constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in project_table.constraints
+        if getattr(constraint, "sqltext", None) is not None
+    }
+
+    assert check_constraints["ck_projects_default_unit_system"] == (
+        "default_unit_system IS NULL OR default_unit_system IN ('metric', 'imperial')"
+    )
+    assert check_constraints["ck_projects_default_currency"] == (
+        "default_currency IS NULL OR default_currency ~ '^[A-Z]{3}$'"
+    )
+
+
+@requires_database
+class TestProjectDatabaseConstraints:
+    """DB-level constraint tests that bypass request/schema validation."""
+
+    async def test_insert_rejects_invalid_default_unit_system(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """Database should reject invalid unit systems on insert."""
+        _ = self
+        _ = cleanup_projects
+
+        assert AsyncSessionLocal is not None
+
+        async with AsyncSessionLocal() as session:
+            session.add(Project(name="Invalid unit insert", default_unit_system="si"))
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()
+
+    async def test_update_rejects_invalid_default_unit_system(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """Database should reject invalid unit systems on update."""
+        _ = self
+        _ = cleanup_projects
+
+        assert AsyncSessionLocal is not None
+
+        async with AsyncSessionLocal() as session:
+            project = Project(name="Invalid unit update", default_unit_system="metric")
+            session.add(project)
+            await session.commit()
+
+            project.default_unit_system = "meters"
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()
+
+    async def test_insert_rejects_invalid_default_currency(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """Database should reject invalid currency codes on insert."""
+        _ = self
+        _ = cleanup_projects
+
+        assert AsyncSessionLocal is not None
+
+        async with AsyncSessionLocal() as session:
+            session.add(Project(name="Invalid currency insert", default_currency="usd"))
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()
+
+    async def test_update_rejects_invalid_default_currency(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """Database should reject invalid currency codes on update."""
+        _ = self
+        _ = cleanup_projects
+
+        assert AsyncSessionLocal is not None
+
+        async with AsyncSessionLocal() as session:
+            project = Project(name="Invalid currency update", default_currency="USD")
+            session.add(project)
+            await session.commit()
+
+            project.default_currency = "US1"
+
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+            await session.rollback()
