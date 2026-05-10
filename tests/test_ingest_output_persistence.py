@@ -238,23 +238,6 @@ async def _load_job_events(job_id: uuid.UUID) -> list[JobEvent]:
         )
 
 
-async def _set_job_extraction_profile_id(
-    job_id: uuid.UUID,
-    extraction_profile_id: uuid.UUID | None,
-) -> Job:
-    """Update a job extraction profile for failure-path setup."""
-    session_maker = session_module.AsyncSessionLocal
-    assert session_maker is not None
-
-    async with session_maker() as session:
-        job = await session.get(Job, job_id)
-        assert job is not None
-        job.extraction_profile_id = extraction_profile_id
-        await session.commit()
-
-    return await _get_job(job_id)
-
-
 @requires_database
 class TestIngestOutputPersistence:
     """Tests for durable ingest output persistence and finalization guards."""
@@ -834,52 +817,6 @@ class TestIngestOutputPersistence:
         assert [row.id for row in second_outputs[1]] == [row.id for row in first_outputs[1]]
         assert [row.id for row in second_outputs[2]] == [row.id for row in first_outputs[2]]
         assert [row.id for row in second_outputs[3]] == [row.id for row in first_outputs[3]]
-
-    async def test_process_ingest_job_missing_profile_fails_without_outputs(
-        self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        enqueued_job_ids: list[str],
-    ) -> None:
-        """Missing extraction profile should fail finalization without partial outputs."""
-        _ = self
-        _ = cleanup_projects
-        _ = enqueued_job_ids
-
-        project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
-        job = await _get_job_for_file(str(uploaded["id"]))
-
-        await _set_job_extraction_profile_id(job.id, None)
-
-        with pytest.raises(ValueError, match="Ingest job missing extraction profile"):
-            await process_ingest_job(job.id)
-
-        updated_job = await _get_job(job.id)
-        assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert updated_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
-
-        events = await _load_job_events(job.id)
-        assert events[-1].level == "error"
-        assert events[-1].message == "Job failed"
-        assert events[-1].data_json == {
-            "status": "failed",
-            "error_code": ErrorCode.INTERNAL_ERROR.value,
-            "error_message": worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE,
-        }
-
-        (
-            adapter_outputs,
-            drawing_revisions,
-            validation_reports,
-            generated_artifacts,
-        ) = await _load_project_outputs(project["id"])
-
-        assert adapter_outputs == []
-        assert drawing_revisions == []
-        assert validation_reports == []
-        assert generated_artifacts == []
 
     async def test_process_ingest_job_precommit_overlay_failure_cleans_storage_without_outputs(
         self,

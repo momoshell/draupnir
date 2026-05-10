@@ -26,7 +26,7 @@ from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
-from app.models.job import Job
+from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.validation_report import ValidationReport
 from app.storage import get_storage
@@ -35,6 +35,7 @@ from app.storage.keys import build_generated_artifact_storage_key
 logger = get_logger(__name__)
 
 _INCOMPLETE_JOB_STATUSES = ("pending", "running")
+_RECOVERABLE_INGEST_JOB_TYPES = (JobType.INGEST.value, JobType.REPROCESS.value)
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
@@ -1119,7 +1120,7 @@ async def process_ingest_job(job_id: UUID) -> None:
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:
-    """Requeue incomplete persisted ingest jobs on worker startup."""
+    """Requeue incomplete persisted ingest/reprocess jobs on worker startup."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -1130,7 +1131,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
         result = await session.execute(
             select(Job)
             .where(
-                (Job.job_type == "ingest")
+                (Job.job_type.in_(_RECOVERABLE_INGEST_JOB_TYPES))
                 & (Job.status.in_(_INCOMPLETE_JOB_STATUSES))
             )
             .order_by(Job.created_at.asc(), Job.id.asc())
@@ -1164,7 +1165,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
 
 
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
-    """Requeue incomplete ingest jobs when a worker starts."""
+    """Requeue incomplete ingest/reprocess jobs when a worker starts."""
     try:
         recovered_job_ids = asyncio.run(recover_incomplete_ingest_jobs())
     except Exception as exc:

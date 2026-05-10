@@ -2,9 +2,11 @@
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -14,7 +16,37 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.errors import ErrorCode
 from app.db.base import Base
+
+
+class JobType(StrEnum):
+    """Supported persisted job types."""
+
+    INGEST = "ingest"
+    REPROCESS = "reprocess"
+
+
+class JobStatus(StrEnum):
+    """Supported persisted job lifecycle states."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_JOB_TYPE_VALUES = tuple(job_type.value for job_type in JobType)
+_JOB_STATUS_VALUES = tuple(status.value for status in JobStatus)
+_JOB_ERROR_CODE_VALUES = tuple(error_code.value for error_code in ErrorCode)
+_PROFILE_REQUIRED_JOB_TYPE_VALUES = (JobType.INGEST.value, JobType.REPROCESS.value)
+
+
+def _sql_in_list(values: tuple[str, ...]) -> str:
+    """Render a SQL string list for check constraints."""
+
+    return ", ".join(f"'{value}'" for value in values)
 
 
 class Job(Base):
@@ -33,6 +65,24 @@ class Job(Base):
             ["extraction_profiles.id", "extraction_profiles.project_id"],
             ondelete="CASCADE",
             name="fk_jobs_extraction_profile_id_project_id_extraction_profiles",
+        ),
+        CheckConstraint(
+            f"job_type IN ({_sql_in_list(_JOB_TYPE_VALUES)})",
+            name="ck_jobs_job_type_valid",
+        ),
+        CheckConstraint(
+            f"status IN ({_sql_in_list(_JOB_STATUS_VALUES)})",
+            name="ck_jobs_status_valid",
+        ),
+        CheckConstraint(
+            "error_code IS NULL "
+            f"OR error_code IN ({_sql_in_list(_JOB_ERROR_CODE_VALUES)})",
+            name="ck_jobs_error_code_valid",
+        ),
+        CheckConstraint(
+            "job_type NOT IN "
+            f"({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)}) OR extraction_profile_id IS NOT NULL",
+            name="ck_jobs_ingest_extraction_profile_required",
         ),
     )
 
@@ -57,7 +107,8 @@ class Job(Base):
         index=True,
         comment=(
             "Immutable extraction profile identifier. Nullable only during the "
-            "expand/rollback window; a future contract migration can enforce NOT NULL."
+            "expand/rollback window; persisted ingest/reprocess jobs require a "
+            "profile and a future contract migration can enforce NOT NULL."
         ),
     )
     job_type: Mapped[str] = mapped_column(

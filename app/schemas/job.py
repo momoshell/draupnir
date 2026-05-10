@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.errors import ErrorCode
+from app.models.job import JobStatus, JobType
 
 
 class JobRead(BaseModel):
@@ -21,12 +22,12 @@ class JobRead(BaseModel):
         default=None,
         description=(
             "Immutable extraction profile identifier. Nullable for historical jobs "
-            "during the migration rollback window; future contract migration can "
-            "enforce non-null."
+            "during the migration rollback window; persisted ingest/reprocess jobs "
+            "require a profile and a future contract migration can enforce non-null."
         ),
     )
-    job_type: str = Field(..., description="Job type")
-    status: str = Field(..., description="Job status")
+    job_type: JobType = Field(..., description="Job type")
+    status: JobStatus = Field(..., description="Job status")
     attempts: int = Field(..., ge=0, description="Current attempt count")
     max_attempts: int = Field(..., ge=1, description="Maximum retry attempts")
     cancel_requested: bool = Field(..., description="Whether cancellation was requested")

@@ -400,65 +400,307 @@ class TestExtractionProfiles:
         assert failed_profile.units_override == "metric"
         assert failed_profile.layout_mode == "paper_space"
 
-    async def test_jobs_column_stays_nullable_for_expand_contract_rollback_window(
+    async def test_job_constraints_migration_upgrade_backfills_and_validates_profiles(
         self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        stub_enqueue_ingest_job: None,
     ) -> None:
-        """Head schema must still allow legacy inserts without extraction_profile_id."""
+        """Upgrade should backfill required profiles and validate all new job constraints."""
         _ = self
-        _ = cleanup_projects
-        _ = stub_enqueue_ingest_job
 
-        project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
-        legacy_job_id = uuid.uuid4()
+        engine = session_module.get_engine()
+        assert engine is not None
 
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
+        schema_name = f"test_job_constraints_{uuid.uuid4().hex}"
+        migration = _load_job_constraints_migration()
+        project_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        profile_id = uuid.uuid4()
+        ingest_job_id = uuid.uuid4()
+        reprocess_job_id = uuid.uuid4()
 
-        async with session_maker() as session:
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO jobs (
-                        id,
-                        project_id,
-                        file_id,
-                        job_type,
-                        status,
-                        attempts,
-                        max_attempts,
-                        cancel_requested
-                    ) VALUES (
-                        :id,
-                        :project_id,
-                        :file_id,
-                        :job_type,
-                        :status,
-                        :attempts,
-                        :max_attempts,
-                        :cancel_requested
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+
+            async with engine.begin() as conn:
+                await conn.execute(text(f'SET search_path TO "{schema_name}"'))
+                await conn.run_sync(_install_pre_0006_jobs_schema)
+
+                await conn.execute(
+                    text("INSERT INTO projects (id) VALUES (:id)"),
+                    {"id": project_id},
+                )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO files (id, project_id, initial_extraction_profile_id)
+                        VALUES (:id, :project_id, :initial_extraction_profile_id)
+                        """
+                    ),
+                    {
+                        "id": file_id,
+                        "project_id": project_id,
+                        "initial_extraction_profile_id": profile_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO jobs (
+                            id,
+                            project_id,
+                            file_id,
+                            extraction_profile_id,
+                            job_type,
+                            status,
+                            attempts,
+                            max_attempts,
+                            cancel_requested,
+                            created_at
+                        ) VALUES (
+                            :id,
+                            :project_id,
+                            :file_id,
+                            :extraction_profile_id,
+                            :job_type,
+                            :status,
+                            0,
+                            3,
+                            false,
+                            :created_at
+                        )
+                        """
+                    ),
+                    [
+                        {
+                            "id": ingest_job_id,
+                            "project_id": project_id,
+                            "file_id": file_id,
+                            "extraction_profile_id": None,
+                            "job_type": "ingest",
+                            "status": "pending",
+                            "created_at": datetime(2026, 5, 10, tzinfo=UTC),
+                        },
+                        {
+                            "id": reprocess_job_id,
+                            "project_id": project_id,
+                            "file_id": file_id,
+                            "extraction_profile_id": profile_id,
+                            "job_type": "reprocess",
+                            "status": "running",
+                            "created_at": datetime(2026, 5, 11, tzinfo=UTC),
+                        },
+                    ],
+                )
+
+                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+
+                jobs = (
+                    (
+                        await conn.execute(
+                            text(
+                                """
+                                SELECT id, job_type, extraction_profile_id
+                                FROM jobs
+                                ORDER BY created_at ASC, id ASC
+                                """
+                            )
+                        )
                     )
-                    """
-                ),
-                {
-                    "id": legacy_job_id,
-                    "project_id": uuid.UUID(project["id"]),
-                    "file_id": uuid.UUID(uploaded["id"]),
-                    "job_type": "ingest",
-                    "status": "pending",
-                    "attempts": 0,
-                    "max_attempts": 3,
-                    "cancel_requested": False,
-                },
-            )
-            await session.commit()
+                    .mappings()
+                    .all()
+                )
+                assert [dict(row) for row in jobs] == [
+                    {
+                        "id": ingest_job_id,
+                        "job_type": "ingest",
+                        "extraction_profile_id": profile_id,
+                    },
+                    {
+                        "id": reprocess_job_id,
+                        "job_type": "reprocess",
+                        "extraction_profile_id": profile_id,
+                    },
+                ]
 
-        jobs = await _get_jobs_for_file(str(uploaded["id"]))
-        legacy_job = next(job for job in jobs if job.id == legacy_job_id)
-        assert legacy_job.extraction_profile_id is None
+                constraints = await _get_job_check_constraints(conn, schema_name)
+                assert constraints == {
+                    "ck_jobs_error_code_valid": True,
+                    "ck_jobs_ingest_extraction_profile_required": True,
+                    "ck_jobs_job_type_valid": True,
+                    "ck_jobs_status_valid": True,
+                }
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+
+    async def test_job_constraints_migration_upgrade_fails_when_backfill_leaves_null_profiles(
+        self,
+    ) -> None:
+        """Upgrade should fail loudly when legacy required-profile jobs cannot be backfilled."""
+        _ = self
+
+        engine = session_module.get_engine()
+        assert engine is not None
+
+        schema_name = f"test_job_constraints_fail_{uuid.uuid4().hex}"
+        migration = _load_job_constraints_migration()
+        project_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        ingest_job_id = uuid.uuid4()
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+
+            with pytest.raises(RuntimeError, match="still have NULL extraction_profile_id after backfill"):
+                async with engine.begin() as conn:
+                    await conn.execute(text(f'SET search_path TO "{schema_name}"'))
+                    await conn.run_sync(_install_pre_0006_jobs_schema)
+
+                    await conn.execute(
+                        text("INSERT INTO projects (id) VALUES (:id)"),
+                        {"id": project_id},
+                    )
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO files (id, project_id, initial_extraction_profile_id)
+                            VALUES (:id, :project_id, NULL)
+                            """
+                        ),
+                        {"id": file_id, "project_id": project_id},
+                    )
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO jobs (
+                                id,
+                                project_id,
+                                file_id,
+                                extraction_profile_id,
+                                job_type,
+                                status,
+                                attempts,
+                                max_attempts,
+                                cancel_requested,
+                                created_at
+                            ) VALUES (
+                                :id,
+                                :project_id,
+                                :file_id,
+                                NULL,
+                                'ingest',
+                                'pending',
+                                0,
+                                3,
+                                false,
+                                :created_at
+                            )
+                            """
+                        ),
+                        {
+                            "id": ingest_job_id,
+                            "project_id": project_id,
+                            "file_id": file_id,
+                            "created_at": datetime(2026, 5, 12, tzinfo=UTC),
+                        },
+                    )
+
+                    await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+
+    async def test_job_constraints_migration_downgrade_drops_constraints(
+        self,
+    ) -> None:
+        """Downgrade should remove the 0006 job check constraints."""
+        _ = self
+
+        engine = session_module.get_engine()
+        assert engine is not None
+
+        schema_name = f"test_job_constraints_down_{uuid.uuid4().hex}"
+        migration = _load_job_constraints_migration()
+        project_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        profile_id = uuid.uuid4()
+        ingest_job_id = uuid.uuid4()
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+
+            async with engine.begin() as conn:
+                await conn.execute(text(f'SET search_path TO "{schema_name}"'))
+                await conn.run_sync(_install_pre_0006_jobs_schema)
+
+                await conn.execute(
+                    text("INSERT INTO projects (id) VALUES (:id)"),
+                    {"id": project_id},
+                )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO files (id, project_id, initial_extraction_profile_id)
+                        VALUES (:id, :project_id, :initial_extraction_profile_id)
+                        """
+                    ),
+                    {
+                        "id": file_id,
+                        "project_id": project_id,
+                        "initial_extraction_profile_id": profile_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO jobs (
+                            id,
+                            project_id,
+                            file_id,
+                            extraction_profile_id,
+                            job_type,
+                            status,
+                            attempts,
+                            max_attempts,
+                            cancel_requested,
+                            created_at
+                        ) VALUES (
+                            :id,
+                            :project_id,
+                            :file_id,
+                            NULL,
+                            'ingest',
+                            'pending',
+                            0,
+                            3,
+                            false,
+                            :created_at
+                        )
+                        """
+                    ),
+                    {
+                        "id": ingest_job_id,
+                        "project_id": project_id,
+                        "file_id": file_id,
+                        "created_at": datetime(2026, 5, 13, tzinfo=UTC),
+                    },
+                )
+
+                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+                assert await _get_job_check_constraints(conn, schema_name) == {
+                    "ck_jobs_error_code_valid": True,
+                    "ck_jobs_ingest_extraction_profile_required": True,
+                    "ck_jobs_job_type_valid": True,
+                    "ck_jobs_status_valid": True,
+                }
+
+                await conn.run_sync(lambda sync_conn: _run_migration_downgrade(sync_conn, migration))
+                assert await _get_job_check_constraints(conn, schema_name) == {}
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
 
     async def test_migration_upgrade_backfills_profiles_and_initial_lineage(
         self,
@@ -644,6 +886,26 @@ def _load_extraction_profiles_migration() -> Any:
     return module
 
 
+def _load_job_constraints_migration() -> Any:
+    """Load the job-constraint migration module directly from disk."""
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "2026_05_10_0006_constrain_job_fields_and_ingest_profile.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migration_2026_05_10_0006_constrain_job_fields_and_ingest_profile",
+        migration_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _install_pre_0004_schema(sync_conn: sa.Connection) -> None:
     """Create the minimal pre-0004 schema needed to exercise the migration."""
     metadata = sa.MetaData()
@@ -688,11 +950,95 @@ def _install_pre_0004_schema(sync_conn: sa.Connection) -> None:
     metadata.create_all(sync_conn)
 
 
+def _install_pre_0006_jobs_schema(sync_conn: sa.Connection) -> None:
+    """Create the minimal pre-0006 schema needed to exercise job constraints."""
+    metadata = sa.MetaData()
+    sa.Table(
+        "projects",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+    )
+    sa.Table(
+        "files",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), nullable=False),
+        sa.Column("initial_extraction_profile_id", sa.Uuid(), nullable=True),
+    )
+    sa.Table(
+        "jobs",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("project_id", sa.Uuid(), nullable=False),
+        sa.Column("file_id", sa.Uuid(), nullable=False),
+        sa.Column("extraction_profile_id", sa.Uuid(), nullable=True),
+        sa.Column("job_type", sa.String(length=64), nullable=False),
+        sa.Column("status", sa.String(length=32), nullable=False),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("max_attempts", sa.Integer(), nullable=False, server_default=sa.text("3")),
+        sa.Column(
+            "cancel_requested",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.text("false"),
+        ),
+        sa.Column("error_code", sa.String(length=128), nullable=True),
+        sa.Column("error_message", sa.String(length=2048), nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    metadata.create_all(sync_conn)
+
+
 def _run_migration_upgrade(sync_conn: sa.Connection, migration: Any) -> None:
     """Run the extraction-profile upgrade against a live connection."""
     migration_context = MigrationContext.configure(sync_conn)
     migration.op = Operations(migration_context)
     migration.upgrade()
+
+
+def _run_migration_downgrade(sync_conn: sa.Connection, migration: Any) -> None:
+    """Run the corresponding downgrade against a live connection."""
+    migration_context = MigrationContext.configure(sync_conn)
+    migration.op = Operations(migration_context)
+    migration.downgrade()
+
+
+async def _get_job_check_constraints(conn: Any, schema_name: str) -> dict[str, bool]:
+    """Return job-table check constraints and validation state for a schema."""
+    rows = (
+        (
+            await conn.execute(
+                text(
+                    """
+                    SELECT con.conname, con.convalidated
+                    FROM pg_constraint AS con
+                    JOIN pg_class AS rel
+                      ON rel.oid = con.conrelid
+                    JOIN pg_namespace AS nsp
+                      ON nsp.oid = rel.relnamespace
+                    WHERE nsp.nspname = :schema_name
+                      AND rel.relname = 'jobs'
+                      AND con.contype = 'c'
+                    ORDER BY con.conname ASC
+                    """
+                ),
+                {"schema_name": schema_name},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        cast(str, row["conname"]): cast(bool, row["convalidated"])
+        for row in rows
+    }
 
 
 class _FakeScalarResult:
