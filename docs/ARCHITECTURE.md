@@ -357,6 +357,9 @@ Local development uses Docker Compose with these services:
 - `rabbitmq` - broker
 - `flower` (optional) - Celery dashboard for development
 
+GitHub Actions CI uses the same PostgreSQL 18 runtime so migrations and tests
+exercise the same database major version as local development.
+
 Production topology is deferred. The compose file should keep service names and
 env vars stable so the same configuration can be lifted to a managed runtime.
 
