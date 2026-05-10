@@ -33,6 +33,7 @@ from app.ingestion.runner import (
 from app.models.file import File
 from app.models.job import Job
 from app.models.job_event import JobEvent
+from app.models.project import Project
 from tests.conftest import requires_database
 
 _FAKE_RUNNER_ADAPTER_KEY = "tests.fake_ingestion_runner"
@@ -294,6 +295,29 @@ async def _update_source_file(
         await session.commit()
 
     return source_file
+
+
+async def _mark_source_deleted(
+    project_id: uuid.UUID,
+    file_id: uuid.UUID,
+    *,
+    delete_project: bool,
+    delete_file: bool,
+) -> None:
+    """Soft-delete the source project and/or file for worker visibility tests."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        if delete_project:
+            project = await session.get(Project, project_id)
+            assert project is not None
+            project.deleted_at = datetime.now(UTC)
+        if delete_file:
+            source_file = await session.get(File, file_id)
+            assert source_file is not None
+            source_file.deleted_at = datetime.now(UTC)
+        await session.commit()
 
 
 async def _create_job_event(
@@ -1804,6 +1828,67 @@ class TestJobs:
             }
         }
 
+    @pytest.mark.parametrize(
+        ("delete_project", "delete_file"),
+        [(True, False), (False, True)],
+    )
+    async def test_retry_job_returns_404_for_soft_deleted_source(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        delete_project: bool,
+        delete_file: bool,
+    ) -> None:
+        """Retry should hide jobs whose backing project or file is soft-deleted."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+            retried_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(
+            jobs_api,
+            "enqueue_ingest_job",
+            _fake_retry_enqueue,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_message="previous failure",
+        )
+        await _mark_source_deleted(
+            uuid.UUID(project["id"]),
+            uuid.UUID(uploaded["id"]),
+            delete_project=delete_project,
+            delete_file=delete_file,
+        )
+
+        response = await async_client.post(f"/v1/jobs/{job.id}/retry")
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Job with identifier '{job.id}' not found",
+                "details": None,
+            }
+        }
+        assert retried_job_ids == []
+        unchanged = await _get_job(job.id)
+        assert unchanged.status == "failed"
+
     async def test_process_ingest_job_finalizes_cancel_requested_job_as_cancelled(
         self,
         async_client: httpx.AsyncClient,
@@ -1828,6 +1913,89 @@ class TestJobs:
         assert updated.error_code == ErrorCode.JOB_CANCELLED.value
         assert updated.finished_at is not None
         assert updated.error_message is None
+
+    async def test_process_ingest_job_cancels_soft_deleted_source_before_runner(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker should not start ingestion when the source project is already soft-deleted."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        runner_calls: list[IngestionRunRequest] = []
+
+        async def _unexpected_run_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            runner_calls.append(request)
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _unexpected_run_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _mark_source_deleted(
+            uuid.UUID(project["id"]),
+            uuid.UUID(uploaded["id"]),
+            delete_project=True,
+            delete_file=False,
+        )
+
+        await worker_module.process_ingest_job(job.id)
+
+        updated = await _get_job(job.id)
+        assert runner_calls == []
+        assert updated.status == "cancelled"
+        assert updated.cancel_requested is True
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated.finished_at is not None
+
+    async def test_process_ingest_job_skips_finalization_storage_for_soft_deleted_source(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker should cancel before storage writes if the source is deleted mid-run."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        class _UnexpectedStorage:
+            async def put(self, *_: Any, **__: Any) -> Any:
+                raise AssertionError("storage.put should not be called for deleted sources")
+
+        async def _delete_source_during_run(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            await _mark_source_deleted(
+                uuid.UUID(project["id"]),
+                uuid.UUID(uploaded["id"]),
+                delete_project=False,
+                delete_file=True,
+            )
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "get_storage", lambda: _UnexpectedStorage())
+        monkeypatch.setattr(worker_module, "run_ingestion", _delete_source_during_run)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await worker_module.process_ingest_job(job.id)
+
+        updated = await _get_job(job.id)
+        assert updated.status == "cancelled"
+        assert updated.cancel_requested is True
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated.finished_at is not None
 
     async def test_process_ingest_job_finalizes_cancelled_when_requested_during_completion_race(
         self,

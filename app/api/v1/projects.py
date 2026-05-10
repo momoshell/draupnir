@@ -3,17 +3,20 @@
 import base64
 import binascii
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
+from app.models.file import File
+from app.models.generated_artifact import GeneratedArtifact
+from app.models.job import Job
 from app.models.project import Project
 from app.schemas.project import (
     ProjectCreate,
@@ -23,6 +26,26 @@ from app.schemas.project import (
 )
 
 project_router = APIRouter()
+
+
+async def _get_active_project_or_404(
+    db: AsyncSession,
+    project_id: UUID,
+    *,
+    for_update: bool = False,
+) -> Project:
+    """Return an active project row or raise not found."""
+    query = select(Project).where(
+        (Project.id == project_id) & (Project.deleted_at.is_(None))
+    )
+    if for_update:
+        query = query.with_for_update()
+    project = (await db.execute(query)).scalar_one_or_none()
+    if project is None:
+        raise_not_found("Project", str(project_id))
+
+    assert project is not None
+    return project
 
 
 def _encode_cursor(created_at: datetime, project_id: UUID) -> str:
@@ -107,7 +130,11 @@ async def list_projects(
     Cursor should be the next_cursor value from a previous response.
     """
     # Build query ordered by created_at DESC, id DESC
-    query = select(Project).order_by(Project.created_at.desc(), Project.id.desc())
+    query = (
+        select(Project)
+        .where(Project.deleted_at.is_(None))
+        .order_by(Project.created_at.desc(), Project.id.desc())
+    )
 
     # Apply cursor filter if provided
     if cursor:
@@ -151,14 +178,7 @@ async def get_project(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Project:
     """Get a project by ID."""
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-
-    if project is None:
-        raise_not_found("Project", str(project_id))
-
-    assert project is not None
-    return project
+    return await _get_active_project_or_404(db, project_id)
 
 
 @project_router.patch(
@@ -171,13 +191,7 @@ async def update_project(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Project:
     """Update an existing project."""
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-
-    if project is None:
-        raise_not_found("Project", str(project_id))
-
-    assert project is not None
+    project = await _get_active_project_or_404(db, project_id)
 
     # Update only provided fields
     update_data = project_in.model_dump(exclude_unset=True)
@@ -198,11 +212,34 @@ async def delete_project(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> None:
     """Delete a project."""
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-
-    if project is None:
-        raise_not_found("Project", str(project_id))
-
-    await db.delete(project)
+    project = await _get_active_project_or_404(db, project_id, for_update=True)
+    deleted_at = datetime.now(UTC)
+    project.deleted_at = deleted_at
+    await db.execute(
+        update(Job)
+        .where(
+            (Job.project_id == project_id)
+            & (Job.status.in_(("pending", "running")))
+        )
+        .values(
+            status="cancelled",
+            cancel_requested=True,
+            error_code=ErrorCode.JOB_CANCELLED.value,
+            error_message=None,
+            finished_at=deleted_at,
+        )
+    )
+    await db.execute(
+        update(File)
+        .where((File.project_id == project_id) & (File.deleted_at.is_(None)))
+        .values(deleted_at=deleted_at)
+    )
+    await db.execute(
+        update(GeneratedArtifact)
+        .where(
+            (GeneratedArtifact.project_id == project_id)
+            & (GeneratedArtifact.deleted_at.is_(None))
+        )
+        .values(deleted_at=deleted_at)
+    )
     await db.commit()

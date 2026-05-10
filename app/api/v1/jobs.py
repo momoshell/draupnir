@@ -15,8 +15,10 @@ from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
+from app.models.file import File
 from app.models.job import Job
 from app.models.job_event import JobEvent
+from app.models.project import Project
 from app.schemas.job import JobEventPage, JobEventRead, JobRead
 
 jobs_router = APIRouter()
@@ -42,6 +44,30 @@ async def _get_job_or_404(db: AsyncSession, job_id: UUID) -> Job:
 async def _get_job_for_update_or_404(db: AsyncSession, job_id: UUID) -> Job:
     """Return a persisted job with a row lock or raise not found."""
     result = await db.execute(select(Job).where(Job.id == job_id).with_for_update())
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise_not_found("Job", str(job_id))
+    assert job is not None
+
+    return job
+
+
+async def _get_active_job_for_retry_or_404(db: AsyncSession, job_id: UUID) -> Job:
+    """Return a job row with active project/file visibility for retries."""
+    result = await db.execute(
+        select(Job)
+        .join(
+            File,
+            (File.id == Job.file_id) & (File.project_id == Job.project_id),
+        )
+        .join(Project, Project.id == Job.project_id)
+        .where(
+            (Job.id == job_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+        .with_for_update()
+    )
     job = result.scalar_one_or_none()
     if job is None:
         raise_not_found("Job", str(job_id))
@@ -195,7 +221,7 @@ async def retry_job(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Job:
     """Requeue a failed persisted job when attempts remain."""
-    job = await _get_job_for_update_or_404(db, job_id)
+    job = await _get_active_job_for_retry_or_404(db, job_id)
     if job.status != "failed" or job.attempts >= job.max_attempts:
         return job
 
