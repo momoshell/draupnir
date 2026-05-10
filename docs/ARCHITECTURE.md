@@ -3,7 +3,7 @@
 ## High-Level Shape
 
 ```text
-Client UI / CLI / TUI
+Future client UI / CLI / TUI
   -> FastAPI backend
       -> Postgres
       -> local/object storage
@@ -15,6 +15,10 @@ Client UI / CLI / TUI
 ```
 
 ## Main Components
+
+MVP delivery is API-only. Client applications such as a web UI, CLI, or TUI are
+downstream consumers of the backend contract and are not themselves MVP product
+requirements in this repository.
 
 ### API Service
 

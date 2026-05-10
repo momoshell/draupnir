@@ -7,6 +7,10 @@ focuses on accepting common real-world drawing inputs, extracting structured
 geometry and semantic data, producing deterministic quantities and estimates,
 and exposing everything through a UI-agnostic API.
 
+The MVP product surface is API-only. Future clients may include a web UI, TUI,
+CLI, or other services, but this repository does not imply that a product CLI
+exists today.
+
 ## Current Status
 
 Docker Compose development stack is available. See "Local Development" below for setup instructions.
@@ -143,7 +147,8 @@ shapes.
 
 ## MVP Direction
 
-- Backend API that any web UI, TUI, CLI, or service can consume.
+- API-only MVP product surface.
+- Backend API that future web UIs, TUIs, CLIs, or services can consume.
 - Primary starting inputs: DWG, vector PDF, and raster PDF.
 - Direct normalized/open inputs: DXF and IFC where available.
 - Outputs: JSON, CSV, PDF estimate/report, and editable CAD revisions.
