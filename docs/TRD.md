@@ -628,9 +628,9 @@ prior one.
 - Idempotent mutating endpoints accept `Idempotency-Key` headers and return the
   prior response on replay within a documented retention window.
 - When job enqueue fails after durable records are created, the public error must
-  stay sanitized and may include only safe identifiers already assigned by the
-  system, such as `file_id`, `job_id`, or `extraction_profile_id` where
-  applicable.
+  stay sanitized and may include only safe system-assigned identifiers and
+  workflow metadata, such as `file_id`, `job_id`, `extraction_profile_id`, or
+  `status` where applicable.
 
 ## Error Taxonomy
 
