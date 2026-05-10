@@ -3,8 +3,13 @@
 ## System Overview
 
 Draupnir is a backend service for CAD/BIM ingestion, quantity extraction,
-estimation, and revision generation. It exposes a stable API for multiple future
-clients, including web apps, TUIs, CLIs, and other backend services.
+estimation, and revision generation. MVP delivery is API-only. It exposes a
+stable API for future clients, including web apps, TUIs, CLIs, and other
+backend services.
+
+The MVP must not require or imply a separate product CLI. Command-line usage in
+development is operational only (for example, local server, worker, or
+migration commands), not an end-user product surface.
 
 ## Architecture Principles
 
