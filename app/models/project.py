@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import CheckConstraint, DateTime, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -17,6 +17,16 @@ class Project(Base):
     """
 
     __tablename__ = "projects"
+    __table_args__ = (
+        CheckConstraint(
+            "default_unit_system IS NULL OR default_unit_system IN ('metric', 'imperial')",
+            name="ck_projects_default_unit_system",
+        ),
+        CheckConstraint(
+            "default_currency IS NULL OR default_currency ~ '^[A-Z]{3}$'",
+            name="ck_projects_default_currency",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         primary_key=True,
@@ -41,7 +51,7 @@ class Project(Base):
     default_currency: Mapped[str | None] = mapped_column(
         String(3),
         nullable=True,
-        comment="Default currency code (ISO 4217, e.g., 'USD', 'EUR')",
+        comment="Default 3-letter uppercase currency code (e.g., 'USD', 'EUR')",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
