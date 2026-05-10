@@ -17,8 +17,8 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
-from app.models.file import File as FileModel
 from app.models.drawing_revision import DrawingRevision
+from app.models.file import File as FileModel
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent

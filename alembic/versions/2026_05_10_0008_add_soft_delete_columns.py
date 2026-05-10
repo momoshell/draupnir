@@ -1,7 +1,7 @@
 """add soft-delete columns for retention
 
-Revision ID: 2026_05_10_0006
-Revises: 2026_05_05_0005
+Revision ID: 2026_05_10_0008
+Revises: 2026_05_10_0007
 Create Date: 2026-05-10 12:20:00
 """
 
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "2026_05_10_0006"
-down_revision: str | None = "2026_05_05_0005"
+revision: str = "2026_05_10_0008"
+down_revision: str | None = "2026_05_10_0007"
 branch_labels: Sequence[str] | None = None
 depends_on: Sequence[str] | None = None
 

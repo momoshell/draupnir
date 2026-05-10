@@ -15,10 +15,10 @@ def _load_soft_delete_migration() -> Any:
         Path(__file__).resolve().parents[1]
         / "alembic"
         / "versions"
-        / "2026_05_10_0006_add_soft_delete_columns.py"
+        / "2026_05_10_0008_add_soft_delete_columns.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "migration_2026_05_10_0006_add_soft_delete_columns",
+        "migration_2026_05_10_0008_add_soft_delete_columns",
         migration_path,
     )
     assert spec is not None

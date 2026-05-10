@@ -1928,7 +1928,9 @@ class TestJobs:
 
         runner_calls: list[IngestionRunRequest] = []
 
-        async def _unexpected_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+        async def _unexpected_run_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
             runner_calls.append(request)
             return _build_fake_ingest_payload(request)
 
