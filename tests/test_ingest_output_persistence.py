@@ -17,10 +17,12 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
+from app.models.file import File as FileModel
 from app.models.drawing_revision import DrawingRevision
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
+from app.models.project import Project
 from app.models.validation_report import ValidationReport
 from app.storage.keys import build_generated_artifact_storage_key
 from tests.conftest import requires_database
@@ -384,6 +386,48 @@ class TestIngestOutputPersistence:
             adapter_output=adapter_output,
             predecessor_artifact_id=None,
         )
+
+    async def test_delete_project_soft_deletes_generated_artifacts_without_removing_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Project deletion should retain rows while marking files/artifacts deleted."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await process_ingest_job(job.id)
+
+        delete_response = await async_client.delete(f"/v1/projects/{project['id']}")
+        assert delete_response.status_code == 204
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            project_row = await session.get(Project, _as_uuid(project["id"]))
+            file_row = await session.get(FileModel, _as_uuid(uploaded["id"]))
+            artifact_rows = list(
+                (
+                    await session.execute(
+                        select(GeneratedArtifact)
+                        .where(GeneratedArtifact.project_id == _as_uuid(project["id"]))
+                        .order_by(GeneratedArtifact.created_at, GeneratedArtifact.id)
+                    )
+                ).scalars()
+            )
+
+        assert project_row is not None
+        assert project_row.deleted_at is not None
+        assert file_row is not None
+        assert file_row.deleted_at is not None
+        assert len(artifact_rows) == 1
+        assert artifact_rows[0].deleted_at is not None
 
     async def test_process_ingest_job_persists_payload_provenance_and_confidence_precedence(
         self,

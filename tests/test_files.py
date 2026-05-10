@@ -17,8 +17,10 @@ from sqlalchemy import select
 import app.api.v1.files as files_api
 import app.db.session as session_module
 from app.core.config import settings
+from app.core.exceptions import raise_not_found
 from app.models.file import File as FileModel
 from app.models.job import Job
+from app.models.project import Project
 from app.storage import LocalFilesystemStorage, StoredObjectMeta, get_storage
 from tests.conftest import requires_database
 
@@ -54,6 +56,32 @@ async def _upload_file(
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
+
+
+async def _mark_file_deleted(file_id: str) -> None:
+    """Mark a file row as soft-deleted for read-path tests."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        file_row = (
+            await session.execute(select(FileModel).where(FileModel.id == uuid.UUID(file_id)))
+        ).scalar_one()
+        file_row.deleted_at = file_row.created_at
+        await session.commit()
+
+
+async def _mark_project_deleted(project_id: str) -> None:
+    """Mark a project row as soft-deleted for project-scoped file tests."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        project = (
+            await session.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+        ).scalar_one()
+        project.deleted_at = project.updated_at
+        await session.commit()
 
 
 def _make_get_db_override_with_commit_error(
@@ -477,6 +505,38 @@ class TestProjectFiles:
         assert item["initial_job_id"] == uploaded["initial_job_id"]
         assert item["initial_extraction_profile_id"] == uploaded["initial_extraction_profile_id"]
 
+    async def test_list_project_files_excludes_soft_deleted_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """GET list should hide files with deleted_at set."""
+        _ = self
+
+        visible = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="visible.pdf",
+            content=b"%PDF-1.7\nvisible",
+            media_type="application/pdf",
+        )
+        deleted = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="deleted.pdf",
+            content=b"%PDF-1.7\ndeleted",
+            media_type="application/pdf",
+        )
+
+        await _mark_file_deleted(deleted["id"])
+
+        response = await async_client.get(f"/v1/projects/{created_project['id']}/files")
+        assert response.status_code == 200
+
+        returned_ids = {item["id"] for item in response.json()["items"]}
+        assert visible["id"] in returned_ids
+        assert deleted["id"] not in returned_ids
+
     async def test_list_project_files_pagination(
         self,
         async_client: httpx.AsyncClient,
@@ -639,6 +699,52 @@ class TestProjectFiles:
         assert "File" in data["error"]["message"]
         assert data["error"]["details"] is None
 
+    async def test_get_project_file_soft_deleted_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """GET detail should hide files with deleted_at set."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="deleted-detail.pdf",
+            content=b"%PDF-1.7\ndeleted-detail",
+            media_type="application/pdf",
+        )
+
+        await _mark_file_deleted(uploaded["id"])
+
+        response = await async_client.get(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}"
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    async def test_get_project_file_soft_deleted_parent_project_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """GET detail should hide files whose parent project is soft-deleted."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="deleted-project-detail.pdf",
+            content=b"%PDF-1.7\ndeleted-project-detail",
+            media_type="application/pdf",
+        )
+
+        await _mark_project_deleted(created_project["id"])
+
+        response = await async_client.get(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}"
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
     async def test_get_project_file_cross_project_returns_file_not_found(
         self,
         async_client: httpx.AsyncClient,
@@ -697,6 +803,82 @@ class TestProjectFiles:
         assert data["error"]["code"] == "NOT_FOUND"
         assert "Project" in data["error"]["message"]
 
+    async def test_upload_file_soft_deleted_project_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST should treat soft-deleted parent projects as missing."""
+        _ = self
+        await _mark_project_deleted(created_project["id"])
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files",
+            files={"file": ("missing.pdf", b"%PDF-1.7\nx", "application/pdf")},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    async def test_upload_file_cleans_persisted_upload_when_locked_project_recheck_fails(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST should cleanup persisted bytes when the locked project recheck loses the race."""
+        _ = self
+        payload = b"%PDF-1.7\nrace-delete"
+        storage = RecordingStorage()
+        app.dependency_overrides[get_storage] = lambda: storage
+        original_get_active_project = files_api._get_active_project_or_404
+        active_project_checks: list[bool] = []
+
+        async def _race_active_project_check(
+            db: Any,
+            project_id: uuid.UUID,
+            *,
+            for_update: bool = False,
+        ) -> Project:
+            active_project_checks.append(for_update)
+            if for_update:
+                raise_not_found("Project", str(project_id))
+            return await original_get_active_project(db, project_id, for_update=for_update)
+
+        monkeypatch.setattr(
+            files_api,
+            "_get_active_project_or_404",
+            _race_active_project_check,
+        )
+
+        try:
+            response = await async_client.post(
+                f"/v1/projects/{created_project['id']}/files",
+                files={"file": ("race.pdf", payload, "application/pdf")},
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage, None)
+
+        assert response.status_code == 404
+        assert active_project_checks == [False, True]
+        assert len(storage.put_calls) == 1
+        assert storage.delete_calls == [storage.put_calls[0][0]]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            file_result = await session.execute(
+                select(FileModel).where(
+                    FileModel.project_id == uuid.UUID(str(created_project["id"]))
+                )
+            )
+            job_result = await session.execute(
+                select(Job).where(Job.project_id == uuid.UUID(str(created_project["id"])))
+            )
+
+        assert file_result.scalars().all() == []
+        assert job_result.scalars().all() == []
+
     async def test_list_project_files_project_not_found(
         self,
         async_client: httpx.AsyncClient,
@@ -711,6 +893,54 @@ class TestProjectFiles:
         data = response.json()
         assert data["error"]["code"] == "NOT_FOUND"
         assert "Project" in data["error"]["message"]
+
+    async def test_reprocess_soft_deleted_file_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST reprocess should hide files with deleted_at set."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="reprocess.pdf",
+            content=b"%PDF-1.7\nreprocess",
+            media_type="application/pdf",
+        )
+
+        await _mark_file_deleted(uploaded["id"])
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile": {}},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
+    async def test_reprocess_soft_deleted_project_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST reprocess should hide files under a soft-deleted project."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="reprocess-project.pdf",
+            content=b"%PDF-1.7\nreprocess-project",
+            media_type="application/pdf",
+        )
+
+        await _mark_project_deleted(created_project["id"])
+
+        response = await async_client.post(
+            f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile": {}},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
 
     async def test_upload_file_rejects_payload_over_size_limit(
         self,

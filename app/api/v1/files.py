@@ -220,16 +220,47 @@ async def _get_project_file_or_404(
     db: AsyncSession,
     project_id: UUID,
     file_id: UUID,
+    *,
+    for_update: bool = False,
 ) -> FileModel:
     """Return a project-scoped file row or raise not found."""
-    query = select(FileModel).where(
-        (FileModel.project_id == project_id) & (FileModel.id == file_id)
+    query = (
+        select(FileModel)
+        .join(Project, Project.id == FileModel.project_id)
+        .where(
+            (FileModel.project_id == project_id)
+            & (FileModel.id == file_id)
+            & (FileModel.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
     )
+    if for_update:
+        query = query.with_for_update()
     file_row = (await db.execute(query)).scalar_one_or_none()
     if file_row is None:
         raise_not_found("File", str(file_id))
     assert file_row is not None
     return file_row
+
+
+async def _get_active_project_or_404(
+    db: AsyncSession,
+    project_id: UUID,
+    *,
+    for_update: bool = False,
+) -> Project:
+    """Return an active project row or raise not found."""
+    query = select(Project).where(
+        (Project.id == project_id) & (Project.deleted_at.is_(None))
+    )
+    if for_update:
+        query = query.with_for_update()
+    project = (await db.execute(query)).scalar_one_or_none()
+    if project is None:
+        raise_not_found("Project", str(project_id))
+
+    assert project is not None
+    return project
 
 
 async def _resolve_project_extraction_profile(
@@ -307,9 +338,7 @@ async def upload_project_file(
     storage: Annotated[Storage, Depends(get_storage)],
 ) -> FileModel:
     """Upload immutable source file bytes for a project and create ingest job."""
-    project = await db.get(Project, project_id)
-    if project is None:
-        raise_not_found("Project", str(project_id))
+    await _get_active_project_or_404(db, project_id)
 
     original_filename = file.filename or "upload.bin"
     media_type = file.content_type or "application/octet-stream"
@@ -430,6 +459,13 @@ async def upload_project_file(
     assert storage_key is not None
     assert storage_uri is not None
 
+    try:
+        await _get_active_project_or_404(db, project_id, for_update=True)
+    except Exception:
+        await db.rollback()
+        await _cleanup_persisted_upload(storage, storage_key, storage_uri)
+        raise
+
     extraction_profile = _build_extraction_profile(project_id)
     db.add(extraction_profile)
 
@@ -486,11 +522,11 @@ async def reprocess_project_file(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Job:
     """Create a new pending ingest job for an existing file and profile selection."""
-    project = await db.get(Project, project_id)
-    if project is None:
-        raise_not_found("Project", str(project_id))
+    await _get_active_project_or_404(db, project_id)
 
     await _get_project_file_or_404(db, project_id, file_id)
+    await _get_active_project_or_404(db, project_id, for_update=True)
+    await _get_project_file_or_404(db, project_id, file_id, for_update=True)
     extraction_profile = await _resolve_project_extraction_profile(db, project_id, request)
 
     ingest_job = Job(
@@ -534,13 +570,13 @@ async def list_project_files(
     limit: Annotated[int, Query(ge=1, le=200, description="Number of items to return")] = 50,
 ) -> FileListResponse:
     """List files for a project with cursor pagination."""
-    project = await db.get(Project, project_id)
-    if project is None:
-        raise_not_found("Project", str(project_id))
+    await _get_active_project_or_404(db, project_id)
 
     query = (
         select(FileModel)
-        .where(FileModel.project_id == project_id)
+        .where(
+            (FileModel.project_id == project_id) & (FileModel.deleted_at.is_(None))
+        )
         .order_by(FileModel.created_at.desc(), FileModel.id.desc())
     )
 

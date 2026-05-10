@@ -28,6 +28,7 @@ from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
+from app.models.project import Project
 from app.models.validation_report import ValidationReport
 from app.storage import get_storage
 from app.storage.keys import build_generated_artifact_storage_key
@@ -57,6 +58,10 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "detected_format",
     "media_type",
 )
+
+
+class _InactiveSourceError(Exception):
+    """Raised when a job source project or file is no longer active."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +183,16 @@ async def _get_source_file(
     for_update: bool = False,
 ) -> File | None:
     """Load a source file row, optionally under a row lock."""
-    statement = select(File).where((File.project_id == project_id) & (File.id == file_id))
+    statement = (
+        select(File)
+        .join(Project, Project.id == File.project_id)
+        .where(
+            (File.project_id == project_id)
+            & (File.id == file_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
     if for_update:
         statement = statement.with_for_update()
 
@@ -432,8 +446,7 @@ async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        result = await session.execute(select(Job).where(Job.id == job_id))
-        job = result.scalar_one_or_none()
+        job = await _get_job_for_update(session, job_id)
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
@@ -441,10 +454,16 @@ async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
             session,
             project_id=job.project_id,
             file_id=job.file_id,
+            for_update=True,
         )
         if source_file is None:
-            raise LookupError(
-                f"File with identifier '{job.file_id}' for job '{job_id}' not found"
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            raise _InactiveSourceError(
+                f"File with identifier '{job.file_id}' for job '{job_id}' is no longer active"
             )
 
         return IngestionRunRequest(
@@ -518,9 +537,13 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
             for_update=True,
         )
         if source_file is None:
-            raise LookupError(
-                f"File with identifier '{job.file_id}' for job '{job_id}' not found"
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
             )
+            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
 
         predecessor_revision = await _get_latest_drawing_revision(
             session,
@@ -947,6 +970,28 @@ def _finalize_job_cancelled(job: Job) -> None:
     job.finished_at = _utcnow()
 
 
+async def _cancel_job_for_inactive_source(
+    session: AsyncSession,
+    job: Job,
+    *,
+    reason: str,
+) -> None:
+    """Persist cancellation when a job source project/file is no longer active."""
+    if job.status in _TERMINAL_JOB_STATUSES:
+        return
+
+    job.cancel_requested = True
+    _finalize_job_cancelled(job)
+    await emit_job_event(
+        job.id,
+        level="warning",
+        message="Job cancelled",
+        data_json={"status": "cancelled", "reason": reason},
+        session=session,
+    )
+    await session.commit()
+
+
 async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
     """Claim, resume, or cancel a persisted ingest job under a row lock."""
     session_maker = get_session_maker()
@@ -966,6 +1011,21 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                 job_id=str(job_id),
                 status=job.status,
             )
+            return False
+
+        source_file = await _get_source_file(
+            session,
+            project_id=job.project_id,
+            file_id=job.file_id,
+            for_update=True,
+        )
+        if source_file is None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
             return False
 
         if not job.cancel_requested:
@@ -1070,6 +1130,9 @@ async def process_ingest_job(job_id: UUID) -> None:
                 stop_event=stop_event,
                 cancellation_task=cancellation_task,
             )
+    except _InactiveSourceError:
+        logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
+        return
     except IngestionRunnerError as exc:
         if exc.error_code is ErrorCode.JOB_CANCELLED:
             await _mark_job_cancelled(job_id)

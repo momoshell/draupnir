@@ -292,3 +292,41 @@ class TestValidationReportApi:
             _generated_artifacts,
         ) = await _load_project_outputs(project["id"])
         assert validation_reports_after == []
+
+    async def test_get_validation_report_returns_404_for_soft_deleted_project_data(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Validation report reads should hide revisions under soft-deleted project/file data."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await process_ingest_job(job.id)
+
+        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
+            await _load_project_outputs(project["id"])
+        )
+        drawing_revision = drawing_revisions[0]
+
+        delete_response = await async_client.delete(f"/v1/projects/{project['id']}")
+        assert delete_response.status_code == 204
+
+        response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/validation-report"
+        )
+
+        assert response.status_code == 404
+        assert response.json() == {
+            "error": {
+                "code": ErrorCode.NOT_FOUND.value,
+                "message": f"Drawing revision with identifier '{drawing_revision.id}' not found",
+                "details": None,
+            }
+        }

@@ -8,7 +8,10 @@ from typing import Any
 
 import httpx
 import pytest_asyncio
+from sqlalchemy import select
 
+import app.db.session as session_module
+from app.models.project import Project
 from tests.conftest import requires_database
 
 
@@ -24,6 +27,19 @@ async def created_project(
     )
     assert response.status_code == 201
     return typing.cast(dict[str, Any], response.json())
+
+
+async def _mark_project_deleted(project_id: str) -> None:
+    """Mark a project row as soft-deleted for read-path tests."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        project = (
+            await session.execute(select(Project).where(Project.id == uuid.UUID(project_id)))
+        ).scalar_one()
+        project.deleted_at = project.updated_at
+        await session.commit()
 
 
 @requires_database
@@ -217,6 +233,20 @@ class TestGetProject:
         assert data["error"]["message"] == "Request validation failed"
         assert isinstance(data["error"]["details"], list)
 
+    async def test_get_project_soft_deleted_returns_not_found(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """Should hide soft-deleted projects from detail reads."""
+        _ = self
+
+        await _mark_project_deleted(created_project["id"])
+
+        response = await async_client.get(f"/v1/projects/{created_project['id']}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+
 
 @requires_database
 class TestListProjects:
@@ -271,6 +301,35 @@ class TestListProjects:
         # Verify the created project is in the list
         project_ids = [item["id"] for item in data["items"]]
         assert created_project["id"] in project_ids
+
+    async def test_list_projects_excludes_soft_deleted_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        """Should exclude projects with deleted_at set from list results."""
+        _ = self
+        _ = cleanup_projects
+
+        visible_response = await async_client.post(
+            "/v1/projects",
+            json={"name": "Visible Project"},
+        )
+        deleted_response = await async_client.post(
+            "/v1/projects",
+            json={"name": "Deleted Project"},
+        )
+        assert visible_response.status_code == 201
+        assert deleted_response.status_code == 201
+
+        await _mark_project_deleted(deleted_response.json()["id"])
+
+        response = await async_client.get("/v1/projects")
+        assert response.status_code == 200
+
+        project_ids = {item["id"] for item in response.json()["items"]}
+        assert visible_response.json()["id"] in project_ids
+        assert deleted_response.json()["id"] not in project_ids
 
     async def test_list_projects_pagination(
         self,
@@ -544,6 +603,18 @@ class TestDeleteProject:
 
         # Assert project no longer exists
         assert response.status_code == 404
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            project = (
+                await session.execute(
+                    select(Project).where(Project.id == uuid.UUID(created_project["id"]))
+                )
+            ).scalar_one_or_none()
+
+        assert project is not None
+        assert project.deleted_at is not None
 
     async def test_delete_project_not_found(
         self,

@@ -54,3 +54,8 @@ class Project(Base):
         onupdate=func.now(),
         comment="Project last update timestamp",
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Soft deletion timestamp for retention workflows",
+    )

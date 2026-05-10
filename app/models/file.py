@@ -94,3 +94,8 @@ class File(Base):
         nullable=False,
         comment="File creation timestamp",
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Soft deletion timestamp for retention workflows",
+    )

@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
 from app.models.drawing_revision import DrawingRevision
+from app.models.file import File
+from app.models.project import Project
 from app.models.validation_report import ValidationReport
 from app.schemas.validation_report import (
     ValidationReportResponse,
@@ -29,11 +31,40 @@ async def get_validation_report(
 ) -> ValidationReportResponse:
     """Return the persisted canonical validation report for a drawing revision."""
     result = await db.execute(
-        select(ValidationReport).where(ValidationReport.drawing_revision_id == revision_id)
+        select(ValidationReport)
+        .join(
+            DrawingRevision,
+            DrawingRevision.id == ValidationReport.drawing_revision_id,
+        )
+        .join(
+            File,
+            (File.id == DrawingRevision.source_file_id)
+            & (File.project_id == DrawingRevision.project_id),
+        )
+        .join(Project, Project.id == DrawingRevision.project_id)
+        .where(
+            (ValidationReport.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
     )
     report = result.scalar_one_or_none()
     if report is None:
-        revision = await db.get(DrawingRevision, revision_id)
+        revision_result = await db.execute(
+            select(DrawingRevision)
+            .join(
+                File,
+                (File.id == DrawingRevision.source_file_id)
+                & (File.project_id == DrawingRevision.project_id),
+            )
+            .join(Project, Project.id == DrawingRevision.project_id)
+            .where(
+                (DrawingRevision.id == revision_id)
+                & (File.deleted_at.is_(None))
+                & (Project.deleted_at.is_(None))
+            )
+        )
+        revision = revision_result.scalar_one_or_none()
         if revision is None:
             raise_not_found("Drawing revision", str(revision_id))
         raise_not_found("Validation report", str(revision_id))
