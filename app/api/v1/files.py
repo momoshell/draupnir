@@ -11,9 +11,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from fastapi import File as FilePart
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.idempotency import (
+    IdempotencyReplay,
+    IdempotencyReservation,
+    build_idempotency_fingerprint,
+    claim_idempotency,
+    get_idempotency_key,
+    mark_idempotency_completed,
+    replay_idempotency,
+)
 from app.api.pagination import (
     decode_cursor_payload,
     encode_cursor_payload,
@@ -250,19 +260,33 @@ async def _resolve_project_extraction_profile(
 ) -> ExtractionProfile:
     """Return an existing project profile or stage a new immutable one."""
     if request.extraction_profile_id is not None:
-        query = select(ExtractionProfile).where(
-            (ExtractionProfile.project_id == project_id)
-            & (ExtractionProfile.id == request.extraction_profile_id)
+        return await _get_existing_project_extraction_profile_or_404(
+            db,
+            project_id,
+            request.extraction_profile_id,
         )
-        profile_row = (await db.execute(query)).scalar_one_or_none()
-        if profile_row is None:
-            raise_not_found("ExtractionProfile", str(request.extraction_profile_id))
-        assert profile_row is not None
-        return profile_row
 
     assert request.extraction_profile is not None
     profile_row = _build_extraction_profile(project_id, request.extraction_profile)
     db.add(profile_row)
+    return profile_row
+
+
+async def _get_existing_project_extraction_profile_or_404(
+    db: AsyncSession,
+    project_id: UUID,
+    extraction_profile_id: UUID,
+) -> ExtractionProfile:
+    """Return an existing extraction profile for the project or raise not found."""
+
+    query = select(ExtractionProfile).where(
+        (ExtractionProfile.project_id == project_id)
+        & (ExtractionProfile.id == extraction_profile_id)
+    )
+    profile_row = (await db.execute(query)).scalar_one_or_none()
+    if profile_row is None:
+        raise_not_found("ExtractionProfile", str(extraction_profile_id))
+    assert profile_row is not None
     return profile_row
 
 
@@ -275,6 +299,71 @@ async def _mark_job_enqueue_failed(db: AsyncSession, job: Job, exc: Exception) -
     job.finished_at = datetime.now(UTC)
     await db.commit()
     await db.refresh(job)
+
+
+async def _mark_job_enqueue_failed_with_snapshot(
+    db: AsyncSession,
+    job: Job,
+    exc: Exception,
+    *,
+    reservation: IdempotencyReservation | None,
+) -> dict[str, Any]:
+    """Persist enqueue failure state and finalize a replay snapshot when present."""
+
+    _ = exc
+    job.status = "failed"
+    job.error_code = ErrorCode.INTERNAL_ERROR.value
+    job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
+    job.finished_at = datetime.now(UTC)
+    error_body = create_error_response(
+        code=ErrorCode.INTERNAL_ERROR,
+        message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
+        details=_enqueue_failure_details(job),
+    )
+    if reservation is not None:
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            response_body=error_body,
+        )
+    await db.commit()
+    await db.refresh(job)
+    return error_body
+
+
+async def _raise_upload_storage_failure(
+    db: AsyncSession,
+    reservation: IdempotencyReservation | None,
+    *,
+    message: str,
+    cause: Exception | None = None,
+) -> None:
+    """Raise a sanitized storage error and finalize idempotency when reserved."""
+
+    error_body = create_error_response(
+        code=ErrorCode.STORAGE_FAILED,
+        message=message,
+        details=None,
+    )
+    if reservation is not None:
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            response_body=error_body,
+        )
+        await db.commit()
+
+    if cause is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_body,
+        )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=error_body,
+    ) from cause
 
 
 def _enqueue_failure_details(job: Job) -> dict[str, str]:
@@ -318,12 +407,16 @@ async def upload_project_file(
     file: Annotated[UploadFile, FilePart(...)],
     db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[Storage, Depends(get_storage)],
-) -> FileModel:
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> FileModel | Response:
     """Upload immutable source file bytes for a project and create ingest job."""
-    await _get_active_project_or_404(db, project_id)
+    if idempotency_key is None:
+        await _get_active_project_or_404(db, project_id)
 
     original_filename = file.filename or "upload.bin"
     media_type = file.content_type or "application/octet-stream"
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
 
     if len(original_filename) > _MAX_ORIGINAL_FILENAME_LENGTH:
         await _raise_input_invalid_for_upload_metadata(
@@ -396,37 +489,61 @@ async def upload_project_file(
         checksum = checksum_builder.hexdigest()
         storage_key = build_original_storage_key(file_id, checksum)
 
+        if idempotency_key is not None:
+            fingerprint = build_idempotency_fingerprint(
+                f"files.upload:{project_id}",
+                {
+                    "project_id": str(project_id),
+                    "original_filename": original_filename,
+                    "media_type": media_type,
+                    "detected_format": detected_format,
+                    "size_bytes": total_bytes,
+                    "checksum_sha256": checksum,
+                },
+            )
+            replay = await replay_idempotency(
+                db,
+                key=idempotency_key,
+                fingerprint=fingerprint,
+            )
+            if replay is not None:
+                return replay.response
+            await _get_active_project_or_404(db, project_id)
+            claim = await claim_idempotency(
+                db,
+                key=idempotency_key,
+                fingerprint=fingerprint,
+                method="POST",
+                path=f"/projects/{project_id}/files",
+            )
+            if isinstance(claim, IdempotencyReplay):
+                return claim.response
+            reservation = claim
+
         try:
             stored_object = await storage.put(storage_key, staging_path, immutable=True)
             if stored_object.checksum_sha256 != checksum:
                 await _cleanup_persisted_upload(storage, storage_key, stored_object.storage_uri)
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=create_error_response(
-                        code=ErrorCode.STORAGE_FAILED,
-                        message="Stored file checksum mismatch detected.",
-                        details=None,
-                    ),
+                await _raise_upload_storage_failure(
+                    db,
+                    reservation,
+                    message="Stored file checksum mismatch detected.",
                 )
             storage_uri = stored_object.storage_uri
         except FileExistsError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=create_error_response(
-                    code=ErrorCode.STORAGE_FAILED,
-                    message="Storage collision occurred during upload.",
-                    details=None,
-                ),
-            ) from exc
+            await _raise_upload_storage_failure(
+                db,
+                reservation,
+                message="Storage collision occurred during upload.",
+                cause=exc,
+            )
         except OSError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=create_error_response(
-                    code=ErrorCode.STORAGE_FAILED,
-                    message="Failed to persist uploaded file.",
-                    details=None,
-                ),
-            ) from exc
+            await _raise_upload_storage_failure(
+                db,
+                reservation,
+                message="Failed to persist uploaded file.",
+                cause=exc,
+            )
     except HTTPException:
         _cleanup_uploaded_path(staging_path)
         raise
@@ -487,15 +604,29 @@ async def upload_project_file(
     try:
         enqueue_ingest_job(ingest_job.id)
     except Exception as exc:
-        await _mark_job_enqueue_failed(db, ingest_job, exc)
+        error_body = await _mark_job_enqueue_failed_with_snapshot(
+            db,
+            ingest_job,
+            exc,
+            reservation=reservation,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.INTERNAL_ERROR,
-                message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
-                details=_enqueue_failure_details(ingest_job),
-            ),
+            detail=error_body,
         ) from exc
+
+    if reservation is not None:
+        success_body = FileRead.model_validate(
+            _attach_initial_upload_metadata(file_row)
+        ).model_dump(mode="json")
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_201_CREATED,
+            response_body=success_body,
+        )
+        await db.commit()
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=success_body)
 
     return _attach_initial_upload_metadata(file_row)
 
@@ -510,11 +641,44 @@ async def reprocess_project_file(
     file_id: UUID,
     request: FileReprocessRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> Job:
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Job | Response:
     """Create a new pending ingest job for an existing file and profile selection."""
-    await _get_active_project_or_404(db, project_id)
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = build_idempotency_fingerprint(
+            f"files.reprocess:{project_id}:{file_id}",
+            request.model_dump(mode="json"),
+        )
+        replay = await replay_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay is not None:
+            return replay.response
 
+    await _get_active_project_or_404(db, project_id)
     await _get_project_file_or_404(db, project_id, file_id)
+    if request.extraction_profile_id is not None:
+        await _get_existing_project_extraction_profile_or_404(
+            db,
+            project_id,
+            request.extraction_profile_id,
+        )
+    if idempotency_key is not None:
+        assert fingerprint is not None
+        claim = await claim_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+            method="POST",
+            path=f"/projects/{project_id}/files/{file_id}/reprocess",
+        )
+        if isinstance(claim, IdempotencyReplay):
+            return claim.response
+        reservation = claim
     await _get_active_project_or_404(db, project_id, for_update=True)
     await _get_project_file_or_404(db, project_id, file_id, for_update=True)
     extraction_profile = await _resolve_project_extraction_profile(db, project_id, request)
@@ -536,15 +700,27 @@ async def reprocess_project_file(
     try:
         enqueue_ingest_job(ingest_job.id)
     except Exception as exc:
-        await _mark_job_enqueue_failed(db, ingest_job, exc)
+        error_body = await _mark_job_enqueue_failed_with_snapshot(
+            db,
+            ingest_job,
+            exc,
+            reservation=reservation,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.INTERNAL_ERROR,
-                message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
-                details=_enqueue_failure_details(ingest_job),
-            ),
+            detail=error_body,
         ) from exc
+
+    if reservation is not None:
+        success_body = JobRead.model_validate(ingest_job).model_dump(mode="json")
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_202_ACCEPTED,
+            response_body=success_body,
+        )
+        await db.commit()
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
 
     return ingest_job
 

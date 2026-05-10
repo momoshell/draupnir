@@ -5,9 +5,19 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.idempotency import (
+    IdempotencyReplay,
+    IdempotencyReservation,
+    build_idempotency_fingerprint,
+    claim_idempotency,
+    get_idempotency_key,
+    mark_idempotency_completed,
+    replay_idempotency,
+)
 from app.api.pagination import (
     decode_cursor_payload,
     encode_cursor_payload,
@@ -79,8 +89,25 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
 async def create_project(
     project_in: ProjectCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> Project:
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Project | Response:
     """Create a new project."""
+    reservation: IdempotencyReservation | None = None
+    if idempotency_key is not None:
+        claim = await claim_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=build_idempotency_fingerprint(
+                "projects.create",
+                project_in.model_dump(mode="json", exclude_unset=True),
+            ),
+            method="POST",
+            path="/projects",
+        )
+        if isinstance(claim, IdempotencyReplay):
+            return claim.response
+        reservation = claim
+
     project = Project(
         name=project_in.name,
         description=project_in.description,
@@ -88,6 +115,19 @@ async def create_project(
         default_currency=project_in.default_currency,
     )
     db.add(project)
+    if reservation is not None:
+        await db.flush()
+        await db.refresh(project)
+        body = ProjectRead.model_validate(project).model_dump(mode="json")
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_201_CREATED,
+            response_body=body,
+        )
+        await db.commit()
+        return JSONResponse(status_code=status.HTTP_201_CREATED, content=body)
+
     await db.commit()
     await db.refresh(project)
     return project
@@ -165,14 +205,56 @@ async def update_project(
     project_id: UUID,
     project_in: ProjectUpdate,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> Project:
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Project | Response:
     """Update an existing project."""
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = build_idempotency_fingerprint(
+            f"projects.update:{project_id}",
+            project_in.model_dump(mode="json", exclude_unset=True),
+        )
+        replay = await replay_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay is not None:
+            return replay.response
+
     project = await _get_active_project_or_404(db, project_id)
+    if idempotency_key is not None:
+        assert fingerprint is not None
+        claim = await claim_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+            method="PATCH",
+            path=f"/projects/{project_id}",
+        )
+        if isinstance(claim, IdempotencyReplay):
+            return claim.response
+        reservation = claim
+        project = await _get_active_project_or_404(db, project_id)
 
     # Update only provided fields
     update_data = project_in.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(project, field, value)
+
+    if reservation is not None:
+        await db.flush()
+        await db.refresh(project)
+        body = ProjectRead.model_validate(project).model_dump(mode="json")
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_200_OK,
+            response_body=body,
+        )
+        await db.commit()
+        return JSONResponse(status_code=status.HTTP_200_OK, content=body)
 
     await db.commit()
     await db.refresh(project)
@@ -186,8 +268,39 @@ async def update_project(
 async def delete_project(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> None:
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Response:
     """Delete a project."""
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = build_idempotency_fingerprint(
+            f"projects.delete:{project_id}",
+            {"project_id": str(project_id)},
+        )
+        replay = await replay_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay is not None:
+            return replay.response
+
+    await _get_active_project_or_404(db, project_id)
+
+    if idempotency_key is not None:
+        assert fingerprint is not None
+        claim = await claim_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+            method="DELETE",
+            path=f"/projects/{project_id}",
+        )
+        if isinstance(claim, IdempotencyReplay):
+            return claim.response
+        reservation = claim
+
     project = await _get_active_project_or_404(db, project_id, for_update=True)
     deleted_at = datetime.now(UTC)
     project.deleted_at = deleted_at
@@ -218,4 +331,12 @@ async def delete_project(
         )
         .values(deleted_at=deleted_at)
     )
+    if reservation is not None:
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_204_NO_CONTENT,
+            response_body=None,
+        )
     await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
