@@ -423,7 +423,7 @@ class TestExtractionProfiles:
 
             async with engine.begin() as conn:
                 await conn.execute(text(f'SET search_path TO "{schema_name}"'))
-                await conn.run_sync(_install_pre_0006_jobs_schema)
+                await conn.run_sync(_install_pre_0007_jobs_schema)
 
                 await conn.execute(
                     text("INSERT INTO projects (id) VALUES (:id)"),
@@ -492,7 +492,9 @@ class TestExtractionProfiles:
                     ],
                 )
 
-                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+                await conn.run_sync(
+                    lambda sync_conn: _run_migration_upgrade(sync_conn, migration)
+                )
 
                 jobs = (
                     (
@@ -552,10 +554,13 @@ class TestExtractionProfiles:
             async with engine.begin() as conn:
                 await conn.execute(text(f'CREATE SCHEMA "{schema_name}"'))
 
-            with pytest.raises(RuntimeError, match="still have NULL extraction_profile_id after backfill"):
+            with pytest.raises(
+                RuntimeError,
+                match="still have NULL extraction_profile_id after backfill",
+            ):
                 async with engine.begin() as conn:
                     await conn.execute(text(f'SET search_path TO "{schema_name}"'))
-                    await conn.run_sync(_install_pre_0006_jobs_schema)
+                    await conn.run_sync(_install_pre_0007_jobs_schema)
 
                     await conn.execute(
                         text("INSERT INTO projects (id) VALUES (:id)"),
@@ -606,7 +611,12 @@ class TestExtractionProfiles:
                         },
                     )
 
-                    await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+                    await conn.run_sync(
+                        lambda sync_conn: _run_migration_upgrade(
+                            sync_conn,
+                            migration,
+                        )
+                    )
         finally:
             async with engine.begin() as conn:
                 await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
@@ -614,7 +624,7 @@ class TestExtractionProfiles:
     async def test_job_constraints_migration_downgrade_drops_constraints(
         self,
     ) -> None:
-        """Downgrade should remove the 0006 job check constraints."""
+        """Downgrade should remove the 0007 job check constraints."""
         _ = self
 
         engine = session_module.get_engine()
@@ -633,7 +643,7 @@ class TestExtractionProfiles:
 
             async with engine.begin() as conn:
                 await conn.execute(text(f'SET search_path TO "{schema_name}"'))
-                await conn.run_sync(_install_pre_0006_jobs_schema)
+                await conn.run_sync(_install_pre_0007_jobs_schema)
 
                 await conn.execute(
                     text("INSERT INTO projects (id) VALUES (:id)"),
@@ -688,7 +698,9 @@ class TestExtractionProfiles:
                     },
                 )
 
-                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
+                await conn.run_sync(
+                    lambda sync_conn: _run_migration_upgrade(sync_conn, migration)
+                )
                 assert await _get_job_check_constraints(conn, schema_name) == {
                     "ck_jobs_error_code_valid": True,
                     "ck_jobs_ingest_extraction_profile_required": True,
@@ -696,7 +708,12 @@ class TestExtractionProfiles:
                     "ck_jobs_status_valid": True,
                 }
 
-                await conn.run_sync(lambda sync_conn: _run_migration_downgrade(sync_conn, migration))
+                await conn.run_sync(
+                    lambda sync_conn: _run_migration_downgrade(
+                        sync_conn,
+                        migration,
+                    )
+                )
                 assert await _get_job_check_constraints(conn, schema_name) == {}
         finally:
             async with engine.begin() as conn:
@@ -892,10 +909,10 @@ def _load_job_constraints_migration() -> Any:
         Path(__file__).resolve().parents[1]
         / "alembic"
         / "versions"
-        / "2026_05_10_0006_constrain_job_fields_and_ingest_profile.py"
+        / "2026_05_10_0007_constrain_job_fields_and_ingest_profile.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "migration_2026_05_10_0006_constrain_job_fields_and_ingest_profile",
+        "migration_2026_05_10_0007_constrain_job_fields_and_ingest_profile",
         migration_path,
     )
     assert spec is not None
@@ -950,8 +967,8 @@ def _install_pre_0004_schema(sync_conn: sa.Connection) -> None:
     metadata.create_all(sync_conn)
 
 
-def _install_pre_0006_jobs_schema(sync_conn: sa.Connection) -> None:
-    """Create the minimal pre-0006 schema needed to exercise job constraints."""
+def _install_pre_0007_jobs_schema(sync_conn: sa.Connection) -> None:
+    """Create the minimal pre-0007 schema needed to exercise job constraints."""
     metadata = sa.MetaData()
     sa.Table(
         "projects",

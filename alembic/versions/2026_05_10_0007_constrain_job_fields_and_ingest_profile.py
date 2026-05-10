@@ -1,7 +1,7 @@
 """constrain job fields and ingest profile invariant
 
-Revision ID: 2026_05_10_0006
-Revises: 2026_05_05_0005
+Revision ID: 2026_05_10_0007
+Revises: 2026_05_10_0006
 Create Date: 2026-05-10 12:30:00
 """
 
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "2026_05_10_0006"
-down_revision: str | None = "2026_05_05_0005"
+revision: str = "2026_05_10_0007"
+down_revision: str | None = "2026_05_10_0006"
 branch_labels: Sequence[str] | None = None
 depends_on: Sequence[str] | None = None
 
@@ -48,7 +48,8 @@ def _profile_required_constraint_sql() -> str:
 
     return (
         "job_type NOT IN "
-        f"({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)}) OR extraction_profile_id IS NOT NULL"
+        f"({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)}) "
+        "OR extraction_profile_id IS NOT NULL"
     )
 
 
@@ -112,7 +113,7 @@ def upgrade() -> None:
     ).scalar_one()
     if invalid_profile_required_jobs != 0:
         raise RuntimeError(
-            "Migration 2026_05_10_0006 requires extraction_profile_id for persisted "
+            "Migration 2026_05_10_0007 requires extraction_profile_id for persisted "
             "ingest/reprocess jobs, but "
             f"{invalid_profile_required_jobs} row(s) still have NULL extraction_profile_id "
             "after backfill. Populate jobs.extraction_profile_id (for ingest jobs, "

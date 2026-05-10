@@ -81,7 +81,8 @@ class Job(Base):
         ),
         CheckConstraint(
             "job_type NOT IN "
-            f"({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)}) OR extraction_profile_id IS NOT NULL",
+            f"({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)}) "
+            "OR extraction_profile_id IS NOT NULL",
             name="ck_jobs_ingest_extraction_profile_required",
         ),
     )
