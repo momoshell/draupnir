@@ -868,6 +868,7 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
             quantity_gate="review_gated",
             diagnostic_codes=("pymupdf.extract",),
         ),
+        timeout=AdapterTimeout(seconds=5),
     )
     result = await adapter.ingest(source, AdapterExecutionOptions())
 
