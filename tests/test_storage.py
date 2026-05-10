@@ -1,7 +1,10 @@
 """Unit tests for storage backends."""
 
+from __future__ import annotations
+
 import hashlib
 from pathlib import Path
+from typing import BinaryIO, Literal, cast
 
 import pytest
 
@@ -10,7 +13,11 @@ from app.storage import (
     LocalStorage,
     MemoryStorage,
 )
-from app.storage.base import StorageChecksumMismatchError
+from app.storage.base import (
+    StorageChecksumMismatchError,
+    StorageReadError,
+    StorageWriteError,
+)
 
 
 @pytest.mark.asyncio
@@ -56,6 +63,28 @@ async def test_memory_storage_stat_and_presign_stub() -> None:
     assert stat.size_bytes == 3
     assert stat.checksum_sha256 == hashlib.sha256(b"abc").hexdigest()
     assert await storage.presign(key) is None
+
+
+@pytest.mark.asyncio
+async def test_memory_storage_copy_to_path_round_trip(tmp_path: Path) -> None:
+    """Memory storage should stream a stored object into a destination path."""
+    storage = MemoryStorage()
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    await storage.put(key, payload, immutable=True)
+    destination = tmp_path / "staged.bin"
+
+    meta = await storage.copy_to_path(
+        key,
+        destination,
+        expected_checksum_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+    assert destination.read_bytes() == payload
+    assert meta.key == key
+    assert meta.storage_uri == f"memory://{key}"
+    assert meta.size_bytes == len(payload)
+    assert meta.checksum_sha256 == hashlib.sha256(payload).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -152,6 +181,110 @@ async def test_local_storage_round_trip_and_cleanup(tmp_path: Path) -> None:
 
     assert await storage.exists(key) is True
     assert list((tmp_path / "originals" / "file-4").glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_local_storage_copy_to_path_round_trip(tmp_path: Path) -> None:
+    """Local storage should stream a stored object into a destination path."""
+    storage = LocalFilesystemStorage(tmp_path / "storage")
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    meta = await storage.put(key, payload, immutable=True)
+    destination = tmp_path / "staging" / "staged.bin"
+    destination.parent.mkdir()
+
+    copied = await storage.copy_to_path(
+        key,
+        destination,
+        expected_checksum_sha256=meta.checksum_sha256,
+    )
+
+    assert destination.read_bytes() == payload
+    assert copied == meta
+
+
+@pytest.mark.asyncio
+async def test_local_storage_copy_to_path_classifies_source_read_oserror_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local storage should classify source read failures and remove partial outputs."""
+    storage = LocalFilesystemStorage(tmp_path / "storage")
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    await storage.put(key, payload, immutable=True)
+    destination = tmp_path / "staging" / "staged.bin"
+    destination.parent.mkdir()
+
+    class _BrokenSourceStream:
+        def __enter__(self) -> _BrokenSourceStream:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
+            return False
+
+        def read(self, _size: int) -> bytes:
+            raise OSError("source read failed")
+
+        def close(self) -> None:
+            return None
+
+    def _open_copy_source(_source_path: Path, _key: str) -> BinaryIO:
+        return cast(BinaryIO, _BrokenSourceStream())
+
+    monkeypatch.setattr(storage, "_open_copy_source", _open_copy_source)
+
+    with pytest.raises(StorageReadError):
+        await storage.copy_to_path(key, destination)
+
+    assert destination.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_local_storage_copy_to_path_classifies_destination_write_oserror_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local storage should classify destination write failures and remove partial outputs."""
+    storage = LocalFilesystemStorage(tmp_path / "storage")
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    await storage.put(key, payload, immutable=True)
+    destination = tmp_path / "staging" / "staged.bin"
+    destination.parent.mkdir()
+
+    class _BrokenDestinationStream:
+        def __init__(self, stream: BinaryIO) -> None:
+            self._stream = stream
+
+        def __enter__(self) -> _BrokenDestinationStream:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
+            self._stream.close()
+            return False
+
+        def write(self, _chunk: bytes) -> int:
+            raise OSError("destination write failed")
+
+        def flush(self) -> None:
+            self._stream.flush()
+
+        def fileno(self) -> int:
+            return self._stream.fileno()
+
+        def close(self) -> None:
+            self._stream.close()
+
+    def _open_copy_destination(_destination: Path, _key: str) -> BinaryIO:
+        return cast(BinaryIO, _BrokenDestinationStream(destination.open("xb")))
+
+    monkeypatch.setattr(storage, "_open_copy_destination", _open_copy_destination)
+
+    with pytest.raises(StorageWriteError):
+        await storage.copy_to_path(key, destination)
+
+    assert destination.exists() is False
 
 
 @pytest.mark.asyncio
@@ -338,3 +471,56 @@ async def test_local_storage_detects_checksum_tampering_on_get_and_stat(tmp_path
 
     with pytest.raises(StorageChecksumMismatchError):
         await storage.stat(key, expected_checksum_sha256=meta.checksum_sha256)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_kind", ["memory", "local"])
+async def test_storage_copy_to_path_removes_partial_destination_on_checksum_mismatch(
+    tmp_path: Path,
+    storage_kind: str,
+) -> None:
+    """Streaming copy should clean up partial destinations on checksum mismatch."""
+    storage: MemoryStorage | LocalFilesystemStorage
+    if storage_kind == "memory":
+        storage = MemoryStorage()
+    else:
+        storage = LocalFilesystemStorage(tmp_path / "storage")
+
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    await storage.put(key, payload, immutable=True)
+    destination = tmp_path / f"{storage_kind}-checksum.bin"
+
+    with pytest.raises(StorageChecksumMismatchError):
+        await storage.copy_to_path(
+            key,
+            destination,
+            expected_checksum_sha256=hashlib.sha256(b"different").hexdigest(),
+        )
+
+    assert destination.exists() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_kind", ["memory", "local"])
+async def test_storage_copy_to_path_rejects_existing_destination_without_overwrite(
+    tmp_path: Path,
+    storage_kind: str,
+) -> None:
+    """Streaming copy should fail when the destination already exists."""
+    storage: MemoryStorage | LocalFilesystemStorage
+    if storage_kind == "memory":
+        storage = MemoryStorage()
+    else:
+        storage = LocalFilesystemStorage(tmp_path / "storage")
+
+    key = "originals/file-copy/checksum-copy"
+    payload = b"copy-payload"
+    await storage.put(key, payload, immutable=True)
+    destination = tmp_path / f"{storage_kind}-exists.bin"
+    destination.write_bytes(b"existing")
+
+    with pytest.raises(FileExistsError):
+        await storage.copy_to_path(key, destination)
+
+    assert destination.read_bytes() == b"existing"

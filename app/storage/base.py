@@ -31,6 +31,14 @@ class StorageChecksumMismatchError(ValueError):
         )
 
 
+class StorageReadError(OSError):
+    """Raised when a storage backend cannot read object bytes."""
+
+
+class StorageWriteError(OSError):
+    """Raised when a storage backend cannot stage bytes to a destination path."""
+
+
 @dataclass(frozen=True, slots=True)
 class StoredObject:
     """Stored object bytes and metadata."""
@@ -66,6 +74,15 @@ class Storage(Protocol):
         expected_checksum_sha256: str | None = None,
     ) -> StoredObject:
         """Read an object by key and optionally verify its checksum."""
+
+    async def copy_to_path(
+        self,
+        key: str,
+        destination: Path,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObjectMeta:
+        """Stream an object into a caller-owned destination path and verify its checksum."""
 
     async def stat(
         self,

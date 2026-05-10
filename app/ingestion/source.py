@@ -11,7 +11,11 @@ from uuid import UUID
 
 from app.ingestion.contracts import AdapterSource, InputFamily, UploadFormat
 from app.storage import Storage, get_storage
-from app.storage.base import StorageChecksumMismatchError
+from app.storage.base import (
+    StorageChecksumMismatchError,
+    StorageReadError,
+    StorageWriteError,
+)
 from app.storage.keys import build_original_storage_key
 
 
@@ -54,32 +58,32 @@ async def materialize_original_source(
     """Fetch an immutable original and stage it into an attempt-local tempdir."""
     resolved_storage = storage or get_storage()
     storage_key = build_original_storage_key(source.file_id, source.checksum_sha256)
-    try:
-        stored_object = await resolved_storage.get(
-            storage_key,
-            expected_checksum_sha256=source.checksum_sha256,
-        )
-    except StorageChecksumMismatchError as exc:
-        raise OriginalSourceReadError(
-            storage_key=storage_key,
-            reason="checksum_mismatch",
-        ) from exc
-    except (FileNotFoundError, KeyError) as exc:
-        raise OriginalSourceReadError(
-            storage_key=storage_key,
-            reason="not_found",
-        ) from exc
-    except OSError as exc:
-        raise OriginalSourceReadError(
-            storage_key=storage_key,
-            reason="read_failed",
-        ) from exc
-
     temp_dir_root = str(temp_root) if temp_root is not None else None
     with TemporaryDirectory(prefix="ingestion-source-", dir=temp_dir_root) as temp_dir:
         file_path = Path(temp_dir) / _materialized_name(source)
         try:
-            file_path.write_bytes(stored_object.body)
+            await resolved_storage.copy_to_path(
+                storage_key,
+                file_path,
+                expected_checksum_sha256=source.checksum_sha256,
+            )
+        except StorageChecksumMismatchError as exc:
+            raise OriginalSourceReadError(
+                storage_key=storage_key,
+                reason="checksum_mismatch",
+            ) from exc
+        except (FileNotFoundError, KeyError) as exc:
+            raise OriginalSourceReadError(
+                storage_key=storage_key,
+                reason="not_found",
+            ) from exc
+        except StorageReadError as exc:
+            raise OriginalSourceReadError(
+                storage_key=storage_key,
+                reason="read_failed",
+            ) from exc
+        except StorageWriteError as exc:
+            raise OriginalSourceStageError(reason="stage_failed") from exc
         except OSError as exc:
             raise OriginalSourceStageError(reason="stage_failed") from exc
         yield AdapterSource(

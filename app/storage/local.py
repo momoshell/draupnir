@@ -14,6 +14,8 @@ from app.storage.base import (
     StorageChecksumMismatchError,
     StorageHealthReport,
     StoragePayload,
+    StorageReadError,
+    StorageWriteError,
     StoredObject,
     StoredObjectMeta,
 )
@@ -45,6 +47,21 @@ class LocalFilesystemStorage:
     ) -> StoredObject:
         """Load a stored object and optionally verify its checksum."""
         return await asyncio.to_thread(self._get_sync, key, expected_checksum_sha256)
+
+    async def copy_to_path(
+        self,
+        key: str,
+        destination: Path,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObjectMeta:
+        """Copy a stored object into a caller-owned destination path."""
+        return await asyncio.to_thread(
+            self._copy_to_path_sync,
+            key,
+            destination,
+            expected_checksum_sha256,
+        )
 
     async def stat(
         self,
@@ -142,6 +159,45 @@ class LocalFilesystemStorage:
             checksum_sha256=checksum_sha256,
         )
 
+    def _copy_to_path_sync(
+        self,
+        key: str,
+        destination: Path,
+        expected_checksum_sha256: str | None,
+    ) -> StoredObjectMeta:
+        source_path = self._path_for_key(key)
+        destination_created = False
+        try:
+            with (
+                self._open_copy_source(source_path, key) as source_stream,
+                self._open_copy_destination(destination, key) as destination_stream,
+            ):
+                destination_created = True
+                size_bytes, checksum_sha256 = self._copy_stream_to_destination(
+                    source_stream,
+                    destination_stream,
+                    key=key,
+                )
+                try:
+                    destination_stream.flush()
+                    os.fsync(destination_stream.fileno())
+                except OSError as exc:
+                    raise StorageWriteError(
+                        f"Failed to stage storage key '{key}' to destination."
+                    ) from exc
+            self._verify_checksum(key, expected_checksum_sha256, checksum_sha256)
+            return StoredObjectMeta(
+                key=key,
+                storage_uri=f"file://{source_path}",
+                size_bytes=size_bytes,
+                checksum_sha256=checksum_sha256,
+            )
+        except BaseException:
+            if destination_created:
+                with suppress(OSError):
+                    destination.unlink()
+            raise
+
     def _delete_sync(self, key: str) -> None:
         path = self._path_for_key(key)
         if path.exists() and self._is_immutable_path(path):
@@ -201,6 +257,49 @@ class LocalFilesystemStorage:
             checksum_builder.update(chunk)
             size_bytes += len(chunk)
         return size_bytes, checksum_builder.hexdigest()
+
+    def _copy_stream_to_destination(
+        self,
+        source_stream: BinaryIO,
+        destination_stream: BinaryIO,
+        *,
+        key: str,
+    ) -> tuple[int, str]:
+        checksum_builder = hashlib.sha256()
+        size_bytes = 0
+        while True:
+            try:
+                chunk = source_stream.read(_COPY_CHUNK_SIZE_BYTES)
+            except OSError as exc:
+                raise StorageReadError(f"Failed to read storage key '{key}'.") from exc
+            if not chunk:
+                return size_bytes, checksum_builder.hexdigest()
+            try:
+                destination_stream.write(chunk)
+            except OSError as exc:
+                raise StorageWriteError(
+                    f"Failed to stage storage key '{key}' to destination."
+                ) from exc
+            checksum_builder.update(chunk)
+            size_bytes += len(chunk)
+
+    def _open_copy_source(self, source_path: Path, key: str) -> BinaryIO:
+        try:
+            return source_path.open("rb")
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise StorageReadError(f"Failed to read storage key '{key}'.") from exc
+
+    def _open_copy_destination(self, destination: Path, key: str) -> BinaryIO:
+        try:
+            return destination.open("xb")
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise StorageWriteError(
+                f"Failed to stage storage key '{key}' to destination."
+            ) from exc
 
     def _read_body_with_checksum(self, path: Path) -> tuple[bytes, str]:
         checksum_builder = hashlib.sha256()

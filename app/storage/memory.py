@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import BinaryIO
 
 from app.storage.base import (
     StorageChecksumMismatchError,
     StorageHealthReport,
     StoragePayload,
+    StorageWriteError,
     StoredObject,
     StoredObjectMeta,
 )
@@ -64,6 +66,44 @@ class MemoryStorage:
             body=body,
         )
 
+    async def copy_to_path(
+        self,
+        key: str,
+        destination: Path,
+        *,
+        expected_checksum_sha256: str | None = None,
+    ) -> StoredObjectMeta:
+        """Copy a stored object into a caller-owned destination path."""
+        body, _ = self._objects[key]
+        checksum_builder = hashlib.sha256()
+        size_bytes = 0
+        destination_created = False
+        try:
+            with self._open_copy_destination(destination, key) as stream:
+                destination_created = True
+                for index in range(0, len(body), _MEMORY_READ_CHUNK_SIZE_BYTES):
+                    chunk = body[index : index + _MEMORY_READ_CHUNK_SIZE_BYTES]
+                    try:
+                        stream.write(chunk)
+                    except OSError as exc:
+                        raise StorageWriteError(
+                            f"Failed to stage storage key '{key}' to destination."
+                        ) from exc
+                    checksum_builder.update(chunk)
+                    size_bytes += len(chunk)
+            checksum_sha256 = checksum_builder.hexdigest()
+            self._verify_checksum(key, expected_checksum_sha256, checksum_sha256)
+            return StoredObjectMeta(
+                key=key,
+                storage_uri=f"memory://{key}",
+                size_bytes=size_bytes,
+                checksum_sha256=checksum_sha256,
+            )
+        except BaseException:
+            if destination_created:
+                destination.unlink(missing_ok=True)
+            raise
+
     async def stat(
         self,
         key: str,
@@ -117,6 +157,16 @@ class MemoryStorage:
     async def healthcheck(self) -> StorageHealthReport:
         """Report that in-memory storage is available."""
         return StorageHealthReport(ok=True, details={"backend": "memory", "reachable": True})
+
+    def _open_copy_destination(self, destination: Path, key: str) -> BinaryIO:
+        try:
+            return destination.open("xb")
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise StorageWriteError(
+                f"Failed to stage storage key '{key}' to destination."
+            ) from exc
 
     def _read_path_bytes(self, path: Path) -> bytes:
         body = bytearray()

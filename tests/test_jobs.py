@@ -609,8 +609,8 @@ class TestJobs:
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
             logger_error_calls.append((event, kwargs))
 
-        def _fail_write_bytes(self: Any, _: bytes) -> int:
-            raise OSError(f"{secret_temp_marker}: {self}")
+        async def _fail_copy_to_path(*args: Any, **kwargs: Any) -> Any:
+            raise OSError(f"{secret_temp_marker}: staging")
 
         module = _AdapterModule("available_stage_vector_adapter_module", lambda: object())
 
@@ -627,7 +627,11 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
         await _update_source_file(uuid.UUID(uploaded["id"]), original_filename="..")
-        monkeypatch.setattr("app.ingestion.source.Path.write_bytes", _fail_write_bytes)
+        monkeypatch.setattr("app.storage.memory.MemoryStorage.copy_to_path", _fail_copy_to_path)
+        monkeypatch.setattr(
+            "app.storage.local.LocalFilesystemStorage.copy_to_path",
+            _fail_copy_to_path,
+        )
 
         with pytest.raises(IngestionRunnerError, match="Failed to stage original source"):
             await worker_module.process_ingest_job(job.id)
