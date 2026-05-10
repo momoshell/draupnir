@@ -267,11 +267,13 @@ async def _mark_job_enqueue_failed(db: AsyncSession, job: Job, exc: Exception) -
 
 
 def _enqueue_failure_details(job: Job) -> dict[str, str]:
-    """Return safe durable identifiers for a failed enqueue response."""
+    """Return safe durable identifiers and status for a failed enqueue response."""
     assert job.extraction_profile_id is not None
     return {
+        "file_id": str(job.file_id),
         "job_id": str(job.id),
         "extraction_profile_id": str(job.extraction_profile_id),
+        "status": job.status,
     }
 
 
@@ -470,6 +472,14 @@ async def upload_project_file(
         enqueue_ingest_job(ingest_job.id)
     except Exception as exc:
         await _mark_job_enqueue_failed(db, ingest_job, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=create_error_response(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
+                details=_enqueue_failure_details(ingest_job),
+            ),
+        ) from exc
 
     return _attach_initial_upload_metadata(file_row)
 

@@ -385,8 +385,10 @@ class TestExtractionProfiles:
 
         failed_job = jobs[1]
         assert details == {
+            "file_id": str(failed_job.file_id),
             "job_id": str(failed_job.id),
             "extraction_profile_id": str(failed_job.extraction_profile_id),
+            "status": "failed",
         }
         assert failed_job.status == "failed"
         assert failed_job.error_code == "INTERNAL_ERROR"

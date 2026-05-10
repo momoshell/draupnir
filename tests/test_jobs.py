@@ -405,7 +405,7 @@ class TestJobs:
         cleanup_projects: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Uploading should leave a visible failed job when broker publish fails."""
+        """Uploading should expose safe failed-job identifiers when broker publish fails."""
         _ = self
         _ = cleanup_projects
 
@@ -415,8 +415,27 @@ class TestJobs:
         monkeypatch.setattr(files_api, "enqueue_ingest_job", _fail_enqueue)
 
         project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
-        job = await _get_job_for_file(str(uploaded["id"]))
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files",
+            files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+        )
+
+        assert response.status_code == 500
+        payload = response.json()
+        assert payload["error"]["code"] == "INTERNAL_ERROR"
+        assert payload["error"]["message"] == "Failed to enqueue ingest job"
+        assert payload["error"]["details"] is not None
+        assert "broker unavailable" not in response.text
+
+        details = cast(dict[str, str], payload["error"]["details"])
+        job = await _get_job_for_file(details["file_id"])
+
+        assert details == {
+            "file_id": str(job.file_id),
+            "job_id": str(job.id),
+            "extraction_profile_id": str(job.extraction_profile_id),
+            "status": "failed",
+        }
 
         assert job.status == "failed"
         assert job.attempts == 0
