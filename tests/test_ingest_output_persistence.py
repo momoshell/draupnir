@@ -41,7 +41,20 @@ from tests.test_jobs import (
     _upload_file,
 )
 
-pytest_plugins = ("tests.test_jobs",)
+
+@pytest.fixture(autouse=True)
+def fake_ingestion_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[IngestionRunRequest]:
+    """Patch worker ingestion with a deterministic fake runner payload."""
+    recorded_requests: list[IngestionRunRequest] = []
+
+    async def _fake_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+        recorded_requests.append(request)
+        return _build_fake_ingest_payload(request)
+
+    monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
+    return recorded_requests
 
 
 def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:

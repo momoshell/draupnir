@@ -4,9 +4,13 @@ import uuid
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 import app.db.session as session_module
+import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
+from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
@@ -14,9 +18,27 @@ from tests.test_ingest_output_persistence import (
     _assert_validation_report_json_matches_columns,
     _load_project_outputs,
 )
-from tests.test_jobs import _create_project, _get_job_for_file, _upload_file
+from tests.test_jobs import (
+    _build_fake_ingest_payload,
+    _create_project,
+    _get_job_for_file,
+    _upload_file,
+)
 
-pytest_plugins = ("tests.test_jobs",)
+
+@pytest.fixture(autouse=True)
+def fake_ingestion_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[IngestionRunRequest]:
+    """Patch worker ingestion with a deterministic fake runner payload."""
+    recorded_requests: list[IngestionRunRequest] = []
+
+    async def _fake_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+        recorded_requests.append(request)
+        return _build_fake_ingest_payload(request)
+
+    monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
+    return recorded_requests
 
 
 def _parse_timestamp(value: str) -> datetime:
