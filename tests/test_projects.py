@@ -11,7 +11,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.exc import IntegrityError
 
-from app.db.session import AsyncSessionLocal
+import app.db.session as session_module
 from app.models.project import Project
 from tests.conftest import requires_database
 
@@ -716,9 +716,10 @@ class TestProjectDatabaseConstraints:
         _ = self
         _ = cleanup_projects
 
-        assert AsyncSessionLocal is not None
+        session_local = session_module.AsyncSessionLocal
+        assert session_local is not None
 
-        async with AsyncSessionLocal() as session:
+        async with session_local() as session:
             session.add(Project(name="Invalid unit insert", default_unit_system="si"))
 
             with pytest.raises(IntegrityError):
@@ -734,9 +735,10 @@ class TestProjectDatabaseConstraints:
         _ = self
         _ = cleanup_projects
 
-        assert AsyncSessionLocal is not None
+        session_local = session_module.AsyncSessionLocal
+        assert session_local is not None
 
-        async with AsyncSessionLocal() as session:
+        async with session_local() as session:
             project = Project(name="Invalid unit update", default_unit_system="metric")
             session.add(project)
             await session.commit()
@@ -756,9 +758,10 @@ class TestProjectDatabaseConstraints:
         _ = self
         _ = cleanup_projects
 
-        assert AsyncSessionLocal is not None
+        session_local = session_module.AsyncSessionLocal
+        assert session_local is not None
 
-        async with AsyncSessionLocal() as session:
+        async with session_local() as session:
             session.add(Project(name="Invalid currency insert", default_currency="usd"))
 
             with pytest.raises(IntegrityError):
@@ -774,9 +777,10 @@ class TestProjectDatabaseConstraints:
         _ = self
         _ = cleanup_projects
 
-        assert AsyncSessionLocal is not None
+        session_local = session_module.AsyncSessionLocal
+        assert session_local is not None
 
-        async with AsyncSessionLocal() as session:
+        async with session_local() as session:
             project = Project(name="Invalid currency update", default_currency="USD")
             session.add(project)
             await session.commit()
