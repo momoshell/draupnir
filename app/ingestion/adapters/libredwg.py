@@ -498,6 +498,7 @@ def _build_placeholder_canonical(
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
         "adapter_mode": "placeholder",
+        "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
         "dwgread": {
             "output_kind": run_result.output_kind,
             "output_size_bytes": run_result.output_size_bytes,

@@ -400,6 +400,8 @@ def _extract_document_canonical(
         },
         "text_blocks": tuple(text_blocks),
     }
+    if not entities:
+        metadata["empty_entities_reason"] = "no_vector_entities_detected"
 
     return {
         "schema_version": _SCHEMA_VERSION,
@@ -738,6 +740,12 @@ def _build_lineish_entity(
             "score": _VECTOR_CONFIDENCE_SCORE,
             "basis": "vector_path_segment",
         },
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
     }
     if entity_type == "line":
         start, end = normalized_points

@@ -44,6 +44,7 @@ from app.ingestion.contracts import (
 
 _PACKAGE_NAME = "ifcopenshell"
 _ADAPTER_KEY = "ifcopenshell"
+_SCHEMA_VERSION = "0.1"
 _SCHEMA_PATTERN = re.compile(r"FILE_SCHEMA\s*\(\s*\(\s*'([^']+)'", re.IGNORECASE)
 _SUPPORTED_SCHEMAS = frozenset({"IFC2X3", "IFC4", "IFC4X3"})
 _HEADER_READ_LIMIT_BYTES = 64 * 1024
@@ -58,6 +59,16 @@ _SCHEMA_ALIASES = {
     "IFC4X3ADD2": "IFC4X3",
     "IFC4X3ADD2TC1": "IFC4X3",
 }
+_NULLABLE_LINKAGE_KEYS = frozenset(
+    {
+        "drawing_revision_id",
+        "source_file_id",
+        "layout_ref",
+        "layer_ref",
+        "block_ref",
+        "parent_entity_ref",
+    }
+)
 
 _BASE_DESCRIPTOR = AdapterDescriptor(
     key=_ADAPTER_KEY,
@@ -260,6 +271,7 @@ class IfcOpenShellAdapter(IngestionAdapter):
                     entities=(),
                     layer_names=(),
                     units={"normalized": "meter", "source": "default", "assumed": True},
+                    empty_entities_reason="semantic_extract_skipped",
                 ),
                 provenance=tuple(provenance),
                 confidence=ConfidenceSummary(
@@ -298,11 +310,13 @@ class IfcOpenShellAdapter(IngestionAdapter):
         ]
         project = _first(_sequence(_model_by_type(model, "IfcProject")))
         util_element = _resolve_element_module(runtime)
+        units = _extract_units(project)
 
         raw_entities = [
             _extract_entity_payload(
                 product=product,
                 util_element=util_element,
+                units=units,
                 warnings=warnings,
             )
             for product in products
@@ -310,7 +324,6 @@ class IfcOpenShellAdapter(IngestionAdapter):
         entities = _finalize_entity_ids(raw_entities)
         layer_names = tuple(_unique_strings(entity.get("layer") for entity in entities))
         project_metadata = _extract_project_metadata(project)
-        units = _extract_units(project)
 
         if units.get("assumed") is True:
             warnings.append(
@@ -372,6 +385,7 @@ class IfcOpenShellAdapter(IngestionAdapter):
                 entities=tuple(entities),
                 layer_names=layer_names,
                 units=units,
+                empty_entities_reason="no_ifc_products" if not entities else None,
             ),
             provenance=tuple(provenance),
             confidence=ConfidenceSummary(
@@ -557,10 +571,15 @@ def _build_canonical(
     entities: Sequence[Mapping[str, JSONValue]],
     layer_names: Sequence[str],
     units: Mapping[str, JSONValue],
+    empty_entities_reason: str | None = None,
 ) -> dict[str, JSONValue]:
     project_payload = dict(project_metadata)
     metadata: dict[str, JSONValue] = {"project": project_payload}
+    if empty_entities_reason is not None:
+        metadata["empty_entities_reason"] = empty_entities_reason
     canonical: dict[str, JSONValue] = {
+        "schema_version": _SCHEMA_VERSION,
+        "canonical_entity_schema_version": _SCHEMA_VERSION,
         "units": dict(units),
         "coordinate_system": {"name": "local", "source": "semantic_ifc_metadata"},
         "layouts": (),
@@ -600,6 +619,7 @@ def _extract_entity_payload(
     *,
     product: object,
     util_element: object | None,
+    units: Mapping[str, JSONValue],
     warnings: list[AdapterWarning],
 ) -> _RawEntity:
     ifc_type = _entity_type(product)
@@ -654,9 +674,13 @@ def _extract_entity_payload(
         )
     payload: dict[str, JSONValue] = {
         "id": preferred_id,
+        "entity_id": preferred_id,
+        "entity_type": "ifc_product",
+        "entity_schema_version": _SCHEMA_VERSION,
         "kind": "ifc_product",
         "ifc_type": ifc_type,
         "layer": ifc_type,
+        "layout": None,
         "name": _string_or_none(getattr(product, "Name", None)),
         "description": _string_or_none(getattr(product, "Description", None)),
         "object_type": _string_or_none(getattr(product, "ObjectType", None)),
@@ -671,9 +695,35 @@ def _extract_entity_payload(
         "psets": psets,
         "qtos": qtos,
         "material_refs": material_refs,
+        "geometry": _entity_geometry(units=units),
+        "properties": _entity_properties(
+            ifc_type=ifc_type,
+            global_id=global_id,
+            step_id_token=step_id_token,
+        ),
+        "provenance": _entity_provenance(
+            entity_id=preferred_id,
+            ifc_type=ifc_type,
+            global_id=global_id,
+            step_id_token=step_id_token,
+        ),
+        "confidence": {
+            "score": 0.4,
+            "basis": "semantic_ifc_metadata_only",
+        },
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": None,
+        "layer_ref": ifc_type,
+        "block_ref": None,
+        "parent_entity_ref": None,
     }
     return _RawEntity(
-        payload={key: value for key, value in payload.items() if value is not None},
+        payload={
+            key: value
+            for key, value in payload.items()
+            if value is not None or key in _NULLABLE_LINKAGE_KEYS
+        },
         preferred_id=preferred_id,
         has_global_id=global_id is not None,
         step_id_value=step_id_value,
@@ -708,9 +758,62 @@ def _finalize_entity_ids(raw_entities: Sequence[_RawEntity]) -> tuple[dict[str, 
         count = seen.get(entity.preferred_id, 0) + 1
         seen[entity.preferred_id] = count
         payload = dict(entity.payload)
-        payload["id"] = entity.preferred_id if count == 1 else f"{entity.preferred_id}-{count}"
+        finalized_id = entity.preferred_id if count == 1 else f"{entity.preferred_id}-{count}"
+        payload["id"] = finalized_id
+        payload["entity_id"] = finalized_id
+        provenance = payload.get("provenance")
+        if isinstance(provenance, dict):
+            provenance["source_entity_ref"] = f"entities.{finalized_id}"
         finalized.append(payload)
     return tuple(finalized)
+
+
+def _entity_geometry(*, units: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
+    return {
+        "bbox": None,
+        "units": dict(units),
+        "status": "absent",
+        "reason": "semantic_metadata_only",
+        "geometry_summary": {
+            "kind": "none",
+            "reason": "semantic_metadata_only",
+        },
+    }
+
+
+def _entity_properties(
+    *,
+    ifc_type: str,
+    global_id: str | None,
+    step_id_token: str | None,
+) -> dict[str, JSONValue]:
+    return {
+        "source_type": ifc_type,
+        "source_handle": step_id_token,
+        "quantity_hints": None,
+        "adapter_native": {
+            "ifcopenshell": {
+                "ifc_type": ifc_type,
+                "ifc_global_id": global_id,
+                "ifc_step_id": step_id_token,
+            }
+        },
+    }
+
+
+def _entity_provenance(
+    *,
+    entity_id: str,
+    ifc_type: str,
+    global_id: str | None,
+    step_id_token: str | None,
+) -> dict[str, JSONValue]:
+    return {
+        "source_entity_ref": f"entities.{entity_id}",
+        "native_entity_type": ifc_type,
+        "ifc_global_id": global_id,
+        "ifc_step_id": step_id_token,
+    }
 
 
 def _extract_project_metadata(project: object | None) -> dict[str, JSONValue]:
