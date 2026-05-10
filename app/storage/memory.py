@@ -7,6 +7,7 @@ from pathlib import Path
 
 from app.storage.base import (
     StorageChecksumMismatchError,
+    StorageHealthReport,
     StoragePayload,
     StoredObject,
     StoredObjectMeta,
@@ -112,6 +113,10 @@ class MemoryStorage:
         """Stub presign support for interface parity."""
         _ = (key, method, expires_in_seconds)
         return None
+
+    async def healthcheck(self) -> StorageHealthReport:
+        """Report that in-memory storage is available."""
+        return StorageHealthReport(ok=True, details={"backend": "memory", "reachable": True})
 
     def _read_path_bytes(self, path: Path) -> bytes:
         body = bytearray()

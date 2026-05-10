@@ -39,6 +39,14 @@ class StoredObject:
     body: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class StorageHealthReport:
+    """Backend-specific health check result."""
+
+    ok: bool
+    details: dict[str, object] | None = None
+
+
 class Storage(Protocol):
     """Abstract storage backend contract."""
 
@@ -84,3 +92,6 @@ class Storage(Protocol):
         expires_in_seconds: int = 3600,
     ) -> str | None:
         """Return a presigned URL when supported."""
+
+    async def healthcheck(self) -> StorageHealthReport:
+        """Run a bounded, side-effect-free backend health check."""

@@ -9,7 +9,6 @@ import shutil
 import socket
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
-from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlparse
 
@@ -375,15 +374,6 @@ def _aggregate_adapter_check_status(adapters: Iterable[AdapterHealthCheck]) -> S
     return SystemCheckStatus.DOWN
 
 
-def _nearest_existing_ancestor(path: Path) -> Path | None:
-    """Return the nearest existing path at or above the given path."""
-
-    for candidate in (path, *path.parents):
-        if candidate.exists():
-            return candidate
-    return None
-
-
 async def _probe_database_check() -> DependencyHealthCheck:
     """Run a bounded liveness query against the configured database."""
 
@@ -418,43 +408,15 @@ async def _probe_database_check() -> DependencyHealthCheck:
     )
 
 
-def _probe_storage_root_sync(storage_root: Path) -> bool:
-    """Check whether the configured local storage root can be traversed or created."""
-
-    existing = _nearest_existing_ancestor(storage_root)
-    if existing is None or not existing.is_dir():
-        return False
-    return os.access(existing, os.R_OK | os.W_OK | os.X_OK)
-
-
 async def _probe_storage_check() -> DependencyHealthCheck:
     """Run a bounded health check for the configured storage backend."""
 
     storage = get_storage()
     started_at = perf_counter()
 
-    storage_attributes = vars(storage) if hasattr(storage, "__dict__") else {}
-    raw_root = storage_attributes.get("root")
-    if isinstance(raw_root, Path):
-        try:
-            async with asyncio.timeout(_DEPENDENCY_PROBE_TIMEOUT_SECONDS):
-                healthy = await asyncio.to_thread(_probe_storage_root_sync, raw_root)
-        except TimeoutError:
-            return DependencyHealthCheck(
-                status=SystemCheckStatus.DOWN,
-                latency_ms=(perf_counter() - started_at) * 1000,
-                details={"timed_out": True},
-            )
-
-        return DependencyHealthCheck(
-            status=SystemCheckStatus.OK if healthy else SystemCheckStatus.DOWN,
-            latency_ms=(perf_counter() - started_at) * 1000,
-            details=None if healthy else {"reachable": False},
-        )
-
     try:
         async with asyncio.timeout(_DEPENDENCY_PROBE_TIMEOUT_SECONDS):
-            await storage.exists("__draupnir_system_health__/nonexistent")
+            report = await storage.healthcheck()
     except TimeoutError:
         return DependencyHealthCheck(
             status=SystemCheckStatus.DOWN,
@@ -469,8 +431,9 @@ async def _probe_storage_check() -> DependencyHealthCheck:
         )
 
     return DependencyHealthCheck(
-        status=SystemCheckStatus.OK,
+        status=SystemCheckStatus.OK if report.ok else SystemCheckStatus.DOWN,
         latency_ms=(perf_counter() - started_at) * 1000,
+        details=report.details if report.ok or report.details is not None else {"reachable": False},
     )
 
 
