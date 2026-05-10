@@ -61,8 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        # NOTE: TRD mentions PostgreSQL 18 (planned); latest stable is 17.
-        image: postgres:17-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres

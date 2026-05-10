@@ -35,6 +35,9 @@ AI gateway:     LiteLLM later
 Agent layer:    Pydantic AI later, optional
 ```
 
+Local Docker Compose development and GitHub Actions CI must run PostgreSQL 18 to
+match the MVP database contract.
+
 ## Input Handling
 
 ### DWG
