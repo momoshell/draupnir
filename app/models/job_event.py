@@ -30,7 +30,11 @@ class JobEvent(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey(
+            "jobs.id",
+            name="fk_job_events_job_id_jobs",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
     )
     level: Mapped[str] = mapped_column(String(length=32), nullable=False)

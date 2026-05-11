@@ -30,7 +30,7 @@ class ValidationReport(Base):
         ForeignKeyConstraint(
             ["drawing_revision_id", "project_id"],
             ["drawing_revisions.id", "drawing_revisions.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_validation_reports_drawing_revision_id_project_id_revisions",
         ),
         UniqueConstraint(
@@ -73,7 +73,11 @@ class ValidationReport(Base):
         comment="Unique validation report identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_validation_reports_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",
@@ -83,7 +87,11 @@ class ValidationReport(Base):
         comment="Drawing revision identifier addressed by this canonical validation report",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey(
+            "jobs.id",
+            name="fk_validation_reports_source_job_id_jobs",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Job identifier that produced this validation report",

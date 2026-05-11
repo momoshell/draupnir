@@ -620,10 +620,19 @@ For MVP, retention is conservative:
 - prefer soft-delete or hidden metadata state before physical deletion
 - require manual/administrative action for physical artifact deletion
 - do not auto-delete superseded artifacts in MVP
+- destructive database cascades must not remove lineage, audit, or append-only
+  history rows
+- physical delete paths should be restrictive by default and fail while lineage
+  children still reference the target record
 
 Any physical deletion flow must preserve at least the metadata needed to explain
 what was produced and must not imply that a replacement artifact overwrote the
 prior one.
+
+Soft deletion is the normal MVP deletion path. Hiding a project, file, or
+artifact must not rewrite lineage, and database constraints should prevent
+parent-row deletion from cascading through retained revisions, jobs, artifacts,
+or other historical children.
 
 ## API Conventions
 

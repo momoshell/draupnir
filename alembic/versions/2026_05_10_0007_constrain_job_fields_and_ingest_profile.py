@@ -90,25 +90,23 @@ def upgrade() -> None:
     )
     op.execute(
         sa.text(
-            """
+            f"""
             ALTER TABLE jobs
             ADD CONSTRAINT ck_jobs_ingest_extraction_profile_required
-            CHECK ({constraint_sql})
+            CHECK ({_profile_required_constraint_sql()})
             NOT VALID
             """
-            .format(constraint_sql=_profile_required_constraint_sql())
         )
     )
 
     invalid_profile_required_jobs = bind.execute(
         sa.text(
-            """
+            f"""
             SELECT COUNT(*)
             FROM jobs
-            WHERE job_type IN ({job_type_values})
+            WHERE job_type IN ({_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES)})
               AND extraction_profile_id IS NULL
             """
-            .format(job_type_values=_sql_in_list(_PROFILE_REQUIRED_JOB_TYPE_VALUES))
         )
     ).scalar_one()
     if invalid_profile_required_jobs != 0:
