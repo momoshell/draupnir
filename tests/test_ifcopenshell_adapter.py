@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.machinery
 from collections.abc import Mapping
 from pathlib import Path
@@ -273,7 +274,24 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
     assert entities[0]["entity_type"] == "ifc_product"
     assert entities[0]["entity_schema_version"] == "0.1"
     assert entities[0]["geometry"]["reason"] == "semantic_metadata_only"
-    assert entities[0]["provenance"]["source_entity_ref"] == "entities.DUPLICATE"
+    assert entities[0]["provenance"]["origin"] == "adapter_normalized"
+    assert entities[0]["provenance"]["adapter"] == "ifcopenshell"
+    assert entities[0]["provenance"]["source"] == "ifc://IfcWall/global-id:DUPLICATE/step-id:10"
+    assert (
+        entities[0]["provenance"]["source_entity_ref"]
+        == "ifc://IfcWall/global-id:DUPLICATE/step-id:10"
+    )
+    assert entities[0]["provenance"]["source_identity"] == "DUPLICATE"
+    assert entities[0]["provenance"]["canonical_entity_ref"] == "entities.DUPLICATE"
+    assert entities[0]["provenance"]["normalized_source_hash"] == hashlib.sha256(
+        b"ifc://IfcWall/global-id:DUPLICATE"
+    ).hexdigest()
+    assert entities[0]["provenance"]["notes"] == ["semantic_ifc_metadata_only"]
+    assert entities[0]["confidence"] == {
+        "score": 0.4,
+        "review_required": True,
+        "basis": "semantic_ifc_metadata_only",
+    }
     assert entities[0]["psets"][0]["name"] == "Pset_WallCommon"
     assert entities[0]["qtos"][0]["name"] == "Qto_WallBaseQuantities"
     assert entities[0]["material_refs"][0]["name"] == "Concrete"
@@ -281,6 +299,13 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
         entities[0]["representation"]["representations"][0]["representation_identifier"]
         == "Body"
     )
+    assert entities[2]["provenance"]["source"] == "ifc://IfcDoor/step-id:42"
+    assert entities[2]["provenance"]["source_entity_ref"] == "ifc://IfcDoor/step-id:42"
+    assert entities[2]["provenance"]["source_identity"] == "#42"
+    assert entities[2]["provenance"]["canonical_entity_ref"] == "entities.#42"
+    assert entities[2]["provenance"]["normalized_source_hash"] == hashlib.sha256(
+        b"ifc://IfcDoor/step-id:42"
+    ).hexdigest()
     assert canonical["layers"] == [{"name": "IfcWall"}, {"name": "IfcDoor"}]
     assert payload.provenance_json["records"][1]["details"]["entity_count"] == 3
     assert {record["source_ref"] for record in payload.provenance_json["records"]} == {
@@ -705,6 +730,7 @@ async def test_ifcopenshell_adapter_quoted_endsec_in_capped_header_continues_nat
 
     runtime = SimpleNamespace(open=_open_runtime)
     monkeypatch.setattr(adapter_module, "_load_runtime_module", lambda: runtime)
+    monkeypatch.setattr(adapter_module, "_resolve_element_module", lambda _runtime: None)
 
     result = await adapter_module.create_adapter().ingest(
         build_contract_source(

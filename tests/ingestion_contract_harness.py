@@ -310,6 +310,16 @@ def _assert_entity_confidence(confidence: JSONValue) -> None:
                 "Canonical entity confidence objects must include a numeric score."
             )
         score = float(score_value)
+        review_required = confidence.get("review_required")
+        if review_required is not None and not isinstance(review_required, bool):
+            raise AssertionError(
+                "Canonical entity confidence.review_required must be boolean when present."
+            )
+        basis = confidence.get("basis")
+        if basis is not None and (not isinstance(basis, str) or not basis.strip()):
+            raise AssertionError(
+                "Canonical entity confidence.basis must be non-empty when present."
+            )
     else:
         raise AssertionError("Canonical entities must include confidence metadata.")
 

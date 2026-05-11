@@ -129,7 +129,7 @@ Each entity record must include:
 - `geometry` - normalized geometry payload for the entity type
 - `properties` - normalized semantic properties and adapter-carried attributes
 - `provenance` - structured origin and extraction metadata
-- `confidence` - float in `[0, 1]`
+- `confidence` - float in `[0, 1]` or a structured object with at least `score`
 
 Version-field rule: `canonical_entity_schema_version` is revision-scoped and
 declares the canonical contract for the full revision payload. The
@@ -194,6 +194,12 @@ logic must not lose source identity.
 Entity identity must preserve source-native identity when available and also
 record a normalized source hash or equivalent fingerprint so dedup/re-ingestion
 logic can compare semantically identical entities across adapter passes.
+
+Entity provenance must carry a stable source locator or source-native identity
+when the adapter can provide one. Semantic-only envelopes such as IFC products
+may also include an adapter-normalized provenance object with fields like
+`source`, `source_entity_ref`, `source_identity`, and
+`normalized_source_hash`.
 
 For raster-derived entities, the canonical payload must also record page-scoped
 or view-scoped scale calibration metadata when used, because quantities are not
