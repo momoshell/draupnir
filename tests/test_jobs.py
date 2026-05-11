@@ -48,6 +48,7 @@ _FAKE_RUNNER_QUANTITY_GATE = "allowed_provisional"
 _FAKE_RUNNER_VALIDATOR_NAME = "tests.fake_ingestion_runner"
 _FAKE_RUNNER_VALIDATOR_VERSION = "1.0"
 _TEST_UPLOAD_BODY = b"%PDF-1.7\njob-test\n"
+_UNSET = object()
 
 
 class _AdapterModule(types.ModuleType):
@@ -249,6 +250,12 @@ async def _update_job(
     cancel_requested: bool | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    enqueue_status: str | None = None,
+    enqueue_attempts: int | None = None,
+    enqueue_owner_token: uuid.UUID | object = _UNSET,
+    enqueue_lease_expires_at: datetime | object = _UNSET,
+    enqueue_last_attempted_at: datetime | object = _UNSET,
+    enqueue_published_at: datetime | object = _UNSET,
 ) -> Job:
     """Update and return a persisted job for test setup."""
     session_maker = session_module.AsyncSessionLocal
@@ -271,6 +278,18 @@ async def _update_job(
 
         if error_message is not None:
             job.error_message = error_message
+        if enqueue_status is not None:
+            job.enqueue_status = enqueue_status
+        if enqueue_attempts is not None:
+            job.enqueue_attempts = enqueue_attempts
+        if enqueue_owner_token is not _UNSET:
+            job.enqueue_owner_token = cast(uuid.UUID | None, enqueue_owner_token)
+        if enqueue_lease_expires_at is not _UNSET:
+            job.enqueue_lease_expires_at = cast(datetime | None, enqueue_lease_expires_at)
+        if enqueue_last_attempted_at is not _UNSET:
+            job.enqueue_last_attempted_at = cast(datetime | None, enqueue_last_attempted_at)
+        if enqueue_published_at is not _UNSET:
+            job.enqueue_published_at = cast(datetime | None, enqueue_published_at)
 
         await session.commit()
 
@@ -433,21 +452,29 @@ class TestJobs:
         assert enqueued_job_ids == [str(job.id)]
         assert job.status == "pending"
         assert job.attempts == 0
+        assert job.enqueue_status == "published"
 
-    async def test_upload_file_marks_job_failed_when_enqueue_publish_fails(
+    async def test_upload_file_succeeds_when_publish_is_deferred(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Uploading should expose safe failed-job identifiers when broker publish fails."""
+        """Uploading should succeed once durable enqueue intent commits."""
         _ = self
         _ = cleanup_projects
 
-        def _fail_enqueue(_: uuid.UUID) -> None:
-            raise RuntimeError("broker unavailable")
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
 
-        monkeypatch.setattr(files_api, "enqueue_ingest_job", _fail_enqueue)
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
 
         project = await _create_project(async_client)
         response = await async_client.post(
@@ -455,31 +482,88 @@ class TestJobs:
             files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
         )
 
-        assert response.status_code == 500
+        assert response.status_code == 201
         payload = response.json()
-        assert payload["error"]["code"] == "INTERNAL_ERROR"
-        assert payload["error"]["message"] == "Failed to enqueue ingest job"
-        assert payload["error"]["details"] is not None
-        assert "broker unavailable" not in response.text
+        job = await _get_job_for_file(payload["id"])
 
-        details = cast(dict[str, str], payload["error"]["details"])
-        job = await _get_job_for_file(details["file_id"])
-
-        assert details == {
-            "file_id": str(job.file_id),
-            "job_id": str(job.id),
-            "extraction_profile_id": str(job.extraction_profile_id),
-            "status": "failed",
-        }
-
-        assert job.status == "failed"
+        assert job.status == "pending"
         assert job.attempts == 0
-        assert job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert job.error_message == "Failed to enqueue ingest job"
-        assert "broker unavailable" not in job.error_message
-        assert len(job.error_message) <= 255
+        assert job.error_code is None
+        assert job.error_message is None
         assert job.started_at is None
-        assert job.finished_at is not None
+        assert job.finished_at is None
+        assert job.enqueue_status == "pending"
+        assert job.enqueue_attempts == 0
+
+    async def test_upload_file_replays_success_when_publish_is_deferred_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Upload idempotency should snapshot success before best-effort publish."""
+        _ = self
+        _ = cleanup_projects
+
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
+
+        project = await _create_project(async_client)
+        headers = {"Idempotency-Key": "upload-outbox-replay"}
+
+        first = await async_client.post(
+            f"/v1/projects/{project['id']}/files",
+            files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+            headers=headers,
+        )
+        second = await async_client.post(
+            f"/v1/projects/{project['id']}/files",
+            files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+            headers=headers,
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert second.json() == first.json()
+
+        job = await _get_job_for_file(first.json()["id"])
+        assert job.status == "pending"
+        assert job.enqueue_status == "pending"
+
+    async def test_upload_file_succeeds_when_enqueue_claim_raises_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Upload should not fail if post-commit enqueue bookkeeping raises before claim."""
+        _ = self
+        _ = cleanup_projects
+
+        async def _fail_claim(_: uuid.UUID) -> worker_module._EnqueueIntentLease | None:
+            raise RuntimeError("transient enqueue claim failure")
+
+        monkeypatch.setattr(worker_module, "_claim_job_enqueue_intent", _fail_claim)
+
+        project = await _create_project(async_client)
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files",
+            files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+        )
+
+        assert response.status_code == 201
+        job = await _get_job_for_file(response.json()["id"])
+        assert job.status == "pending"
+        assert job.enqueue_status == "pending"
 
     async def test_process_ingest_job_marks_internal_error_code_on_failure(
         self,
@@ -1506,7 +1590,7 @@ class TestJobs:
         assert updated_job.attempt_token is None
         assert updated_job.attempt_lease_expires_at is None
 
-    async def test_recover_incomplete_ingest_jobs_requeues_pending_jobs(
+    async def test_recover_incomplete_ingest_jobs_requeues_stranded_pending_jobs(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
@@ -1522,6 +1606,17 @@ class TestJobs:
         def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
             recovered_job_ids.append(str(job_id))
 
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
         monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
 
         project = await _create_project(async_client)
@@ -1536,8 +1631,56 @@ class TestJobs:
         updated_job = await _get_job(job.id)
         assert updated_job.status == "pending"
         assert updated_job.attempts == 0
+        assert updated_job.enqueue_status == "published"
+        assert updated_job.enqueue_attempts == 1
 
-    async def test_recover_incomplete_ingest_jobs_requeues_pending_reprocess_jobs(
+    async def test_recover_incomplete_ingest_jobs_does_not_duplicate_requeue_after_publish(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recovery should not requeue the same pending job twice once publish state is durable."""
+        _ = self
+        _ = cleanup_projects
+
+        recovered_job_ids: list[str] = []
+
+        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+            recovered_job_ids.append(str(job_id))
+
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        enqueued_job_ids.clear()
+
+        first_requeued = await worker_module.recover_incomplete_ingest_jobs()
+        second_requeued = await worker_module.recover_incomplete_ingest_jobs()
+
+        assert recovered_job_ids == [str(job.id)]
+        assert first_requeued == [job.id]
+        assert second_requeued == []
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "pending"
+        assert updated_job.enqueue_status == "published"
+        assert updated_job.enqueue_attempts == 1
+
+    async def test_recover_incomplete_ingest_jobs_requeues_stranded_pending_reprocess_jobs(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
@@ -1559,6 +1702,18 @@ class TestJobs:
         uploaded = await _upload_file(async_client, project["id"])
         initial_job = await _get_job_for_file(str(uploaded["id"]))
         await worker_module.process_ingest_job(initial_job.id)
+
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
         reprocess_response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
             json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
@@ -1607,6 +1762,88 @@ class TestJobs:
         reprocess_job = await _get_job(uuid.UUID(response.json()["id"]))
         assert reprocess_job.job_type == "reprocess"
         assert reprocess_job.base_revision_id == uuid.UUID(response.json()["base_revision_id"])
+
+    async def test_reprocess_job_replays_success_when_publish_is_deferred_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reprocess idempotency should snapshot success before best-effort publish."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
+
+        headers = {"Idempotency-Key": "reprocess-outbox-replay"}
+        first = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+            headers=headers,
+        )
+        second = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+            headers=headers,
+        )
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json() == first.json()
+
+        reprocess_job = await _get_job(uuid.UUID(first.json()["id"]))
+        assert reprocess_job.status == "pending"
+        assert reprocess_job.enqueue_status == "pending"
+
+    async def test_reprocess_job_succeeds_when_enqueue_finalize_raises_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reprocess should not fail if post-commit enqueue bookkeeping raises after publish."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+
+        async def _fail_finalize(_: uuid.UUID, *, lease_token: uuid.UUID) -> bool:
+            _ = lease_token
+            raise RuntimeError("transient enqueue finalize failure")
+
+        monkeypatch.setattr(worker_module, "_mark_job_enqueue_published", _fail_finalize)
+
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+
+        assert response.status_code == 202
+        job = await _get_job(uuid.UUID(response.json()["id"]))
+        assert job.status == "pending"
+        assert job.enqueue_status == "publishing"
 
     async def test_process_reprocess_job_rejects_payload_revision_kind_mismatch(
         self,
@@ -1844,6 +2081,17 @@ class TestJobs:
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
             logger_error_calls.append((event, kwargs))
 
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
         monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fail_recovery_enqueue)
         monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
 
@@ -2073,13 +2321,21 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
+            return True
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fake_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
             raising=False,
         )
 
@@ -2100,26 +2356,35 @@ class TestJobs:
         assert retried_job_ids == [str(job.id)]
         updated = await _get_job(job.id)
         assert updated.status == "pending"
+        assert updated.error_code is None
+        assert updated.error_message is None
 
-    async def test_retry_job_returns_error_envelope_when_enqueue_fails(
+    async def test_retry_job_succeeds_when_publish_is_deferred(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Retry should standardize broker enqueue failures and persist job failure."""
+        """Retry should succeed once durable enqueue intent commits."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
 
-        def _fail_retry_enqueue(_: uuid.UUID) -> None:
-            raise RuntimeError("broker unavailable")
+        async def _skip_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fail_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _skip_retry_publish,
             raising=False,
         )
 
@@ -2136,23 +2401,101 @@ class TestJobs:
 
         response = await async_client.post(f"/v1/jobs/{job.id}/retry")
 
-        assert response.status_code == 500
-        assert response.json() == {
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": "Failed to enqueue ingest job",
-                "details": None,
-            }
-        }
-        assert "broker unavailable" not in response.text
+        assert response.status_code == 202
 
         updated = await _get_job(job.id)
-        assert updated.status == "failed"
-        assert updated.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert updated.error_message == "Failed to enqueue ingest job"
-        assert "broker unavailable" not in updated.error_message
-        assert len(updated.error_message) <= 255
-        assert updated.finished_at is not None
+        assert updated.status == "pending"
+        assert updated.error_code is None
+        assert updated.error_message is None
+        assert updated.finished_at is None
+        assert updated.enqueue_status == "pending"
+
+    async def test_retry_job_replays_success_when_publish_is_deferred_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry idempotency should snapshot success before best-effort publish."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _skip_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _skip_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_message="previous failure",
+        )
+
+        headers = {"Idempotency-Key": "retry-outbox-replay"}
+        first = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=headers)
+        second = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=headers)
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json() == first.json()
+
+        updated = await _get_job(job.id)
+        assert updated.status == "pending"
+        assert updated.enqueue_status == "pending"
+
+    async def test_retry_job_succeeds_when_enqueue_claim_raises_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should not fail if post-commit enqueue bookkeeping raises before claim."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _fail_claim(_: uuid.UUID) -> worker_module._EnqueueIntentLease | None:
+            raise RuntimeError("transient enqueue claim failure")
+
+        monkeypatch.setattr(worker_module, "_claim_job_enqueue_intent", _fail_claim)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_message="previous failure",
+        )
+
+        response = await async_client.post(f"/v1/jobs/{job.id}/retry")
+
+        assert response.status_code == 202
+        updated = await _get_job(job.id)
+        assert updated.status == "pending"
+        assert updated.enqueue_status == "pending"
 
     async def test_retry_job_noops_when_attempt_limit_reached(
         self,
@@ -2168,13 +2511,21 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
+            return True
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fake_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
             raising=False,
         )
 
@@ -2212,13 +2563,21 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
+            return True
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fake_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
             raising=False,
         )
 
@@ -2260,13 +2619,21 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
+            return True
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fake_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
             raising=False,
         )
 
@@ -2325,13 +2692,21 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
+            return True
 
         monkeypatch.setattr(
             jobs_api,
-            "enqueue_ingest_job",
-            _fake_retry_enqueue,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
             raising=False,
         )
 
@@ -2566,6 +2941,7 @@ class TestJobs:
             persisted_job.status = "failed"
             persisted_job.error_code = ErrorCode.ADAPTER_FAILED.value
             persisted_job.error_message = "Adapter execution failed."
+            persisted_job.enqueue_status = "published"
 
             await session.commit()
 
@@ -2580,6 +2956,7 @@ class TestJobs:
             ("job_type", "not-a-job-type"),
             ("status", "queued"),
             ("error_code", "NOT_A_REAL_ERROR_CODE"),
+            ("enqueue_status", "queued"),
         ],
     )
     async def test_job_constraints_reject_invalid_string_writes(
