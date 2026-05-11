@@ -575,6 +575,127 @@ def test_build_validation_outcome_rejects_invalid_or_unconfirmed_pdf_scale_value
     assert outcome.quantity_gate == quantity_gate
 
 
+def test_build_validation_outcome_review_gates_placeholder_mode_without_placeholder_semantics(
+) -> None:
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DWG,
+        canonical_json={
+            "entities": (),
+            "metadata": {
+                "adapter_mode": "placeholder",
+                "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+            },
+        },
+        canonical_entity_schema_version="0.1",
+        result=_build_result(
+            score=0.99,
+            input_family=InputFamily.DWG,
+            canonical={
+                "entities": (),
+                "metadata": {
+                    "adapter_mode": "placeholder",
+                    "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+                },
+            },
+        ),
+        generated_at=_GENERATED_AT,
+    )
+
+    findings = {finding["check_key"]: finding for finding in outcome.report_json["findings"]}
+
+    assert outcome.validation_status == "needs_review"
+    assert outcome.review_state == "review_required"
+    assert outcome.quantity_gate == "review_gated"
+    assert findings["placeholder_semantics"]["details"] == {
+        "status": "placeholder",
+        "quantity_gate": "review_gated",
+        "reason": "placeholder_canonical_no_entity_mapping",
+        "adapter_mode": "placeholder",
+        "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+        "derived_from": ["adapter_mode", "empty_entities_reason"],
+        "placeholder_semantics": None,
+    }
+    assert findings["placeholder_semantics_contract_violation"]["details"] == {
+        "contract_violation_codes": ["missing_placeholder_semantics"],
+        "status": "placeholder",
+        "quantity_gate": "review_gated",
+        "reason": "placeholder_canonical_no_entity_mapping",
+        "adapter_mode": "placeholder",
+        "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+        "placeholder_semantics": None,
+    }
+
+
+def test_build_validation_outcome_forces_review_gated_placeholder_semantics_when_inconsistent(
+) -> None:
+    canonical_json: dict[str, JSONValue] = {
+        "entities": (),
+        "metadata": {
+            "adapter_mode": "sparse_placeholder",
+            "empty_entities_reason": "raster_vectorization_deferred",
+            "placeholder_semantics": {
+                "status": "complete",
+                "review_required": False,
+                "quantity_gate": "allowed",
+                "reason": "wrong_reason",
+                "coverage": {"entities": "none"},
+            },
+        },
+    }
+    outcome = build_validation_outcome(
+        input_family=InputFamily.PDF_RASTER,
+        canonical_json=canonical_json,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(
+            score=0.99,
+            input_family=InputFamily.PDF_RASTER,
+            canonical=canonical_json,
+        ),
+        generated_at=_GENERATED_AT,
+    )
+
+    findings = {finding["check_key"]: finding for finding in outcome.report_json["findings"]}
+
+    assert outcome.validation_status == "needs_review"
+    assert outcome.review_state == "review_required"
+    assert outcome.quantity_gate == "review_gated"
+    assert findings["placeholder_semantics"]["details"] == {
+        "status": "sparse",
+        "quantity_gate": "review_gated",
+        "reason": "wrong_reason",
+        "adapter_mode": "sparse_placeholder",
+        "empty_entities_reason": "raster_vectorization_deferred",
+        "derived_from": ["placeholder_semantics", "adapter_mode", "empty_entities_reason"],
+        "placeholder_semantics": {
+            "status": "complete",
+            "review_required": False,
+            "quantity_gate": "allowed",
+            "reason": "wrong_reason",
+            "coverage": {"entities": "none"},
+        },
+    }
+    assert findings["placeholder_semantics_contract_violation"]["details"] == {
+        "contract_violation_codes": [
+            "placeholder_status_not_recognized",
+            "review_required_not_true",
+            "quantity_gate_not_review_gated",
+            "reason_mismatch",
+        ],
+        "status": "sparse",
+        "quantity_gate": "review_gated",
+        "reason": "wrong_reason",
+        "adapter_mode": "sparse_placeholder",
+        "empty_entities_reason": "raster_vectorization_deferred",
+        "placeholder_semantics": {
+            "status": "complete",
+            "review_required": False,
+            "quantity_gate": "allowed",
+            "reason": "wrong_reason",
+            "coverage": {"entities": "none"},
+        },
+    }
+
+
 def test_build_validation_outcome_includes_raw_provenance_in_report_json() -> None:
     result = _build_result(score=0.95)
 

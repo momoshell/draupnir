@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,7 @@ from app.ingestion.contracts import (
     InputFamily,
     UploadFormat,
 )
+from app.ingestion.validation import build_validation_outcome
 from tests.ingestion_contract_harness import (
     ContractFinalizationExpectation,
     build_contract_source,
@@ -253,6 +255,20 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     assert payload.canonical_json["metadata"]["empty_entities_reason"] == (
         "placeholder_canonical_no_entity_mapping"
     )
+    assert payload.canonical_json["metadata"]["placeholder_semantics"] == {
+        "status": "placeholder",
+        "review_required": True,
+        "quantity_gate": "review_gated",
+        "reason": "placeholder_canonical_no_entity_mapping",
+        "coverage": {
+            "entities": "none",
+            "geometry": "none",
+            "layers": "none",
+            "blocks": "none",
+            "text": "none",
+            "quantity_hints": "none",
+        },
+    }
 
     result = await adapter.ingest(
         source,
@@ -267,6 +283,26 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     assert str(second_output_path.parent) not in stderr_excerpt
     assert "<source>" in stdout_excerpt
     assert "<tempdir>" in stderr_excerpt
+
+    validation = build_validation_outcome(
+        input_family=InputFamily.DWG,
+        canonical_json=result.canonical,
+        canonical_entity_schema_version=cast(
+            str,
+            result.canonical["canonical_entity_schema_version"],
+        ),
+        result=result,
+        generated_at=datetime.now(UTC),
+    )
+    findings = cast(list[Mapping[str, object]], validation.report_json["findings"])
+    assert validation.review_state == "review_required"
+    assert validation.quantity_gate == "review_gated"
+    assert any(
+        finding.get("check_key") == "placeholder_semantics"
+        and cast(Mapping[str, object], finding["details"]).get("reason")
+        == "placeholder_canonical_no_entity_mapping"
+        for finding in findings
+    )
 
 
 @pytest.mark.asyncio

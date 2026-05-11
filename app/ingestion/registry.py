@@ -47,13 +47,6 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
         module="app.ingestion.adapters.libredwg",
         license_name="GPL-3.0-or-later",
         capabilities=AdapterCapabilities(
-            extracts_geometry=True,
-            extracts_layers=True,
-            extracts_blocks=True,
-            extracts_text=True,
-            supports_quantity_hints=True,
-            supports_layout_selection=True,
-            supports_xref_resolution=True,
         ),
         confidence_range=(0.95, 1.0),
         probes=(
@@ -70,7 +63,11 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
                 detail="Distribution or on-prem bundling requires GPL review.",
             ),
         ),
-        notes=("Primary DWG adapter is isolated behind the ingestion contract.",),
+        notes=(
+            "Primary DWG adapter is isolated behind the ingestion contract.",
+            "Current Phase 2 output is placeholder-only and does not expose "
+            "real DWG extraction coverage yet.",
+        ),
     ),
     AdapterDescriptor(
         key="ezdxf",
@@ -157,11 +154,7 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
         display_name="VTracer + Tesseract",
         module="app.ingestion.adapters.vtracer_tesseract",
         license_name="MIT + Apache-2.0",
-        capabilities=AdapterCapabilities(
-            extracts_geometry=True,
-            extracts_text=True,
-            supports_quantity_hints=True,
-        ),
+        capabilities=AdapterCapabilities(),
         experimental=True,
         confidence_range=(0.3, 0.6),
         probes=(
@@ -177,6 +170,10 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
                 failure_status=AdapterStatus.DEGRADED,
                 detail="Tesseract enables OCR and confidence scoring for raster PDFs.",
             ),
+        ),
+        notes=(
+            "Experimental raster scaffold only; vectorization, OCR, and "
+            "quantity hints remain deferred.",
         ),
     ),
 )

@@ -46,6 +46,7 @@ _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1 * 1024 * 1024
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
+_PLACEHOLDER_EMPTY_ENTITIES_REASON = "placeholder_canonical_no_entity_mapping"
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,10 +496,14 @@ def _build_placeholder_canonical(
     source: AdapterSource,
     run_result: _DwgreadRunResult,
 ) -> dict[str, JSONValue]:
+    empty_entities_reason = _PLACEHOLDER_EMPTY_ENTITIES_REASON
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
         "adapter_mode": "placeholder",
-        "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+        "empty_entities_reason": empty_entities_reason,
+        "placeholder_semantics": _build_placeholder_semantics(
+            empty_entities_reason=empty_entities_reason,
+        ),
         "dwgread": {
             "output_kind": run_result.output_kind,
             "output_size_bytes": run_result.output_size_bytes,
@@ -525,6 +530,23 @@ def _build_placeholder_canonical(
         "entities": (),
         "xrefs": (),
         "metadata": metadata,
+    }
+
+
+def _build_placeholder_semantics(*, empty_entities_reason: str) -> dict[str, JSONValue]:
+    return {
+        "status": "placeholder",
+        "review_required": True,
+        "quantity_gate": "review_gated",
+        "reason": empty_entities_reason,
+        "coverage": {
+            "entities": "none",
+            "geometry": "none",
+            "layers": "none",
+            "blocks": "none",
+            "text": "none",
+            "quantity_hints": "none",
+        },
     }
 
 
