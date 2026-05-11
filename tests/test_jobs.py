@@ -464,7 +464,14 @@ class TestJobs:
         _ = self
         _ = cleanup_projects
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -498,7 +505,14 @@ class TestJobs:
         _ = self
         _ = cleanup_projects
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -1592,7 +1606,14 @@ class TestJobs:
         def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
             recovered_job_ids.append(str(job_id))
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -1629,7 +1650,14 @@ class TestJobs:
         def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
             recovered_job_ids.append(str(job_id))
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -1675,7 +1703,14 @@ class TestJobs:
         initial_job = await _get_job_for_file(str(uploaded["id"]))
         await worker_module.process_ingest_job(initial_job.id)
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -1745,7 +1780,14 @@ class TestJobs:
         initial_job = await _get_job_for_file(str(uploaded["id"]))
         await worker_module.process_ingest_job(initial_job.id)
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -2039,7 +2081,14 @@ class TestJobs:
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
             logger_error_calls.append((event, kwargs))
 
-        async def _skip_publish(_: uuid.UUID) -> bool:
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
@@ -2272,7 +2321,14 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        async def _fake_retry_publish(job_id: uuid.UUID) -> bool:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 
@@ -2315,7 +2371,14 @@ class TestJobs:
         _ = cleanup_projects
         _ = enqueued_job_ids
 
-        async def _skip_retry_publish(_: uuid.UUID) -> bool:
+        async def _skip_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(
@@ -2359,7 +2422,14 @@ class TestJobs:
         _ = cleanup_projects
         _ = enqueued_job_ids
 
-        async def _skip_retry_publish(_: uuid.UUID) -> bool:
+        async def _skip_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
             return False
 
         monkeypatch.setattr(
@@ -2441,7 +2511,14 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        async def _fake_retry_publish(job_id: uuid.UUID) -> bool:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 
@@ -2486,7 +2563,14 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        async def _fake_retry_publish(job_id: uuid.UUID) -> bool:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 
@@ -2535,7 +2619,14 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        async def _fake_retry_publish(job_id: uuid.UUID) -> bool:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 
@@ -2601,7 +2692,14 @@ class TestJobs:
 
         retried_job_ids: list[str] = []
 
-        async def _fake_retry_publish(job_id: uuid.UUID) -> bool:
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 

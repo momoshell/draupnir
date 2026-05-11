@@ -557,20 +557,20 @@ class TestEndpointIdempotency:
             }
         }
 
-    async def test_upload_enqueue_failure_replays_sanitized_error_snapshot(
+    async def test_upload_publish_failure_replays_success_snapshot(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Enqueue failures must replay the original sanitized 500 after durable writes."""
+        """Publish failures after commit must replay the original success snapshot."""
 
         _ = self
         _ = cleanup_projects
         project = cast(dict[str, Any], (await _create_project(async_client)).json())
         key = "file-upload-enqueue-failure-1"
 
-        def _fail_enqueue(_: uuid.UUID) -> None:
+        def _fail_enqueue(_: uuid.UUID, **__: Any) -> None:
             raise RuntimeError("broker unavailable")
 
         monkeypatch.setattr(files_api, "enqueue_ingest_job", _fail_enqueue)
@@ -579,12 +579,12 @@ class TestEndpointIdempotency:
         second = await _upload_pdf(async_client, project_id=project["id"], idempotency_key=key)
         record = await _get_idempotency_record(key)
 
-        assert first.status_code == 500
-        assert first.json()["error"]["message"] == "Failed to enqueue ingest job"
-        assert second.status_code == 500
+        assert first.status_code == 201
+        assert second.status_code == 201
         assert second.json() == first.json()
+        assert await _job_count_for_file(first.json()["id"]) == 1
         assert record.status == IdempotencyStatus.COMPLETED.value
-        assert record.response_status_code == 500
+        assert record.response_status_code == 201
         assert record.response_body_json == first.json()
 
     async def test_upload_storage_failure_replays_sanitized_error_snapshot(
@@ -827,14 +827,14 @@ class TestEndpointIdempotency:
         assert second.json() == first.json()
         assert await _get_idempotency_record_or_none(key) is None
 
-    async def test_reprocess_enqueue_failure_replays_sanitized_error_snapshot(
+    async def test_reprocess_publish_failure_replays_success_snapshot(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Reprocess enqueue failures must finalize and replay the sanitized 500."""
+        """Reprocess publish failures after commit must replay success."""
 
         _ = self
         _ = cleanup_projects
@@ -848,7 +848,7 @@ class TestEndpointIdempotency:
         key = "file-reprocess-enqueue-failure-1"
         payload = {"extraction_profile": {"profile_version": "v0.1"}}
 
-        def _fail_enqueue(_: uuid.UUID) -> None:
+        def _fail_enqueue(_: uuid.UUID, **__: Any) -> None:
             raise RuntimeError("broker unavailable")
 
         monkeypatch.setattr(files_api, "enqueue_ingest_job", _fail_enqueue)
@@ -865,12 +865,14 @@ class TestEndpointIdempotency:
         )
         record = await _get_idempotency_record(key)
 
-        assert first.status_code == 500
-        assert first.json()["error"]["message"] == "Failed to enqueue ingest job"
-        assert second.status_code == 500
+        assert first.status_code == 202
+        assert first.json()["job_type"] == "reprocess"
+        assert first.json()["base_revision_id"] is not None
+        assert second.status_code == 202
         assert second.json() == first.json()
+        assert await _job_count_for_file(uploaded["id"]) == 2
         assert record.status == IdempotencyStatus.COMPLETED.value
-        assert record.response_status_code == 500
+        assert record.response_status_code == 202
         assert record.response_body_json == first.json()
 
     async def test_cancel_replays_original_job_snapshot(
@@ -984,14 +986,14 @@ class TestEndpointIdempotency:
         assert record.response_status_code == 202
         assert record.response_body_json == first.json()
 
-    async def test_retry_enqueue_failure_replays_sanitized_error_snapshot(
+    async def test_retry_publish_failure_replays_success_snapshot(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Retry enqueue failures must finalize and replay the sanitized 500."""
+        """Retry publish failures after commit must replay success."""
 
         _ = self
         _ = cleanup_projects
@@ -1005,7 +1007,7 @@ class TestEndpointIdempotency:
         await _mark_job_failed(str(job.id))
         key = "job-retry-enqueue-failure-1"
 
-        def _fail_enqueue(_: uuid.UUID) -> None:
+        def _fail_enqueue(_: uuid.UUID, **__: Any) -> None:
             raise RuntimeError("broker unavailable")
 
         monkeypatch.setattr(jobs_api, "enqueue_ingest_job", _fail_enqueue)
@@ -1014,10 +1016,10 @@ class TestEndpointIdempotency:
         second = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=_headers(key))
         record = await _get_idempotency_record(key)
 
-        assert first.status_code == 500
-        assert first.json()["error"]["message"] == "Failed to enqueue ingest job"
-        assert second.status_code == 500
+        assert first.status_code == 202
+        assert first.json()["status"] == "pending"
+        assert second.status_code == 202
         assert second.json() == first.json()
         assert record.status == IdempotencyStatus.COMPLETED.value
-        assert record.response_status_code == 500
+        assert record.response_status_code == 202
         assert record.response_body_json == first.json()
