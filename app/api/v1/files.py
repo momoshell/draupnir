@@ -4,7 +4,7 @@ import hashlib
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 from uuid import UUID
@@ -33,7 +33,13 @@ from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
-from app.jobs.worker import enqueue_ingest_job
+from app.jobs.worker import (
+    enqueue_ingest_job as _enqueue_ingest_job,
+)
+from app.jobs.worker import (
+    prepare_job_enqueue_intent,
+    publish_job_enqueue_intent,
+)
 from app.models.drawing_revision import DrawingRevision
 from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File as FileModel
@@ -48,8 +54,6 @@ from app.storage.keys import build_original_storage_key
 files_router = APIRouter()
 _UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 _UPLOAD_SNIFF_BYTES = 4096
-_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH = 255
-_PUBLIC_ENQUEUE_FAILURE_MESSAGE = "Failed to enqueue ingest job"
 # UPLOAD_FORMAT_SIGNATURES:
 # _sniff_format accepts these leading-byte signatures for upload detection:
 # - PDF: b"%PDF-"
@@ -64,6 +68,11 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _SUPPORTED_FORMATS_MESSAGE = "Unsupported file format. Supported formats: pdf, dwg, dxf, ifc."
 _MAX_ORIGINAL_FILENAME_LENGTH = 512
 _MAX_MEDIA_TYPE_LENGTH = 255
+
+
+def enqueue_ingest_job(job_id: UUID) -> None:
+    """Compatibility wrapper kept for test fixture patching."""
+    _enqueue_ingest_job(job_id)
 
 
 def _encode_cursor(created_at: datetime, file_id: UUID) -> str:
@@ -323,48 +332,6 @@ def _raise_reprocess_base_revision_conflict() -> None:
     )
 
 
-async def _mark_job_enqueue_failed(db: AsyncSession, job: Job, exc: Exception) -> None:
-    """Persist a visible failed job after enqueue publish errors."""
-    _ = exc
-    job.status = "failed"
-    job.error_code = ErrorCode.INTERNAL_ERROR.value
-    job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
-    job.finished_at = datetime.now(UTC)
-    await db.commit()
-    await db.refresh(job)
-
-
-async def _mark_job_enqueue_failed_with_snapshot(
-    db: AsyncSession,
-    job: Job,
-    exc: Exception,
-    *,
-    reservation: IdempotencyReservation | None,
-) -> dict[str, Any]:
-    """Persist enqueue failure state and finalize a replay snapshot when present."""
-
-    _ = exc
-    job.status = "failed"
-    job.error_code = ErrorCode.INTERNAL_ERROR.value
-    job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
-    job.finished_at = datetime.now(UTC)
-    error_body = create_error_response(
-        code=ErrorCode.INTERNAL_ERROR,
-        message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
-        details=_enqueue_failure_details(job),
-    )
-    if reservation is not None:
-        await mark_idempotency_completed(
-            db,
-            reservation,
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            response_body=error_body,
-        )
-    await db.commit()
-    await db.refresh(job)
-    return error_body
-
-
 async def _raise_upload_storage_failure(
     db: AsyncSession,
     reservation: IdempotencyReservation | None,
@@ -397,17 +364,6 @@ async def _raise_upload_storage_failure(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail=error_body,
     ) from cause
-
-
-def _enqueue_failure_details(job: Job) -> dict[str, str]:
-    """Return safe durable identifiers and status for a failed enqueue response."""
-    assert job.extraction_profile_id is not None
-    return {
-        "file_id": str(job.file_id),
-        "job_id": str(job.id),
-        "extraction_profile_id": str(job.extraction_profile_id),
-        "status": job.status,
-    }
 
 
 def _attach_initial_upload_metadata(file_row: FileModel) -> FileModel:
@@ -628,26 +584,12 @@ async def upload_project_file(
     )
     db.add(file_row)
     db.add(ingest_job)
-
-    await db.commit()
-
+    prepare_job_enqueue_intent(ingest_job)
+    await db.flush()
     await db.refresh(file_row)
     await db.refresh(ingest_job)
 
-    try:
-        enqueue_ingest_job(ingest_job.id)
-    except Exception as exc:
-        error_body = await _mark_job_enqueue_failed_with_snapshot(
-            db,
-            ingest_job,
-            exc,
-            reservation=reservation,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_body,
-        ) from exc
-
+    success_body: dict[str, Any] | None = None
     if reservation is not None:
         success_body = FileRead.model_validate(
             _attach_initial_upload_metadata(file_row)
@@ -658,7 +600,16 @@ async def upload_project_file(
             status_code=status.HTTP_201_CREATED,
             response_body=success_body,
         )
-        await db.commit()
+
+    await db.commit()
+    await publish_job_enqueue_intent(
+        ingest_job.id,
+        publisher=enqueue_ingest_job,
+        suppress_exceptions=True,
+    )
+
+    if reservation is not None:
+        assert success_body is not None
         return JSONResponse(status_code=status.HTTP_201_CREATED, content=success_body)
 
     return _attach_initial_upload_metadata(file_row)
@@ -742,23 +693,11 @@ async def reprocess_project_file(
         cancel_requested=False,
     )
     db.add(ingest_job)
-    await db.commit()
+    prepare_job_enqueue_intent(ingest_job)
+    await db.flush()
     await db.refresh(ingest_job)
 
-    try:
-        enqueue_ingest_job(ingest_job.id)
-    except Exception as exc:
-        error_body = await _mark_job_enqueue_failed_with_snapshot(
-            db,
-            ingest_job,
-            exc,
-            reservation=reservation,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_body,
-        ) from exc
-
+    success_body: dict[str, Any] | None = None
     if reservation is not None:
         success_body = JobRead.model_validate(ingest_job).model_dump(mode="json")
         await mark_idempotency_completed(
@@ -767,7 +706,16 @@ async def reprocess_project_file(
             status_code=status.HTTP_202_ACCEPTED,
             response_body=success_body,
         )
-        await db.commit()
+
+    await db.commit()
+    await publish_job_enqueue_intent(
+        ingest_job.id,
+        publisher=enqueue_ingest_job,
+        suppress_exceptions=True,
+    )
+
+    if reservation is not None:
+        assert success_body is not None
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
 
     return ingest_job

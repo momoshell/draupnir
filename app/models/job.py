@@ -40,6 +40,7 @@ class JobStatus(StrEnum):
 _JOB_TYPE_VALUES = tuple(job_type.value for job_type in JobType)
 _JOB_STATUS_VALUES = tuple(status.value for status in JobStatus)
 _JOB_ERROR_CODE_VALUES = tuple(error_code.value for error_code in ErrorCode)
+_ENQUEUE_STATUS_VALUES = ("pending", "publishing", "published")
 _PROFILE_REQUIRED_JOB_TYPE_VALUES = (JobType.INGEST.value, JobType.REPROCESS.value)
 _BASE_REQUIRED_JOB_TYPE_VALUES = (JobType.REPROCESS.value,)
 
@@ -79,6 +80,10 @@ class Job(Base):
             "error_code IS NULL "
             f"OR error_code IN ({_sql_in_list(_JOB_ERROR_CODE_VALUES)})",
             name="ck_jobs_error_code_valid",
+        ),
+        CheckConstraint(
+            f"enqueue_status IN ({_sql_in_list(_ENQUEUE_STATUS_VALUES)})",
+            name="ck_jobs_enqueue_status_valid",
         ),
         CheckConstraint(
             "job_type NOT IN "
@@ -170,6 +175,37 @@ class Job(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="Current running attempt lease expiry used to reclaim stale deliveries",
+    )
+    enqueue_status: Mapped[str] = mapped_column(
+        String(32),
+        default="pending",
+        nullable=False,
+        comment="Durable enqueue intent state (pending, publishing, published)",
+    )
+    enqueue_attempts: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        nullable=False,
+        comment="Broker publish attempts for the current durable enqueue intent",
+    )
+    enqueue_owner_token: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Current enqueue publisher ownership token for stranded-intent recovery",
+    )
+    enqueue_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Current enqueue publisher lease expiry used to reclaim stranded intents",
+    )
+    enqueue_last_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Most recent broker publish attempt timestamp for the current intent",
+    )
+    enqueue_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when the current durable enqueue intent was last published",
     )
     cancel_requested: Mapped[bool] = mapped_column(
         Boolean,

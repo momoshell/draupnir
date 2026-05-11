@@ -655,18 +655,15 @@ or other historical children.
 - The replay contract applies to project create/update/delete, file upload,
   file reprocess, job cancel, and job retry.
 - A matching completed reservation replays the original response body/status
-  exactly, including the sanitized enqueue-failure `500` body when durable work
-  has already been recorded. Completed snapshots are write-once: the server must
-  not expose a completed success replay before the final enqueue outcome is
-  known, and later failures must not overwrite an already completed snapshot.
+  exactly. For upload, reprocess, and retry, the completed success snapshot is
+  committed atomically with the durable enqueue intent and is write-once; later
+  broker publish or recovery outcomes must not overwrite that snapshot.
 - A matching `in_progress` reservation returns `409 IDEMPOTENCY_CONFLICT` with
   `Retry-After: 1`. MVP does not reclaim stale `in_progress` reservations.
 - Reusing the same key for a different fingerprint returns
   `409 IDEMPOTENCY_CONFLICT` with `details.reason = "request_mismatch"`.
-- When job enqueue fails after durable records are created, the public error must
-  stay sanitized and may include only safe system-assigned identifiers and
-  workflow metadata, such as `file_id`, `job_id`, `extraction_profile_id`, or
-  `status` where applicable.
+- Upload, reprocess, and retry success depends on durably recording the enqueue
+  intent in Postgres, not on synchronous broker publish success.
 
 ## Error Taxonomy
 
@@ -695,6 +692,12 @@ New codes require a docs change in this file.
 
 - Default ingestion adapter timeout: 5 minutes. Override per-adapter via config.
 - Default max attempts: 3. Backoff is exponential with jitter.
+- Upload, reprocess, and retry commit the pending job state and a durable enqueue
+  intent atomically in Postgres before any broker publish attempt.
+- Broker publish is best-effort after commit. If the process crashes or publish
+  raises before the intent is marked published, worker-start recovery owns the
+  stranded intent and either re-enqueues it or marks the still-pending job
+  failed with a sanitized enqueue error.
 - Cancel is cooperative. Workers must check `cancel_requested` before starting
   work, between adapter steps, on every persisted progress event, and again
   before any terminal success commit.
@@ -968,7 +971,8 @@ Probe rules:
     project before the request claims idempotency or creates a new job
   - the server creates a new ingestion/reprocessing job bound to `project_id`,
     `file_id`, the resolved `extraction_profile_id`, and the current finalized
-    base revision as `jobs.base_revision_id`
+    base revision as `jobs.base_revision_id`, plus a durable enqueue intent in
+    the same transaction
   - if the file has no finalized base revision yet, the request fails with `409`
     `REVISION_CONFLICT`, creates no job, and enqueues nothing
   - successful completion creates a new drawing revision rather than mutating
