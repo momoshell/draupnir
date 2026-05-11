@@ -29,19 +29,19 @@ class GeneratedArtifact(Base):
         ForeignKeyConstraint(
             ["source_file_id", "project_id"],
             ["files.id", "files.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_generated_artifacts_source_file_id_project_id_files",
         ),
         ForeignKeyConstraint(
             ["drawing_revision_id", "project_id"],
             ["drawing_revisions.id", "drawing_revisions.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_generated_artifacts_drawing_revision_id_project_id_revisions",
         ),
         ForeignKeyConstraint(
             ["adapter_run_output_id", "project_id"],
             ["adapter_run_outputs.id", "adapter_run_outputs.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_generated_artifacts_adapter_run_output_id_project_id_outputs",
         ),
         ForeignKeyConstraint(
@@ -75,7 +75,11 @@ class GeneratedArtifact(Base):
         comment="Unique generated artifact identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_generated_artifacts_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",
@@ -86,7 +90,11 @@ class GeneratedArtifact(Base):
         comment="Source file identifier for artifact lineage",
     )
     job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey(
+            "jobs.id",
+            name="fk_generated_artifacts_job_id_jobs",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Job identifier that produced this generated artifact",

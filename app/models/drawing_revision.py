@@ -29,19 +29,19 @@ class DrawingRevision(Base):
         ForeignKeyConstraint(
             ["source_file_id", "project_id"],
             ["files.id", "files.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_drawing_revisions_source_file_id_project_id_files",
         ),
         ForeignKeyConstraint(
             ["extraction_profile_id", "project_id"],
             ["extraction_profiles.id", "extraction_profiles.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_drawing_revisions_extraction_profile_proj_profiles",
         ),
         ForeignKeyConstraint(
             ["adapter_run_output_id", "project_id"],
             ["adapter_run_outputs.id", "adapter_run_outputs.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_drawing_revisions_adapter_run_output_id_project_id_outputs",
         ),
         UniqueConstraint(
@@ -88,7 +88,11 @@ class DrawingRevision(Base):
         comment="Unique drawing revision identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_drawing_revisions_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",
@@ -104,7 +108,11 @@ class DrawingRevision(Base):
         comment="Immutable extraction profile identifier used to derive this revision",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey(
+            "jobs.id",
+            name="fk_drawing_revisions_source_job_id_jobs",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Job identifier that committed this drawing revision",

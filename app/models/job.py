@@ -57,13 +57,13 @@ class Job(Base):
         ForeignKeyConstraint(
             ["file_id", "project_id"],
             ["files.id", "files.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_jobs_file_id_project_id_files",
         ),
         ForeignKeyConstraint(
             ["extraction_profile_id", "project_id"],
             ["extraction_profiles.id", "extraction_profiles.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_jobs_extraction_profile_id_project_id_extraction_profiles",
         ),
         CheckConstraint(
@@ -93,7 +93,11 @@ class Job(Base):
         comment="Unique job identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_jobs_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",

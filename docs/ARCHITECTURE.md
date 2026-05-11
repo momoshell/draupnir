@@ -296,6 +296,9 @@ Soft deletion is a database visibility flag, not a storage mutation.
 - Soft deletion never rewrites lineage. References from artifacts to source
   files, drawing revisions, jobs, changesets, takeoffs, or estimates remain
   intact even when one of those records is hidden from default views.
+- Database-level delete behavior must match that policy: restrictive foreign
+  keys should block physical deletion while lineage, audit, or history children
+  still exist, rather than cascading through append-only records.
 
 MVP does not perform automatic physical deletion. In particular:
 
@@ -306,6 +309,8 @@ MVP does not perform automatic physical deletion. In particular:
 - superseded or soft-deleted artifacts may be filtered from default product
   views, but they remain restorable from retained metadata/object storage during
   MVP
+- physical deletes are exceptional/manual and should fail until dependent
+  lineage-bearing rows are handled in a way that preserves audit history
 
 ## Job Pipeline Orchestration
 

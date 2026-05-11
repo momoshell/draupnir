@@ -30,13 +30,13 @@ class AdapterRunOutput(Base):
         ForeignKeyConstraint(
             ["source_file_id", "project_id"],
             ["files.id", "files.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_adapter_run_outputs_source_file_id_project_id_files",
         ),
         ForeignKeyConstraint(
             ["extraction_profile_id", "project_id"],
             ["extraction_profiles.id", "extraction_profiles.project_id"],
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
             name="fk_adapter_run_outputs_extraction_profile_proj_profiles",
         ),
         UniqueConstraint(
@@ -65,7 +65,11 @@ class AdapterRunOutput(Base):
         comment="Unique adapter run output identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_adapter_run_outputs_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",
@@ -81,7 +85,11 @@ class AdapterRunOutput(Base):
         comment="Immutable extraction profile identifier used for this adapter run",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("jobs.id", ondelete="CASCADE"),
+        ForeignKey(
+            "jobs.id",
+            name="fk_adapter_run_outputs_source_job_id_jobs",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         comment="Job identifier that produced this committed adapter output",
     )

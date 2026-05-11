@@ -37,7 +37,11 @@ class ExtractionProfile(Base):
         comment="Unique extraction profile identifier (UUID v4)",
     )
     project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("projects.id", ondelete="CASCADE"),
+        ForeignKey(
+            "projects.id",
+            name="fk_extraction_profiles_project_id_projects",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
         comment="Owning project identifier",
