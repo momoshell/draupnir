@@ -115,6 +115,17 @@ Minimum top-level canonical revision payload requirements:
 `layouts`, `layers`, `blocks`, and `entities` are required keys and may be
 empty lists when extraction finds none.
 
+If an adapter emits an explicit placeholder or sparse scaffold instead of real
+canonical entities, the payload must also include
+`metadata.placeholder_semantics` with at minimum:
+
+- `status` - placeholder posture such as `placeholder` or `sparse`
+- `review_required` - must be `true`
+- `quantity_gate` - must be `review_gated`
+- `reason` - must align with `metadata.empty_entities_reason`
+- `coverage` - structured extraction limitations so operators do not infer real
+  DWG/raster entity coverage where none exists yet
+
 ### Canonical Entity Schema v0.1
 
 Canonical entity schema v0.1 is a JSON-first strict contract for normalized
@@ -1040,6 +1051,9 @@ Probe rules:
   review, even when individual heuristics score above the normal provisional
   band. Raster confidence may guide prioritization, but it cannot auto-approve
   trusted quantity input.
+- Placeholder or sparse adapter outputs are also a hard exception: explicit
+  placeholder semantics must keep the revision `review_required` and
+  `review_gated` until a non-placeholder extraction pass replaces it.
 - Human review may promote a revision from `review_required` or `provisional` to
   `approved`, keep it `provisional`, mark it `rejected`, or leave it
   `review_required` pending more information. A revision replaced by a later
