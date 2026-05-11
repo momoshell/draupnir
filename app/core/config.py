@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 200
+    idempotency_key_hash_secret: str | None = None
     storage_local_root: str = Field(
         default="var/uploads",
         validation_alias=AliasChoices("storage_local_root", "upload_storage_root"),

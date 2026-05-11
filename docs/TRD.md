@@ -635,6 +635,25 @@ prior one.
 - Ids are opaque ULIDs or UUIDs; clients must not parse them.
 - Idempotent mutating endpoints accept `Idempotency-Key` headers and return the
   prior response on replay within a documented retention window.
+- `Idempotency-Key` validation uses the RFC 9110 `token` syntax: one or more of
+  `A-Z a-z 0-9 ! # $ % & ' * + - . ^ _ \` | ~` with no whitespace, commas, or
+  quoted strings.
+- Idempotency is endpoint-integrated, not middleware-driven. When the header is
+  absent, mutating endpoints keep their non-idempotent MVP behavior.
+- The server stores only an HMAC-SHA256 hash of the raw `Idempotency-Key`
+  header. The preferred stable setting is `idempotency_key_hash_secret`; when
+  unset in local MVP, hashing falls back to `service_name`.
+- The replay contract applies to project create/update/delete, file upload,
+  file reprocess, job cancel, and job retry.
+- A matching completed reservation replays the original response body/status
+  exactly, including the sanitized enqueue-failure `500` body when durable work
+  has already been recorded. Completed snapshots are write-once: the server must
+  not expose a completed success replay before the final enqueue outcome is
+  known, and later failures must not overwrite an already completed snapshot.
+- A matching `in_progress` reservation returns `409 IDEMPOTENCY_CONFLICT` with
+  `Retry-After: 1`. MVP does not reclaim stale `in_progress` reservations.
+- Reusing the same key for a different fingerprint returns
+  `409 IDEMPOTENCY_CONFLICT` with `details.reason = "request_mismatch"`.
 - When job enqueue fails after durable records are created, the public error must
   stay sanitized and may include only safe system-assigned identifiers and
   workflow metadata, such as `file_id`, `job_id`, `extraction_profile_id`, or
@@ -655,6 +674,7 @@ codes:
 - `ADAPTER_FAILED` - adapter returned non-zero or malformed output
 - `STORAGE_FAILED` - read/write/link/checksum failure
 - `DB_CONFLICT` - optimistic concurrency or unique violation
+- `IDEMPOTENCY_CONFLICT` - duplicate idempotency key is in progress or mapped to a different request fingerprint
 - `REVISION_CONFLICT` - changeset base revision is stale at apply time
 - `JOB_CANCELLED` - cancelled by user before completion
 - `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
@@ -930,6 +950,8 @@ Probe rules:
 - Reprocess API contract: `POST /v1/projects/{project_id}/files/{file_id}/reprocess`
   - request body accepts exactly one of an existing `extraction_profile_id` or a
     new extraction profile payload to persist before job creation
+  - when `extraction_profile_id` is provided, it must resolve within the
+    project before the request claims idempotency or creates a new job
   - the server creates a new ingestion/reprocessing job bound to `project_id`,
     `file_id`, and the resolved `extraction_profile_id`
   - successful completion creates a new drawing revision rather than mutating
