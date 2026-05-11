@@ -230,7 +230,20 @@ Reprocessing a file always creates a new drawing revision from the original
 immutable `file_id`; it never overwrites the previous revision. The new revision
 records the adapter version used for the run and the `extraction_profile_id`
 that defined the extraction settings so later jobs and audits can reproduce the
-result.
+result. Each reprocess job also captures the finalized base revision in
+`jobs.base_revision_id`.
+
+The reprocess path uses the same optimistic revision guardrail as changeset
+apply, but at request and finalization time instead of edit apply time:
+
+- if `POST /v1/projects/{project_id}/files/{file_id}/reprocess` finds no
+  finalized base revision, it returns `409 REVISION_CONFLICT`, creates no job,
+  and enqueues nothing
+- worker finalization re-checks that `jobs.base_revision_id` still matches the
+  current finalized revision; if not, the job fails with `REVISION_CONFLICT`
+  and commits no new revision, outputs, artifacts, or storage writes
+- retrying a `REVISION_CONFLICT` reprocess job returns the unchanged failed job
+  and does not enqueue a new attempt
 
 ## Original File Policy
 

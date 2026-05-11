@@ -423,6 +423,7 @@ class TestValidationReportApi:
         next_job = _clone_model(
             job,
             id=uuid.uuid4(),
+            base_revision_id=drawing_revision.id,
             job_type="reprocess",
             status="succeeded",
             started_at=next_created_at,

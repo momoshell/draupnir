@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 import app.api.v1.files as files_api
 import app.db.session as session_module
+import app.jobs.worker as worker_module
 from app.core.config import settings
 from app.core.exceptions import raise_not_found
 from app.models.file import File as FileModel
@@ -23,6 +24,7 @@ from app.models.job import Job
 from app.models.project import Project
 from app.storage import LocalFilesystemStorage, StoredObjectMeta, get_storage
 from tests.conftest import requires_database
+from tests.test_jobs import _build_fake_ingest_payload
 
 
 @pytest_asyncio.fixture
@@ -56,6 +58,26 @@ async def _upload_file(
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
+
+
+async def _get_job_for_file(file_id: str) -> Job:
+    """Load the single current job for a newly uploaded file."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        return (
+            await session.execute(select(Job).where(Job.file_id == uuid.UUID(file_id)))
+        ).scalar_one()
+
+
+async def _finalize_initial_revision(file_id: str) -> Job:
+    """Process the initial ingest job so reprocess has a finalized base."""
+
+    initial_job = await _get_job_for_file(file_id)
+    await worker_module.process_ingest_job(initial_job.id)
+    return await _get_job_for_file(file_id)
 
 
 async def _mark_file_deleted(file_id: str) -> None:
@@ -203,6 +225,15 @@ class LocalChecksumMismatchStorage(LocalFilesystemStorage):
 @requires_database
 class TestProjectFiles:
     """Tests for project file upload and retrieval endpoints."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_ingestion_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Patch worker ingestion with a deterministic fake runner payload."""
+
+        async def _fake_run_ingestion(request: Any) -> Any:
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
 
     @pytest.fixture(autouse=True)
     def _stub_enqueue_ingest_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -456,6 +487,7 @@ class TestProjectFiles:
             content=b"%PDF-1.7\ninitial",
             media_type="application/pdf",
         )
+        await _finalize_initial_revision(str(uploaded["id"]))
 
         response = await async_client.post(
             f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",
@@ -649,6 +681,7 @@ class TestProjectFiles:
             content=b"%PDF-1.7\ndetail",
             media_type="application/pdf",
         )
+        await _finalize_initial_revision(str(uploaded["id"]))
 
         response = await async_client.post(
             f"/v1/projects/{created_project['id']}/files/{uploaded['id']}/reprocess",

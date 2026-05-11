@@ -26,6 +26,13 @@ class JobRead(BaseModel):
             "require a profile and a future contract migration can enforce non-null."
         ),
     )
+    base_revision_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Pinned latest finalized drawing revision captured when a reprocess "
+            "job was created. Null for initial ingest jobs."
+        ),
+    )
     job_type: JobType = Field(..., description="Job type")
     status: JobStatus = Field(..., description="Job status")
     attempts: int = Field(..., ge=0, description="Current attempt count")
