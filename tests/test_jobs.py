@@ -371,24 +371,30 @@ async def test_mark_recovery_enqueue_failed_logs_only_safe_fields(
     logger_error_calls: list[tuple[str, dict[str, Any]]] = []
     marked_failed_job_ids: list[uuid.UUID] = []
 
-    async def _fake_mark_job_failed(
+    async def _fake_mark_job_failed_if_recovery_safe(
         failed_job_id: uuid.UUID,
         *,
         error_message: str,
         error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
-    ) -> None:
+    ) -> bool:
         marked_failed_job_ids.append(failed_job_id)
         assert error_message == "Failed to enqueue ingest job"
         assert error_code == ErrorCode.INTERNAL_ERROR
+        return True
 
     def _capture_logger_error(event: str, **kwargs: Any) -> None:
         logger_error_calls.append((event, kwargs))
 
-    monkeypatch.setattr(worker_module, "_mark_job_failed", _fake_mark_job_failed)
+    monkeypatch.setattr(
+        worker_module,
+        "_mark_job_failed_if_recovery_safe",
+        _fake_mark_job_failed_if_recovery_safe,
+    )
     monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
 
-    await worker_module._mark_recovery_enqueue_failed(job_id)
+    marked_failed = await worker_module._mark_recovery_enqueue_failed(job_id)
 
+    assert marked_failed is True
     assert marked_failed_job_ids == [job_id]
     assert logger_error_calls == [
         (
@@ -1266,20 +1272,33 @@ class TestJobs:
             "cancelled",
         ]
 
-    async def test_process_ingest_job_continues_redelivered_running_job(
+    async def test_process_ingest_job_skips_fresh_redelivered_running_job(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Redelivery should complete an already-running ingest attempt."""
+        """Fresh redelivery should not execute or mutate an already-running attempt."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
 
+        runner_calls: list[IngestionRunRequest] = []
+
+        async def _unexpected_run_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            runner_calls.append(request)
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _unexpected_run_ingestion)
+
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
+        attempt_token = uuid.uuid4()
+        lease_expires_at = datetime.now(UTC) + worker_module._RUNNING_JOB_STALE_AFTER
 
         session_maker = session_module.AsyncSessionLocal
         assert session_maker is not None
@@ -1289,15 +1308,199 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = datetime.now(UTC)
+            persisted_job.attempt_token = attempt_token
+            persisted_job.attempt_lease_expires_at = lease_expires_at
             await session.commit()
 
         await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
-        assert updated_job.status == "succeeded"
+        assert runner_calls == []
+        assert updated_job.status == "running"
         assert updated_job.attempts == 1
         assert updated_job.started_at is not None
-        assert updated_job.finished_at is not None
+        assert updated_job.finished_at is None
+        assert updated_job.attempt_token == attempt_token
+        assert updated_job.attempt_lease_expires_at == lease_expires_at
+
+    async def test_begin_or_resume_ingest_job_reclaims_stale_running_attempt_with_new_token(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Stale running attempts should be reclaimed with a fresh ownership token."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        old_attempt_token = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = (
+                datetime.now(UTC)
+                - worker_module._RUNNING_JOB_STALE_AFTER
+                - timedelta(seconds=1)
+            )
+            persisted_job.attempt_token = old_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert lease is not None
+        assert lease.token != old_attempt_token
+        reclaimed_job = await _get_job(job.id)
+        assert reclaimed_job.status == "running"
+        assert reclaimed_job.attempts == 2
+        assert reclaimed_job.attempt_token == lease.token
+        assert reclaimed_job.attempt_lease_expires_at == lease.lease_expires_at
+        assert reclaimed_job.attempt_lease_expires_at is not None
+        assert reclaimed_job.attempt_lease_expires_at > datetime.now(UTC)
+
+    async def test_stale_attempt_writes_noop_after_reclaim(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Stale attempt events and terminal writes should no-op after reclaim."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        old_attempt_token = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = (
+                datetime.now(UTC)
+                - worker_module._RUNNING_JOB_STALE_AFTER
+                - timedelta(seconds=1)
+            )
+            persisted_job.attempt_token = old_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        new_lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert new_lease is not None
+        event_written = await worker_module.emit_job_event(
+            job.id,
+            level="info",
+            message="Stale progress",
+            data_json={"status": "running", "event": "progress", "stage": "stale"},
+            attempt_token=old_attempt_token,
+        )
+        failed = await worker_module._mark_job_failed(
+            job.id,
+            error_message="stale failure",
+            attempt_token=old_attempt_token,
+        )
+        cancelled = await worker_module._mark_job_cancelled(
+            job.id,
+            attempt_token=old_attempt_token,
+        )
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            inactive_source_cancelled = await worker_module._cancel_job_for_inactive_source(
+                session,
+                persisted_job,
+                reason="source_deleted",
+                attempt_token=old_attempt_token,
+            )
+
+        finalize_request = IngestionRunRequest(
+            job_id=job.id,
+            file_id=job.file_id,
+            checksum_sha256=hashlib.sha256(_TEST_UPLOAD_BODY).hexdigest(),
+            detected_format="pdf",
+            media_type="application/pdf",
+            original_name="plan.pdf",
+            extraction_profile_id=job.extraction_profile_id,
+            initial_job_id=job.id,
+        )
+        finalized = await worker_module._finalize_ingest_job(
+            job.id,
+            attempt_token=old_attempt_token,
+            payload=_build_fake_ingest_payload(finalize_request),
+        )
+
+        assert event_written is False
+        assert failed is False
+        assert cancelled is False
+        assert inactive_source_cancelled is False
+        assert finalized is False
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "running"
+        assert updated_job.attempts == 2
+        assert updated_job.attempt_token == new_lease.token
+        assert updated_job.finished_at is None
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert [event["message"] for event in data["items"]] == ["Job started"]
+
+    async def test_finalize_ingest_job_clears_owned_attempt_lease_on_success(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Owned terminal success should clear persisted attempt lease state."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert lease is not None
+        finalize_request = IngestionRunRequest(
+            job_id=job.id,
+            file_id=job.file_id,
+            checksum_sha256=hashlib.sha256(_TEST_UPLOAD_BODY).hexdigest(),
+            detected_format="pdf",
+            media_type="application/pdf",
+            original_name="plan.pdf",
+            extraction_profile_id=job.extraction_profile_id,
+            initial_job_id=job.id,
+        )
+
+        finalized = await worker_module._finalize_ingest_job(
+            job.id,
+            attempt_token=lease.token,
+            payload=_build_fake_ingest_payload(finalize_request),
+        )
+
+        assert finalized is True
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "succeeded"
+        assert updated_job.attempt_token is None
+        assert updated_job.attempt_lease_expires_at is None
 
     async def test_recover_incomplete_ingest_jobs_requeues_pending_jobs(
         self,
@@ -1394,6 +1597,7 @@ class TestJobs:
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
+        old_attempt_token = uuid.uuid4()
         enqueued_job_ids.clear()
 
         session_maker = session_module.AsyncSessionLocal
@@ -1408,6 +1612,8 @@ class TestJobs:
                 - worker_module._RUNNING_JOB_STALE_AFTER
                 - timedelta(seconds=1)
             )
+            persisted_job.attempt_token = old_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
             await session.commit()
 
         requeued = await worker_module.recover_incomplete_ingest_jobs()
@@ -1420,12 +1626,86 @@ class TestJobs:
         assert recovered_job.attempts == 1
         assert recovered_job.started_at is None
         assert recovered_job.finished_at is None
+        assert recovered_job.attempt_token is None
+        assert recovered_job.attempt_lease_expires_at is None
 
         await worker_module.process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
         assert updated_job.status == "succeeded"
         assert updated_job.attempts == 2
+
+    async def test_recover_incomplete_ingest_jobs_skips_locked_reclaimed_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker startup recovery should not clobber a concurrently reclaimed live attempt."""
+        _ = self
+        _ = cleanup_projects
+
+        recovered_job_ids: list[str] = []
+
+        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+            recovered_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        stale_attempt_token = uuid.uuid4()
+        fresh_attempt_token = uuid.uuid4()
+        enqueued_job_ids.clear()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = (
+                datetime.now(UTC)
+                - worker_module._RUNNING_JOB_STALE_AFTER
+                - timedelta(seconds=1)
+            )
+            persisted_job.attempt_token = stale_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        fresh_lease_expires_at = datetime.now(UTC) + worker_module._RUNNING_JOB_STALE_AFTER
+
+        async with session_maker() as reclaim_session:
+            reclaimed_job = await worker_module._get_job_for_update(reclaim_session, job.id)
+            assert reclaimed_job is not None
+            reclaimed_job.status = "running"
+            reclaimed_job.attempts = 2
+            reclaimed_job.started_at = datetime.now(UTC)
+            reclaimed_job.finished_at = None
+            reclaimed_job.error_code = None
+            reclaimed_job.error_message = None
+            reclaimed_job.attempt_token = fresh_attempt_token
+            reclaimed_job.attempt_lease_expires_at = fresh_lease_expires_at
+            await reclaim_session.flush()
+
+            requeued = await asyncio.wait_for(
+                worker_module.recover_incomplete_ingest_jobs(),
+                timeout=2,
+            )
+
+            assert requeued == []
+            assert recovered_job_ids == []
+
+            await reclaim_session.commit()
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "running"
+        assert updated_job.attempts == 2
+        assert updated_job.attempt_token == fresh_attempt_token
+        assert updated_job.attempt_lease_expires_at == fresh_lease_expires_at
 
     async def test_recover_incomplete_ingest_jobs_skips_fresh_running_jobs(
         self,
@@ -1531,6 +1811,81 @@ class TestJobs:
                 },
             )
         ]
+
+    async def test_mark_recovery_enqueue_failed_skips_owned_running_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Recovery enqueue failure should not fail a job reclaimed by a live attempt."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        attempt_token = uuid.uuid4()
+        lease_expires_at = datetime.now(UTC) + worker_module._RUNNING_JOB_STALE_AFTER
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = datetime.now(UTC)
+            persisted_job.finished_at = None
+            persisted_job.error_code = None
+            persisted_job.error_message = None
+            persisted_job.attempt_token = attempt_token
+            persisted_job.attempt_lease_expires_at = lease_expires_at
+            await session.commit()
+
+        marked_failed = await worker_module._mark_recovery_enqueue_failed(job.id)
+
+        assert marked_failed is False
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "running"
+        assert updated_job.error_code is None
+        assert updated_job.error_message is None
+        assert updated_job.finished_at is None
+        assert updated_job.attempt_token == attempt_token
+        assert updated_job.attempt_lease_expires_at == lease_expires_at
+
+    async def test_mark_recovery_enqueue_failed_skips_terminal_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Recovery enqueue failure should not rewrite a terminalized job."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.status = "succeeded"
+            persisted_job.finished_at = datetime.now(UTC)
+            await session.commit()
+
+        marked_failed = await worker_module._mark_recovery_enqueue_failed(job.id)
+
+        assert marked_failed is False
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "succeeded"
+        assert updated_job.error_code is None
+        assert updated_job.error_message is None
 
     async def test_process_ingest_job_ignores_duplicate_delivery_after_success(
         self,

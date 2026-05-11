@@ -138,6 +138,15 @@ class Job(Base):
         nullable=False,
         comment="Maximum retry attempts",
     )
+    attempt_token: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Current running attempt ownership token fence",
+    )
+    attempt_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Current running attempt lease expiry used to reclaim stale deliveries",
+    )
     cancel_requested: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

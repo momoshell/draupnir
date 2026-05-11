@@ -65,6 +65,10 @@ class _InactiveSourceError(Exception):
     """Raised when a job source project or file is no longer active."""
 
 
+class _StaleJobAttemptError(Exception):
+    """Raised when a worker attempt no longer owns the job lease."""
+
+
 @dataclass(frozen=True, slots=True)
 class _QueuedJobEvent:
     """Buffered job event persisted by the progress drain."""
@@ -72,6 +76,14 @@ class _QueuedJobEvent:
     level: str
     message: str
     data_json: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _JobAttemptLease:
+    """Persisted ownership token for a claimed job attempt."""
+
+    token: UUID
+    lease_expires_at: datetime
 
 
 class _PersistedJobCancellationHandle:
@@ -92,8 +104,9 @@ class _JobProgressEventBridge:
 
     _STOP = object()
 
-    def __init__(self, job_id: UUID) -> None:
+    def __init__(self, job_id: UUID, *, attempt_token: UUID) -> None:
         self._job_id = job_id
+        self._attempt_token = attempt_token
         self._queue: asyncio.Queue[_QueuedJobEvent | object] = asyncio.Queue()
         self._drain_task = asyncio.create_task(self._drain())
         self._closed = False
@@ -132,6 +145,7 @@ class _JobProgressEventBridge:
                     level=queued.level,
                     message=queued.message,
                     data_json=queued.data_json,
+                    attempt_token=self._attempt_token,
                 )
             finally:
                 self._queue.task_done()
@@ -158,8 +172,58 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _clear_job_attempt_lease(job: Job) -> None:
+    """Clear persisted ownership fencing for a job attempt."""
+    job.attempt_token = None
+    job.attempt_lease_expires_at = None
+
+
+def _claim_job_attempt_lease(
+    job: Job,
+    *,
+    now: datetime,
+    increment_attempt: bool,
+) -> _JobAttemptLease:
+    """Mint and persist a fresh job-attempt ownership lease."""
+    attempt_token = uuid.uuid4()
+    lease_expires_at = now + _RUNNING_JOB_STALE_AFTER
+
+    if increment_attempt:
+        job.attempts += 1
+
+    job.status = "running"
+    job.started_at = now
+    job.finished_at = None
+    job.error_code = None
+    job.error_message = None
+    job.attempt_token = attempt_token
+    job.attempt_lease_expires_at = lease_expires_at
+
+    return _JobAttemptLease(token=attempt_token, lease_expires_at=lease_expires_at)
+
+
+def _job_attempt_is_current(job: Job, *, attempt_token: UUID) -> bool:
+    """Return whether a worker still owns the persisted job attempt lease."""
+    return job.status == "running" and job.attempt_token == attempt_token
+
+
+def _job_is_safe_recovery_failure_target(job: Job) -> bool:
+    """Return whether recovery can still safely mark the job failed."""
+    return (
+        job.status == "pending"
+        and job.attempt_token is None
+        and job.attempt_lease_expires_at is None
+    )
+
+
 def _is_stale_running_job(job: Job, *, now: datetime) -> bool:
     """Return whether a running job is old enough to treat as orphaned."""
+    lease_expires_at = job.attempt_lease_expires_at
+    if lease_expires_at is not None:
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+        return lease_expires_at <= now
+
     if job.started_at is None:
         return True
 
@@ -440,7 +504,7 @@ async def _cleanup_failed_storage_writes(
             )
 
 
-async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
+async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> IngestionRunRequest:
     """Load persisted job and file metadata for the ingestion runner."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -450,6 +514,8 @@ async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
         job = await _get_job_for_update(session, job_id)
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
 
         source_file = await _get_source_file(
             session,
@@ -458,11 +524,14 @@ async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
             for_update=True,
         )
         if source_file is None:
-            await _cancel_job_for_inactive_source(
+            cancelled = await _cancel_job_for_inactive_source(
                 session,
                 job,
                 reason="source_deleted",
+                attempt_token=attempt_token,
             )
+            if not cancelled:
+                raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
             raise _InactiveSourceError(
                 f"File with identifier '{job.file_id}' for job '{job_id}' is no longer active"
             )
@@ -479,7 +548,12 @@ async def _build_ingestion_run_request(job_id: UUID) -> IngestionRunRequest:
         )
 
 
-async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPayload) -> bool:
+async def _finalize_ingest_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    payload: IngestFinalizationPayload,
+) -> bool:
     """Atomically publish durable ingest outputs and terminal job success."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -493,6 +567,14 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
         if job.status in _TERMINAL_JOB_STATUSES:
             logger.info(
                 "ingest_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "ingest_job_completion_skipped_stale_attempt",
                 job_id=str(job_id),
                 status=job.status,
             )
@@ -542,6 +624,7 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
                 session,
                 job,
                 reason="source_deleted",
+                attempt_token=attempt_token,
             )
             logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
             return False
@@ -708,6 +791,7 @@ async def _finalize_ingest_job(job_id: UUID, *, payload: IngestFinalizationPaylo
             job.finished_at = finished_at
             job.error_code = None
             job.error_message = None
+            _clear_job_attempt_lease(job)
             await emit_job_event(
                 job.id,
                 level="info",
@@ -752,8 +836,9 @@ async def emit_job_event(
     level: str,
     message: str,
     data_json: dict[str, Any] | None = None,
+    attempt_token: UUID | None = None,
     session: AsyncSession | None = None,
-) -> None:
+) -> bool:
     """Persist a job lifecycle event."""
     event = JobEvent(
         job_id=job_id,
@@ -762,16 +847,30 @@ async def emit_job_event(
         data_json=data_json,
     )
     if session is not None:
+        if attempt_token is not None:
+            job = await _get_job_for_update(session, job_id)
+            if job is None:
+                raise LookupError(f"Job with identifier '{job_id}' not found")
+            if not _job_attempt_is_current(job, attempt_token=attempt_token):
+                return False
         session.add(event)
-        return
+        return True
 
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as managed_session:
+        if attempt_token is not None:
+            job = await _get_job_for_update(managed_session, job_id)
+            if job is None:
+                raise LookupError(f"Job with identifier '{job_id}' not found")
+            if not _job_attempt_is_current(job, attempt_token=attempt_token):
+                return False
         managed_session.add(event)
         await managed_session.commit()
+
+    return True
 
 
 def _progress_event_data(update: ProgressUpdate) -> dict[str, Any]:
@@ -836,6 +935,7 @@ async def _invoke_ingestion_runner(
 async def _poll_job_cancellation(
     job_id: UUID,
     *,
+    attempt_token: UUID,
     cancellation: _PersistedJobCancellationHandle,
     run_task: asyncio.Task[IngestFinalizationPayload],
     stop_event: asyncio.Event,
@@ -847,13 +947,15 @@ async def _poll_job_cancellation(
 
     while not stop_event.is_set() and not cancellation.is_cancelled():
         async with session_maker() as session:
-            result = await session.execute(select(Job.cancel_requested).where(Job.id == job_id))
-            cancel_requested = result.scalar_one_or_none()
+            job = await session.get(Job, job_id)
 
-        if cancel_requested is None:
+        if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        if cancel_requested:
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            return
+
+        if job.cancel_requested:
             cancellation.mark_cancelled()
             run_task.cancel()
             return
@@ -881,12 +983,39 @@ async def _stop_job_execution_monitor(
         await progress_bridge.flush()
 
 
+async def _persist_job_failed(
+    session: AsyncSession,
+    job: Job,
+    *,
+    error_message: str,
+    error_code: ErrorCode,
+) -> None:
+    """Persist a failed job state and matching event within an active session."""
+    job.status = "failed"
+    job.error_code = error_code.value
+    job.error_message = error_message
+    job.finished_at = _utcnow()
+    _clear_job_attempt_lease(job)
+    await emit_job_event(
+        job.id,
+        level="error",
+        message="Job failed",
+        data_json={
+            "status": "failed",
+            "error_code": error_code.value,
+            "error_message": error_message,
+        },
+        session=session,
+    )
+
+
 async def _mark_job_failed(
     job_id: UUID,
     *,
     error_message: str,
     error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
-) -> None:
+    attempt_token: UUID | None = None,
+) -> bool:
     """Persist a failed job state with the supplied message."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -903,26 +1032,30 @@ async def _mark_job_failed(
                 job_id=str(job_id),
                 status=job.status,
             )
-            return
-        job.status = "failed"
-        job.error_code = error_code.value
-        job.error_message = error_message
-        job.finished_at = _utcnow()
-        await emit_job_event(
-            job_id,
-            level="error",
-            message="Job failed",
-            data_json={
-                "status": "failed",
-                "error_code": error_code.value,
-                "error_message": error_message,
-            },
-            session=session,
+            return False
+        if attempt_token is not None and not _job_attempt_is_current(
+            job,
+            attempt_token=attempt_token,
+        ):
+            logger.info(
+                "ingest_job_failure_mark_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        await _persist_job_failed(
+            session,
+            job,
+            error_message=error_message,
+            error_code=error_code,
         )
         await session.commit()
 
+    return True
 
-async def _mark_job_cancelled(job_id: UUID) -> None:
+
+async def _mark_job_cancelled(job_id: UUID, *, attempt_token: UUID | None = None) -> bool:
     """Persist a cancelled job state."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -939,7 +1072,18 @@ async def _mark_job_cancelled(job_id: UUID) -> None:
                 job_id=str(job_id),
                 status=job.status,
             )
-            return
+            return False
+
+        if attempt_token is not None and not _job_attempt_is_current(
+            job,
+            attempt_token=attempt_token,
+        ):
+            logger.info(
+                "ingest_job_cancel_mark_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
 
         _finalize_job_cancelled(job)
         await emit_job_event(
@@ -951,16 +1095,60 @@ async def _mark_job_cancelled(job_id: UUID) -> None:
         )
         await session.commit()
 
+    return True
 
-async def _mark_recovery_enqueue_failed(job_id: UUID) -> None:
+
+async def _mark_job_failed_if_recovery_safe(
+    job_id: UUID,
+    *,
+    error_message: str,
+    error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
+) -> bool:
+    """Fail a recovered job only if it is still pending and unowned."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await _get_job_for_update(session, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if not _job_is_safe_recovery_failure_target(job):
+            logger.info(
+                "ingest_job_recovery_enqueue_failure_mark_skipped_changed_state",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        await _persist_job_failed(
+            session,
+            job,
+            error_message=error_message,
+            error_code=error_code,
+        )
+        await session.commit()
+
+    return True
+
+
+async def _mark_recovery_enqueue_failed(job_id: UUID) -> bool:
     """Persist and log a sanitized worker-recovery enqueue failure."""
-    await _mark_job_failed(job_id, error_message=_ENQUEUE_INGEST_JOB_ERROR_MESSAGE)
+    marked_failed = await _mark_job_failed_if_recovery_safe(
+        job_id,
+        error_message=_ENQUEUE_INGEST_JOB_ERROR_MESSAGE,
+    )
+    if not marked_failed:
+        return False
+
     logger.error(
         "ingest_job_recovery_enqueue_failed",
         job_id=str(job_id),
         error_code=ErrorCode.INTERNAL_ERROR.value,
         recovery_action="mark_failed",
     )
+    return True
 
 
 def _finalize_job_cancelled(job: Job) -> None:
@@ -969,6 +1157,7 @@ def _finalize_job_cancelled(job: Job) -> None:
     job.error_code = _JOB_CANCELLED_ERROR_CODE
     job.error_message = None
     job.finished_at = _utcnow()
+    _clear_job_attempt_lease(job)
 
 
 async def _cancel_job_for_inactive_source(
@@ -976,10 +1165,14 @@ async def _cancel_job_for_inactive_source(
     job: Job,
     *,
     reason: str,
-) -> None:
+    attempt_token: UUID | None = None,
+) -> bool:
     """Persist cancellation when a job source project/file is no longer active."""
     if job.status in _TERMINAL_JOB_STATUSES:
-        return
+        return False
+
+    if attempt_token is not None and not _job_attempt_is_current(job, attempt_token=attempt_token):
+        return False
 
     job.cancel_requested = True
     _finalize_job_cancelled(job)
@@ -992,8 +1185,10 @@ async def _cancel_job_for_inactive_source(
     )
     await session.commit()
 
+    return True
 
-async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
+
+async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted ingest job under a row lock."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -1012,7 +1207,7 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                 job_id=str(job_id),
                 status=job.status,
             )
-            return False
+            return None
 
         source_file = await _get_source_file(
             session,
@@ -1027,16 +1222,12 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                 reason="source_deleted",
             )
             logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
-            return False
+            return None
 
         if not job.cancel_requested:
             if job.status == "running":
                 if _is_stale_running_job(job, now=now):
-                    job.attempts += 1
-                    job.started_at = now
-                    job.finished_at = None
-                    job.error_code = None
-                    job.error_message = None
+                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
                     await emit_job_event(
                         job.id,
                         level="info",
@@ -1054,21 +1245,16 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                         job_id=str(job_id),
                         status=job.status,
                     )
-                    return True
+                    return lease
 
                 logger.info(
-                    "ingest_job_continuing_running_status",
+                    "ingest_job_duplicate_delivery_skipped_running_attempt",
                     job_id=str(job_id),
                     status=job.status,
                 )
-                return True
+                return None
 
-            job.attempts += 1
-            job.status = "running"
-            job.started_at = now
-            job.finished_at = None
-            job.error_code = None
-            job.error_message = None
+            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
             await emit_job_event(
                 job.id,
                 level="info",
@@ -1077,7 +1263,7 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
                 session=session,
             )
             await session.commit()
-            return True
+            return lease
 
         _finalize_job_cancelled(job)
         await emit_job_event(
@@ -1090,7 +1276,7 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> bool:
         await session.commit()
 
     logger.info("ingest_job_cancelled", job_id=str(job_id))
-    return False
+    return None
 
 
 async def process_ingest_job(job_id: UUID) -> None:
@@ -1099,12 +1285,13 @@ async def process_ingest_job(job_id: UUID) -> None:
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
-    if not await _begin_or_resume_ingest_job(job_id):
+    lease = await _begin_or_resume_ingest_job(job_id)
+    if lease is None:
         return
 
     try:
-        request = await _build_ingestion_run_request(job_id)
-        progress_bridge = _JobProgressEventBridge(job_id)
+        request = await _build_ingestion_run_request(job_id, attempt_token=lease.token)
+        progress_bridge = _JobProgressEventBridge(job_id, attempt_token=lease.token)
         cancellation = _PersistedJobCancellationHandle()
         stop_event = asyncio.Event()
         run_task = asyncio.create_task(
@@ -1118,6 +1305,7 @@ async def process_ingest_job(job_id: UUID) -> None:
         cancellation_task = asyncio.create_task(
             _poll_job_cancellation(
                 job_id,
+                attempt_token=lease.token,
                 cancellation=cancellation,
                 run_task=run_task,
                 stop_event=stop_event,
@@ -1134,24 +1322,36 @@ async def process_ingest_job(job_id: UUID) -> None:
     except _InactiveSourceError:
         logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
         return
+    except _StaleJobAttemptError:
+        logger.info("ingest_job_stale_attempt_skipped", job_id=str(job_id))
+        return
     except IngestionRunnerError as exc:
         if exc.error_code is ErrorCode.JOB_CANCELLED:
-            await _mark_job_cancelled(job_id)
+            await _mark_job_cancelled(job_id, attempt_token=lease.token)
             logger.info(
                 "ingest_job_cancelled_during_execution",
                 job_id=str(job_id),
                 error_code=exc.error_code.value,
             )
         else:
-            await _mark_job_failed(job_id, error_message=exc.message, error_code=exc.error_code)
+            await _mark_job_failed(
+                job_id,
+                error_message=exc.message,
+                error_code=exc.error_code,
+                attempt_token=lease.token,
+            )
             logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
         raise
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id)
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
         logger.info("ingest_job_cancelled_during_execution", job_id=str(job_id))
         raise
     except Exception:
-        await _mark_job_failed(job_id, error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE)
+        await _mark_job_failed(
+            job_id,
+            error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
         logger.error(
             "ingest_job_failed",
             job_id=str(job_id),
@@ -1162,13 +1362,21 @@ async def process_ingest_job(job_id: UUID) -> None:
         raise
 
     try:
-        finalized = await _finalize_ingest_job(job_id, payload=payload)
+        finalized = await _finalize_ingest_job(
+            job_id,
+            attempt_token=lease.token,
+            payload=payload,
+        )
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id)
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
         logger.info("ingest_job_cancelled_during_finalization", job_id=str(job_id))
         raise
     except Exception as exc:
-        await _mark_job_failed(job_id, error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE)
+        await _mark_job_failed(
+            job_id,
+            error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
         logger.error(
             "ingest_job_finalization_failed",
             job_id=str(job_id),
@@ -1198,6 +1406,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
                 & (Job.status.in_(_INCOMPLETE_JOB_STATUSES))
             )
             .order_by(Job.created_at.asc(), Job.id.asc())
+            .with_for_update(skip_locked=True)
         )
         jobs = result.scalars().all()
 
@@ -1211,6 +1420,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
                 job.finished_at = None
                 job.error_code = None
                 job.error_message = None
+                _clear_job_attempt_lease(job)
             recovered_job_ids.append(job.id)
 
         await session.commit()
