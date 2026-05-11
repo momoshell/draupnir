@@ -1,8 +1,5 @@
 """Job status endpoints."""
 
-import base64
-import binascii
-import json
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
@@ -11,6 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.pagination import (
+    decode_cursor_payload,
+    encode_cursor_payload,
+    raise_invalid_cursor,
+)
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
@@ -82,38 +84,28 @@ def _encode_job_events_cursor(event: JobEvent) -> str:
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
 
-    payload = json.dumps(
+    return encode_cursor_payload(
         {
             "created_at": created_at.astimezone(UTC).isoformat(),
             "sequence_id": event.sequence_id,
             "id": str(event.id),
         },
-        separators=(",", ":"),
+        compact=True,
     )
-    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("utf-8").rstrip("=")
 
 
 def _decode_job_events_cursor(cursor: str) -> tuple[datetime, int | None, UUID]:
     """Decode a pagination cursor into its sort key values."""
     try:
-        padded_cursor = cursor + ("=" * (-len(cursor) % 4))
-        decoded = base64.urlsafe_b64decode(padded_cursor.encode("utf-8")).decode("utf-8")
-        payload = json.loads(decoded)
-        created_at = datetime.fromisoformat(payload["created_at"])
+        payload = decode_cursor_payload(cursor)
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
         sequence_id_raw = payload.get("sequence_id")
         sequence_id = int(sequence_id_raw) if sequence_id_raw is not None else None
         if sequence_id is not None and sequence_id < 0:
             raise ValueError("sequence_id must be non-negative")
-        cursor_id = UUID(payload["id"])
-    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=create_error_response(
-                code=ErrorCode.INVALID_CURSOR,
-                message="Invalid cursor format",
-                details=None,
-            ),
-        ) from exc
+        cursor_id = UUID(str(payload["id"]))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise_invalid_cursor(exc)
 
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)

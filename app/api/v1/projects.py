@@ -1,18 +1,20 @@
 """Project CRUD endpoints."""
 
-import base64
-import binascii
-import json
 from datetime import UTC, datetime
-from typing import Annotated, Any, cast
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.pagination import (
+    decode_cursor_payload,
+    encode_cursor_payload,
+    raise_invalid_cursor,
+)
 from app.core.errors import ErrorCode
-from app.core.exceptions import create_error_response, raise_not_found
+from app.core.exceptions import raise_not_found
 from app.db.session import get_db
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
@@ -50,47 +52,23 @@ async def _get_active_project_or_404(
 
 def _encode_cursor(created_at: datetime, project_id: UUID) -> str:
     """Encode cursor from created_at and project_id."""
-    cursor_data = {
-        "created_at": created_at.isoformat(),
-        "id": str(project_id),
-    }
-    return base64.urlsafe_b64encode(json.dumps(cursor_data).encode()).decode().rstrip("=")
+    return encode_cursor_payload(
+        {
+            "created_at": created_at.isoformat(),
+            "id": str(project_id),
+        }
+    )
 
 
-def _decode_cursor(cursor: str) -> dict[str, Any]:
-    """Decode cursor to dict with created_at and id."""
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    """Decode cursor to typed created_at and id values."""
     try:
-        # Add padding if needed
-        padding = 4 - (len(cursor) % 4)
-        if padding != 4:
-            cursor += "=" * padding
-
-        decoded = base64.urlsafe_b64decode(cursor)
-        cursor_data_raw = json.loads(decoded.decode("utf-8"))
-        if not isinstance(cursor_data_raw, dict):
-            raise TypeError("Cursor payload must be a JSON object")
-        cursor_data = cast(dict[str, Any], cursor_data_raw)
-
-        # Validate required keys and value formats.
-        _ = datetime.fromisoformat(str(cursor_data["created_at"]))
-        _ = UUID(str(cursor_data["id"]))
-        return cursor_data
-    except (
-        binascii.Error,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=create_error_response(
-                code=ErrorCode.INVALID_CURSOR,
-                message="Invalid cursor format",
-                details=None,
-            ),
-        ) from e
+        cursor_data = decode_cursor_payload(cursor)
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
+            str(cursor_data["id"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
 
 
 @project_router.post(
@@ -138,9 +116,7 @@ async def list_projects(
 
     # Apply cursor filter if provided
     if cursor:
-        cursor_data = _decode_cursor(cursor)
-        created_at = datetime.fromisoformat(str(cursor_data["created_at"]))
-        project_id = UUID(str(cursor_data["id"]))
+        created_at, project_id = _decode_cursor(cursor)
         # Filter for items after the cursor position
         query = query.filter(
             (Project.created_at < created_at)
