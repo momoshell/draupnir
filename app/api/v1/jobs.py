@@ -329,6 +329,19 @@ async def retry_job(
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
         return job
 
+    if job.error_code == ErrorCode.REVISION_CONFLICT.value:
+        if reservation is not None:
+            body = JobRead.model_validate(job).model_dump(mode="json")
+            await mark_idempotency_completed(
+                db,
+                reservation,
+                status_code=status.HTTP_202_ACCEPTED,
+                response_body=body,
+            )
+            await db.commit()
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+        return job
+
     job.status = "pending"
     job.cancel_requested = False
     job.error_code = None

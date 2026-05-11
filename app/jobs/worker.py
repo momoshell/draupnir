@@ -70,6 +70,17 @@ class _StaleJobAttemptError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class _RevisionConflictError(Exception):
+    """Raised when a persisted ingest/reprocess revision base is invalid or stale."""
+
+    message: str
+    details: dict[str, Any]
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True, slots=True)
 class _QueuedJobEvent:
     """Buffered job event persisted by the progress drain."""
 
@@ -296,6 +307,138 @@ async def _get_latest_drawing_revision(
     return result.scalar_one_or_none()
 
 
+async def _get_drawing_revision(
+    session: AsyncSession,
+    *,
+    revision_id: UUID,
+) -> DrawingRevision | None:
+    """Load a drawing revision row by identifier."""
+
+    return await session.get(DrawingRevision, revision_id)
+
+
+def _expected_revision_kind_for_job(job: Job) -> str:
+    """Return the expected persisted revision kind for a job type."""
+
+    if job.job_type == JobType.INGEST.value:
+        return _INITIAL_INGEST_REVISION_KIND
+    if job.job_type == JobType.REPROCESS.value:
+        return _REPROCESS_REVISION_KIND
+    raise ValueError(f"Unsupported ingest job type '{job.job_type}'")
+
+
+def _assert_job_base_revision_invariants(job: Job) -> None:
+    """Reject persisted jobs whose job_type/base_revision_id pairing is invalid."""
+
+    if job.job_type == JobType.INGEST.value:
+        if job.base_revision_id is not None:
+            raise ValueError("Initial ingest job cannot retain a base revision")
+        return
+
+    if job.job_type == JobType.REPROCESS.value:
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Reprocess job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "base_revision_sequence": None,
+                    "current_revision_id": None,
+                    "current_revision_sequence": None,
+                },
+            )
+        return
+
+    raise ValueError(f"Unsupported ingest job type '{job.job_type}'")
+
+
+def _revision_reference(
+    revision: DrawingRevision | None,
+) -> tuple[str | None, int | None]:
+    """Return stable revision identifier/sequence details for conflict payloads."""
+
+    if revision is None:
+        return None, None
+
+    return str(revision.id), revision.revision_sequence
+
+
+def _build_revision_conflict_details(
+    *,
+    base_revision: DrawingRevision | None,
+    current_revision: DrawingRevision | None,
+) -> dict[str, str | int | None]:
+    """Build structured stale-base details for durable job events."""
+
+    base_revision_id, base_revision_sequence = _revision_reference(base_revision)
+    current_revision_id, current_revision_sequence = _revision_reference(current_revision)
+    return {
+        "base_revision_id": base_revision_id,
+        "base_revision_sequence": base_revision_sequence,
+        "current_revision_id": current_revision_id,
+        "current_revision_sequence": current_revision_sequence,
+    }
+
+
+async def _resolve_finalization_predecessor_revision(
+    session: AsyncSession,
+    *,
+    job: Job,
+    source_file: File,
+    payload_revision_kind: str,
+) -> DrawingRevision | None:
+    """Validate job lineage invariants and return the predecessor revision to append to."""
+
+    _assert_job_base_revision_invariants(job)
+    expected_revision_kind = _expected_revision_kind_for_job(job)
+    if payload_revision_kind != expected_revision_kind:
+        raise _RevisionConflictError(
+            message="Ingest job revision kind changed before finalization.",
+            details={
+                "expected_revision_kind": expected_revision_kind,
+                "payload_revision_kind": payload_revision_kind,
+            },
+        )
+
+    current_revision = await _get_latest_drawing_revision(
+        session,
+        project_id=job.project_id,
+        source_file_id=source_file.id,
+    )
+    if expected_revision_kind == _INITIAL_INGEST_REVISION_KIND:
+        if current_revision is not None:
+            raise _RevisionConflictError(
+                message="Initial ingest cannot finalize after another revision already exists.",
+                details=_build_revision_conflict_details(
+                    base_revision=None,
+                    current_revision=current_revision,
+                ),
+            )
+        return None
+
+    assert job.base_revision_id is not None
+    base_revision = await _get_drawing_revision(session, revision_id=job.base_revision_id)
+    if base_revision is None:
+        raise _RevisionConflictError(
+            message="Reprocess job base revision no longer exists.",
+            details=_build_revision_conflict_details(
+                base_revision=None,
+                current_revision=current_revision,
+            ),
+        )
+    if base_revision.project_id != job.project_id or base_revision.source_file_id != source_file.id:
+        raise ValueError("Reprocess job base revision does not belong to the source file")
+    if current_revision is None or current_revision.id != base_revision.id:
+        raise _RevisionConflictError(
+            message="Reprocess base revision became stale before finalization.",
+            details=_build_revision_conflict_details(
+                base_revision=base_revision,
+                current_revision=current_revision,
+            ),
+        )
+
+    return base_revision
+
+
 async def _get_generated_artifact_for_revision(
     session: AsyncSession,
     *,
@@ -315,40 +458,6 @@ async def _get_generated_artifact_for_revision(
         .limit(1)
     )
     return result.scalar_one_or_none()
-
-
-def _resolve_revision_kind(job_id: UUID, *, initial_job_id: UUID | None) -> str:
-    """Map file linkage to the correct ingest revision kind."""
-    if initial_job_id == job_id:
-        return _INITIAL_INGEST_REVISION_KIND
-
-    return _REPROCESS_REVISION_KIND
-
-
-def _assert_revision_invariants(
-    job_id: UUID,
-    *,
-    source_file: File,
-    predecessor_revision: DrawingRevision | None,
-    payload_revision_kind: str,
-) -> None:
-    """Reject finalization when revision lineage invariants are violated."""
-    expected_revision_kind = _resolve_revision_kind(
-        job_id,
-        initial_job_id=source_file.initial_job_id,
-    )
-    if payload_revision_kind != expected_revision_kind:
-        raise ValueError("Ingest job revision kind changed before finalization")
-
-    if expected_revision_kind == _INITIAL_INGEST_REVISION_KIND:
-        if predecessor_revision is not None:
-            raise ValueError("Initial ingest cannot finalize after a predecessor revision exists")
-        return
-
-    if predecessor_revision is None:
-        raise ValueError(
-            "Reprocess ingest job cannot finalize before a predecessor revision exists"
-        )
 
 
 def _build_persisted_validation_report_json(
@@ -516,6 +625,7 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
             raise LookupError(f"Job with identifier '{job_id}' not found")
         if not _job_attempt_is_current(job, attempt_token=attempt_token):
             raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+        _assert_job_base_revision_invariants(job)
 
         source_file = await _get_source_file(
             session,
@@ -629,15 +739,10 @@ async def _finalize_ingest_job(
             logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
             return False
 
-        predecessor_revision = await _get_latest_drawing_revision(
+        predecessor_revision = await _resolve_finalization_predecessor_revision(
             session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-        )
-        _assert_revision_invariants(
-            job.id,
+            job=job,
             source_file=source_file,
-            predecessor_revision=predecessor_revision,
             payload_revision_kind=payload.revision_kind,
         )
         revision_sequence = 1
@@ -989,6 +1094,7 @@ async def _persist_job_failed(
     *,
     error_message: str,
     error_code: ErrorCode,
+    error_details: dict[str, Any] | None = None,
 ) -> None:
     """Persist a failed job state and matching event within an active session."""
     job.status = "failed"
@@ -1004,6 +1110,7 @@ async def _persist_job_failed(
             "status": "failed",
             "error_code": error_code.value,
             "error_message": error_message,
+            **({"details": error_details} if error_details is not None else {}),
         },
         session=session,
     )
@@ -1015,6 +1122,7 @@ async def _mark_job_failed(
     error_message: str,
     error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
     attempt_token: UUID | None = None,
+    error_details: dict[str, Any] | None = None,
 ) -> bool:
     """Persist a failed job state with the supplied message."""
     session_maker = get_session_maker()
@@ -1049,6 +1157,7 @@ async def _mark_job_failed(
             job,
             error_message=error_message,
             error_code=error_code,
+            error_details=error_details,
         )
         await session.commit()
 
@@ -1103,6 +1212,7 @@ async def _mark_job_failed_if_recovery_safe(
     *,
     error_message: str,
     error_code: ErrorCode = ErrorCode.INTERNAL_ERROR,
+    error_details: dict[str, Any] | None = None,
 ) -> bool:
     """Fail a recovered job only if it is still pending and unowned."""
     session_maker = get_session_maker()
@@ -1127,6 +1237,7 @@ async def _mark_job_failed_if_recovery_safe(
             job,
             error_message=error_message,
             error_code=error_code,
+            error_details=error_details,
         )
         await session.commit()
 
@@ -1325,6 +1436,21 @@ async def process_ingest_job(job_id: UUID) -> None:
     except _StaleJobAttemptError:
         logger.info("ingest_job_stale_attempt_skipped", job_id=str(job_id))
         return
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "ingest_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        raise
     except IngestionRunnerError as exc:
         if exc.error_code is ErrorCode.JOB_CANCELLED:
             await _mark_job_cancelled(job_id, attempt_token=lease.token)
@@ -1371,6 +1497,21 @@ async def process_ingest_job(job_id: UUID) -> None:
         await _mark_job_cancelled(job_id, attempt_token=lease.token)
         logger.info("ingest_job_cancelled_during_finalization", job_id=str(job_id))
         raise
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "ingest_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        raise
     except Exception as exc:
         await _mark_job_failed(
             job_id,
@@ -1387,7 +1528,6 @@ async def process_ingest_job(job_id: UUID) -> None:
 
     if finalized:
         logger.info("ingest_job_succeeded", job_id=str(job_id))
-
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:

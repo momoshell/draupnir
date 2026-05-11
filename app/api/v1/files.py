@@ -34,6 +34,7 @@ from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_ingest_job
+from app.models.drawing_revision import DrawingRevision
 from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File as FileModel
 from app.models.job import Job
@@ -288,6 +289,38 @@ async def _get_existing_project_extraction_profile_or_404(
         raise_not_found("ExtractionProfile", str(extraction_profile_id))
     assert profile_row is not None
     return profile_row
+
+
+async def _get_latest_finalized_revision(
+    db: AsyncSession,
+    project_id: UUID,
+    file_id: UUID,
+) -> DrawingRevision | None:
+    """Return the latest finalized drawing revision for a file."""
+
+    query = (
+        select(DrawingRevision)
+        .where(
+            (DrawingRevision.project_id == project_id)
+            & (DrawingRevision.source_file_id == file_id)
+        )
+        .order_by(DrawingRevision.revision_sequence.desc())
+        .limit(1)
+    )
+    return (await db.execute(query)).scalar_one_or_none()
+
+
+def _raise_reprocess_base_revision_conflict() -> None:
+    """Raise the standardized missing-base revision conflict response."""
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=create_error_response(
+            code=ErrorCode.REVISION_CONFLICT,
+            message="Reprocess requires a finalized base revision.",
+            details=None,
+        ),
+    )
 
 
 async def _mark_job_enqueue_failed(db: AsyncSession, job: Job, exc: Exception) -> None:
@@ -643,7 +676,7 @@ async def reprocess_project_file(
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> Job | Response:
-    """Create a new pending ingest job for an existing file and profile selection."""
+    """Create a new pending reprocess job for an existing file and profile selection."""
     reservation: IdempotencyReservation | None = None
     fingerprint: str | None = None
     if idempotency_key is not None:
@@ -667,6 +700,14 @@ async def reprocess_project_file(
             project_id,
             request.extraction_profile_id,
         )
+
+    if idempotency_key is not None:
+        await _get_active_project_or_404(db, project_id, for_update=True)
+        await _get_project_file_or_404(db, project_id, file_id, for_update=True)
+        if await _get_latest_finalized_revision(db, project_id, file_id) is None:
+            await db.rollback()
+            _raise_reprocess_base_revision_conflict()
+
     if idempotency_key is not None:
         assert fingerprint is not None
         claim = await claim_idempotency(
@@ -681,13 +722,20 @@ async def reprocess_project_file(
         reservation = claim
     await _get_active_project_or_404(db, project_id, for_update=True)
     await _get_project_file_or_404(db, project_id, file_id, for_update=True)
+    base_revision = await _get_latest_finalized_revision(db, project_id, file_id)
+    if base_revision is None:
+        await db.rollback()
+        _raise_reprocess_base_revision_conflict()
+    assert base_revision is not None
+
     extraction_profile = await _resolve_project_extraction_profile(db, project_id, request)
 
     ingest_job = Job(
         project_id=project_id,
         file_id=file_id,
         extraction_profile_id=extraction_profile.id,
-        job_type="ingest",
+        base_revision_id=base_revision.id,
+        job_type="reprocess",
         status="pending",
         attempts=0,
         max_attempts=3,

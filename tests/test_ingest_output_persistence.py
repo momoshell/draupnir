@@ -635,7 +635,7 @@ class TestIngestOutputPersistence:
         cleanup_projects: None,
         enqueued_job_ids: list[str],
     ) -> None:
-        """Concurrent reprocess runs should still persist a linear revision chain."""
+        """Concurrent reprocess runs should leave one success and one stale conflict."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -661,9 +661,34 @@ class TestIngestOutputPersistence:
         second_job = await _get_job(_as_uuid(second_reprocess_response.json()["id"]))
         third_job = await _get_job(_as_uuid(third_reprocess_response.json()["id"]))
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             process_ingest_job(second_job.id),
             process_ingest_job(third_job.id),
+            return_exceptions=True,
+        )
+
+        assert sum(result is None for result in results) == 1
+        assert (
+            sum(
+                isinstance(result, worker_module._RevisionConflictError)
+                for result in results
+            )
+            == 1
+        )
+
+        second_job = await _get_job(second_job.id)
+        third_job = await _get_job(third_job.id)
+        succeeded_reprocess_jobs = [
+            job for job in (second_job, third_job) if job.status == "succeeded"
+        ]
+        failed_reprocess_jobs = [job for job in (second_job, third_job) if job.status == "failed"]
+
+        assert len(succeeded_reprocess_jobs) == 1
+        assert len(failed_reprocess_jobs) == 1
+        assert failed_reprocess_jobs[0].error_code == ErrorCode.REVISION_CONFLICT.value
+        assert (
+            failed_reprocess_jobs[0].error_message
+            == "Reprocess base revision became stale before finalization."
         )
 
         (
@@ -673,45 +698,44 @@ class TestIngestOutputPersistence:
             generated_artifacts,
         ) = await _load_project_outputs(project["id"])
 
-        assert len(adapter_outputs) == 3
-        assert len(drawing_revisions) == 3
-        assert len(validation_reports) == 3
-        assert len(generated_artifacts) == 3
+        assert len(adapter_outputs) == 2
+        assert len(drawing_revisions) == 2
+        assert len(validation_reports) == 2
+        assert len(generated_artifacts) == 2
 
-        first_revision, second_revision, _third_revision = drawing_revisions
+        first_revision, second_revision = drawing_revisions
         artifacts_by_revision_id = {
             artifact.drawing_revision_id: artifact for artifact in generated_artifacts
         }
         first_artifact = artifacts_by_revision_id[first_revision.id]
         second_artifact = artifacts_by_revision_id[second_revision.id]
-        third_artifact = artifacts_by_revision_id[drawing_revisions[2].id]
-        assert [revision.revision_sequence for revision in drawing_revisions] == [1, 2, 3]
+        assert [revision.revision_sequence for revision in drawing_revisions] == [1, 2]
         assert [revision.predecessor_revision_id for revision in drawing_revisions] == [
             None,
             first_revision.id,
-            second_revision.id,
         ]
         assert [revision.revision_kind for revision in drawing_revisions] == [
             "ingest",
             "reprocess",
-            "reprocess",
         ]
 
-        expected_job_ids = {first_job.id, second_job.id, third_job.id}
+        expected_job_ids = {first_job.id, succeeded_reprocess_jobs[0].id}
         assert {output.source_job_id for output in adapter_outputs} == expected_job_ids
         assert {report.source_job_id for report in validation_reports} == expected_job_ids
         assert {artifact.job_id for artifact in generated_artifacts} == expected_job_ids
+        assert failed_reprocess_jobs[0].id not in {
+            output.source_job_id for output in adapter_outputs
+        }
         assert first_artifact.predecessor_artifact_id is None
         assert second_artifact.predecessor_artifact_id == first_artifact.id
-        assert third_artifact.predecessor_artifact_id == second_artifact.id
 
-    async def test_reprocess_before_initial_finalization_fails_without_outputs(
+    async def test_reprocess_without_finalized_base_returns_conflict_without_job(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
     ) -> None:
-        """A reprocess cannot finalize before the initial revision exists."""
+        """Reprocess creation should fail before enqueue when no finalized base exists."""
         _ = self
         _ = cleanup_projects
 
@@ -719,38 +743,33 @@ class TestIngestOutputPersistence:
         uploaded = await _upload_file(async_client, project["id"])
         initial_job = await _get_job_for_file(str(uploaded["id"]))
 
-        first_reprocess_response = await async_client.post(
+        reprocess_response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
             json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
         )
-        assert first_reprocess_response.status_code == 202
+        assert reprocess_response.status_code == 409
+        assert reprocess_response.json() == {
+            "error": {
+                "code": "REVISION_CONFLICT",
+                "message": "Reprocess requires a finalized base revision.",
+                "details": None,
+            }
+        }
+        assert enqueued_job_ids == [str(initial_job.id)]
 
-        second_reprocess_response = await async_client.post(
-            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
-            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
-        )
-        assert second_reprocess_response.status_code == 202
-
-        blocked_reprocess_job = await _get_job(_as_uuid(first_reprocess_response.json()["id"]))
-        _unused_reprocess_job = await _get_job(_as_uuid(second_reprocess_response.json()["id"]))
-        assert enqueued_job_ids == [
-            str(initial_job.id),
-            str(blocked_reprocess_job.id),
-            str(_unused_reprocess_job.id),
-        ]
-
-        with pytest.raises(
-            ValueError,
-            match="Reprocess ingest job cannot finalize before a predecessor revision exists",
-        ):
-            await process_ingest_job(blocked_reprocess_job.id)
-
-        failed_reprocess_job = await _get_job(blocked_reprocess_job.id)
-        assert failed_reprocess_job.status == "failed"
-        assert failed_reprocess_job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert (
-            failed_reprocess_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
-        )
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_jobs = list(
+                (
+                    await session.execute(
+                        select(Job)
+                        .where(Job.file_id == initial_job.file_id)
+                        .order_by(Job.created_at, Job.id)
+                    )
+                ).scalars()
+            )
+        assert [job.id for job in persisted_jobs] == [initial_job.id]
 
         (
             adapter_outputs,
@@ -763,8 +782,93 @@ class TestIngestOutputPersistence:
         assert validation_reports == []
         assert generated_artifacts == []
 
+    async def test_stale_reprocess_finalization_fails_without_storage_or_extra_outputs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stale reprocess base should fail before storage writes and append no outputs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        @dataclass(frozen=True, slots=True)
+        class _StoredOverlay:
+            key: str
+            storage_uri: str
+            size_bytes: int
+            checksum_sha256: str
+
+        class _RecordingStorage:
+            def __init__(self) -> None:
+                self.put_calls: list[str] = []
+                self.delete_calls: list[tuple[str, str]] = []
+
+            async def put(self, key: str, payload: bytes, *, immutable: bool) -> _StoredOverlay:
+                assert immutable is True
+                self.put_calls.append(key)
+                return _StoredOverlay(
+                    key=key,
+                    storage_uri=f"memory://{key}",
+                    size_bytes=len(payload),
+                    checksum_sha256="0" * 64,
+                )
+
+            async def delete_failed_put(self, key: str, *, storage_uri: str) -> None:
+                self.delete_calls.append((key, storage_uri))
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        storage = _RecordingStorage()
+        monkeypatch.setattr(worker_module, "get_storage", lambda: storage)
+
         await process_ingest_job(initial_job.id)
-        initial_job = await _get_job(initial_job.id)
+
+        (
+            adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        base_revision = drawing_revisions[0]
+        assert len(adapter_outputs) == 1
+
+        first_reprocess_response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        second_reprocess_response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        assert first_reprocess_response.status_code == 202
+        assert second_reprocess_response.status_code == 202
+
+        first_reprocess_job = await _get_job(_as_uuid(first_reprocess_response.json()["id"]))
+        second_reprocess_job = await _get_job(_as_uuid(second_reprocess_response.json()["id"]))
+        assert first_reprocess_job.job_type == "reprocess"
+        assert second_reprocess_job.job_type == "reprocess"
+        assert first_reprocess_job.base_revision_id == base_revision.id
+        assert second_reprocess_job.base_revision_id == base_revision.id
+
+        await process_ingest_job(first_reprocess_job.id)
+
+        (
+            adapter_outputs_before_stale,
+            drawing_revisions_before_stale,
+            validation_reports_before_stale,
+            generated_artifacts_before_stale,
+        ) = await _load_project_outputs(project["id"])
+        storage_put_calls_before_stale = list(storage.put_calls)
+
+        with pytest.raises(
+            worker_module._RevisionConflictError,
+            match=r"Reprocess base revision became stale before finalization\.",
+        ):
+            await process_ingest_job(second_reprocess_job.id)
 
         (
             adapter_outputs,
@@ -772,22 +876,60 @@ class TestIngestOutputPersistence:
             validation_reports,
             generated_artifacts,
         ) = await _load_project_outputs(project["id"])
-        assert len(adapter_outputs) == 1
-        assert len(drawing_revisions) == 1
-        assert len(validation_reports) == 1
-        assert len(generated_artifacts) == 1
-        assert adapter_outputs[0].source_job_id == initial_job.id
-        assert drawing_revisions[0].source_job_id == initial_job.id
-        assert drawing_revisions[0].revision_sequence == 1
-        assert drawing_revisions[0].predecessor_revision_id is None
-        assert drawing_revisions[0].revision_kind == "ingest"
-        _assert_debug_overlay_artifact(
-            generated_artifacts[0],
-            job=initial_job,
-            drawing_revision=drawing_revisions[0],
-            adapter_output=adapter_outputs[0],
-            predecessor_artifact_id=None,
+        current_revision = next(
+            revision
+            for revision in drawing_revisions
+            if revision.source_job_id == first_reprocess_job.id
         )
+        assert [row.id for row in adapter_outputs] == [
+            row.id for row in adapter_outputs_before_stale
+        ]
+        assert [row.id for row in drawing_revisions] == [
+            row.id for row in drawing_revisions_before_stale
+        ]
+        assert [row.id for row in validation_reports] == [
+            row.id for row in validation_reports_before_stale
+        ]
+        assert [row.id for row in generated_artifacts] == [
+            row.id for row in generated_artifacts_before_stale
+        ]
+        assert second_reprocess_job.id not in {output.source_job_id for output in adapter_outputs}
+        assert second_reprocess_job.id not in {
+            revision.source_job_id for revision in drawing_revisions
+        }
+        assert second_reprocess_job.id not in {
+            report.source_job_id for report in validation_reports
+        }
+        assert second_reprocess_job.id not in {artifact.job_id for artifact in generated_artifacts}
+        failed_reprocess_job = await _get_job(second_reprocess_job.id)
+        assert failed_reprocess_job.status == "failed"
+        assert failed_reprocess_job.error_code == ErrorCode.REVISION_CONFLICT.value
+        assert (
+            failed_reprocess_job.error_message
+            == "Reprocess base revision became stale before finalization."
+        )
+        assert failed_reprocess_job.attempt_token is None
+        assert failed_reprocess_job.attempt_lease_expires_at is None
+
+        job_events = await _load_job_events(second_reprocess_job.id)
+        assert job_events[-1].data_json == {
+            "status": "failed",
+            "error_code": ErrorCode.REVISION_CONFLICT.value,
+            "error_message": "Reprocess base revision became stale before finalization.",
+            "details": {
+                "base_revision_id": str(base_revision.id),
+                "base_revision_sequence": 1,
+                "current_revision_id": str(current_revision.id),
+                "current_revision_sequence": 2,
+            },
+        }
+
+        assert len(adapter_outputs) == 2
+        assert len(drawing_revisions) == 2
+        assert len(validation_reports) == 2
+        assert len(generated_artifacts) == 2
+        assert storage.put_calls == storage_put_calls_before_stale
+        assert storage.delete_calls == []
 
     async def test_process_ingest_job_cancelled_before_finalization_creates_no_outputs(
         self,

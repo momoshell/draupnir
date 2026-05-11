@@ -1,7 +1,7 @@
 """add job attempt lease fencing
 
-Revision ID: 2026_05_11_0010
-Revises: 2026_05_10_0009
+Revision ID: 2026_05_11_0011
+Revises: 2026_05_11_0010
 Create Date: 2026-05-11 12:30:00
 """
 
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "2026_05_11_0010"
-down_revision: str | None = "2026_05_10_0009"
+revision: str = "2026_05_11_0011"
+down_revision: str | None = "2026_05_11_0010"
 branch_labels: Sequence[str] | None = None
 depends_on: Sequence[str] | None = None
 

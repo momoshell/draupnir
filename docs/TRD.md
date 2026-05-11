@@ -684,7 +684,8 @@ codes:
 - `STORAGE_FAILED` - read/write/link/checksum failure
 - `DB_CONFLICT` - optimistic concurrency or unique violation
 - `IDEMPOTENCY_CONFLICT` - duplicate idempotency key is in progress or mapped to a different request fingerprint
-- `REVISION_CONFLICT` - changeset base revision is stale at apply time
+- `REVISION_CONFLICT` - changeset or reprocess base revision is stale at
+  apply/request/finalization time
 - `JOB_CANCELLED` - cancelled by user before completion
 - `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
 
@@ -718,6 +719,8 @@ New codes require a docs change in this file.
 - Retry is only for failed work. A retry attempt may replace staged attempt
   data, but it does not overwrite or mutate already committed artifacts from a
   different completed job path.
+- Retrying a job that failed with `REVISION_CONFLICT` must return the unchanged
+  failed job and must not enqueue a new attempt.
 - Attempt-local staging is mutable until commit, but staged rows/objects are not
   authoritative product records. Only the atomic finalization step may publish
   new append-only records, and cancellation before that step must leave no new
@@ -954,6 +957,8 @@ Probe rules:
 - Reprocessing is not an in-place rerun. Reprocessing creates a new drawing
   revision from an existing `file_id`, records the `extraction_profile_id` used
   for the run, and records the adapter name/version that produced the result.
+- Reprocess jobs also record the finalized base revision they were created
+  against in `jobs.base_revision_id`.
 - The prior revision remains available for lineage, comparison, and audit even
   when the newer reprocessed revision supersedes it.
 - Reprocess API contract: `POST /v1/projects/{project_id}/files/{file_id}/reprocess`
@@ -962,11 +967,18 @@ Probe rules:
   - when `extraction_profile_id` is provided, it must resolve within the
     project before the request claims idempotency or creates a new job
   - the server creates a new ingestion/reprocessing job bound to `project_id`,
-    `file_id`, and the resolved `extraction_profile_id`
+    `file_id`, the resolved `extraction_profile_id`, and the current finalized
+    base revision as `jobs.base_revision_id`
+  - if the file has no finalized base revision yet, the request fails with `409`
+    `REVISION_CONFLICT`, creates no job, and enqueues nothing
   - successful completion creates a new drawing revision rather than mutating
     the previous revision in place
   - the resulting revision must expose adapter version, extraction profile, and
     predecessor/superseded lineage metadata
+  - worker finalization must re-check that `jobs.base_revision_id` still matches
+    the current finalized revision; if stale, the job fails with
+    `REVISION_CONFLICT`, commits no outputs/artifacts/storage writes, and emits
+    conflict details including base/current revision ids and sequences
   - during the expand/rollback window for this contract, `jobs.extraction_profile_id`
     may remain nullable even though file initial lineage and resolved reprocess
     lineage are durable

@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 import app.api.v1.files as files_api
 import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
+import app.jobs.worker as worker_module
 from app.api.idempotency import (
     IdempotencyReservation,
     build_idempotency_fingerprint,
@@ -24,10 +25,14 @@ from app.api.idempotency import (
     replay_idempotency,
 )
 from app.core.config import settings
+from app.core.errors import ErrorCode
+from app.jobs.worker import process_ingest_job
+from app.models.drawing_revision import DrawingRevision
 from app.models.idempotency_key import IdempotencyKey, IdempotencyStatus
 from app.models.job import Job
 from app.models.project import Project
 from tests.conftest import requires_database
+from tests.test_jobs import _build_fake_ingest_payload
 
 
 def _headers(idempotency_key: str | None) -> dict[str, str]:
@@ -119,6 +124,16 @@ def _set_idempotency_hash_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "idempotency_key_hash_secret", "test-idempotency-secret")
 
 
+@pytest.fixture(autouse=True)
+def _fake_ingestion_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch worker ingestion with a deterministic fake runner payload."""
+
+    async def _fake_run_ingestion(request: Any) -> Any:
+        return _build_fake_ingest_payload(request)
+
+    monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
+
+
 async def _create_project(
     async_client: httpx.AsyncClient,
     *,
@@ -190,6 +205,43 @@ async def _get_job_for_file(file_id: str) -> Job:
         ).scalar_one()
 
 
+async def _get_job(job_id: str | uuid.UUID) -> Job:
+    """Return the persisted job by identifier."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    async with session_maker() as session:
+        job = await session.get(Job, uuid.UUID(str(job_id)))
+
+    assert job is not None
+    return job
+
+
+async def _get_file_revisions(file_id: str) -> list[DrawingRevision]:
+    """Return drawing revisions for a file in revision order."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    async with session_maker() as session:
+        return list(
+            (
+                await session.execute(
+                    select(DrawingRevision)
+                    .where(DrawingRevision.source_file_id == uuid.UUID(file_id))
+                    .order_by(DrawingRevision.revision_sequence, DrawingRevision.id)
+                )
+            ).scalars()
+        )
+
+
+async def _finalize_initial_revision(file_id: str) -> Job:
+    """Process the initial ingest job so reprocess has a finalized base."""
+
+    initial_job = await _get_job_for_file(file_id)
+    await process_ingest_job(initial_job.id)
+    return await _get_job(initial_job.id)
+
+
 async def _update_job_status(job_id: str, *, status_value: str) -> None:
     """Mutate a persisted job status for replay assertions."""
 
@@ -202,7 +254,12 @@ async def _update_job_status(job_id: str, *, status_value: str) -> None:
         await session.commit()
 
 
-async def _mark_job_failed(job_id: str) -> None:
+async def _mark_job_failed(
+    job_id: str,
+    *,
+    error_code: str | None = None,
+    error_message: str = "failed",
+) -> None:
     """Place a persisted job into the failed state for retry tests."""
 
     session_maker = session_module.AsyncSessionLocal
@@ -211,7 +268,8 @@ async def _mark_job_failed(job_id: str) -> None:
         job = await session.get(Job, uuid.UUID(job_id))
         assert job is not None
         job.status = "failed"
-        job.error_message = "failed"
+        job.error_code = error_code
+        job.error_message = error_message
         await session.commit()
 
 
@@ -636,17 +694,26 @@ class TestEndpointIdempotency:
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """POST /reprocess should replay the original 202 job snapshot for the same key."""
 
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
+
+        async def _fake_run_ingestion(request: Any) -> Any:
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
+
         project = cast(dict[str, Any], (await _create_project(async_client)).json())
         uploaded = cast(
             dict[str, Any],
             (await _upload_pdf(async_client, project_id=project["id"])).json(),
         )
+        initial_job = await _get_job_for_file(uploaded["id"])
+        await process_ingest_job(initial_job.id)
         key = "file-reprocess-1"
         payload = {"extraction_profile": {"profile_version": "v0.1"}}
 
@@ -656,7 +723,21 @@ class TestEndpointIdempotency:
             headers=_headers(key),
         )
         assert first.status_code == 202
-        await _update_job_status(first.json()["id"], status_value="running")
+        original_base_revision_id = first.json()["base_revision_id"]
+        assert first.json()["job_type"] == "reprocess"
+        assert original_base_revision_id is not None
+
+        reprocess_job = await _get_job(first.json()["id"])
+        assert reprocess_job.base_revision_id == uuid.UUID(original_base_revision_id)
+
+        await process_ingest_job(reprocess_job.id)
+
+        revisions = await _get_file_revisions(uploaded["id"])
+        assert [revision.revision_sequence for revision in revisions] == [1, 2]
+        assert str(revisions[-1].id) != original_base_revision_id
+
+        updated_reprocess_job = await _get_job(reprocess_job.id)
+        assert updated_reprocess_job.base_revision_id == uuid.UUID(original_base_revision_id)
 
         second = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
@@ -666,7 +747,50 @@ class TestEndpointIdempotency:
 
         assert second.status_code == 202
         assert second.json() == first.json()
+        assert second.json()["base_revision_id"] == original_base_revision_id
         assert await _job_count_for_file(uploaded["id"]) == 2
+
+    async def test_reprocess_missing_base_revision_returns_conflict_without_snapshot(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Missing base revisions should not persist a completed reprocess snapshot."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        project = cast(dict[str, Any], (await _create_project(async_client)).json())
+        uploaded = cast(
+            dict[str, Any],
+            (await _upload_pdf(async_client, project_id=project["id"])).json(),
+        )
+        key = "file-reprocess-missing-base-1"
+        payload = {"extraction_profile": {"profile_version": "v0.1"}}
+
+        first = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json=payload,
+            headers=_headers(key),
+        )
+        second = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json=payload,
+            headers=_headers(key),
+        )
+
+        assert first.status_code == 409
+        assert first.json() == {
+            "error": {
+                "code": "REVISION_CONFLICT",
+                "message": "Reprocess requires a finalized base revision.",
+                "details": None,
+            }
+        }
+        assert second.status_code == 409
+        assert second.json() == first.json()
+        assert await _get_idempotency_record_or_none(key) is None
 
     async def test_reprocess_invalid_extraction_profile_replays_original_not_found(
         self,
@@ -720,6 +844,7 @@ class TestEndpointIdempotency:
             dict[str, Any],
             (await _upload_pdf(async_client, project_id=project["id"])).json(),
         )
+        await _finalize_initial_revision(uploaded["id"])
         key = "file-reprocess-enqueue-failure-1"
         payload = {"extraction_profile": {"profile_version": "v0.1"}}
 
@@ -813,6 +938,51 @@ class TestEndpointIdempotency:
         assert second.status_code == 202
         assert second.json() == first.json()
         assert len(enqueued_job_ids) == enqueued_before_retry + 1
+
+    async def test_retry_revision_conflict_replays_original_failed_snapshot_without_enqueue(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REVISION_CONFLICT retries should replay the unchanged failed job snapshot."""
+
+        _ = self
+        _ = cleanup_projects
+        project = cast(dict[str, Any], (await _create_project(async_client)).json())
+        uploaded = cast(
+            dict[str, Any],
+            (await _upload_pdf(async_client, project_id=project["id"])).json(),
+        )
+
+        def _record_retry_enqueue(job_id: uuid.UUID) -> None:
+            enqueued_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(jobs_api, "enqueue_ingest_job", _record_retry_enqueue)
+
+        job = await _get_job_for_file(uploaded["id"])
+        await _mark_job_failed(
+            str(job.id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            error_message="Reprocess base revision became stale before finalization.",
+        )
+        key = "job-retry-revision-conflict-1"
+        enqueued_before_retry = len(enqueued_job_ids)
+
+        first = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=_headers(key))
+        second = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=_headers(key))
+        record = await _get_idempotency_record(key)
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json() == first.json()
+        assert first.json()["status"] == "failed"
+        assert first.json()["error_code"] == ErrorCode.REVISION_CONFLICT.value
+        assert len(enqueued_job_ids) == enqueued_before_retry
+        assert record.status == IdempotencyStatus.COMPLETED.value
+        assert record.response_status_code == 202
+        assert record.response_body_json == first.json()
 
     async def test_retry_enqueue_failure_replays_sanitized_error_snapshot(
         self,

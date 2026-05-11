@@ -6,6 +6,7 @@ import types
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -246,6 +247,7 @@ async def _update_job(
     attempts: int | None = None,
     max_attempts: int | None = None,
     cancel_requested: bool | None = None,
+    error_code: str | None = None,
     error_message: str | None = None,
 ) -> Job:
     """Update and return a persisted job for test setup."""
@@ -264,6 +266,8 @@ async def _update_job(
             job.max_attempts = max_attempts
         if cancel_requested is not None:
             job.cancel_requested = cancel_requested
+        if error_code is not None:
+            job.error_code = error_code
 
         if error_message is not None:
             job.error_message = error_message
@@ -1553,16 +1557,15 @@ class TestJobs:
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
-        job = await _get_job_for_file(str(uploaded["id"]))
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+        reprocess_response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        assert reprocess_response.status_code == 202
+        job = await _get_job(uuid.UUID(reprocess_response.json()["id"]))
         enqueued_job_ids.clear()
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-        async with session_maker() as session:
-            persisted_job = await session.get(Job, job.id)
-            assert persisted_job is not None
-            persisted_job.job_type = "reprocess"
-            await session.commit()
 
         requeued = await worker_module.recover_incomplete_ingest_jobs()
 
@@ -1575,6 +1578,77 @@ class TestJobs:
         assert updated_job.job_type == "reprocess"
         assert updated_job.status == "succeeded"
         assert updated_job.attempts == 1
+
+    async def test_reprocess_job_persists_base_revision_snapshot(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Reprocess creation should persist job_type and the latest finalized base revision."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+
+        assert response.status_code == 202
+        assert response.json()["job_type"] == "reprocess"
+        assert response.json()["base_revision_id"] is not None
+
+        reprocess_job = await _get_job(uuid.UUID(response.json()["id"]))
+        assert reprocess_job.job_type == "reprocess"
+        assert reprocess_job.base_revision_id == uuid.UUID(response.json()["base_revision_id"])
+
+    async def test_process_reprocess_job_rejects_payload_revision_kind_mismatch(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker finalization should fail reprocess jobs whose payload kind drifts."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+
+        response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        assert response.status_code == 202
+        reprocess_job = await _get_job(uuid.UUID(response.json()["id"]))
+
+        async def _run_ingestion_with_wrong_kind(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return replace(_build_fake_ingest_payload(request), revision_kind="ingest")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion_with_wrong_kind)
+
+        with pytest.raises(
+            worker_module._RevisionConflictError,
+            match=r"Ingest job revision kind changed before finalization\.",
+        ):
+            await worker_module.process_ingest_job(reprocess_job.id)
+
+        failed_job = await _get_job(reprocess_job.id)
+        assert failed_job.status == "failed"
+        assert failed_job.error_code == ErrorCode.REVISION_CONFLICT.value
+        assert failed_job.error_message == "Ingest job revision kind changed before finalization."
 
     async def test_recover_incomplete_ingest_jobs_requeues_orphaned_running_jobs(
         self,
@@ -2124,6 +2198,54 @@ class TestJobs:
         assert unchanged.attempts == 3
         assert unchanged.max_attempts == 3
 
+    async def test_retry_job_noops_for_revision_conflict_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should not requeue jobs that already failed with REVISION_CONFLICT."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        def _fake_retry_enqueue(job_id: uuid.UUID) -> None:
+            retried_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(
+            jobs_api,
+            "enqueue_ingest_job",
+            _fake_retry_enqueue,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            error_message="Reprocess base revision became stale before finalization.",
+        )
+
+        response = await async_client.post(f"/v1/jobs/{job.id}/retry")
+
+        assert response.status_code == 202
+        assert retried_job_ids == []
+        unchanged = await _get_job(job.id)
+        assert unchanged.status == "failed"
+        assert unchanged.error_code == ErrorCode.REVISION_CONFLICT.value
+        assert (
+            unchanged.error_message
+            == "Reprocess base revision became stale before finalization."
+        )
+
     async def test_retry_job_is_terminal_no_op_for_cancelled_job(
         self,
         async_client: httpx.AsyncClient,
@@ -2424,7 +2546,14 @@ class TestJobs:
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
-        job = await _get_job_for_file(str(uploaded["id"]))
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+        reprocess_response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        assert reprocess_response.status_code == 202
+        job = await _get_job(uuid.UUID(reprocess_response.json()["id"]))
 
         session_maker = session_module.AsyncSessionLocal
         assert session_maker is not None

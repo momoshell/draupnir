@@ -41,6 +41,7 @@ _JOB_TYPE_VALUES = tuple(job_type.value for job_type in JobType)
 _JOB_STATUS_VALUES = tuple(status.value for status in JobStatus)
 _JOB_ERROR_CODE_VALUES = tuple(error_code.value for error_code in ErrorCode)
 _PROFILE_REQUIRED_JOB_TYPE_VALUES = (JobType.INGEST.value, JobType.REPROCESS.value)
+_BASE_REQUIRED_JOB_TYPE_VALUES = (JobType.REPROCESS.value,)
 
 
 def _sql_in_list(values: tuple[str, ...]) -> str:
@@ -85,6 +86,16 @@ class Job(Base):
             "OR extraction_profile_id IS NOT NULL",
             name="ck_jobs_ingest_extraction_profile_required",
         ),
+        CheckConstraint(
+            "job_type NOT IN "
+            f"({_sql_in_list(_BASE_REQUIRED_JOB_TYPE_VALUES)}) "
+            "OR base_revision_id IS NOT NULL",
+            name="ck_jobs_reprocess_base_revision_required",
+        ),
+        CheckConstraint(
+            f"job_type != '{JobType.INGEST.value}' OR base_revision_id IS NULL",
+            name="ck_jobs_ingest_base_revision_forbidden",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -114,6 +125,19 @@ class Job(Base):
             "Immutable extraction profile identifier. Nullable only during the "
             "expand/rollback window; persisted ingest/reprocess jobs require a "
             "profile and a future contract migration can enforce NOT NULL."
+        ),
+    )
+    base_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "drawing_revisions.id",
+            name="fk_jobs_base_revision_id_drawing_revisions",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+        index=True,
+        comment=(
+            "Pinned latest finalized drawing revision captured when a reprocess "
+            "job was created. Null for initial ingest jobs."
         ),
     )
     job_type: Mapped[str] = mapped_column(

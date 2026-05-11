@@ -17,11 +17,23 @@ from sqlalchemy import select, text
 
 import app.api.v1.files as files_api
 import app.db.session as session_module
+import app.jobs.worker as worker_module
 from app.models.extraction_profile import ExtractionProfile
 from app.models.job import Job
 from app.schemas.extraction_profile import ExtractionProfileCreate
 from app.schemas.job import JobRead
 from tests.conftest import requires_database
+from tests.test_jobs import _build_fake_ingest_payload
+
+
+@pytest.fixture(autouse=True)
+def fake_ingestion_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch worker ingestion with a deterministic fake runner payload."""
+
+    async def _fake_run_ingestion(request: Any) -> Any:
+        return _build_fake_ingest_payload(request)
+
+    monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
 
 
 async def _create_project(async_client: httpx.AsyncClient) -> dict[str, Any]:
@@ -74,6 +86,16 @@ async def _get_extraction_profile(profile_id: uuid.UUID) -> ExtractionProfile:
 
     assert profile is not None
     return profile
+
+
+async def _finalize_initial_revision(file_id: str) -> Job:
+    """Process the initial ingest job so reprocess has a finalized base."""
+
+    initial_job = (await _get_jobs_for_file(file_id))[0]
+    await worker_module.process_ingest_job(initial_job.id)
+
+    refreshed_jobs = await _get_jobs_for_file(file_id)
+    return next(job for job in refreshed_jobs if job.id == initial_job.id)
 
 
 @pytest.fixture
@@ -136,8 +158,7 @@ class TestExtractionProfiles:
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
-        original_jobs = await _get_jobs_for_file(str(uploaded["id"]))
-        original_job = original_jobs[0]
+        original_job = await _finalize_initial_revision(str(uploaded["id"]))
 
         response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
@@ -148,8 +169,9 @@ class TestExtractionProfiles:
         payload = response.json()
         assert payload["file_id"] == uploaded["id"]
         assert payload["project_id"] == project["id"]
-        assert payload["job_type"] == "ingest"
+        assert payload["job_type"] == "reprocess"
         assert payload["status"] == "pending"
+        assert payload["base_revision_id"] is not None
         assert payload["extraction_profile_id"] == str(original_job.extraction_profile_id)
 
         jobs = await _get_jobs_for_file(str(uploaded["id"]))
@@ -157,6 +179,7 @@ class TestExtractionProfiles:
         assert jobs[0].id == original_job.id
         assert jobs[0].extraction_profile_id == original_job.extraction_profile_id
         assert jobs[1].id != original_job.id
+        assert jobs[1].job_type == "reprocess"
         assert jobs[1].extraction_profile_id == original_job.extraction_profile_id
 
     async def test_reprocess_creates_new_profile_from_payload(
@@ -172,8 +195,7 @@ class TestExtractionProfiles:
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
-        original_jobs = await _get_jobs_for_file(str(uploaded["id"]))
-        original_job = original_jobs[0]
+        original_job = await _finalize_initial_revision(str(uploaded["id"]))
 
         response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
@@ -195,6 +217,8 @@ class TestExtractionProfiles:
 
         assert response.status_code == 202
         payload = response.json()
+        assert payload["job_type"] == "reprocess"
+        assert payload["base_revision_id"] is not None
         assert payload["extraction_profile_id"] != str(original_job.extraction_profile_id)
 
         jobs = await _get_jobs_for_file(str(uploaded["id"]))
@@ -347,6 +371,7 @@ class TestExtractionProfiles:
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
+        await _finalize_initial_revision(str(uploaded["id"]))
 
         def _failing_enqueue(_: uuid.UUID) -> None:
             raise RuntimeError("broker exploded: amqp://user:secret@mq.internal/vhost")
@@ -390,6 +415,8 @@ class TestExtractionProfiles:
             "extraction_profile_id": str(failed_job.extraction_profile_id),
             "status": "failed",
         }
+        assert failed_job.job_type == "reprocess"
+        assert failed_job.base_revision_id is not None
         assert failed_job.status == "failed"
         assert failed_job.error_code == "INTERNAL_ERROR"
         assert failed_job.error_message == "Failed to enqueue ingest job"
