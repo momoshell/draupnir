@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.metadata
+import json
 import math
 import multiprocessing
 from collections.abc import Callable
@@ -596,10 +598,52 @@ def _extract_page_entities(
             )
             if warning is not None:
                 warnings.append(warning)
+            try:
+                _append_entity(
+                    entities,
+                    _build_unknown_entity(
+                        item=item,
+                        page_number=page_number,
+                        layout_name=layout_name,
+                        layer_name=layer_name,
+                        drawing_index=drawing_index,
+                        entity_index=emitted_count,
+                        item_index=item_index,
+                        drawing=drawing,
+                    ),
+                    entity_limit=entity_limit,
+                )
+            except PyMuPDFNonFiniteValueError:
+                warnings.append(
+                    AdapterWarning(
+                        code="pymupdf_entity_non_finite",
+                        message="Skipping PyMuPDF entity with non-finite numeric values.",
+                        details={
+                            "page_number": page_number,
+                            "drawing_index": drawing_index,
+                            "item_index": item_index,
+                            "operator": str(operator),
+                        },
+                    )
+                )
+                warnings.append(
+                    AdapterWarning(
+                        code="pymupdf_path_operator_unsupported",
+                        message="Skipping unsupported PyMuPDF path operator.",
+                        details={
+                            "page_number": page_number,
+                            "drawing_index": drawing_index,
+                            "item_index": item_index,
+                            "operator": str(operator),
+                        },
+                    )
+                )
+                continue
+            emitted_count += 1
             warnings.append(
                 AdapterWarning(
                     code="pymupdf_path_operator_unsupported",
-                    message="Skipping unsupported PyMuPDF path operator.",
+                    message="Retained unsupported PyMuPDF path operator as unknown entity.",
                     details={
                         "page_number": page_number,
                         "drawing_index": drawing_index,
@@ -608,6 +652,7 @@ def _extract_page_entities(
                     },
                 )
             )
+            continue
 
         _, warning = _flush_pending_entity(
             entities=entities,
@@ -818,6 +863,71 @@ def _build_rect_entity(
     return entity
 
 
+def _build_unknown_entity(
+    *,
+    item: tuple[Any, ...],
+    page_number: int,
+    layout_name: str,
+    layer_name: str,
+    drawing_index: int,
+    entity_index: int,
+    item_index: int,
+    drawing: dict[str, Any],
+) -> dict[str, JSONValue]:
+    operator = str(item[0])
+    entity_id = _entity_id(
+        page_number=page_number,
+        drawing_index=drawing_index,
+        entity_index=entity_index,
+    )
+    bbox = _bbox_from_unsupported_item(item)
+    provenance: dict[str, JSONValue] = {
+        "page_number": page_number,
+        "drawing_index": drawing_index,
+        "item_index": item_index,
+        "operator": operator,
+        "source": "pymupdf.get_drawings",
+    }
+    normalized_source_hash = _normalized_source_hash(item)
+    if normalized_source_hash is not None:
+        provenance["normalized_source_hash"] = normalized_source_hash
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": "unknown",
+        "entity_schema_version": _SCHEMA_VERSION,
+        "id": entity_id,
+        "kind": "unknown",
+        "layout": layout_name,
+        "layer": layer_name,
+        "bbox": bbox,
+        "properties": {
+            **_entity_properties(drawing, closed=False, rect_like=False),
+            "unsupported_operator": operator,
+        },
+        "provenance": provenance,
+        "confidence": {
+            "score": _VECTOR_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": "vector_pdf_unconfirmed_scale",
+        },
+        "geometry": {
+            "kind": "unknown",
+            "coordinate_space": "pdf_page_space_unrotated",
+            "units": "unknown",
+            "bbox": bbox,
+            "status": "unsupported",
+            "reason": "unsupported_path_operator",
+        },
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
+    }
+
+
 def _flush_pending_entity(
     *,
     entities: list[dict[str, JSONValue]],
@@ -894,6 +1004,101 @@ def _entity_properties(
         "rect_like": rect_like,
         "sequence_number": int(drawing.get("seqno", 0)),
     }
+
+
+def _normalized_source_hash(value: Any) -> str | None:
+    normalized, representable = _normalize_source_value(value)
+    if not representable:
+        return None
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _normalize_source_value(value: Any) -> tuple[JSONValue, bool]:
+    if value is None or isinstance(value, (str, bool)):
+        return value, True
+    if isinstance(value, int):
+        return value, True
+    if isinstance(value, float):
+        return _round_float(value), True
+    if _looks_like_point(value):
+        return {
+            "x": _round_float(float(value.x)),
+            "y": _round_float(float(value.y)),
+        }, True
+    if _looks_like_rect(value):
+        return {
+            "x0": _round_float(float(value.x0)),
+            "y0": _round_float(float(value.y0)),
+            "x1": _round_float(float(value.x1)),
+            "y1": _round_float(float(value.y1)),
+        }, True
+    if isinstance(value, dict):
+        normalized: dict[str, JSONValue] = {}
+        for key in sorted(value, key=str):
+            child, representable = _normalize_source_value(value[key])
+            if not representable:
+                return None, False
+            normalized[str(key)] = child
+        return normalized, True
+    if isinstance(value, (list, tuple)):
+        normalized_items: list[JSONValue] = []
+        for child_value in value:
+            child, representable = _normalize_source_value(child_value)
+            if not representable:
+                return None, False
+            normalized_items.append(child)
+        return tuple(normalized_items), True
+    return None, False
+
+
+def _bbox_from_unsupported_item(item: tuple[Any, ...]) -> dict[str, JSONValue] | None:
+    points = _bbox_points_from_value(item[1:])
+    if not points:
+        return None
+    return _bbox_from_points(tuple(points))
+
+
+def _bbox_points_from_value(value: Any) -> list[tuple[float, float]]:
+    if _looks_like_point(value):
+        return [_point_tuple(value)]
+    if _looks_like_rect(value):
+        return [
+            (_round_float(float(value.x0)), _round_float(float(value.y0))),
+            (_round_float(float(value.x1)), _round_float(float(value.y1))),
+        ]
+    if isinstance(value, tuple) and len(value) == 2 and all(
+        isinstance(component, int | float) for component in value
+    ):
+        x, y = value
+        return [(_round_float(float(x)), _round_float(float(y)))]
+    if isinstance(value, tuple) and len(value) == 4 and all(
+        isinstance(component, int | float) for component in value
+    ):
+        x0, y0, x1, y1 = value
+        return [
+            (_round_float(float(x0)), _round_float(float(y0))),
+            (_round_float(float(x1)), _round_float(float(y1))),
+        ]
+    if isinstance(value, dict):
+        points: list[tuple[float, float]] = []
+        for child in value.values():
+            points.extend(_bbox_points_from_value(child))
+        return points
+    if isinstance(value, (list, tuple)):
+        nested_points: list[tuple[float, float]] = []
+        for child in value:
+            nested_points.extend(_bbox_points_from_value(child))
+        return nested_points
+    return []
+
+
+def _looks_like_point(value: Any) -> bool:
+    return hasattr(value, "x") and hasattr(value, "y")
+
+
+def _looks_like_rect(value: Any) -> bool:
+    return all(hasattr(value, attr) for attr in ("x0", "y0", "x1", "y1"))
 
 
 def _line_geometry(
