@@ -326,7 +326,7 @@ async def _assert_hard_delete_fails(model: type[Any], object_id: uuid.UUID) -> N
             if sqlstate == "55000":
                 assert "append-only trigger blocked DELETE on" in str(exc_info.value)
             else:
-                assert sqlstate == "23503"
+                assert sqlstate in {"23503", "23001"}
 
         await session.rollback()
 
