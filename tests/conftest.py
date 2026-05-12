@@ -20,6 +20,22 @@ from app.db.session import get_db
 from app.main import app as fastapi_app
 from app.storage.dependencies import _get_default_storage
 
+APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
+    "files",
+    "extraction_profiles",
+    "adapter_run_outputs",
+    "drawing_revisions",
+    "validation_reports",
+    "generated_artifacts",
+    "job_events",
+)
+APPEND_ONLY_ROW_TRIGGER_NAME = "trg_append_only_row_guard"
+APPEND_ONLY_TRUNCATE_TRIGGER_NAME = "trg_append_only_truncate_guard"
+_APPEND_ONLY_TRIGGER_NAMES: tuple[str, ...] = (
+    APPEND_ONLY_ROW_TRIGGER_NAME,
+    APPEND_ONLY_TRUNCATE_TRIGGER_NAME,
+)
+
 # Marker for tests that require a running database
 requires_database = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -82,6 +98,125 @@ async def _override_get_db() -> AsyncGenerator[AsyncSession, None]:
         await session.close()
 
 
+async def _append_only_trigger_exists(
+    session: AsyncSession,
+    *,
+    table_name: str,
+    trigger_name: str,
+) -> bool:
+    """Return whether a named append-only trigger exists on a table."""
+
+    result = await session.execute(
+        text(
+            """
+            SELECT 1
+            FROM pg_trigger
+            WHERE tgrelid = to_regclass(:table_name)
+              AND tgname = :trigger_name
+            """
+        ),
+        {"table_name": table_name, "trigger_name": trigger_name},
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _load_existing_append_only_triggers(
+    session: AsyncSession,
+) -> list[tuple[str, str]]:
+    """Return append-only triggers currently installed in the test database."""
+
+    existing_triggers: list[tuple[str, str]] = []
+    for table_name in APPEND_ONLY_PROTECTED_TABLES:
+        for trigger_name in _APPEND_ONLY_TRIGGER_NAMES:
+            if await _append_only_trigger_exists(
+                session,
+                table_name=table_name,
+                trigger_name=trigger_name,
+            ):
+                existing_triggers.append((table_name, trigger_name))
+
+    return existing_triggers
+
+
+async def _set_append_only_triggers_enabled(
+    session: AsyncSession,
+    *,
+    triggers: list[tuple[str, str]],
+    enabled: bool,
+) -> None:
+    """Enable or disable named append-only triggers for test-only cleanup."""
+
+    action = "ENABLE" if enabled else "DISABLE"
+    for table_name, trigger_name in triggers:
+        await session.execute(
+            text(f'ALTER TABLE "{table_name}" {action} TRIGGER {trigger_name}')
+        )
+
+
+async def _assert_append_only_triggers_enabled(
+    session: AsyncSession,
+    *,
+    triggers: list[tuple[str, str]],
+) -> None:
+    """Assert named append-only triggers are fully re-enabled."""
+
+    for table_name, trigger_name in triggers:
+        state = await session.execute(
+            text(
+                """
+                SELECT tgenabled
+                FROM pg_trigger
+                WHERE tgrelid = to_regclass(:table_name)
+                  AND tgname = :trigger_name
+                """
+            ),
+            {"table_name": table_name, "trigger_name": trigger_name},
+        )
+        raw_state = state.scalar_one()
+        normalized_state = raw_state.decode() if isinstance(raw_state, bytes) else raw_state
+        assert normalized_state == "O"
+
+
+async def truncate_projects_cascade_for_cleanup() -> None:
+    """Hard-clean projects by temporarily disabling only append-only triggers."""
+
+    if not os.environ.get("DATABASE_URL"):
+        return
+
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        existing_triggers: list[tuple[str, str]] = []
+        triggers_disabled = False
+        try:
+            try:
+                existing_triggers = await _load_existing_append_only_triggers(session)
+                if existing_triggers:
+                    await _set_append_only_triggers_enabled(
+                        session,
+                        triggers=existing_triggers,
+                        enabled=False,
+                    )
+                    triggers_disabled = True
+                await session.execute(text("TRUNCATE TABLE projects CASCADE"))
+            finally:
+                if triggers_disabled:
+                    await _set_append_only_triggers_enabled(
+                        session,
+                        triggers=existing_triggers,
+                        enabled=True,
+                    )
+                    await _assert_append_only_triggers_enabled(session, triggers=existing_triggers)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
 @pytest_asyncio.fixture
 async def async_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient, None]:
     """Provide an async HTTP client for testing with DB dependency override."""
@@ -103,17 +238,9 @@ async def cleanup_projects() -> AsyncGenerator[None, None]:
         yield
         return
 
-    import app.db.session as session_module
-
-    session_maker = session_module.AsyncSessionLocal
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
     yield
 
-    async with session_maker() as session:
-        await session.execute(text("TRUNCATE TABLE projects CASCADE"))
-        await session.commit()
+    await truncate_projects_cascade_for_cleanup()
 
 
 @pytest.fixture

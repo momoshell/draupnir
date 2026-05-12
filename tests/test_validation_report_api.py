@@ -1,6 +1,7 @@
 """Integration tests for validation report API responses."""
 
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,7 +15,6 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.generated_artifact import GeneratedArtifact
-from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
 from tests.test_ingest_output_persistence import (
     _assert_validation_report_json_matches_columns,
@@ -143,6 +143,7 @@ class TestValidationReportApi:
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """API output should prefer persisted columns over stale nested confidence JSON."""
         _ = self
@@ -153,42 +154,49 @@ class TestValidationReportApi:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
-        await process_ingest_job(job.id)
-
-        _adapter_outputs, drawing_revisions, validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
-        drawing_revision = drawing_revisions[0]
-        validation_report = validation_reports[0]
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-
-        async with session_maker() as session:
-            persisted_report = await session.get(ValidationReport, validation_report.id)
-            assert persisted_report is not None
-            persisted_report.validation_status = "needs_review"
-            persisted_report.review_state = "review_required"
-            persisted_report.quantity_gate = "review_gated"
-            persisted_report.effective_confidence = 0.59
-            persisted_report.report_json = {
-                **persisted_report.report_json,
-                "confidence": {
+        async def _run_ingestion_with_stale_confidence(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return replace(
+                payload,
+                validation_status="needs_review",
+                review_state="review_required",
+                quantity_gate="review_gated",
+                effective_confidence=0.59,
+                confidence_json={
                     "score": 0.95,
                     "effective_confidence": 0.95,
                     "review_state": "approved",
-                    "review_required": False,
                     "basis": "stale",
                 },
-                "summary": {
-                    **persisted_report.report_json["summary"],
-                    "validation_status": "valid",
-                    "review_state": "approved",
-                    "quantity_gate": "allowed",
-                    "effective_confidence": 0.95,
+                report_json={
+                    **payload.report_json,
+                    "confidence": {
+                        "score": 0.95,
+                        "effective_confidence": 0.95,
+                        "review_state": "approved",
+                        "review_required": False,
+                        "basis": "stale",
+                    },
+                    "summary": {
+                        **payload.report_json["summary"],
+                        "validation_status": "valid",
+                        "review_state": "approved",
+                        "quantity_gate": "allowed",
+                        "effective_confidence": 0.95,
+                    },
                 },
-            }
-            await session.commit()
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion_with_stale_confidence)
+
+        await process_ingest_job(job.id)
+
+        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
+            await _load_project_outputs(project["id"])
+        )
+        drawing_revision = drawing_revisions[0]
 
         response = await async_client.get(
             f"/v1/revisions/{drawing_revision.id}/validation-report"
@@ -271,23 +279,55 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, validation_reports, _generated_artifacts = (
+        adapter_outputs, drawing_revisions, validation_reports, _generated_artifacts = (
             await _load_project_outputs(project["id"])
         )
         drawing_revision = drawing_revisions[0]
+        adapter_output = adapter_outputs[0]
         validation_report = validation_reports[0]
 
         session_maker = session_module.AsyncSessionLocal
         assert session_maker is not None
 
+        next_created_at = drawing_revision.created_at + timedelta(seconds=1)
+        next_job = _clone_model(
+            job,
+            id=uuid.uuid4(),
+            base_revision_id=drawing_revision.id,
+            job_type="reprocess",
+            status="succeeded",
+            started_at=next_created_at,
+            finished_at=next_created_at,
+            created_at=next_created_at,
+        )
+        next_adapter_output = _clone_model(
+            adapter_output,
+            id=uuid.uuid4(),
+            source_job_id=next_job.id,
+            result_checksum_sha256=uuid.uuid4().hex * 2,
+            created_at=next_created_at,
+        )
+        next_revision = _clone_model(
+            drawing_revision,
+            id=uuid.uuid4(),
+            source_job_id=next_job.id,
+            adapter_run_output_id=next_adapter_output.id,
+            predecessor_revision_id=drawing_revision.id,
+            revision_sequence=drawing_revision.revision_sequence + 1,
+            created_at=next_created_at,
+        )
+
         async with session_maker() as session:
-            persisted_report = await session.get(ValidationReport, validation_report.id)
-            assert persisted_report is not None
-            await session.delete(persisted_report)
+            session.add(next_job)
+            await session.commit()
+
+        async with session_maker() as session:
+            session.add(next_adapter_output)
+            session.add(next_revision)
             await session.commit()
 
         response = await async_client.get(
-            f"/v1/revisions/{drawing_revision.id}/validation-report"
+            f"/v1/revisions/{next_revision.id}/validation-report"
         )
 
         assert response.status_code == 404
@@ -295,7 +335,7 @@ class TestValidationReportApi:
             "error": {
                 "code": ErrorCode.NOT_FOUND.value,
                 "message": (
-                    f"Validation report with identifier '{drawing_revision.id}' not found"
+                    f"Validation report with identifier '{next_revision.id}' not found"
                 ),
                 "details": None,
             }
@@ -307,7 +347,7 @@ class TestValidationReportApi:
             validation_reports_after,
             _generated_artifacts,
         ) = await _load_project_outputs(project["id"])
-        assert validation_reports_after == []
+        assert [report.id for report in validation_reports_after] == [validation_report.id]
 
     async def test_get_validation_report_returns_404_for_soft_deleted_project_data(
         self,

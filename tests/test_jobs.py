@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -297,28 +298,22 @@ async def _update_job(
     return await _get_job(job_id)
 
 
-async def _update_source_file(
-    file_id: uuid.UUID,
-    *,
-    checksum_sha256: str | None = None,
-    original_filename: str | None = None,
-) -> File:
-    """Update and return a persisted source file for test setup."""
+async def _remove_source_file_bytes(file_id: uuid.UUID) -> str:
+    """Delete stored source bytes without mutating append-only file metadata."""
+
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
 
     async with session_maker() as session:
         source_file = await session.get(File, file_id)
         assert source_file is not None
+        storage_uri = source_file.storage_uri
 
-        if checksum_sha256 is not None:
-            source_file.checksum_sha256 = checksum_sha256
-        if original_filename is not None:
-            source_file.original_filename = original_filename
-
-        await session.commit()
-
-    return source_file
+    assert storage_uri.startswith("file://")
+    storage_path = Path(storage_uri.removeprefix("file://"))
+    assert storage_path.exists()
+    storage_path.unlink()
+    return storage_uri
 
 
 async def _mark_source_deleted(
@@ -688,7 +683,6 @@ class TestJobs:
         _ = cleanup_projects
         _ = enqueued_job_ids
 
-        secret_checksum = "f" * 64
         logger_error_calls: list[tuple[str, dict[str, Any]]] = []
 
         def _capture_logger_error(event: str, **kwargs: Any) -> None:
@@ -708,7 +702,7 @@ class TestJobs:
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
-        await _update_source_file(uuid.UUID(uploaded["id"]), checksum_sha256=secret_checksum)
+        secret_storage_uri = await _remove_source_file_bytes(uuid.UUID(uploaded["id"]))
 
         with pytest.raises(
             IngestionRunnerError,
@@ -720,7 +714,7 @@ class TestJobs:
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.STORAGE_FAILED.value
         assert updated_job.error_message == "Failed to read original source from storage."
-        assert secret_checksum not in updated_job.error_message
+        assert secret_storage_uri not in updated_job.error_message
 
         response = await async_client.get(f"/v1/jobs/{job.id}/events")
         assert response.status_code == 200
@@ -730,8 +724,8 @@ class TestJobs:
             "error_code": ErrorCode.STORAGE_FAILED.value,
             "error_message": "Failed to read original source from storage.",
         }
-        assert secret_checksum not in str(data["items"][-1]["data_json"])
-        assert secret_checksum not in str(logger_error_calls)
+        assert secret_storage_uri not in str(data["items"][-1]["data_json"])
+        assert secret_storage_uri not in str(logger_error_calls)
         assert logger_error_calls == [
             (
                 "ingest_job_failed",
@@ -782,7 +776,6 @@ class TestJobs:
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
-        await _update_source_file(uuid.UUID(uploaded["id"]), original_filename="..")
         monkeypatch.setattr("app.storage.memory.MemoryStorage.copy_to_path", _fail_copy_to_path)
         monkeypatch.setattr(
             "app.storage.local.LocalFilesystemStorage.copy_to_path",

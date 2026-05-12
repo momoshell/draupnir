@@ -3,7 +3,7 @@
 import asyncio
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import httpx
@@ -588,6 +588,7 @@ class TestIngestOutputPersistence:
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Persisted validation reports should accept TRD v0.1 status and gate values."""
         _ = self
@@ -598,6 +599,28 @@ class TestIngestOutputPersistence:
         uploaded = await _upload_file(async_client, project["id"])
         job = await _get_job_for_file(str(uploaded["id"]))
 
+        async def _run_ingestion_with_trd_values(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            validation_status = "valid_with_warnings"
+            quantity_gate = "allowed_provisional"
+            return replace(
+                payload,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+                report_json={
+                    **payload.report_json,
+                    "summary": {
+                        **payload.report_json["summary"],
+                        "validation_status": validation_status,
+                        "quantity_gate": quantity_gate,
+                    },
+                },
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_ingestion_with_trd_values)
+
         await process_ingest_job(job.id)
 
         (
@@ -606,28 +629,10 @@ class TestIngestOutputPersistence:
             validation_reports,
             _generated_artifacts,
         ) = await _load_project_outputs(project["id"])
+
         validation_report = validation_reports[0]
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-
-        async with session_maker() as session:
-            persisted_validation_report = await session.get(ValidationReport, validation_report.id)
-            assert persisted_validation_report is not None
-            persisted_validation_report.validation_status = "valid_with_warnings"
-            persisted_validation_report.quantity_gate = "allowed_provisional"
-            await session.commit()
-
-        (
-            _adapter_outputs,
-            _drawing_revisions,
-            updated_validation_reports,
-            _generated_artifacts,
-        ) = await _load_project_outputs(project["id"])
-        updated_validation_report = updated_validation_reports[0]
-
-        assert updated_validation_report.validation_status == "valid_with_warnings"
-        assert updated_validation_report.quantity_gate == "allowed_provisional"
+        assert validation_report.validation_status == "valid_with_warnings"
+        assert validation_report.quantity_gate == "allowed_provisional"
 
     async def test_concurrent_reprocess_creates_linear_three_revision_chain(
         self,
