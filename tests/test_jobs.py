@@ -32,6 +32,7 @@ from app.ingestion.runner import (
     run_ingestion as real_run_ingestion,
 )
 from app.models.file import File
+from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
 from app.models.project import Project
@@ -369,6 +370,23 @@ async def _create_job_event(
         await session.refresh(event)
 
     return event
+
+
+async def _get_generated_artifacts_for_job(job_id: uuid.UUID) -> list[GeneratedArtifact]:
+    """Load generated artifacts for a job id."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        artifacts = (
+            await session.execute(
+                select(GeneratedArtifact)
+                .where(GeneratedArtifact.job_id == job_id)
+                .order_by(GeneratedArtifact.created_at.asc(), GeneratedArtifact.id.asc())
+            )
+        ).scalars().all()
+
+    return list(artifacts)
 
 
 @pytest.fixture(autouse=True)
@@ -1359,6 +1377,58 @@ class TestJobs:
             "running",
             "cancelled",
         ]
+
+    async def test_process_ingest_job_cancels_mid_run_when_project_is_deleted(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Project deletion during execution should cancel the active runner."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        runner_started = asyncio.Event()
+
+        async def _wait_for_project_delete_cancel(
+            _: IngestionRunRequest,
+            *,
+            cancellation: CancellationHandle | None = None,
+            **__: Any,
+        ) -> IngestFinalizationPayload:
+            assert cancellation is not None
+            runner_started.set()
+            cancellation_deadline = asyncio.get_running_loop().time() + 1
+            while not cancellation.is_cancelled():
+                if asyncio.get_running_loop().time() >= cancellation_deadline:
+                    raise AssertionError("Expected project delete to cancel runner within 1 second")
+                await asyncio.sleep(0.01)
+
+            await asyncio.sleep(1)
+            raise AssertionError("Worker cancellation should interrupt the runner task")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _wait_for_project_delete_cancel)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        process_task = asyncio.create_task(worker_module.process_ingest_job(job.id))
+        await asyncio.wait_for(runner_started.wait(), timeout=2)
+
+        delete_response = await async_client.delete(f"/v1/projects/{project['id']}")
+
+        assert delete_response.status_code == 204
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(process_task, timeout=2)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.cancel_requested is True
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.finished_at is not None
 
     async def test_process_ingest_job_skips_fresh_redelivered_running_job(
         self,
@@ -2741,6 +2811,86 @@ class TestJobs:
         unchanged = await _get_job(job.id)
         assert unchanged.status == "failed"
 
+    async def test_retry_job_delete_race_delete_wins_returns_404_without_requeue(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Delete vs retry lock contention should settle without deadlock when delete wins."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            retried_job_ids.append(str(job_id))
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            error_message="previous failure",
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await session.execute(
+                select(Project)
+                .where(Project.id == uuid.UUID(project["id"]))
+                .with_for_update(of=Project)
+            )
+
+            delete_task = asyncio.create_task(
+                async_client.delete(f"/v1/projects/{project['id']}")
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
+
+            retry_task = asyncio.create_task(async_client.post(f"/v1/jobs/{job.id}/retry"))
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(retry_task), timeout=0.2)
+
+        delete_response = await asyncio.wait_for(delete_task, timeout=2)
+        retry_response = await asyncio.wait_for(retry_task, timeout=2)
+
+        assert delete_response.status_code == 204
+        assert retry_response.status_code == 404
+        assert retry_response.json() == {
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Job with identifier '{job.id}' not found",
+                "details": None,
+            }
+        }
+        assert retried_job_ids == []
+
+        unchanged = await _get_job(job.id)
+        assert unchanged.status == "failed"
+
     async def test_process_ingest_job_finalizes_cancel_requested_job_as_cancelled(
         self,
         async_client: httpx.AsyncClient,
@@ -2848,6 +2998,200 @@ class TestJobs:
         assert updated.cancel_requested is True
         assert updated.error_code == ErrorCode.JOB_CANCELLED.value
         assert updated.finished_at is not None
+
+    async def test_process_ingest_job_begin_race_delete_wins_cancels_before_runner(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Delete vs worker begin lock contention should cancel without deadlock."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        runner_calls: list[IngestionRunRequest] = []
+
+        async def _unexpected_run_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            runner_calls.append(request)
+            return _build_fake_ingest_payload(request)
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _unexpected_run_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await session.execute(
+                select(Project)
+                .where(Project.id == uuid.UUID(project["id"]))
+                .with_for_update(of=Project)
+            )
+
+            delete_task = asyncio.create_task(
+                async_client.delete(f"/v1/projects/{project['id']}")
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
+
+            process_task = asyncio.create_task(worker_module.process_ingest_job(job.id))
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(process_task), timeout=0.2)
+
+        delete_response = await asyncio.wait_for(delete_task, timeout=2)
+        await asyncio.wait_for(process_task, timeout=2)
+
+        assert delete_response.status_code == 204
+        updated = await _get_job(job.id)
+        assert runner_calls == []
+        assert updated.status == "cancelled"
+        assert updated.cancel_requested is True
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated.finished_at is not None
+
+        artifacts = await _get_generated_artifacts_for_job(job.id)
+        assert artifacts == []
+
+    async def test_mark_job_failed_delete_race_delete_wins_without_failed_overwrite(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Delete should win over a concurrent worker failure terminal write."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert lease is not None
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await session.execute(
+                select(Project)
+                .where(Project.id == uuid.UUID(project["id"]))
+                .with_for_update(of=Project)
+            )
+
+            delete_task = asyncio.create_task(
+                async_client.delete(f"/v1/projects/{project['id']}")
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
+
+            fail_task = asyncio.create_task(
+                worker_module._mark_job_failed(
+                    job.id,
+                    error_message="Ingest job failed unexpectedly.",
+                    attempt_token=lease.token,
+                )
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(fail_task), timeout=0.2)
+
+        delete_response = await asyncio.wait_for(delete_task, timeout=2)
+        failed = await asyncio.wait_for(fail_task, timeout=2)
+
+        assert delete_response.status_code == 204
+        assert failed is False
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.cancel_requested is True
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.error_message is None
+        assert updated_job.finished_at is not None
+
+    async def test_finalize_ingest_job_delete_race_finalize_wins_soft_deletes_artifact(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Finalize before delete should keep job terminal while delete soft-deletes outputs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        storage_put_started = asyncio.Event()
+        allow_storage_put = asyncio.Event()
+
+        class _BlockingStorage:
+            async def put(self, key: str, payload: bytes, *, immutable: bool = True) -> Any:
+                _ = immutable
+                storage_put_started.set()
+                await allow_storage_put.wait()
+                return types.SimpleNamespace(
+                    key=key,
+                    storage_uri=f"file://tests/{key}",
+                    size_bytes=len(payload),
+                    checksum_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+
+        monkeypatch.setattr(worker_module, "get_storage", lambda: _BlockingStorage())
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+        assert lease is not None
+
+        finalize_request = IngestionRunRequest(
+            job_id=job.id,
+            file_id=job.file_id,
+            checksum_sha256=hashlib.sha256(_TEST_UPLOAD_BODY).hexdigest(),
+            detected_format="pdf",
+            media_type="application/pdf",
+            original_name="plan.pdf",
+            extraction_profile_id=job.extraction_profile_id,
+            initial_job_id=job.id,
+        )
+        payload = _build_fake_ingest_payload(finalize_request)
+
+        finalize_task = asyncio.create_task(
+            worker_module._finalize_ingest_job(
+                job.id,
+                attempt_token=lease.token,
+                payload=payload,
+            )
+        )
+
+        await asyncio.wait_for(storage_put_started.wait(), timeout=2)
+
+        delete_task = asyncio.create_task(async_client.delete(f"/v1/projects/{project['id']}"))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
+
+        allow_storage_put.set()
+
+        finalized = await asyncio.wait_for(finalize_task, timeout=3)
+        delete_response = await asyncio.wait_for(delete_task, timeout=3)
+
+        assert finalized is True
+        assert delete_response.status_code == 204
+
+        updated = await _get_job(job.id)
+        assert updated.status == "succeeded"
+        assert updated.cancel_requested is False
+        assert updated.finished_at is not None
+
+        artifacts = await _get_generated_artifacts_for_job(job.id)
+        assert len(artifacts) == 1
+        assert artifacts[0].deleted_at is not None
 
     async def test_process_ingest_job_finalizes_cancelled_when_requested_during_completion_race(
         self,

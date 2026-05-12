@@ -109,6 +109,23 @@ class _EnqueueIntentLease:
     lease_expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _JobLockBootstrap:
+    """Non-locking job metadata needed to acquire ordered row locks."""
+
+    project_id: UUID
+    file_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _LockedJobSource:
+    """Project/job/file rows locked in the approved terminal-mutation order."""
+
+    project: Project
+    job: Job
+    source_file: File | None
+
+
 class _PersistedJobCancellationHandle:
     """Cancellation handle backed by worker polling."""
 
@@ -299,8 +316,62 @@ def _claim_enqueue_intent_lease(job: Job, *, now: datetime) -> _EnqueueIntentLea
 
 async def _get_job_for_update(session: AsyncSession, job_id: UUID) -> Job | None:
     """Load and lock a persisted job row."""
-    result = await session.execute(select(Job).where(Job.id == job_id).with_for_update())
+    return await _get_job_for_update_with_metadata(session, job_id)
+
+
+async def _get_job_lock_bootstrap(
+    session: AsyncSession,
+    job_id: UUID,
+) -> _JobLockBootstrap | None:
+    """Load job metadata without taking locks."""
+    result = await session.execute(
+        select(Job.project_id, Job.file_id).where(Job.id == job_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+
+    project_id, file_id = row
+    return _JobLockBootstrap(project_id=project_id, file_id=file_id)
+
+
+async def _get_project(
+    session: AsyncSession,
+    project_id: UUID,
+    *,
+    for_update: bool = False,
+) -> Project | None:
+    """Load a persisted project row, optionally under a row lock."""
+    statement = select(Project).where(Project.id == project_id)
+    if for_update:
+        statement = statement.with_for_update(of=Project)
+
+    result = await session.execute(statement)
     return result.scalar_one_or_none()
+
+
+async def _get_job_for_update_with_metadata(
+    session: AsyncSession,
+    job_id: UUID,
+    *,
+    expected_project_id: UUID | None = None,
+    expected_file_id: UUID | None = None,
+) -> Job | None:
+    """Load and lock a persisted job row, revalidating stable metadata."""
+    result = await session.execute(
+        select(Job)
+        .where(Job.id == job_id)
+        .with_for_update(of=Job)
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        return None
+    if expected_project_id is not None and job.project_id != expected_project_id:
+        return None
+    if expected_file_id is not None and job.file_id != expected_file_id:
+        return None
+
+    return job
 
 
 async def _get_source_file(
@@ -311,21 +382,48 @@ async def _get_source_file(
     for_update: bool = False,
 ) -> File | None:
     """Load a source file row, optionally under a row lock."""
-    statement = (
-        select(File)
-        .join(Project, Project.id == File.project_id)
-        .where(
-            (File.project_id == project_id)
-            & (File.id == file_id)
-            & (File.deleted_at.is_(None))
-            & (Project.deleted_at.is_(None))
-        )
+    statement = select(File).where(
+        (File.project_id == project_id)
+        & (File.id == file_id)
     )
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update(of=File)
 
     result = await session.execute(statement)
     return result.scalar_one_or_none()
+
+
+async def _lock_job_source_for_terminal_mutation(
+    session: AsyncSession,
+    job_id: UUID,
+) -> _LockedJobSource:
+    """Lock project/job/file rows in the approved order for terminal writes."""
+    bootstrap = await _get_job_lock_bootstrap(session, job_id)
+    if bootstrap is None:
+        raise LookupError(f"Job with identifier '{job_id}' not found")
+
+    project = await _get_project(session, bootstrap.project_id, for_update=True)
+    if project is None:
+        raise LookupError(
+            f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+        )
+
+    job = await _get_job_for_update_with_metadata(
+        session,
+        job_id,
+        expected_project_id=bootstrap.project_id,
+        expected_file_id=bootstrap.file_id,
+    )
+    if job is None:
+        raise LookupError(f"Job with identifier '{job_id}' not found")
+
+    source_file = await _get_source_file(
+        session,
+        project_id=bootstrap.project_id,
+        file_id=bootstrap.file_id,
+        for_update=True,
+    )
+    return _LockedJobSource(project=project, job=job, source_file=source_file)
 
 
 async def _get_existing_adapter_run_output(
@@ -672,12 +770,40 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
+        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        if bootstrap is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        if project is None:
+            raise LookupError(
+                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+            )
+
+        job = await _get_job_for_update_with_metadata(
+            session,
+            job_id,
+            expected_project_id=bootstrap.project_id,
+            expected_file_id=bootstrap.file_id,
+        )
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
         if not _job_attempt_is_current(job, attempt_token=attempt_token):
             raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
         _assert_job_base_revision_invariants(job)
+
+        if project.deleted_at is not None:
+            cancelled = await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            if not cancelled:
+                raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+            raise _InactiveSourceError(
+                f"Project with identifier '{job.project_id}' for job '{job_id}' is no longer active"
+            )
 
         source_file = await _get_source_file(
             session,
@@ -685,7 +811,7 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
             file_id=job.file_id,
             for_update=True,
         )
-        if source_file is None:
+        if source_file is None or source_file.deleted_at is not None:
             cancelled = await _cancel_job_for_inactive_source(
                 session,
                 job,
@@ -722,7 +848,22 @@ async def _finalize_ingest_job(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
+        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        if bootstrap is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        if project is None:
+            raise LookupError(
+                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+            )
+
+        job = await _get_job_for_update_with_metadata(
+            session,
+            job_id,
+            expected_project_id=bootstrap.project_id,
+            expected_file_id=bootstrap.file_id,
+        )
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
@@ -775,13 +916,23 @@ async def _finalize_ingest_job(
         if job.extraction_profile_id is None:
             raise ValueError("Ingest job missing extraction profile during finalization")
 
+        if project.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
         source_file = await _get_source_file(
             session,
             project_id=job.project_id,
             file_id=job.file_id,
             for_update=True,
         )
-        if source_file is None:
+        if source_file is None or source_file.deleted_at is not None:
             await _cancel_job_for_inactive_source(
                 session,
                 job,
@@ -1109,12 +1260,17 @@ async def _poll_job_cancellation(
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            return
-
         if job.cancel_requested:
             cancellation.mark_cancelled()
             run_task.cancel()
+            return
+
+        if job.status == "cancelled":
+            cancellation.mark_cancelled()
+            run_task.cancel()
+            return
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
             return
 
         try:
@@ -1182,9 +1338,8 @@ async def _mark_job_failed(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
 
         if job.status in _TERMINAL_JOB_STATUSES:
             logger.info(
@@ -1199,6 +1354,24 @@ async def _mark_job_failed(
         ):
             logger.info(
                 "ingest_job_failure_mark_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info(
+                "ingest_job_failure_mark_skipped_inactive_source",
                 job_id=str(job_id),
                 status=job.status,
             )
@@ -1272,9 +1445,25 @@ async def _mark_job_failed_if_recovery_safe(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info(
+                "ingest_job_recovery_enqueue_failure_mark_skipped_inactive_source",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
 
         if not _job_is_safe_recovery_failure_target(job):
             logger.info(
@@ -1485,7 +1674,22 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
     now = _utcnow()
 
     async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
+        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        if bootstrap is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        if project is None:
+            raise LookupError(
+                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+            )
+
+        job = await _get_job_for_update_with_metadata(
+            session,
+            job_id,
+            expected_project_id=bootstrap.project_id,
+            expected_file_id=bootstrap.file_id,
+        )
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
@@ -1497,13 +1701,22 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
             )
             return None
 
+        if project.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
+            return None
+
         source_file = await _get_source_file(
             session,
             project_id=job.project_id,
             file_id=job.file_id,
             for_update=True,
         )
-        if source_file is None:
+        if source_file is None or source_file.deleted_at is not None:
             await _cancel_job_for_inactive_source(
                 session,
                 job,
