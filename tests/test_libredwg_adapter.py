@@ -216,7 +216,7 @@ async def test_ingest_preflights_missing_binary_as_shared_unavailable_error(
 
 
 @pytest.mark.asyncio
-async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload(
+async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _build_source()
@@ -224,6 +224,19 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     seen = _install_fake_subprocess(
         monkeypatch,
         process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layer": "Walls",
+                        "start": {"x": 1, "y": 2, "z": 0},
+                        "end": {"x": 4, "y": 6, "z": 0},
+                    }
+                ]
+            }
+        ),
         stdout_text="reading {source}\n",
         stderr_text="wrote {source} to {output} from {tempdir}\n",
     )
@@ -239,7 +252,7 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
             validation_status="needs_review",
             review_state="review_required",
             quantity_gate="review_gated",
-            warning_codes=("libredwg.placeholder_canonical",),
+            warning_codes=("libredwg.units_unconfirmed",),
             diagnostic_codes=("libredwg.extract",),
         ),
     )
@@ -248,11 +261,70 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     output_path = Path(command[4])
     assert command[:4] == ("/opt/homebrew/bin/dwgread", "-O", "JSON", "-o")
     assert output_path.parent != _FIXTURE_PATH.parent
-    assert payload.canonical_json["entities"] == []
-    assert payload.canonical_json["metadata"]["adapter_mode"] == "placeholder"
-    assert payload.canonical_json["metadata"]["empty_entities_reason"] == (
-        "placeholder_canonical_no_entity_mapping"
-    )
+    assert payload.canonical_json["metadata"]["adapter_mode"] == "dwgread_json_v0_1"
+    assert "empty_entities_reason" not in payload.canonical_json["metadata"]
+    assert payload.canonical_json["layers"] == [{"name": "Walls"}]
+
+    entities = cast(list[dict[str, Any]], payload.canonical_json["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_id"] == "libredwg-line-1a"
+    assert entity["entity_type"] == "line"
+    assert entity["entity_schema_version"] == "0.1"
+    assert entity["source_entity_handle"] == "1A"
+    assert entity["layout_name"] == "Model"
+    assert entity["layer_name"] == "Walls"
+    assert entity["block_name"] is None
+    assert entity["parent_entity_id"] is None
+    assert entity["drawing_revision_id"] is None
+    assert entity["source_file_id"] is None
+    assert entity["layout_ref"] is None
+    assert entity["layer_ref"] is None
+    assert entity["block_ref"] is None
+    assert entity["parent_entity_ref"] is None
+    assert entity["bbox"] == {
+        "min": {"x": 1.0, "y": 2.0, "z": 0.0},
+        "max": {"x": 4.0, "y": 6.0, "z": 0.0},
+    }
+    assert entity["geometry"] == {
+        "start": {"x": 1.0, "y": 2.0, "z": 0.0},
+        "end": {"x": 4.0, "y": 6.0, "z": 0.0},
+        "bbox": {
+            "min": {"x": 1.0, "y": 2.0, "z": 0.0},
+            "max": {"x": 4.0, "y": 6.0, "z": 0.0},
+        },
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "line_segment",
+            "length": 5.0,
+            "vertex_count": 2,
+        },
+    }
+    assert entity["properties"] == {
+        "source_type": "LINE",
+        "source_handle": "1A",
+        "quantity_hints": {"length": 5.0, "count": 1.0},
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "LINE",
+                "handle": "1A",
+            }
+        },
+    }
+    assert entity["kind"] == "line"
+    assert entity["start"] == {"x": 1.0, "y": 2.0, "z": 0.0}
+    assert entity["end"] == {"x": 4.0, "y": 6.0, "z": 0.0}
+    assert entity["length"] == 5.0
+    assert "quantity_hints" not in entity
+    assert "adapter_native" not in entity
+    assert entity["provenance"]["source_locator"] == "OBJECTS/LINE/1A"
+    assert entity["provenance"]["record_hash"].startswith("sha256:")
+    assert entity["confidence"] == {
+        "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_line_mapping_units_unconfirmed",
+    }
 
     result = await adapter.ingest(
         source,
@@ -267,6 +339,375 @@ async def test_libredwg_adapter_emits_review_gated_placeholder_canonical_payload
     assert str(second_output_path.parent) not in stderr_excerpt
     assert "<source>" in stdout_excerpt
     assert "<tempdir>" in stderr_excerpt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_payload", "expected_handle", "expected_layer", "expected_length"),
+    [
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "DWG_TYPE_LINE",
+                        "handle": "AB",
+                        "layer": "A-WALL",
+                        "start": {"x": "0", "y": "1"},
+                        "end": {"x": 3, "y": 5, "z": 0},
+                    }
+                ]
+            },
+            "AB",
+            "A-WALL",
+            5.0,
+        ),
+        (
+            {
+                "OBJECTS": {
+                    "first": {
+                        "name": "AcDbLine",
+                        "id": "CD",
+                        "layer_name": "B-DOOR",
+                        "entity": {
+                            "start_point": [1, 2, 0],
+                            "end_point": [1, 5, 0],
+                        },
+                    }
+                }
+            },
+            "CD",
+            "B-DOOR",
+            3.0,
+        ),
+        (
+            {
+                "OBJECTS": {
+                    "wrapped": {
+                        "fixed_type": "LINE",
+                        "object_handle": "EF",
+                        "owner_layer": "C-GRID",
+                        "data": {
+                            "start_x": 2,
+                            "start_y": 2,
+                            "end_x": 2,
+                            "end_y": 6,
+                        },
+                    }
+                }
+            },
+            "EF",
+            "C-GRID",
+            4.0,
+        ),
+    ],
+)
+async def test_libredwg_adapter_handles_objects_variants_and_type_markers(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+    expected_handle: str,
+    expected_layer: str,
+    expected_length: float,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "line"
+    assert entity["source_entity_handle"] == expected_handle
+    assert entity["layer_name"] == expected_layer
+    assert entity["kind"] == "line"
+    assert entity["length"] == expected_length
+    assert entity["properties"]["source_type"] == "LINE"
+    assert entity["properties"]["source_handle"] == expected_handle
+    assert entity["properties"]["quantity_hints"] == {
+        "length": expected_length,
+        "count": 1.0,
+    }
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "line_segment",
+        "length": expected_length,
+        "vertex_count": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_drawables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {"type": "DICTIONARY", "handle": "10"},
+                    {"type": "LAYER", "name": "Model"},
+                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    assert entities[0]["entity_id"] == "libredwg-unknown-20"
+    assert entities[0]["entity_type"] == "unknown"
+    assert entities[0]["entity_schema_version"] == "0.1"
+    assert entities[0]["source_entity_handle"] == "20"
+    assert entities[0]["layout_name"] == "Model"
+    assert entities[0]["layer_name"] == "Unsupported"
+    assert entities[0]["block_name"] is None
+    assert entities[0]["parent_entity_id"] is None
+    assert entities[0]["drawing_revision_id"] is None
+    assert entities[0]["source_file_id"] is None
+    assert entities[0]["layout_ref"] is None
+    assert entities[0]["layer_ref"] is None
+    assert entities[0]["block_ref"] is None
+    assert entities[0]["parent_entity_ref"] is None
+    assert entities[0]["bbox"] is None
+    assert entities[0]["geometry"] == {
+        "bbox": None,
+        "units": {"normalized": "unknown"},
+        "status": "absent",
+        "reason": "unsupported_drawable_record",
+        "geometry_summary": {
+            "kind": "unknown",
+            "source_type": "CIRCLE",
+            "reason": "unsupported_drawable_record",
+        },
+    }
+    assert entities[0]["geometry_reason"] == "unsupported_drawable_record"
+    assert entities[0]["quantity_hints"] == {}
+    assert entities[0]["adapter_native"] == {
+        "section": "OBJECTS",
+        "record_type": "CIRCLE",
+        "handle": "20",
+    }
+    assert entities[0]["provenance"]["record_hash"].startswith("sha256:")
+    assert entities[0]["confidence"] == {
+        "score": adapter_module._UNKNOWN_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "unsupported_drawable_record",
+    }
+    assert entities[0]["unknown_reason"] == "unsupported_drawable_record"
+    assert entities[0]["provenance"]["record_hash"].startswith("sha256:")
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.unsupported_drawable_record",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "99",
+                        "layer": "Broken",
+                        "start": {"x": "NaN", "y": 0},
+                        "end": {"x": 1, "y": 1},
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    assert entities[0]["entity_id"] == "libredwg-unknown-99"
+    assert entities[0]["entity_type"] == "unknown"
+    assert entities[0]["geometry"] == {
+        "bbox": None,
+        "units": {"normalized": "unknown"},
+        "status": "absent",
+        "reason": "malformed_line_geometry",
+        "geometry_summary": {
+            "kind": "unknown",
+            "source_type": "LINE",
+            "reason": "malformed_line_geometry",
+        },
+    }
+    assert entities[0]["geometry_reason"] == "malformed_line_geometry"
+    assert entities[0]["unknown_reason"] == "malformed_line_geometry"
+    assert entities[0]["layer_name"] == "Broken"
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.malformed_drawable_record",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "output_payload",
+        "expected_reason",
+        "expected_source_type",
+        "expected_warning_codes",
+    ),
+    [
+        (
+            {
+                "OBJECTS": [
+                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
+                ]
+            },
+            "unsupported_drawable_record",
+            "CIRCLE",
+            ("libredwg.units_unconfirmed", "libredwg.unsupported_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "99",
+                        "layer": "Broken",
+                        "start": {"x": "NaN", "y": 0},
+                        "end": {"x": 1, "y": 1},
+                    }
+                ]
+            },
+            "malformed_line_geometry",
+            "LINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+    ],
+)
+async def test_libredwg_adapter_contract_accepts_unknown_geometry_entities(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+    expected_reason: str,
+    expected_source_type: str,
+    expected_warning_codes: tuple[str, ...],
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    payload = await exercise_adapter_contract(
+        adapter_module.create_adapter(),
+        source=_build_source(),
+        input_family=InputFamily.DWG,
+        adapter_key="libredwg",
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            warning_codes=expected_warning_codes,
+            diagnostic_codes=("libredwg.extract",),
+        ),
+    )
+
+    entities = cast(list[dict[str, Any]], payload.canonical_json["entities"])
+    assert len(entities) == 1
+    assert entities[0]["geometry"]["status"] == "absent"
+    assert entities[0]["geometry"]["reason"] == expected_reason
+    assert entities[0]["geometry"]["geometry_summary"] == {
+        "kind": "unknown",
+        "source_type": expected_source_type,
+        "reason": expected_reason,
+    }
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_lowers_confidence_for_mixed_entity_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layer": "Walls",
+                        "start": {"x": 1, "y": 2},
+                        "end": {"x": 4, "y": 6},
+                    },
+                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._MIXED_ENTITY_CONFIDENCE_SCORE
+    assert result.confidence.review_required is True
+    assert result.confidence.basis == "libredwg_dwgread_json_mixed_entity_mapping"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": {
+                    "metadata": {"type": "DICTIONARY", "handle": "meta"},
+                    "layers": [{"type": "LAYER", "name": "Default"}],
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    assert result.canonical["entities"] == ()
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["empty_entities_reason"] == "no_drawable_candidates_detected"
+    assert metadata["entity_counts"] == {
+        "drawable_candidates": 0,
+        "supported_lines": 0,
+        "unsupported_drawables": 0,
+        "malformed_drawables": 0,
+    }
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
 
 
 @pytest.mark.asyncio

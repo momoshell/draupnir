@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import resource
 import shutil
 import tempfile
@@ -46,6 +48,42 @@ _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1 * 1024 * 1024
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
+_LINE_ENTITY_CONFIDENCE_SCORE = 0.72
+_MIXED_ENTITY_CONFIDENCE_SCORE = 0.5
+_UNKNOWN_ENTITY_CONFIDENCE_SCORE = 0.2
+_DEFAULT_LAYOUT_NAME = "Model"
+_WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
+_NON_DRAWABLE_OBJECT_TYPES = frozenset(
+    {
+        "APPID",
+        "BLOCK_CONTROL",
+        "BLOCK_HEADER",
+        "CLASS",
+        "DBPLACEHOLDER",
+        "DICTIONARY",
+        "DICTIONARYVAR",
+        "DIMSTYLE",
+        "GROUP",
+        "LAYOUT",
+        "LAYER",
+        "LAYER_INDEX",
+        "LTYPE",
+        "MATERIAL",
+        "MLINESTYLE",
+        "OBJECT_PTR",
+        "PLOTSETTINGS",
+        "STYLE",
+        "TABLESTYLE",
+        "UCS",
+        "VIEW",
+        "VISUALSTYLE",
+        "VPORT",
+        "XDICTIONARY",
+        "XRECORD",
+    }
+)
+
+_JSONDict = dict[str, JSONValue]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +100,14 @@ class _DwgreadRunResult:
     output_size_bytes: int
     output_kind: str
     output_key_count: int | None
+    output_payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalBuildResult:
+    canonical: _JSONDict
+    warnings: tuple[AdapterWarning, ...]
+    confidence: ConfidenceSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +124,7 @@ def create_adapter() -> IngestionAdapter:
 
 
 class LibreDWGAdapter(IngestionAdapter):
-    """DWG adapter that shells out to ``dwgread`` and emits placeholder canonical JSON."""
+    """DWG adapter that shells out to ``dwgread`` and maps minimal canonical JSON."""
 
     descriptor = _DESCRIPTOR
 
@@ -94,7 +140,6 @@ class LibreDWGAdapter(IngestionAdapter):
         details: dict[str, JSONValue] = {
             "binary": _BINARY_NAME,
             "distribution_review_required": True,
-            "placeholder_contract_phase": 2,
         }
         if binary_path is not None:
             details["binary_name"] = Path(binary_path).name
@@ -111,7 +156,7 @@ class LibreDWGAdapter(IngestionAdapter):
         source: AdapterSource,
         options: AdapterExecutionOptions,
     ) -> AdapterResult:
-        """Run ``dwgread`` and emit a review-gated placeholder canonical payload."""
+        """Run ``dwgread`` and emit a review-gated canonical payload."""
 
         started_at = perf_counter()
         _raise_if_cancelled(options)
@@ -123,19 +168,9 @@ class LibreDWGAdapter(IngestionAdapter):
             source=source,
             options=options,
         )
+        canonical_result = _build_canonical_output(source=source, run_result=run_result)
         elapsed_ms = (perf_counter() - started_at) * 1000.0
 
-        warning = AdapterWarning(
-            code="libredwg.placeholder_canonical",
-            message=(
-                "LibreDWG Phase 2 emits placeholder canonical output; "
-                "DWG entities remain review-gated until native mapping lands."
-            ),
-            details={
-                "output_kind": run_result.output_kind,
-                "output_size_bytes": run_result.output_size_bytes,
-            },
-        )
         diagnostic_details: dict[str, JSONValue] = {
             "command": (_BINARY_NAME, "-O", "JSON", "-o", "<tempdir>/dwgread.json", "<source>"),
             "stdout_bytes": run_result.stdout.byte_count,
@@ -151,7 +186,7 @@ class LibreDWGAdapter(IngestionAdapter):
             diagnostic_details["output_key_count"] = run_result.output_key_count
 
         return AdapterResult(
-            canonical=_build_placeholder_canonical(source=source, run_result=run_result),
+            canonical=canonical_result.canonical,
             provenance=(
                 ProvenanceRecord(
                     stage="extract",
@@ -164,16 +199,12 @@ class LibreDWGAdapter(IngestionAdapter):
                     },
                 ),
             ),
-            confidence=ConfidenceSummary(
-                score=_PLACEHOLDER_CONFIDENCE_SCORE,
-                review_required=True,
-                basis="libredwg_placeholder_wrapper",
-            ),
-            warnings=(warning,),
+            confidence=canonical_result.confidence,
+            warnings=canonical_result.warnings,
             diagnostics=(
                 AdapterDiagnostic(
                     code="libredwg.extract",
-                    message="Executed dwgread and produced placeholder canonical DWG output.",
+                    message="Executed dwgread and mapped LibreDWG JSON into canonical DWG output.",
                     details=diagnostic_details,
                     elapsed_ms=elapsed_ms,
                 ),
@@ -307,6 +338,7 @@ async def _run_dwgread(
             output_size_bytes=output_size_bytes,
             output_kind=output_kind,
             output_key_count=output_key_count,
+            output_payload=output_payload,
         )
 
 
@@ -490,42 +522,573 @@ def _sanitize_text(text: str, *, source_path: Path, temp_path: Path) -> str:
     ).strip()
 
 
-def _build_placeholder_canonical(
+def _build_canonical_output(
     *,
     source: AdapterSource,
     run_result: _DwgreadRunResult,
-) -> dict[str, JSONValue]:
+) -> _CanonicalBuildResult:
+    entities: list[JSONValue] = []
+    layers_seen: set[str] = set()
+    supported_line_count = 0
+    unsupported_drawable_count = 0
+    malformed_drawable_count = 0
+    unsupported_types: set[str] = set()
+    malformed_handles: set[str] = set()
+    drawable_candidate_count = 0
+
+    for record in _iter_object_records(run_result.output_payload):
+        record_type = _extract_record_type(record)
+        if record_type is None:
+            continue
+        if record_type in _NON_DRAWABLE_OBJECT_TYPES:
+            continue
+
+        drawable_candidate_count += 1
+        if record_type == "LINE":
+            line_entity = _build_line_entity(record)
+            if line_entity is not None:
+                entities.append(line_entity)
+                supported_line_count += 1
+                layer_name = cast(str | None, line_entity.get("layer_name"))
+                if layer_name:
+                    layers_seen.add(layer_name)
+                continue
+
+            malformed_drawable_count += 1
+            unknown_entity = _build_unknown_entity(record, reason="malformed_line_geometry")
+            entities.append(unknown_entity)
+            layer_name = cast(str | None, unknown_entity.get("layer_name"))
+            if layer_name:
+                layers_seen.add(layer_name)
+            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
+        unsupported_drawable_count += 1
+        unsupported_types.add(record_type)
+        unknown_entity = _build_unknown_entity(record, reason="unsupported_drawable_record")
+        entities.append(unknown_entity)
+        layer_name = cast(str | None, unknown_entity.get("layer_name"))
+        if layer_name:
+            layers_seen.add(layer_name)
+
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
-        "adapter_mode": "placeholder",
-        "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+        "adapter_mode": "dwgread_json_v0_1",
         "dwgread": {
             "output_kind": run_result.output_kind,
             "output_size_bytes": run_result.output_size_bytes,
             "stdout_bytes": run_result.stdout.byte_count,
             "stderr_bytes": run_result.stderr.byte_count,
         },
+        "entity_counts": {
+            "drawable_candidates": drawable_candidate_count,
+            "supported_lines": supported_line_count,
+            "unsupported_drawables": unsupported_drawable_count,
+            "malformed_drawables": malformed_drawable_count,
+        },
     }
     if run_result.output_key_count is not None:
         dwgread_metadata = cast(dict[str, JSONValue], metadata["dwgread"])
         dwgread_metadata["output_key_count"] = run_result.output_key_count
+    if not entities:
+        metadata["empty_entities_reason"] = "no_drawable_candidates_detected"
 
-    return {
+    warnings = [_units_unconfirmed_warning()]
+    if unsupported_drawable_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.unsupported_drawable_record",
+                message="LibreDWG emitted drawable records that are not mapped yet.",
+                details={
+                    "count": unsupported_drawable_count,
+                    "types": tuple(sorted(unsupported_types))[:10],
+                },
+            )
+        )
+    if malformed_drawable_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.malformed_drawable_record",
+                message="LibreDWG emitted drawable records with malformed geometry.",
+                details={
+                    "count": malformed_drawable_count,
+                    "handles": tuple(sorted(malformed_handles))[:10],
+                },
+            )
+        )
+
+    has_mixed_entity_outcomes = supported_line_count > 0 and (
+        unsupported_drawable_count > 0 or malformed_drawable_count > 0
+    )
+    if has_mixed_entity_outcomes:
+        confidence_score = _MIXED_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_mixed_entity_mapping"
+    elif supported_line_count > 0:
+        confidence_score = _LINE_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_line_mapping"
+    elif entities:
+        confidence_score = _UNKNOWN_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_unknown_entity_mapping"
+    else:
+        confidence_score = _PLACEHOLDER_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_placeholder"
+
+    canonical: _JSONDict = {
         "schema_version": _SCHEMA_VERSION,
         "canonical_entity_schema_version": _SCHEMA_VERSION,
         "units": {"normalized": "unknown"},
         "coordinate_system": {
             "name": "local",
             "type": "cartesian",
-            "source": "libredwg_placeholder_wrapper",
+            "source": "libredwg_dwgread_json",
         },
-        "layouts": ({"name": "Model"},),
-        "layers": (),
+        "layouts": ({"name": _DEFAULT_LAYOUT_NAME},),
+        "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
         "blocks": (),
-        "entities": (),
+        "entities": tuple(entities),
         "xrefs": (),
         "metadata": metadata,
     }
+
+    return _CanonicalBuildResult(
+        canonical=canonical,
+        warnings=tuple(warnings),
+        confidence=ConfidenceSummary(
+            score=confidence_score,
+            review_required=True,
+            basis=confidence_basis,
+        ),
+    )
+
+
+def _units_unconfirmed_warning() -> AdapterWarning:
+    return AdapterWarning(
+        code="libredwg.units_unconfirmed",
+        message="LibreDWG JSON output does not confirm drawing units for canonical quantities.",
+        details={"normalized_units": "unknown"},
+    )
+
+
+def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(payload, Mapping):
+        objects = _mapping_get(payload, "OBJECTS")
+        if objects is None:
+            return ()
+        return tuple(_iter_mapping_candidates(objects))
+    if isinstance(payload, list):
+        return tuple(
+            item for item in payload if isinstance(item, Mapping)
+        )
+    return ()
+
+
+def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, Mapping)]
+    if not isinstance(value, Mapping):
+        return []
+    if _extract_record_type(value) is not None:
+        return [cast(Mapping[str, Any], value)]
+
+    candidates: list[Mapping[str, Any]] = []
+    for nested_value in value.values():
+        if isinstance(nested_value, Mapping):
+            candidates.extend(_iter_mapping_candidates(nested_value))
+        elif isinstance(nested_value, list):
+            candidates.extend(item for item in nested_value if isinstance(item, Mapping))
+    return candidates
+
+
+def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+    start_point = _extract_point(record, prefixes=("start", "start_point", "point1", "p1", "from"))
+    end_point = _extract_point(record, prefixes=("end", "end_point", "point2", "p2", "to"))
+    if start_point is None or end_point is None:
+        return None
+
+    if not _point_is_finite(start_point) or not _point_is_finite(end_point):
+        return None
+
+    entity_id = _entity_id(record, record_type="line")
+    layout_name = _extract_layout_name(record)
+    layer_name = _extract_layer_name(record)
+    block_name = _extract_block_name(record)
+    source_handle = _extract_handle(record)
+    quantity_length = math.dist(start_point, end_point)
+    start = _point_json(start_point)
+    end = _point_json(end_point)
+    bbox = {
+        "min": {
+            "x": min(start_point[0], end_point[0]),
+            "y": min(start_point[1], end_point[1]),
+            "z": min(start_point[2], end_point[2]),
+        },
+        "max": {
+            "x": max(start_point[0], end_point[0]),
+            "y": max(start_point[1], end_point[1]),
+            "z": max(start_point[2], end_point[2]),
+        },
+    }
+    safe_projection = _safe_record_projection(
+        record,
+        record_type="LINE",
+        geometry={
+            "start": start,
+            "end": end,
+        },
+    )
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": "line",
+        "entity_schema_version": _SCHEMA_VERSION,
+        "source_entity_handle": source_handle,
+        "layout_name": layout_name,
+        "layer_name": layer_name,
+        "block_name": block_name,
+        "parent_entity_id": None,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": None,
+        "layer_ref": None,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "bbox": bbox,
+        "geometry": {
+            "start": start,
+            "end": end,
+            "bbox": bbox,
+            "units": {"normalized": "unknown"},
+            "geometry_summary": {
+                "kind": "line_segment",
+                "length": quantity_length,
+                "vertex_count": 2,
+            },
+        },
+        "properties": {
+            "source_type": "LINE",
+            "source_handle": source_handle,
+            "quantity_hints": {
+                "length": quantity_length,
+                "count": 1.0,
+            },
+            "adapter_native": {
+                "libredwg": {
+                    "section": "OBJECTS",
+                    "record_type": "LINE",
+                    "handle": source_handle,
+                }
+            },
+        },
+        "provenance": {
+            "adapter": "libredwg",
+            "source_section": "OBJECTS",
+            "source_entity_ref": _source_locator(record, record_type="LINE"),
+            "source_locator": _source_locator(record, record_type="LINE"),
+            "source_ref": _source_locator(record, record_type="LINE"),
+            "entity_ref": _source_locator(record, record_type="LINE"),
+            "native_handle": source_handle,
+            "source_entity_handle": source_handle,
+            "record_hash": _hash_json_value(safe_projection),
+        },
+        "confidence": {
+            "score": _LINE_ENTITY_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": "libredwg_line_mapping_units_unconfirmed",
+        },
+        "kind": "line",
+        "start": start,
+        "end": end,
+        "length": quantity_length,
+    }
+
+
+def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDict:
+    record_type = _extract_record_type(record) or "UNKNOWN"
+    layout_name = _extract_layout_name(record)
+    layer_name = _extract_layer_name(record)
+    block_name = _extract_block_name(record)
+    source_handle = _extract_handle(record)
+    safe_projection = _safe_record_projection(record, record_type=record_type, geometry=None)
+
+    return {
+        "entity_id": _entity_id(record, record_type="unknown"),
+        "entity_type": "unknown",
+        "entity_schema_version": _SCHEMA_VERSION,
+        "source_entity_handle": source_handle,
+        "layout_name": layout_name,
+        "layer_name": layer_name,
+        "block_name": block_name,
+        "parent_entity_id": None,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": None,
+        "layer_ref": None,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "bbox": None,
+        "geometry": {
+            "bbox": None,
+            "units": {"normalized": "unknown"},
+            "status": "absent",
+            "reason": reason,
+            "geometry_summary": {
+                "kind": "unknown",
+                "source_type": record_type,
+                "reason": reason,
+            },
+        },
+        "quantity_hints": {},
+        "adapter_native": {
+            "section": "OBJECTS",
+            "record_type": record_type,
+            "handle": source_handle,
+        },
+        "provenance": {
+            "adapter": "libredwg",
+            "source_section": "OBJECTS",
+            "source_entity_ref": _source_locator(record, record_type=record_type),
+            "source_locator": _source_locator(record, record_type=record_type),
+            "source_ref": _source_locator(record, record_type=record_type),
+            "entity_ref": _source_locator(record, record_type=record_type),
+            "native_handle": source_handle,
+            "source_entity_handle": source_handle,
+            "record_hash": _hash_json_value(safe_projection),
+        },
+        "confidence": {
+            "score": _UNKNOWN_ENTITY_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": reason,
+        },
+        "kind": "unknown",
+        "geometry_reason": reason,
+        "unknown_reason": reason,
+    }
+
+
+def _extract_record_type(record: Mapping[str, Any]) -> str | None:
+    raw_type = _first_string(
+        record,
+        "type",
+        "object_type",
+        "entity_type",
+        "fixedtype",
+        "fixed_type",
+        "name",
+        "dxf_name",
+        "class",
+    )
+    if raw_type is None:
+        return None
+
+    token = raw_type.strip()
+    if not token:
+        return None
+    for separator in ("::", "/", "."):
+        if separator in token:
+            token = token.split(separator)[-1]
+    token = token.replace("-", "_").replace(" ", "_")
+    token_upper = token.upper()
+    if token_upper.startswith("DWG_TYPE_"):
+        token_upper = token_upper.removeprefix("DWG_TYPE_")
+    if token_upper.startswith("ACDB"):
+        token_upper = token_upper.removeprefix("ACDB")
+    return token_upper or None
+
+
+def _extract_handle(record: Mapping[str, Any]) -> str | None:
+    raw_handle = _first_value(
+        record,
+        "handle",
+        "entity_handle",
+        "object_handle",
+        "id",
+        "entity_id",
+        "object_id",
+    )
+    if raw_handle is None:
+        return None
+    return _sanitize_string_value(str(raw_handle))
+
+
+def _extract_layer_name(record: Mapping[str, Any]) -> str | None:
+    return _first_string(record, "layer", "layer_name", "owner_layer")
+
+
+def _extract_layout_name(record: Mapping[str, Any]) -> str | None:
+    return _first_string(record, "layout", "layout_name", "owner_layout") or _DEFAULT_LAYOUT_NAME
+
+
+def _extract_block_name(record: Mapping[str, Any]) -> str | None:
+    return _first_string(record, "block", "block_name", "owner_block")
+
+
+def _extract_point(
+    record: Mapping[str, Any], *, prefixes: tuple[str, ...]
+) -> tuple[float, float, float] | None:
+    for prefix in prefixes:
+        point_value = _first_value(record, prefix)
+        point = _coerce_point(point_value)
+        if point is not None:
+            return point
+
+        x_value = _first_value(record, f"{prefix}_x", f"{prefix}.x", f"{prefix}x")
+        y_value = _first_value(record, f"{prefix}_y", f"{prefix}.y", f"{prefix}y")
+        z_value = _first_value(record, f"{prefix}_z", f"{prefix}.z", f"{prefix}z")
+        if x_value is None or y_value is None:
+            continue
+
+        point = _coerce_point((x_value, y_value, z_value if z_value is not None else 0.0))
+        if point is not None:
+            return point
+    return None
+
+
+def _coerce_point(value: Any) -> tuple[float, float, float] | None:
+    if isinstance(value, Mapping):
+        x_value = _mapping_get(value, "x", "10", "0")
+        y_value = _mapping_get(value, "y", "20", "1")
+        z_value = _mapping_get(value, "z", "30", "2")
+        if x_value is None or y_value is None:
+            return None
+        return _coerce_point((x_value, y_value, z_value if z_value is not None else 0.0))
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        x_value = _coerce_float(value[0])
+        y_value = _coerce_float(value[1])
+        z_value = _coerce_float(value[2]) if len(value) >= 3 else 0.0
+        if x_value is None or y_value is None or z_value is None:
+            return None
+        return (x_value, y_value, z_value)
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return float(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def _point_is_finite(point: tuple[float, float, float]) -> bool:
+    return all(math.isfinite(component) for component in point)
+
+
+def _point_json(point: tuple[float, float, float]) -> _JSONDict:
+    return {"x": point[0], "y": point[1], "z": point[2]}
+
+
+def _entity_id(record: Mapping[str, Any], *, record_type: str) -> str:
+    handle = _extract_handle(record)
+    if handle is not None:
+        return f"libredwg-{record_type}-{handle.lower()}"
+    record_hash = _hash_json_value(
+        _safe_record_projection(record, record_type=record_type.upper(), geometry=None)
+    )
+    return f"libredwg-{record_type}-{record_hash[:18]}"
+
+
+def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
+    handle = _extract_handle(record)
+    if handle is not None:
+        return f"OBJECTS/{record_type}/{handle}"
+    return f"OBJECTS/{record_type}/{_entity_id(record, record_type='record')}"
+
+
+def _record_views(record: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    views: list[Mapping[str, Any]] = [record]
+    for wrapper_key in _WRAPPER_KEYS:
+        nested_value = _mapping_get(record, wrapper_key)
+        if isinstance(nested_value, Mapping):
+            views.append(cast(Mapping[str, Any], nested_value))
+    return tuple(views)
+
+
+def _first_value(record: Mapping[str, Any], *candidates: str) -> Any:
+    for view in _record_views(record):
+        value = _mapping_get(view, *candidates)
+        if value is not None:
+            return value
+    return None
+
+
+def _first_string(record: Mapping[str, Any], *candidates: str) -> str | None:
+    value = _first_value(record, *candidates)
+    if not isinstance(value, str):
+        return None
+    return _sanitize_string_value(value)
+
+
+def _mapping_get(mapping: Mapping[str, Any], *candidates: str) -> Any:
+    normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            continue
+        if _normalize_lookup_key(key) in normalized_candidates:
+            return value
+    return None
+
+
+def _normalize_lookup_key(value: str) -> str:
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _sanitize_string_value(value: str) -> str | None:
+    sanitized = "".join(
+        character
+        for character in value.strip()
+        if character.isprintable() or character in {" ", "_", "-"}
+    )
+    if not sanitized:
+        return None
+    if _looks_like_path(sanitized):
+        return f"<redacted:{_hash_text(sanitized)[:12]}>"
+    return sanitized
+
+
+def _looks_like_path(value: str) -> bool:
+    return (
+        "/" in value
+        or "\\" in value
+        or value.startswith("~")
+        or (len(value) >= 2 and value[1] == ":")
+    )
+
+
+def _safe_record_projection(
+    record: Mapping[str, Any],
+    *,
+    record_type: str,
+    geometry: _JSONDict | None,
+) -> _JSONDict:
+    projection: _JSONDict = {
+        "record_type": record_type,
+        "handle": _extract_handle(record),
+        "layer_name": _extract_layer_name(record),
+        "layout_name": _extract_layout_name(record),
+        "block_name": _extract_block_name(record),
+    }
+    if geometry is not None:
+        projection["geometry"] = geometry
+    return projection
+
+
+def _hash_json_value(value: JSONValue) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return f"sha256:{_hash_text(payload)}"
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _source_ref(source: AdapterSource) -> str:
