@@ -7,6 +7,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from itertools import pairwise
 from math import isfinite, sqrt
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ _DESCRIPTOR = get_descriptor(InputFamily.DXF)
 _CANONICAL_SCHEMA_VERSION = "0.1"
 _METER_UNITS = 6
 _MODEL_LAYOUT_NAME = "Model"
+_MAX_POLYLINE_VERTICES = 10_000
 _UNIT_NAMES: dict[int, str] = {
     0: "unitless",
     1: "inch",
@@ -97,6 +99,14 @@ class _CheckpointBudget:
         elapsed_seconds = time.monotonic() - self.started_at
         if elapsed_seconds >= self.timeout.seconds:
             raise TimeoutError("DXF ingestion exceeded the adapter timeout budget.")
+
+
+class _UnsupportedPolylineError(ValueError):
+    """Raised when a DXF polyline uses unsupported simple-geometry semantics."""
+
+
+class _PolylineLimitError(ValueError):
+    """Raised when a DXF polyline exceeds supported adapter limits."""
 
 
 class EzdxfAdapter:
@@ -186,6 +196,85 @@ class EzdxfAdapter:
                         layout_name=layout_name,
                         units=units_payload,
                     )
+                except ValueError as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="malformed_coordinates",
+                            message=(
+                                "DXF entity coordinates were invalid and the entity "
+                                "was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    invalid_geometry_entities += 1
+                else:
+                    supported_entities += 1
+            elif entity_type in {"LWPOLYLINE", "POLYLINE"}:
+                try:
+                    canonical_entity = _polyline_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                        budget=budget,
+                    )
+                except _PolylineLimitError as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="polyline_vertex_limit_exceeded",
+                            message=(
+                                "DXF polyline exceeded the supported vertex limit and "
+                                "was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
+                except _UnsupportedPolylineError as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="unsupported_entity",
+                            message=(
+                                f"DXF polyline entity type '{entity_type}' uses unsupported "
+                                "semantics and was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
                 except ValueError as exc:
                     canonical_entity = _unknown_entity_payload(
                         entity,
@@ -667,6 +756,284 @@ def _unknown_entity_payload(
         "layer": layer_name,
         "layout": layout_name,
     }
+
+
+def _polyline_entity_payload(
+    entity: Any,
+    *,
+    layout_name: str,
+    units: dict[str, JSONValue],
+    budget: _CheckpointBudget,
+) -> dict[str, JSONValue]:
+    native_type = str(entity.dxftype()).upper()
+    handle = _entity_handle(entity)
+    layer_name = _entity_layer(entity)
+    native_points, closed, adapter_native = _polyline_native_geometry(entity, budget=budget)
+    points = _scaled_points_payload(native_points, units=units)
+    metric_name = "perimeter" if closed else "length"
+    native_measure = _polyline_measure(native_points, closed=closed, budget=budget)
+    measure = _polyline_measure(points, closed=closed, budget=budget)
+    geometry_payload: dict[str, JSONValue] = {
+        "points": points,
+        "closed": closed,
+    }
+    entity_id = _entity_id(
+        native_type=native_type,
+        handle=handle,
+        layout_name=layout_name,
+        layer_name=layer_name,
+        geometry=geometry_payload,
+    )
+
+    if _native_geometry_should_be_preserved(units):
+        adapter_native["geometry"] = {
+            "points": native_points,
+            "closed": closed,
+            metric_name: native_measure,
+            "units": {
+                "normalized": _normalized_unit_name(_source_unit_value(units)),
+                "source_value": _source_unit_value(units),
+            },
+        }
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": "polyline",
+        "entity_schema_version": _CANONICAL_SCHEMA_VERSION,
+        "geometry": {
+            "vertices": points,
+            "points": points,
+            "closed": closed,
+            "bbox": _points_bbox_payload(points),
+            "units": dict(units),
+            "geometry_summary": {
+                "kind": "polyline",
+                "vertex_count": len(points),
+                "closed": closed,
+                "dimensionality": _polyline_dimensionality(points, budget=budget),
+                metric_name: measure,
+            },
+        },
+        "properties": {
+            "source_type": native_type,
+            "source_handle": handle or None,
+            "quantity_hints": {
+                metric_name: measure,
+                "count": 1.0,
+            },
+            "adapter_native": {
+                "ezdxf": adapter_native,
+            },
+        },
+        "provenance": _entity_provenance(
+            native_type=native_type,
+            handle=handle,
+            layout_name=layout_name,
+            layer_name=layer_name,
+            entity_id=entity_id,
+            geometry=geometry_payload,
+        ),
+        "confidence": 0.99,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "kind": "polyline",
+        "handle": handle,
+        "layer": layer_name,
+        "layout": layout_name,
+        "vertices": points,
+        "points": points,
+        "closed": closed,
+        metric_name: measure,
+    }
+
+
+def _polyline_native_geometry(
+    entity: Any,
+    *,
+    budget: _CheckpointBudget,
+) -> tuple[tuple[dict[str, JSONValue], ...], bool, dict[str, JSONValue]]:
+    native_type = str(entity.dxftype()).upper()
+    layer_name = _entity_layer(entity)
+    linetype = _optional_string(getattr(entity.dxf, "linetype", None))
+
+    if native_type == "LWPOLYLINE":
+        if bool(getattr(entity, "has_arc", False)):
+            raise _UnsupportedPolylineError("Polyline bulge arcs are not supported.")
+        if _polyline_width_is_nonzero(getattr(entity.dxf, "const_width", 0.0)):
+            raise _UnsupportedPolylineError("Polyline widths are not supported.")
+        if bool(getattr(entity, "has_width", False)):
+            for vertex_count, vertex in enumerate(entity, start=1):
+                budget.check()
+                _enforce_polyline_vertex_limit(vertex_count)
+                if _lwpolyline_vertex_has_width(vertex):
+                    raise _UnsupportedPolylineError("Polyline widths are not supported.")
+        closed = bool(getattr(entity, "is_closed", False))
+        points = _points_payload(entity.vertices_in_wcs(), budget=budget)
+        if len(points) < 2:
+            raise _UnsupportedPolylineError("Polyline must contain at least 2 vertices.")
+        return (
+            points,
+            closed,
+            {
+                "layer": layer_name,
+                "linetype": linetype,
+                "flags": int(getattr(entity.dxf, "flags", 0)),
+                "closed": closed,
+            },
+        )
+
+    if native_type != "POLYLINE":
+        raise _UnsupportedPolylineError(f"Unsupported polyline entity type '{native_type}'.")
+
+    flags = int(getattr(entity.dxf, "flags", 0))
+    if flags & 2:
+        raise _UnsupportedPolylineError("Polyline curve-fit vertices are not supported.")
+    if flags & 4:
+        raise _UnsupportedPolylineError("Polyline spline-fit vertices are not supported.")
+    if bool(getattr(entity, "is_polygon_mesh", False)):
+        raise _UnsupportedPolylineError("Polyline mesh entities are not supported.")
+    if bool(getattr(entity, "is_poly_face_mesh", False)):
+        raise _UnsupportedPolylineError("Polyline polyface entities are not supported.")
+    if not bool(getattr(entity, "is_2d_polyline", False)) and not bool(
+        getattr(entity, "is_3d_polyline", False)
+    ):
+        raise _UnsupportedPolylineError("Polyline semantics are not supported.")
+    if bool(getattr(entity, "has_arc", False)):
+        raise _UnsupportedPolylineError("Polyline bulge arcs are not supported.")
+
+    unsupported_vertex_mask = 1 | 2 | 8 | 16 | 64 | 128
+    point_payloads: list[dict[str, JSONValue]] = []
+    for vertex_count, vertex in enumerate(entity.vertices, start=1):
+        budget.check()
+        _enforce_polyline_vertex_limit(vertex_count)
+        vertex_flags = int(getattr(vertex.dxf, "flags", 0))
+        if vertex_flags & unsupported_vertex_mask:
+            raise _UnsupportedPolylineError("Polyline vertex semantics are not supported.")
+        if _polyline_width_is_nonzero(getattr(vertex.dxf, "start_width", 0.0)) or (
+            _polyline_width_is_nonzero(getattr(vertex.dxf, "end_width", 0.0))
+        ):
+            raise _UnsupportedPolylineError("Polyline widths are not supported.")
+        point_payloads.append(_point_payload(vertex.dxf.location))
+
+    native_points = tuple(point_payloads)
+    if len(native_points) < 2:
+        raise _UnsupportedPolylineError("Polyline must contain at least 2 vertices.")
+
+    closed = bool(getattr(entity, "is_closed", False))
+    mode = "3d" if bool(getattr(entity, "is_3d_polyline", False)) else "2d"
+    return (
+        native_points,
+        closed,
+        {
+            "layer": layer_name,
+            "linetype": linetype,
+            "flags": flags,
+            "closed": closed,
+            "mode": mode,
+        },
+    )
+
+
+def _points_payload(
+    points: Any,
+    *,
+    budget: _CheckpointBudget,
+) -> tuple[dict[str, JSONValue], ...]:
+    payloads: list[dict[str, JSONValue]] = []
+    for vertex_count, point in enumerate(points, start=1):
+        budget.check()
+        _enforce_polyline_vertex_limit(vertex_count)
+        payloads.append(_point_payload(point))
+    if len(payloads) < 2:
+        raise _UnsupportedPolylineError("Polyline must contain at least 2 vertices.")
+    return tuple(payloads)
+
+
+def _enforce_polyline_vertex_limit(vertex_count: int) -> None:
+    if vertex_count > _MAX_POLYLINE_VERTICES:
+        raise _PolylineLimitError(
+            f"Polyline vertex count exceeds supported limit of {_MAX_POLYLINE_VERTICES}."
+        )
+
+
+def _polyline_width_is_nonzero(value: Any) -> bool:
+    try:
+        width = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Polyline width must be finite.") from exc
+    if not isfinite(width):
+        raise ValueError("Polyline width must be finite.")
+    return width != 0.0
+
+
+def _lwpolyline_vertex_has_width(vertex: Any) -> bool:
+    if not hasattr(vertex, "__len__") or not hasattr(vertex, "__getitem__") or len(vertex) < 4:
+        return False
+    return _polyline_width_is_nonzero(vertex[2]) or _polyline_width_is_nonzero(vertex[3])
+
+
+def _scaled_points_payload(
+    points: tuple[dict[str, JSONValue], ...],
+    *,
+    units: dict[str, JSONValue],
+) -> tuple[dict[str, JSONValue], ...]:
+    return tuple(_scaled_point_payload(point, units=units, point_payload=point) for point in points)
+
+
+def _points_bbox_payload(points: tuple[dict[str, JSONValue], ...]) -> dict[str, JSONValue]:
+    x_values = tuple(_point_component(point, "x") for point in points)
+    y_values = tuple(_point_component(point, "y") for point in points)
+    z_values = tuple(_point_component(point, "z") for point in points)
+    return {
+        "min": {
+            "x": min(x_values),
+            "y": min(y_values),
+            "z": min(z_values),
+        },
+        "max": {
+            "x": max(x_values),
+            "y": max(y_values),
+            "z": max(z_values),
+        },
+    }
+
+
+def _polyline_measure(
+    points: tuple[dict[str, JSONValue], ...],
+    *,
+    closed: bool,
+    budget: _CheckpointBudget,
+) -> float:
+    metric_name = "perimeter" if closed else "length"
+    total = 0.0
+    for start, end in pairwise(points):
+        budget.check()
+        total += _line_length(start, end)
+        if not isfinite(total):
+            raise ValueError(f"Polyline {metric_name} must be finite.")
+    if closed:
+        budget.check()
+        total += _line_length(points[-1], points[0])
+        if not isfinite(total):
+            raise ValueError("Polyline perimeter must be finite.")
+    return total
+
+
+def _polyline_dimensionality(
+    points: tuple[dict[str, JSONValue], ...],
+    *,
+    budget: _CheckpointBudget,
+) -> int:
+    first_z = _point_component(points[0], "z")
+    for point in points[1:]:
+        budget.check()
+        if _point_component(point, "z") != first_z:
+            return 3
+    return 2
 
 
 def _entity_provenance(

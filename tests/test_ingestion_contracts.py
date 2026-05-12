@@ -128,6 +128,19 @@ class _FakeDocument:
         self.closed = True
 
 
+def _assert_no_nonfinite_numbers(value: object) -> None:
+    if isinstance(value, dict):
+        for nested in value.values():
+            _assert_no_nonfinite_numbers(nested)
+        return
+    if isinstance(value, (tuple, list)):
+        for nested in value:
+            _assert_no_nonfinite_numbers(nested)
+        return
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        assert math.isfinite(float(value))
+
+
 async def _ingest_fake_document(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1537,6 +1550,211 @@ async def test_pymupdf_ingest_skips_non_finite_entities_and_text_blocks_with_san
         "pymupdf_entity_non_finite",
         "pymupdf_text_block_non_finite",
     }
+
+
+@pytest.mark.asyncio
+async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    unsupported_item = (
+        "c",
+        _FakePoint(10.0, 0.0),
+        _FakePoint(12.0, 4.0),
+        _FakePoint(14.0, 4.0),
+        _FakePoint(16.0, 0.0),
+    )
+    document = _FakeDocument(
+        [
+            _FakePage(
+                drawings=[
+                    {
+                        "items": (
+                            ("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),
+                            unsupported_item,
+                            ("l", _FakePoint(20.0, 0.0), _FakePoint(30.0, 0.0)),
+                            ("l", _FakePoint(30.0, 0.0), _FakePoint(40.0, 10.0)),
+                        ),
+                        "width": 1.0,
+                        "color": (0.1, 0.2, 0.3),
+                    }
+                ]
+            )
+        ]
+    )
+
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document)
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert [entity["entity_id"] for entity in entities] == [
+        "page-1:drawing-0:entity-0",
+        "page-1:drawing-0:entity-1",
+        "page-1:drawing-0:entity-2",
+    ]
+
+    first_entity, unknown_entity, final_entity = entities
+    assert first_entity["entity_type"] == "line"
+    assert first_entity["provenance"] == {
+        "page_number": 1,
+        "drawing_index": 0,
+        "item_indices": (0,),
+        "source": "pymupdf.get_drawings",
+    }
+
+    assert unknown_entity["kind"] == "unknown"
+    assert unknown_entity["entity_type"] == "unknown"
+    assert unknown_entity["bbox"] == {
+        "x_min": 10.0,
+        "y_min": 0.0,
+        "x_max": 16.0,
+        "y_max": 4.0,
+    }
+    assert unknown_entity["geometry"] == {
+        "kind": "unknown",
+        "coordinate_space": "pdf_page_space_unrotated",
+        "units": "unknown",
+        "bbox": {
+            "x_min": 10.0,
+            "y_min": 0.0,
+            "x_max": 16.0,
+            "y_max": 4.0,
+        },
+        "status": "unsupported",
+        "reason": "unsupported_path_operator",
+    }
+    assert unknown_entity["confidence"] == {
+        "score": 0.75,
+        "review_required": True,
+        "basis": "vector_pdf_unconfirmed_scale",
+    }
+    assert unknown_entity["provenance"] == {
+        "page_number": 1,
+        "drawing_index": 0,
+        "item_index": 1,
+        "operator": "c",
+        "source": "pymupdf.get_drawings",
+        "normalized_source_hash": pymupdf_adapter._normalized_source_hash(unsupported_item),
+    }
+
+    assert final_entity["entity_type"] == "polyline"
+    assert final_entity["points"] == (
+        {"x": 20.0, "y": 0.0},
+        {"x": 30.0, "y": 0.0},
+        {"x": 40.0, "y": 10.0},
+    )
+    assert final_entity["provenance"] == {
+        "page_number": 1,
+        "drawing_index": 0,
+        "item_indices": (2, 3),
+        "source": "pymupdf.get_drawings",
+    }
+
+    assert result.warnings == (
+        AdapterWarning(
+            code="pymupdf_path_operator_unsupported",
+            message="Retained unsupported PyMuPDF path operator as unknown entity.",
+            details={
+                "page_number": 1,
+                "drawing_index": 0,
+                "item_index": 1,
+                "operator": "c",
+            },
+        ),
+    )
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_pymupdf_ingest_skips_non_finite_unsupported_path_operator_with_sanitized_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    document = _FakeDocument(
+        [
+            _FakePage(
+                drawings=[
+                    {
+                        "items": (
+                            ("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),
+                            (
+                                "c",
+                                _FakePoint(math.inf, 0.0),
+                                _FakePoint(12.0, 4.0),
+                                _FakePoint(14.0, 4.0),
+                                _FakePoint(16.0, 0.0),
+                            ),
+                            ("l", _FakePoint(20.0, 0.0), _FakePoint(30.0, 0.0)),
+                        ),
+                        "width": 1.0,
+                        "color": (0.1, 0.2, 0.3),
+                    }
+                ]
+            )
+        ]
+    )
+
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document)
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["line", "line"]
+    assert result.warnings == (
+        AdapterWarning(
+            code="pymupdf_entity_non_finite",
+            message="Skipping PyMuPDF entity with non-finite numeric values.",
+            details={
+                "page_number": 1,
+                "drawing_index": 0,
+                "item_index": 1,
+                "operator": "c",
+            },
+        ),
+        AdapterWarning(
+            code="pymupdf_path_operator_unsupported",
+            message="Skipping unsupported PyMuPDF path operator.",
+            details={
+                "page_number": 1,
+                "drawing_index": 0,
+                "item_index": 1,
+                "operator": "c",
+            },
+        ),
+    )
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_pymupdf_ingest_unsupported_path_unknown_entity_counts_toward_entity_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    document = _FakeDocument(
+        [
+            _FakePage(
+                drawings=[
+                    {
+                        "items": (
+                            ("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),
+                            (
+                                "c",
+                                _FakePoint(10.0, 0.0),
+                                _FakePoint(12.0, 4.0),
+                                _FakePoint(14.0, 4.0),
+                                _FakePoint(16.0, 0.0),
+                            ),
+                        ),
+                        "width": 1.0,
+                        "color": (0.1, 0.2, 0.3),
+                    }
+                ]
+            )
+        ]
+    )
+    monkeypatch.setattr(pymupdf_adapter, "_MAX_ENTITIES", 1)
+
+    with pytest.raises(pymupdf_adapter.PyMuPDFExtractionLimitError) as exc_info:
+        await _ingest_fake_document(monkeypatch, tmp_path, document)
+
+    assert str(exc_info.value) == "PyMuPDF extraction exceeded entity limit."
 
 
 @pytest.mark.parametrize(

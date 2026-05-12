@@ -73,6 +73,129 @@ class _FakeEntity:
         return self._layout
 
 
+class _FakePolylineVertex:
+    def __init__(
+        self,
+        location: Any,
+        *,
+        flags: int = 0,
+        start_width: float = 0.0,
+        end_width: float = 0.0,
+    ) -> None:
+        self.dxf = types.SimpleNamespace(
+            location=location,
+            flags=flags,
+            start_width=start_width,
+            end_width=end_width,
+        )
+
+
+class _FakePolylineEntity:
+    def __init__(
+        self,
+        *,
+        handle: str,
+        layer: str,
+        layout_name: str,
+        points: tuple[Any, ...],
+        vertex_flags: tuple[int, ...] | None = None,
+        closed: bool = False,
+        flags: int = 0,
+        vertex_widths: tuple[tuple[float, float], ...] | None = None,
+        is_2d_polyline: bool = True,
+        is_3d_polyline: bool = False,
+        is_polygon_mesh: bool = False,
+        is_poly_face_mesh: bool = False,
+        has_arc: bool = False,
+    ) -> None:
+        self._layout = types.SimpleNamespace(name=layout_name)
+        self._points = points
+        self.is_closed = closed
+        self.is_2d_polyline = is_2d_polyline
+        self.is_3d_polyline = is_3d_polyline
+        self.is_polygon_mesh = is_polygon_mesh
+        self.is_poly_face_mesh = is_poly_face_mesh
+        self.has_arc = has_arc
+        flags_by_vertex = vertex_flags or tuple(0 for _ in points)
+        widths_by_vertex = vertex_widths or tuple((0.0, 0.0) for _ in points)
+        self.vertices = tuple(
+            _FakePolylineVertex(
+                point,
+                flags=vertex_flag,
+                start_width=vertex_width[0],
+                end_width=vertex_width[1],
+            )
+            for point, vertex_flag, vertex_width in zip(
+                points,
+                flags_by_vertex,
+                widths_by_vertex,
+                strict=True,
+            )
+        )
+        self.dxf = types.SimpleNamespace(
+            handle=handle,
+            layer=layer,
+            linetype="Continuous",
+            flags=flags,
+        )
+
+    def dxftype(self) -> str:
+        return "POLYLINE"
+
+    def get_layout(self) -> Any:
+        return self._layout
+
+    def points_in_wcs(self) -> tuple[Any, ...]:
+        return self._points
+
+
+class _FakeLWPolylineEntity:
+    def __init__(
+        self,
+        *,
+        handle: str,
+        layer: str,
+        layout_name: str,
+        points: tuple[Any, ...],
+        segment_widths: tuple[tuple[float, float], ...] | None = None,
+        const_width: float = 0.0,
+        closed: bool = False,
+        has_arc: bool = False,
+    ) -> None:
+        self._layout = types.SimpleNamespace(name=layout_name)
+        self._points = points
+        self.is_closed = closed
+        self.has_arc = has_arc
+        widths_by_vertex = segment_widths or tuple((0.0, 0.0) for _ in points)
+        self._vertices = tuple(
+            (point.x, point.y, start_width, end_width, 0.0)
+            for point, (start_width, end_width) in zip(points, widths_by_vertex, strict=True)
+        )
+        self.has_width = const_width != 0.0 or any(
+            start_width != 0.0 or end_width != 0.0
+            for start_width, end_width in widths_by_vertex
+        )
+        self.dxf = types.SimpleNamespace(
+            handle=handle,
+            layer=layer,
+            linetype="Continuous",
+            flags=1 if closed else 0,
+            const_width=const_width,
+        )
+
+    def dxftype(self) -> str:
+        return "LWPOLYLINE"
+
+    def get_layout(self) -> Any:
+        return self._layout
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._vertices)
+
+    def vertices_in_wcs(self) -> tuple[Any, ...]:
+        return self._points
+
+
 class _FakeBlock:
     def __init__(
         self,
@@ -359,6 +482,147 @@ async def test_ezdxf_adapter_normalizes_non_meter_line_geometry_to_meters(
     }
 
 
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_emits_closed_lwpolyline_perimeter_geometry(
+    tmp_path: Path,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "closed-lwpolyline.dxf"
+    document = cast(Any, ezdxf).new(units=6)
+    document.modelspace().add_lwpolyline(
+        [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)],
+        close=True,
+    )
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is False
+    assert result.warnings == ()
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    _assert_common_entity_contract(
+        entity,
+        entity_type="polyline",
+        layout_ref="Model",
+        layer_ref="0",
+    )
+    assert entity["kind"] == "polyline"
+    assert entity["closed"] is True
+    assert "length" not in entity
+    assert entity["perimeter"] == pytest.approx(6.0)
+
+    points = _mapping_tuple(entity["points"])
+    assert points == (
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+        {"x": 2.0, "y": 0.0, "z": 0.0},
+        {"x": 2.0, "y": 1.0, "z": 0.0},
+        {"x": 0.0, "y": 1.0, "z": 0.0},
+    )
+    assert entity["vertices"] == entity["points"]
+
+    geometry = _mapping(entity["geometry"])
+    assert geometry["points"] == entity["points"]
+    assert geometry["vertices"] == entity["vertices"]
+    assert geometry["closed"] is True
+    assert geometry["bbox"] == {
+        "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "max": {"x": 2.0, "y": 1.0, "z": 0.0},
+    }
+    assert geometry["geometry_summary"] == {
+        "kind": "polyline",
+        "vertex_count": 4,
+        "closed": True,
+        "dimensionality": 2,
+        "perimeter": 6.0,
+    }
+
+    properties = _mapping(entity["properties"])
+    assert properties["source_type"] == "LWPOLYLINE"
+    assert properties["source_handle"] == entity["handle"]
+    assert properties["quantity_hints"] == {"perimeter": 6.0, "count": 1.0}
+
+    native = _mapping(_mapping(_mapping(entity["properties"])["adapter_native"])["ezdxf"])
+    assert native == {
+        "layer": "0",
+        "linetype": "BYLAYER",
+        "flags": 1,
+        "closed": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_emits_open_legacy_polyline_length_geometry(
+    tmp_path: Path,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "open-legacy-polyline.dxf"
+    document = cast(Any, ezdxf).new(units=6)
+    document.modelspace().add_polyline3d(
+        [(0.0, 0.0, 0.0), (3.0, 0.0, 4.0), (3.0, 4.0, 4.0)]
+    )
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is False
+    assert result.warnings == ()
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    _assert_common_entity_contract(
+        entity,
+        entity_type="polyline",
+        layout_ref="Model",
+        layer_ref="0",
+    )
+    assert entity["kind"] == "polyline"
+    assert entity["closed"] is False
+    assert entity["length"] == pytest.approx(9.0)
+    assert "perimeter" not in entity
+
+    points = _mapping_tuple(entity["points"])
+    assert points == (
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+        {"x": 3.0, "y": 0.0, "z": 4.0},
+        {"x": 3.0, "y": 4.0, "z": 4.0},
+    )
+
+    geometry = _mapping(entity["geometry"])
+    assert geometry["bbox"] == {
+        "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "max": {"x": 3.0, "y": 4.0, "z": 4.0},
+    }
+    assert geometry["geometry_summary"] == {
+        "kind": "polyline",
+        "vertex_count": 3,
+        "closed": False,
+        "dimensionality": 3,
+        "length": 9.0,
+    }
+
+    properties = _mapping(entity["properties"])
+    assert properties["source_type"] == "POLYLINE"
+    assert properties["source_handle"] == entity["handle"]
+    assert properties["quantity_hints"] == {"length": 9.0, "count": 1.0}
+
+    native = _mapping(_mapping(_mapping(entity["properties"])["adapter_native"])["ezdxf"])
+    assert native == {
+        "layer": "0",
+        "linetype": "BYLAYER",
+        "flags": 8,
+        "closed": False,
+        "mode": "3d",
+    }
+
+
 def test_ezdxf_adapter_sanitizes_structure_errors() -> None:
     class _FakeDXFStructureError(Exception):
         pass
@@ -414,6 +678,250 @@ async def test_ezdxf_adapter_review_gates_malformed_numeric_coordinates(
     assert "start" not in entity
     assert _mapping(result.warnings[0].details)["reason"] == "Point component 'x' must be finite."
     _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_review_gates_malformed_polyline_coordinates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    malformed_document = _FakeDocument(
+        entities=(
+            _FakePolylineEntity(
+                handle="13",
+                layer="0",
+                layout_name="Model",
+                points=(
+                    _fake_point(float("nan"), 0.0, 0.0),
+                    _fake_point(2.0, 0.0, 0.0),
+                ),
+                is_2d_polyline=False,
+                is_3d_polyline=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: malformed_document)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="malformed-polyline.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is True
+    assert [warning.code for warning in result.warnings] == ["malformed_coordinates"]
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    assert entity["entity_type"] == "unknown"
+    assert entity["kind"] == "unknown"
+    assert entity["handle"] == "13"
+    assert _mapping(entity["properties"])["source_type"] == "POLYLINE"
+    assert _mapping(entity["geometry"])["bbox"] is None
+    assert "points" not in entity
+    assert _mapping(result.warnings[0].details)["reason"] == "Point component 'x' must be finite."
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_retains_unsupported_polyline_as_unknown_with_warning(
+    tmp_path: Path,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "unsupported-bulged-polyline.dxf"
+    document = cast(Any, ezdxf).new(units=6)
+    document.modelspace().add_lwpolyline(
+        [(0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0)],
+        format="xyb",
+    )
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is True
+    assert result.confidence.score == 0.95
+    assert [warning.code for warning in result.warnings] == ["unsupported_entity"]
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    _assert_common_entity_contract(
+        entity,
+        entity_type="unknown",
+        layout_ref="Model",
+        layer_ref="0",
+    )
+    assert entity["kind"] == "unknown"
+    assert _mapping(entity["properties"])["source_type"] == "LWPOLYLINE"
+    assert (
+        _mapping(result.warnings[0].details)["reason"]
+        == "Polyline bulge arcs are not supported."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("const_width", "segment_widths"),
+    [
+        (0.5, None),
+        (0.0, ((0.5, 0.0), (0.0, 0.0))),
+    ],
+)
+async def test_ezdxf_adapter_retains_width_bearing_lwpolyline_as_unknown_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    const_width: float,
+    segment_widths: tuple[tuple[float, float], ...] | None,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    unsupported_document = _FakeDocument(
+        entities=(
+            _FakeLWPolylineEntity(
+                handle="14",
+                layer="0",
+                layout_name="Model",
+                points=(
+                    _fake_point(0.0, 0.0, 0.0),
+                    _fake_point(2.0, 0.0, 0.0),
+                ),
+                const_width=const_width,
+                segment_widths=segment_widths,
+            ),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: unsupported_document)
+
+    result = await adapter.ingest(
+        build_contract_source(
+            file_path=_FIXTURE_PATH,
+            original_name="width-bearing-lwpolyline.dxf",
+        ),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is True
+    assert [warning.code for warning in result.warnings] == ["unsupported_entity"]
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    assert entity["entity_type"] == "unknown"
+    assert entity["kind"] == "unknown"
+    assert _mapping(entity["properties"])["source_type"] == "LWPOLYLINE"
+    assert _mapping(result.warnings[0].details)["reason"] == "Polyline widths are not supported."
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_retains_width_bearing_legacy_polyline_as_unknown_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    unsupported_document = _FakeDocument(
+        entities=(
+            _FakePolylineEntity(
+                handle="15",
+                layer="0",
+                layout_name="Model",
+                points=(
+                    _fake_point(0.0, 0.0, 0.0),
+                    _fake_point(3.0, 0.0, 0.0),
+                ),
+                vertex_widths=((0.0, 0.0), (0.5, 0.25)),
+            ),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: unsupported_document)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="width-bearing-polyline.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is True
+    assert [warning.code for warning in result.warnings] == ["unsupported_entity"]
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    assert entity["entity_type"] == "unknown"
+    assert entity["kind"] == "unknown"
+    assert _mapping(entity["properties"])["source_type"] == "POLYLINE"
+    assert _mapping(result.warnings[0].details)["reason"] == "Polyline widths are not supported."
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_retains_vertex_capped_polyline_as_unknown_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    oversized_document = _FakeDocument(
+        entities=(
+            _FakeLWPolylineEntity(
+                handle="16",
+                layer="0",
+                layout_name="Model",
+                points=(
+                    _fake_point(0.0, 0.0, 0.0),
+                    _fake_point(1.0, 0.0, 0.0),
+                    _fake_point(2.0, 0.0, 0.0),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: oversized_document)
+    monkeypatch.setattr("app.ingestion.adapters.ezdxf._MAX_POLYLINE_VERTICES", 2)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="oversized-polyline.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.confidence is not None
+    assert result.confidence.review_required is True
+    assert [warning.code for warning in result.warnings] == ["polyline_vertex_limit_exceeded"]
+
+    entity = _mapping(_mapping_tuple(result.canonical["entities"])[0])
+    assert entity["entity_type"] == "unknown"
+    assert entity["kind"] == "unknown"
+    assert _mapping(entity["properties"])["source_type"] == "LWPOLYLINE"
+    assert _mapping(result.warnings[0].details)["reason"] == (
+        "Polyline vertex count exceeds supported limit of 2."
+    )
+    _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_honors_cancellation_during_polyline_vertex_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _load_ezdxf_adapter()
+    large_document = _FakeDocument(
+        entities=(
+            _FakePolylineEntity(
+                handle="17",
+                layer="0",
+                layout_name="Model",
+                points=(
+                    _fake_point(0.0, 0.0, 0.0),
+                    _fake_point(1.0, 0.0, 0.0),
+                    _fake_point(2.0, 0.0, 0.0),
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: large_document)
+    cancellation = _CancellationAfterChecks(cancel_after=4)
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.ingest(
+            build_contract_source(file_path=_FIXTURE_PATH, original_name="cancel-polyline.dxf"),
+            AdapterExecutionOptions(
+                timeout=AdapterTimeout(seconds=1),
+                cancellation=cancellation,
+            ),
+        )
+
+    assert cancellation.calls >= 4
 
 
 @pytest.mark.asyncio
