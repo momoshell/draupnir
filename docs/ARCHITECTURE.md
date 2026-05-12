@@ -66,6 +66,36 @@ Write ownership is split by responsibility:
 - Append-only records keep their payload and lineage immutable after commit;
   mutable records are limited to workflow/state transitions.
 
+Database-level append-only enforcement protects the core lineage/history tables:
+
+- `files`
+- `extraction_profiles`
+- `adapter_run_outputs`
+- `drawing_revisions`
+- `validation_reports`
+- `generated_artifacts`
+- `job_events`
+
+The implementation uses shared PostgreSQL PL/pgSQL trigger functions with
+per-table row and truncate triggers. Row-update checks compare `to_jsonb(OLD)`
+and `to_jsonb(NEW)` after removing any explicitly allowlisted mutable keys, so
+the comparison is JSON-safe across nullable and structured columns.
+
+The mutable allowlist is intentionally minimal:
+
+- `files.deleted_at`
+- `generated_artifacts.deleted_at`
+
+Those fields are write-once and may transition only from `NULL` to non-`NULL`.
+Protected tables reject `DELETE` and `TRUNCATE`, including cascaded truncate
+attempts. Review-state or report-state changes on protected historical rows are
+not allowed by this enforcement; any future workflow that needs them must ship
+an explicit migration and allowlist update.
+
+This trigger-based protection is an MVP integrity guardrail, not a full
+privilege boundary. Postgres table owners and superusers can still disable
+triggers, so stronger production role separation is a later hardening concern.
+
 ### Ingestion Adapters
 
 Format-specific adapters turn source files into canonical drawing data.
@@ -424,9 +454,10 @@ Append-only versus mutable record rules:
 - Append-only records include original file records, drawing revisions, approved
   quantity takeoffs, finalized estimate versions, generated artifacts, and
   `job_events`.
-- Mutable workflow/state fields include job status, progress, retry/cancel
-  control flags, `deleted_at`, and allowed review/supersession markers on
-  records that support those transitions.
+- Mutable workflow/state fields include job status, progress, and retry/cancel
+  control flags. Within protected append-only tables, only `files.deleted_at`
+  and `generated_artifacts.deleted_at` are mutable, and only as write-once
+  `NULL -> non-NULL` soft-delete markers.
 - Mutable workflow changes must never replace the stored payload, checksum,
   provenance, or lineage of an already committed append-only record.
 

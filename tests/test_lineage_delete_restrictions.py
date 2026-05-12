@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 import app.db.session as session_module
 import app.jobs.worker as worker_module
@@ -318,8 +318,15 @@ async def _assert_hard_delete_fails(model: type[Any], object_id: uuid.UUID) -> N
 
         await session.delete(row)
 
-        with pytest.raises(IntegrityError):
+        with pytest.raises((DBAPIError, IntegrityError)) as exc_info:
             await session.commit()
+
+        if isinstance(exc_info.value, DBAPIError):
+            sqlstate = getattr(exc_info.value.orig, "sqlstate", None)
+            if sqlstate == "55000":
+                assert "append-only trigger blocked DELETE on" in str(exc_info.value)
+            else:
+                assert sqlstate == "23503"
 
         await session.rollback()
 

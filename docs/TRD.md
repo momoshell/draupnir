@@ -621,11 +621,31 @@ Database ownership and append-only policy:
   read them, but never replace the original object or rewrite the row as a new
   source. Upload responses and file-read responses must expose the durable
   initial lineage fields `initial_job_id` and `initial_extraction_profile_id`.
-- Drawing revisions, approved quantity takeoffs, finalized estimate versions,
-  export artifacts, and `job_events` are append-only historical records.
-- Mutable workflow/state records include job status, attempt counters, progress,
-  `cancel_requested`, `deleted_at`, and allowed review/supersession state
-  transitions.
+- Database-level append-only enforcement protects lineage/history tables:
+  `files`, `extraction_profiles`, `adapter_run_outputs`,
+  `drawing_revisions`, `validation_reports`, `generated_artifacts`, and
+  `job_events`.
+- Enforcement is implemented with shared PostgreSQL trigger functions plus
+  per-table row and truncate triggers. Row comparison is JSON-safe: trigger
+  checks compare `to_jsonb(OLD)` and `to_jsonb(NEW)` after removing any
+  explicitly allowlisted mutable keys.
+- The explicit mutable allowlist is narrow and write-once: only
+  `files.deleted_at` and `generated_artifacts.deleted_at` may change, and only
+  from `NULL` to non-`NULL`.
+- Review-state or report-state mutation on protected historical rows is not part
+  of this allowlist. If a future workflow needs those fields to change after
+  insert, that requires an explicit migration and allowlist update rather than a
+  silent policy exception.
+- Protected tables reject `DELETE` and `TRUNCATE`, including cascaded truncate
+  attempts, so lineage/history records cannot be cleared through direct or
+  indirect destructive SQL paths.
+- Downgrade policy is conservative: migrations must refuse to remove these
+  protections from populated protected tables.
+- This is an MVP integrity control, not a full privilege boundary: Postgres
+  table owners and superusers can still disable triggers. Stronger production
+  role separation and trigger-hardening remain later operational concerns.
+- Mutable workflow/state records outside the protected append-only contract
+  include job status, attempt counters, progress, and `cancel_requested`.
 - Mutable state must not be used to rewrite the payload, lineage, checksum, or
   source references of an already committed append-only record.
 
