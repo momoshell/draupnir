@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,9 +24,15 @@ from app.api.pagination import (
     raise_invalid_cursor,
 )
 from app.core.errors import ErrorCode
-from app.core.exceptions import create_error_response, raise_not_found
+from app.core.exceptions import raise_not_found
 from app.db.session import get_db
-from app.jobs.worker import enqueue_ingest_job
+from app.jobs.worker import (
+    enqueue_ingest_job as _enqueue_ingest_job,
+)
+from app.jobs.worker import (
+    prepare_job_enqueue_intent,
+    publish_job_enqueue_intent,
+)
 from app.models.file import File
 from app.models.job import Job
 from app.models.job_event import JobEvent
@@ -37,9 +43,12 @@ jobs_router = APIRouter()
 
 _DEFAULT_EVENTS_LIMIT = 50
 _MAX_EVENTS_LIMIT = 200
-_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH = 255
-_PUBLIC_ENQUEUE_FAILURE_MESSAGE = "Failed to enqueue ingest job"
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
+
+
+def enqueue_ingest_job(job_id: UUID) -> None:
+    """Compatibility wrapper kept for test fixture patching."""
+    _enqueue_ingest_job(job_id)
 
 
 async def _get_job_or_404(db: AsyncSession, job_id: UUID) -> Job:
@@ -348,34 +357,11 @@ async def retry_job(
     job.error_message = None
     job.started_at = None
     job.finished_at = None
-    await db.commit()
-
-    try:
-        enqueue_ingest_job(job.id)
-    except Exception as exc:
-        job.status = "failed"
-        job.error_code = ErrorCode.INTERNAL_ERROR.value
-        job.error_message = _PUBLIC_ENQUEUE_FAILURE_MESSAGE[:_MAX_PUBLIC_JOB_ERROR_MESSAGE_LENGTH]
-        job.finished_at = datetime.now(UTC)
-        error_body = create_error_response(
-            code=ErrorCode.INTERNAL_ERROR,
-            message=_PUBLIC_ENQUEUE_FAILURE_MESSAGE,
-            details=None,
-        )
-        if reservation is not None:
-            await mark_idempotency_completed(
-                db,
-                reservation,
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                response_body=error_body,
-            )
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_body,
-        ) from exc
-
+    prepare_job_enqueue_intent(job)
+    await db.flush()
     await db.refresh(job)
+
+    success_body: dict[str, object] | None = None
     if reservation is not None:
         success_body = JobRead.model_validate(job).model_dump(mode="json")
         await mark_idempotency_completed(
@@ -384,7 +370,16 @@ async def retry_job(
             status_code=status.HTTP_202_ACCEPTED,
             response_body=success_body,
         )
-        await db.commit()
+
+    await db.commit()
+    await publish_job_enqueue_intent(
+        job.id,
+        publisher=enqueue_ingest_job,
+        suppress_exceptions=True,
+    )
+
+    if reservation is not None:
+        assert success_body is not None
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
 
     return job

@@ -115,6 +115,17 @@ Minimum top-level canonical revision payload requirements:
 `layouts`, `layers`, `blocks`, and `entities` are required keys and may be
 empty lists when extraction finds none.
 
+If an adapter emits an explicit placeholder or sparse scaffold instead of real
+canonical entities, the payload must also include
+`metadata.placeholder_semantics` with at minimum:
+
+- `status` - placeholder posture such as `placeholder` or `sparse`
+- `review_required` - must be `true`
+- `quantity_gate` - must be `review_gated`
+- `reason` - must align with `metadata.empty_entities_reason`
+- `coverage` - structured extraction limitations so operators do not infer real
+  DWG/raster entity coverage where none exists yet
+
 ### Canonical Entity Schema v0.1
 
 Canonical entity schema v0.1 is a JSON-first strict contract for normalized
@@ -129,7 +140,7 @@ Each entity record must include:
 - `geometry` - normalized geometry payload for the entity type
 - `properties` - normalized semantic properties and adapter-carried attributes
 - `provenance` - structured origin and extraction metadata
-- `confidence` - float in `[0, 1]`
+- `confidence` - float in `[0, 1]` or a structured object with at least `score`
 
 Version-field rule: `canonical_entity_schema_version` is revision-scoped and
 declares the canonical contract for the full revision payload. The
@@ -194,6 +205,12 @@ logic must not lose source identity.
 Entity identity must preserve source-native identity when available and also
 record a normalized source hash or equivalent fingerprint so dedup/re-ingestion
 logic can compare semantically identical entities across adapter passes.
+
+Entity provenance must carry a stable source locator or source-native identity
+when the adapter can provide one. Semantic-only envelopes such as IFC products
+may also include an adapter-normalized provenance object with fields like
+`source`, `source_entity_ref`, `source_identity`, and
+`normalized_source_hash`.
 
 For raster-derived entities, the canonical payload must also record page-scoped
 or view-scoped scale calibration metadata when used, because quantities are not
@@ -655,18 +672,15 @@ or other historical children.
 - The replay contract applies to project create/update/delete, file upload,
   file reprocess, job cancel, and job retry.
 - A matching completed reservation replays the original response body/status
-  exactly, including the sanitized enqueue-failure `500` body when durable work
-  has already been recorded. Completed snapshots are write-once: the server must
-  not expose a completed success replay before the final enqueue outcome is
-  known, and later failures must not overwrite an already completed snapshot.
+  exactly. For upload, reprocess, and retry, the completed success snapshot is
+  committed atomically with the durable enqueue intent and is write-once; later
+  broker publish or recovery outcomes must not overwrite that snapshot.
 - A matching `in_progress` reservation returns `409 IDEMPOTENCY_CONFLICT` with
   `Retry-After: 1`. MVP does not reclaim stale `in_progress` reservations.
 - Reusing the same key for a different fingerprint returns
   `409 IDEMPOTENCY_CONFLICT` with `details.reason = "request_mismatch"`.
-- When job enqueue fails after durable records are created, the public error must
-  stay sanitized and may include only safe system-assigned identifiers and
-  workflow metadata, such as `file_id`, `job_id`, `extraction_profile_id`, or
-  `status` where applicable.
+- Upload, reprocess, and retry success depends on durably recording the enqueue
+  intent in Postgres, not on synchronous broker publish success.
 
 ## Error Taxonomy
 
@@ -695,6 +709,12 @@ New codes require a docs change in this file.
 
 - Default ingestion adapter timeout: 5 minutes. Override per-adapter via config.
 - Default max attempts: 3. Backoff is exponential with jitter.
+- Upload, reprocess, and retry commit the pending job state and a durable enqueue
+  intent atomically in Postgres before any broker publish attempt.
+- Broker publish is best-effort after commit. If the process crashes or publish
+  raises before the intent is marked published, worker-start recovery owns the
+  stranded intent and either re-enqueues it or marks the still-pending job
+  failed with a sanitized enqueue error.
 - Cancel is cooperative. Workers must check `cancel_requested` before starting
   work, between adapter steps, on every persisted progress event, and again
   before any terminal success commit.
@@ -968,7 +988,8 @@ Probe rules:
     project before the request claims idempotency or creates a new job
   - the server creates a new ingestion/reprocessing job bound to `project_id`,
     `file_id`, the resolved `extraction_profile_id`, and the current finalized
-    base revision as `jobs.base_revision_id`
+    base revision as `jobs.base_revision_id`, plus a durable enqueue intent in
+    the same transaction
   - if the file has no finalized base revision yet, the request fails with `409`
     `REVISION_CONFLICT`, creates no job, and enqueues nothing
   - successful completion creates a new drawing revision rather than mutating
@@ -1030,6 +1051,9 @@ Probe rules:
   review, even when individual heuristics score above the normal provisional
   band. Raster confidence may guide prioritization, but it cannot auto-approve
   trusted quantity input.
+- Placeholder or sparse adapter outputs are also a hard exception: explicit
+  placeholder semantics must keep the revision `review_required` and
+  `review_gated` until a non-placeholder extraction pass replaces it.
 - Human review may promote a revision from `review_required` or `provisional` to
   `approved`, keep it `provisional`, mark it `rejected`, or leave it
   `review_required` pending more information. A revision replaced by a later

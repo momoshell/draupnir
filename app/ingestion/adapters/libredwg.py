@@ -1089,8 +1089,6 @@ def _hash_json_value(value: JSONValue) -> str:
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 def _source_ref(source: AdapterSource) -> str:
     candidate = (
         source.original_name.replace("\\", "/").split("/")[-1].strip()

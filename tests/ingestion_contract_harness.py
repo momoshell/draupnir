@@ -239,6 +239,49 @@ def _assert_empty_entity_collection_reason(canonical: Mapping[str, JSONValue]) -
         raise AssertionError(
             "Canonical payloads with empty entities must include metadata.empty_entities_reason."
         )
+    if _requires_placeholder_semantics(metadata, reason=reason):
+        _assert_placeholder_semantics(metadata, reason=reason)
+
+
+def _requires_placeholder_semantics(metadata: dict[str, JSONValue], *, reason: str) -> bool:
+    adapter_mode = metadata.get("adapter_mode")
+    if adapter_mode in {"placeholder", "sparse_placeholder"}:
+        return True
+
+    return reason in {
+        "placeholder_canonical_no_entity_mapping",
+        "raster_vectorization_deferred",
+    }
+
+
+def _assert_placeholder_semantics(metadata: dict[str, JSONValue], *, reason: str) -> None:
+    placeholder_semantics = metadata.get("placeholder_semantics")
+    if not isinstance(placeholder_semantics, dict):
+        raise AssertionError(
+            "Placeholder or sparse canonical payloads must include metadata.placeholder_semantics."
+        )
+
+    status = placeholder_semantics.get("status")
+    if not isinstance(status, str) or not status.strip():
+        raise AssertionError(
+            "Placeholder semantics must include a non-empty placeholder status."
+        )
+    if placeholder_semantics.get("review_required") is not True:
+        raise AssertionError("Placeholder semantics must explicitly require review.")
+    if placeholder_semantics.get("quantity_gate") != "review_gated":
+        raise AssertionError(
+            "Placeholder semantics must explicitly publish quantity_gate='review_gated'."
+        )
+    if placeholder_semantics.get("reason") != reason:
+        raise AssertionError(
+            "Placeholder semantics reason must match metadata.empty_entities_reason."
+        )
+
+    coverage = placeholder_semantics.get("coverage")
+    if not isinstance(coverage, dict) or not coverage:
+        raise AssertionError(
+            "Placeholder semantics must describe extraction coverage limitations."
+        )
 
 
 def _assert_entity_envelopes(
@@ -310,6 +353,16 @@ def _assert_entity_confidence(confidence: JSONValue) -> None:
                 "Canonical entity confidence objects must include a numeric score."
             )
         score = float(score_value)
+        review_required = confidence.get("review_required")
+        if review_required is not None and not isinstance(review_required, bool):
+            raise AssertionError(
+                "Canonical entity confidence.review_required must be boolean when present."
+            )
+        basis = confidence.get("basis")
+        if basis is not None and (not isinstance(basis, str) or not basis.strip()):
+            raise AssertionError(
+                "Canonical entity confidence.basis must be non-empty when present."
+            )
     else:
         raise AssertionError("Canonical entities must include confidence metadata.")
 

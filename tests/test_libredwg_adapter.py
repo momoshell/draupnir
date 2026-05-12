@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,7 @@ from app.ingestion.contracts import (
     InputFamily,
     UploadFormat,
 )
+from app.ingestion.validation import build_validation_outcome
 from tests.ingestion_contract_harness import (
     ContractFinalizationExpectation,
     build_contract_source,
@@ -339,6 +341,21 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert str(second_output_path.parent) not in stderr_excerpt
     assert "<source>" in stdout_excerpt
     assert "<tempdir>" in stderr_excerpt
+
+    validation = build_validation_outcome(
+        input_family=InputFamily.DWG,
+        canonical_json=result.canonical,
+        canonical_entity_schema_version=cast(
+            str,
+            result.canonical["canonical_entity_schema_version"],
+        ),
+        result=result,
+        generated_at=datetime.now(UTC),
+    )
+    findings = cast(list[Mapping[str, object]], validation.report_json["findings"])
+    assert validation.review_state == "review_required"
+    assert validation.quantity_gate == "review_gated"
+    assert not any(finding.get("check_key") == "placeholder_semantics" for finding in findings)
 
 
 @pytest.mark.asyncio

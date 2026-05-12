@@ -6,6 +6,7 @@ import asyncio
 import math
 from collections.abc import Callable
 from dataclasses import fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -47,9 +48,12 @@ from app.ingestion.registry import (
     get_registry,
     list_descriptors,
 )
+from app.ingestion.validation import build_validation_outcome
 from tests.ingestion_contract_harness import (
     ContractFinalizationExpectation,
+    assert_adapter_result_contract,
     build_contract_source,
+    build_result,
     exercise_adapter_contract,
 )
 
@@ -227,10 +231,25 @@ def test_registry_is_static_and_covers_every_family() -> None:
     assert registry[InputFamily.PDF_RASTER].experimental is True
     assert registry[InputFamily.DWG].capabilities.can_read is True
     assert registry[InputFamily.DWG].capabilities.can_write is False
-    assert registry[InputFamily.DWG].capabilities.extracts_geometry is True
-    assert registry[InputFamily.DWG].capabilities.supports_quantity_hints is True
-    assert registry[InputFamily.DWG].capabilities.supports_layout_selection is True
-    assert registry[InputFamily.DWG].capabilities.supports_xref_resolution is True
+    assert registry[InputFamily.DWG].capabilities.extracts_geometry is False
+    assert registry[InputFamily.DWG].capabilities.extracts_layers is False
+    assert registry[InputFamily.DWG].capabilities.extracts_blocks is False
+    assert registry[InputFamily.DWG].capabilities.extracts_text is False
+    assert registry[InputFamily.DWG].capabilities.supports_quantity_hints is False
+    assert registry[InputFamily.DWG].capabilities.supports_layout_selection is False
+    assert registry[InputFamily.DWG].capabilities.supports_xref_resolution is False
+    assert registry[InputFamily.DWG].notes == (
+        "Primary DWG adapter is isolated behind the ingestion contract.",
+        "Current Phase 2 output is placeholder-only and does not expose "
+        "real DWG extraction coverage yet.",
+    )
+    assert registry[InputFamily.PDF_RASTER].capabilities.extracts_geometry is False
+    assert registry[InputFamily.PDF_RASTER].capabilities.extracts_text is False
+    assert registry[InputFamily.PDF_RASTER].capabilities.supports_quantity_hints is False
+    assert registry[InputFamily.PDF_RASTER].notes == (
+        "Experimental raster scaffold only; vectorization, OCR, and "
+        "quantity hints remain deferred.",
+    )
     assert registry[InputFamily.IFC].capabilities.extracts_materials is True
 
     dwg_license_probe = next(
@@ -415,11 +434,25 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
         "xrefs": (),
         "metadata": {
             "source_format": "pdf",
+            "adapter_mode": "sparse_placeholder",
             "geometry_mode": "raster",
             "page_count": 2,
             "default_layer": "default",
             "empty_entities_reason": "raster_vectorization_deferred",
-            "text_blocks": [],
+            "placeholder_semantics": {
+                "status": "sparse",
+                "review_required": True,
+                "quantity_gate": "review_gated",
+                "reason": "raster_vectorization_deferred",
+                "coverage": {
+                    "entities": "none",
+                    "geometry": "none",
+                    "text": "deferred",
+                    "ocr": "deferred",
+                    "scale": "unconfirmed",
+                },
+            },
+            "text_blocks": (),
             "pdf_scale": {
                 "status": "unconfirmed",
                 "coordinate_space": "pdf_page_space_unrotated",
@@ -494,6 +527,26 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
             code="raster_scale_unconfirmed",
             message="Raster PDF scale remains unconfirmed in scaffold output.",
         ),
+    )
+
+    validation = build_validation_outcome(
+        input_family=InputFamily.PDF_RASTER,
+        canonical_json=result.canonical,
+        canonical_entity_schema_version=cast(
+            str,
+            result.canonical["canonical_entity_schema_version"],
+        ),
+        result=result,
+        generated_at=datetime.now(UTC),
+    )
+    findings = cast(list[dict[str, object]], validation.report_json["findings"])
+    assert validation.review_state == "review_required"
+    assert validation.quantity_gate == "review_gated"
+    assert any(
+        finding.get("check_key") == "placeholder_semantics"
+        and cast(dict[str, object], finding["details"]).get("reason")
+        == "raster_vectorization_deferred"
+        for finding in findings
     )
 
 
@@ -1709,3 +1762,42 @@ def test_adapter_source_rejects_invalid_upload_family_pairing() -> None:
         assert "is not valid" in str(exc)
     else:
         raise AssertionError("Expected invalid upload/family pairing to fail.")
+
+
+def test_contract_rejects_placeholder_semantics_with_non_review_gated_quantity_gate() -> None:
+    result = build_result(
+        adapter_key="contract",
+        score=0.3,
+        review_required=True,
+        canonical={
+            "schema_version": "0.1",
+            "canonical_entity_schema_version": "0.1",
+            "entities": (),
+            "metadata": {
+                "adapter_mode": "placeholder",
+                "empty_entities_reason": "placeholder_canonical_no_entity_mapping",
+                "placeholder_semantics": {
+                    "status": "placeholder",
+                    "review_required": True,
+                    "quantity_gate": "allowed",
+                    "reason": "placeholder_canonical_no_entity_mapping",
+                    "coverage": {"entities": "none"},
+                },
+            },
+        },
+    )
+
+    with pytest.raises(AssertionError, match="quantity_gate='review_gated'"):
+        assert_adapter_result_contract(
+            result,
+            expected_adapter_key="contract",
+            expected_warning_codes=(),
+            expected_diagnostic_codes=(),
+        )
+
+
+def test_registry_placeholder_adapters_do_not_advertise_real_extraction_coverage() -> None:
+    registry = get_registry()
+
+    assert registry[InputFamily.DWG].capabilities == AdapterCapabilities()
+    assert registry[InputFamily.PDF_RASTER].capabilities == AdapterCapabilities()

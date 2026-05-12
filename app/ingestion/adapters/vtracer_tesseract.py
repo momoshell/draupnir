@@ -37,6 +37,7 @@ _PAGE_PATTERN: Final[re.Pattern[bytes]] = re.compile(rb"/Type\s*/Page\b")
 _PAGE_SCAN_CHUNK_SIZE: Final[int] = 64 * 1024
 _PAGE_SCAN_OVERLAP: Final[int] = 64
 _MAX_PAGES: Final[int] = 1024
+_RASTER_EMPTY_ENTITIES_REASON: Final[str] = "raster_vectorization_deferred"
 
 
 class VTracerTesseractAdapter(IngestionAdapter):
@@ -63,45 +64,51 @@ class VTracerTesseractAdapter(IngestionAdapter):
             page_cap=_MAX_PAGES,
             cancellation=options.cancellation,
         )
+        empty_entities_reason = _RASTER_EMPTY_ENTITIES_REASON
+        metadata: dict[str, JSONValue] = {
+            "source_format": UploadFormat.PDF.value,
+            "adapter_mode": "sparse_placeholder",
+            "geometry_mode": "raster",
+            "page_count": page_count,
+            "default_layer": _DEFAULT_LAYER,
+            "empty_entities_reason": empty_entities_reason,
+            "placeholder_semantics": _build_placeholder_semantics(
+                empty_entities_reason=empty_entities_reason,
+            ),
+            "text_blocks": (),
+            "pdf_scale": {
+                "status": "unconfirmed",
+                "coordinate_space": "pdf_page_space_unrotated",
+                "unit": "point",
+                "real_world_units": False,
+                "calibration": {
+                    "provided": False,
+                    "source": "not_supported_in_adapter_options",
+                    "requires_extraction_profile_pass_through": True,
+                },
+            },
+        }
         canonical = cast(
             dict[str, JSONValue],
             {
-            "schema_version": _SCHEMA_VERSION,
-            "canonical_entity_schema_version": _SCHEMA_VERSION,
-            "units": {"normalized": "unknown"},
-            "coordinate_system": {
-                "name": "pdf_page_space_unrotated",
-                "origin": "top_left",
-                "x_axis": "right",
-                "y_axis": "down",
-            },
-            "layouts": tuple(
-                {"name": f"page-{page_number}", "page_number": page_number}
-                for page_number in range(1, page_count + 1)
-            ),
-            "layers": ({"name": _DEFAULT_LAYER},),
-            "blocks": (),
-            "entities": (),
-            "xrefs": (),
-            "metadata": {
-                "source_format": UploadFormat.PDF.value,
-                "geometry_mode": "raster",
-                "page_count": page_count,
-                "default_layer": _DEFAULT_LAYER,
-                "empty_entities_reason": "raster_vectorization_deferred",
-                "text_blocks": [],
-                "pdf_scale": {
-                    "status": "unconfirmed",
-                    "coordinate_space": "pdf_page_space_unrotated",
-                    "unit": "point",
-                    "real_world_units": False,
-                    "calibration": {
-                        "provided": False,
-                        "source": "not_supported_in_adapter_options",
-                        "requires_extraction_profile_pass_through": True,
-                    },
+                "schema_version": _SCHEMA_VERSION,
+                "canonical_entity_schema_version": _SCHEMA_VERSION,
+                "units": {"normalized": "unknown"},
+                "coordinate_system": {
+                    "name": "pdf_page_space_unrotated",
+                    "origin": "top_left",
+                    "x_axis": "right",
+                    "y_axis": "down",
                 },
-            },
+                "layouts": tuple(
+                    {"name": f"page-{page_number}", "page_number": page_number}
+                    for page_number in range(1, page_count + 1)
+                ),
+                "layers": ({"name": _DEFAULT_LAYER},),
+                "blocks": (),
+                "entities": (),
+                "xrefs": (),
+                "metadata": metadata,
             },
         )
 
@@ -298,3 +305,19 @@ def _durable_source_ref(source: AdapterSource) -> str:
     if not sanitized_name:
         return "originals/source.pdf"
     return f"originals/{sanitized_name}"
+
+
+def _build_placeholder_semantics(*, empty_entities_reason: str) -> dict[str, JSONValue]:
+    return {
+        "status": "sparse",
+        "review_required": True,
+        "quantity_gate": "review_gated",
+        "reason": empty_entities_reason,
+        "coverage": {
+            "entities": "none",
+            "geometry": "none",
+            "text": "deferred",
+            "ocr": "deferred",
+            "scale": "unconfirmed",
+        },
+    }

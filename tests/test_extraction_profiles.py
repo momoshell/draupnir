@@ -357,14 +357,14 @@ class TestExtractionProfiles:
         assert "yards" in response.text
         assert "literal_error" in response.text
 
-    async def test_reprocess_enqueue_failure_returns_durable_failed_job_details(
+    async def test_reprocess_publish_failure_returns_success_with_durable_job_details(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         stub_enqueue_ingest_job: None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Reprocess enqueue failures should expose safe durable identifiers."""
+        """Reprocess publish failures after commit should still return success."""
         _ = self
         _ = cleanup_projects
         _ = stub_enqueue_ingest_job
@@ -373,7 +373,7 @@ class TestExtractionProfiles:
         uploaded = await _upload_file(async_client, project["id"])
         await _finalize_initial_revision(str(uploaded["id"]))
 
-        def _failing_enqueue(_: uuid.UUID) -> None:
+        def _failing_enqueue(_: uuid.UUID, **__: Any) -> None:
             raise RuntimeError("broker exploded: amqp://user:secret@mq.internal/vhost")
 
         monkeypatch.setattr(files_api, "enqueue_ingest_job", _failing_enqueue)
@@ -396,38 +396,34 @@ class TestExtractionProfiles:
             },
         )
 
-        assert response.status_code == 500
+        assert response.status_code == 202
         payload = response.json()
-        assert payload["error"]["code"] == "INTERNAL_ERROR"
-        assert payload["error"]["message"] == "Failed to enqueue ingest job"
-        assert payload["error"]["details"] is not None
+        assert payload["file_id"] == uploaded["id"]
+        assert payload["project_id"] == project["id"]
+        assert payload["job_type"] == "reprocess"
+        assert payload["status"] == "pending"
+        assert payload["base_revision_id"] is not None
         assert "broker exploded" not in response.text
         assert "amqp://user:secret@mq.internal/vhost" not in response.text
 
-        details = cast(dict[str, str], payload["error"]["details"])
         jobs = await _get_jobs_for_file(str(uploaded["id"]))
         assert len(jobs) == 2
 
-        failed_job = jobs[1]
-        assert details == {
-            "file_id": str(failed_job.file_id),
-            "job_id": str(failed_job.id),
-            "extraction_profile_id": str(failed_job.extraction_profile_id),
-            "status": "failed",
-        }
-        assert failed_job.job_type == "reprocess"
-        assert failed_job.base_revision_id is not None
-        assert failed_job.status == "failed"
-        assert failed_job.error_code == "INTERNAL_ERROR"
-        assert failed_job.error_message == "Failed to enqueue ingest job"
-        assert "broker exploded" not in failed_job.error_message
-        assert failed_job.extraction_profile_id is not None
+        reprocess_job = jobs[1]
+        assert payload["id"] == str(reprocess_job.id)
+        assert payload["extraction_profile_id"] == str(reprocess_job.extraction_profile_id)
+        assert reprocess_job.job_type == "reprocess"
+        assert reprocess_job.base_revision_id is not None
+        assert reprocess_job.status == "pending"
+        assert reprocess_job.error_code is None
+        assert reprocess_job.error_message is None
+        assert reprocess_job.extraction_profile_id is not None
 
-        failed_profile = await _get_extraction_profile(failed_job.extraction_profile_id)
-        assert str(failed_profile.id) == details["extraction_profile_id"]
-        assert failed_profile.project_id == uuid.UUID(project["id"])
-        assert failed_profile.units_override == "metric"
-        assert failed_profile.layout_mode == "paper_space"
+        reprocess_profile = await _get_extraction_profile(reprocess_job.extraction_profile_id)
+        assert str(reprocess_profile.id) == payload["extraction_profile_id"]
+        assert reprocess_profile.project_id == uuid.UUID(project["id"])
+        assert reprocess_profile.units_override == "metric"
+        assert reprocess_profile.layout_mode == "paper_space"
 
     async def test_job_constraints_migration_upgrade_backfills_and_validates_profiles(
         self,

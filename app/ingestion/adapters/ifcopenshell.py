@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -702,15 +703,12 @@ def _extract_entity_payload(
             step_id_token=step_id_token,
         ),
         "provenance": _entity_provenance(
-            entity_id=preferred_id,
             ifc_type=ifc_type,
             global_id=global_id,
             step_id_token=step_id_token,
+            fallback_identity=preferred_id,
         ),
-        "confidence": {
-            "score": 0.4,
-            "basis": "semantic_ifc_metadata_only",
-        },
+        "confidence": _entity_confidence(),
         "drawing_revision_id": None,
         "source_file_id": None,
         "layout_ref": None,
@@ -763,7 +761,7 @@ def _finalize_entity_ids(raw_entities: Sequence[_RawEntity]) -> tuple[dict[str, 
         payload["entity_id"] = finalized_id
         provenance = payload.get("provenance")
         if isinstance(provenance, dict):
-            provenance["source_entity_ref"] = f"entities.{finalized_id}"
+            provenance["canonical_entity_ref"] = f"entities.{finalized_id}"
         finalized.append(payload)
     return tuple(finalized)
 
@@ -801,19 +799,95 @@ def _entity_properties(
     }
 
 
+def _entity_confidence() -> dict[str, JSONValue]:
+    return {
+        "score": 0.4,
+        "review_required": True,
+        "basis": "semantic_ifc_metadata_only",
+    }
+
+
 def _entity_provenance(
     *,
-    entity_id: str,
     ifc_type: str,
     global_id: str | None,
     step_id_token: str | None,
+    fallback_identity: str,
 ) -> dict[str, JSONValue]:
+    source_entity_ref = _entity_source_locator(
+        ifc_type=ifc_type,
+        global_id=global_id,
+        step_id_token=step_id_token,
+        fallback_identity=fallback_identity,
+    )
     return {
-        "source_entity_ref": f"entities.{entity_id}",
+        "origin": "adapter_normalized",
+        "adapter": _ADAPTER_KEY,
+        "source": source_entity_ref,
+        "source_entity_ref": source_entity_ref,
+        "source_identity": global_id or step_id_token or fallback_identity,
+        "normalized_source_hash": _normalized_source_hash(
+            ifc_type=ifc_type,
+            global_id=global_id,
+            step_id_token=step_id_token,
+            fallback_identity=fallback_identity,
+        ),
         "native_entity_type": ifc_type,
         "ifc_global_id": global_id,
         "ifc_step_id": step_id_token,
+        "extraction_path": ("semantic_extract",),
+        "notes": ("semantic_ifc_metadata_only",),
     }
+
+
+def _entity_source_locator(
+    *,
+    ifc_type: str,
+    global_id: str | None,
+    step_id_token: str | None,
+    fallback_identity: str,
+) -> str:
+    parts = [ifc_type]
+    if global_id is not None:
+        parts.append(f"global-id:{global_id}")
+    if step_id_token is not None:
+        parts.append(f"step-id:{step_id_token.removeprefix('#')}")
+    if len(parts) == 1:
+        parts.append(f"entity:{fallback_identity}")
+    return "ifc://" + "/".join(parts)
+
+
+def _normalized_source_hash(
+    *,
+    ifc_type: str,
+    global_id: str | None,
+    step_id_token: str | None,
+    fallback_identity: str,
+) -> str:
+    durable_source_ref = _normalized_source_locator(
+        ifc_type=ifc_type,
+        global_id=global_id,
+        step_id_token=step_id_token,
+        fallback_identity=fallback_identity,
+    )
+    return hashlib.sha256(durable_source_ref.encode("utf-8")).hexdigest()
+
+
+def _normalized_source_locator(
+    *,
+    ifc_type: str,
+    global_id: str | None,
+    step_id_token: str | None,
+    fallback_identity: str,
+) -> str:
+    parts = [ifc_type]
+    if global_id is not None:
+        parts.append(f"global-id:{global_id}")
+    elif step_id_token is not None:
+        parts.append(f"step-id:{step_id_token.removeprefix('#')}")
+    else:
+        parts.append(f"entity:{fallback_identity}")
+    return "ifc://" + "/".join(parts)
 
 
 def _extract_project_metadata(project: object | None) -> dict[str, JSONValue]:
