@@ -302,22 +302,27 @@ async def delete_project(
         reservation = claim
 
     project = await _get_active_project_or_404(db, project_id, for_update=True)
+    locked_jobs = (
+        await db.execute(
+            select(Job)
+            .where(
+                (Job.project_id == project_id)
+                & (Job.status.in_(("pending", "running")))
+            )
+            .order_by(Job.created_at.asc(), Job.id.asc())
+            .with_for_update(of=Job)
+        )
+    ).scalars().all()
     deleted_at = datetime.now(UTC)
     project.deleted_at = deleted_at
-    await db.execute(
-        update(Job)
-        .where(
-            (Job.project_id == project_id)
-            & (Job.status.in_(("pending", "running")))
-        )
-        .values(
-            status="cancelled",
-            cancel_requested=True,
-            error_code=ErrorCode.JOB_CANCELLED.value,
-            error_message=None,
-            finished_at=deleted_at,
-        )
-    )
+    for job in locked_jobs:
+        job.status = "cancelled"
+        job.cancel_requested = True
+        job.error_code = ErrorCode.JOB_CANCELLED.value
+        job.error_message = None
+        job.finished_at = deleted_at
+        job.attempt_token = None
+        job.attempt_lease_expires_at = None
     await db.execute(
         update(File)
         .where((File.project_id == project_id) & (File.deleted_at.is_(None)))
