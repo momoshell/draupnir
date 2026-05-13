@@ -251,6 +251,7 @@ def test_registry_is_static_and_covers_every_family() -> None:
     assert registry[InputFamily.DWG].capabilities.supports_quantity_hints is False
     assert registry[InputFamily.DWG].capabilities.supports_layout_selection is False
     assert registry[InputFamily.DWG].capabilities.supports_xref_resolution is False
+    assert registry[InputFamily.DWG].confidence_range == (0.2, 0.72)
     assert registry[InputFamily.DWG].notes == (
         "Primary DWG adapter is isolated behind the ingestion contract.",
         "Current Phase 2 output is placeholder-only and does not expose "
@@ -295,6 +296,17 @@ def test_ifc_registry_metadata_stays_semantic_only() -> None:
     assert descriptor.notes == (
         "Semantic-only IFC extraction; tessellation and shape creation are disabled.",
     )
+
+
+def test_libredwg_registry_confidence_range_matches_current_placeholder_envelope() -> None:
+    descriptor = get_registry()[InputFamily.DWG]
+    confidence_range = descriptor.confidence_range
+
+    assert descriptor.confidence_range == (0.2, 0.72)
+    assert confidence_range is not None
+    minimum_confidence, maximum_confidence = confidence_range
+    for emitted_score in (0.2, 0.4, 0.5, 0.72):
+        assert minimum_confidence <= emitted_score <= maximum_confidence
 
 
 def test_registry_rejects_mutation_and_preserves_cached_metadata() -> None:

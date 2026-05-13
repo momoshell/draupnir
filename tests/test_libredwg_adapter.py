@@ -22,6 +22,7 @@ from app.ingestion.contracts import (
     InputFamily,
     UploadFormat,
 )
+from app.ingestion.registry import get_registry
 from app.ingestion.validation import build_validation_outcome
 from tests.ingestion_contract_harness import (
     ContractFinalizationExpectation,
@@ -102,6 +103,16 @@ def _build_source() -> AdapterSource:
         media_type="image/vnd.dwg",
         original_name="fixtures/libredwg-wrapper-smoke.dwg",
     )
+
+
+def _assert_score_within_libredwg_descriptor_range(score: float | None) -> None:
+    confidence_range = get_registry()[InputFamily.DWG].confidence_range
+
+    assert confidence_range is not None
+    assert score is not None
+    minimum_confidence, maximum_confidence = confidence_range
+
+    assert minimum_confidence <= score <= maximum_confidence
 
 
 def _install_fake_subprocess(
@@ -327,6 +338,7 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
         "review_required": True,
         "basis": "libredwg_line_mapping_units_unconfirmed",
     }
+    _assert_score_within_libredwg_descriptor_range(entity["confidence"]["score"])
 
     result = await adapter.ingest(
         source,
@@ -341,6 +353,8 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert str(second_output_path.parent) not in stderr_excerpt
     assert "<source>" in stdout_excerpt
     assert "<tempdir>" in stderr_excerpt
+    assert result.confidence is not None
+    _assert_score_within_libredwg_descriptor_range(result.confidence.score)
 
     validation = build_validation_outcome(
         input_family=InputFamily.DWG,
@@ -521,6 +535,7 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "review_required": True,
         "basis": "unsupported_drawable_record",
     }
+    _assert_score_within_libredwg_descriptor_range(entities[0]["confidence"]["score"])
     assert entities[0]["unknown_reason"] == "unsupported_drawable_record"
     assert entities[0]["provenance"]["record_hash"].startswith("sha256:")
     assert [warning.code for warning in result.warnings] == [
@@ -689,6 +704,7 @@ async def test_libredwg_adapter_lowers_confidence_for_mixed_entity_outcomes(
     assert result.confidence.score == adapter_module._MIXED_ENTITY_CONFIDENCE_SCORE
     assert result.confidence.review_required is True
     assert result.confidence.basis == "libredwg_dwgread_json_mixed_entity_mapping"
+    _assert_score_within_libredwg_descriptor_range(result.confidence.score)
 
 
 @pytest.mark.asyncio
@@ -725,6 +741,8 @@ async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candid
         "malformed_drawables": 0,
     }
     assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+    assert result.confidence is not None
+    _assert_score_within_libredwg_descriptor_range(result.confidence.score)
 
 
 @pytest.mark.asyncio
