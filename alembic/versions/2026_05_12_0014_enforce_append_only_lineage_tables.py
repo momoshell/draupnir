@@ -66,7 +66,11 @@ def _create_guard_functions() -> None:
                 IF TG_OP = 'DELETE' THEN
                     RAISE EXCEPTION USING
                         ERRCODE = '{APPEND_ONLY_SQLSTATE}',
-                        MESSAGE = format('append-only trigger blocked %s on %I', TG_OP, TG_TABLE_NAME),
+                        MESSAGE = format(
+                            'append-only trigger blocked %s on %I',
+                            TG_OP,
+                            TG_TABLE_NAME
+                        ),
                         DETAIL = 'Protected lineage/history tables are append-only.';
                 END IF;
 
@@ -106,8 +110,15 @@ def _create_guard_functions() -> None:
                 IF sanitized_old IS DISTINCT FROM sanitized_new THEN
                     RAISE EXCEPTION USING
                         ERRCODE = '{APPEND_ONLY_SQLSTATE}',
-                        MESSAGE = format('append-only trigger blocked %s on %I', TG_OP, TG_TABLE_NAME),
-                        DETAIL = 'Only allowlisted soft-delete markers may change on protected lineage/history tables.';
+                        MESSAGE = format(
+                            'append-only trigger blocked %s on %I',
+                            TG_OP,
+                            TG_TABLE_NAME
+                        ),
+                        DETAIL = (
+                            'Only allowlisted soft-delete markers may change on '
+                            'protected lineage/history tables.'
+                        );
                 END IF;
 
                 IF 'deleted_at' = ANY(allowlisted_columns) THEN
@@ -124,8 +135,15 @@ def _create_guard_functions() -> None:
 
                     RAISE EXCEPTION USING
                         ERRCODE = '{APPEND_ONLY_SQLSTATE}',
-                        MESSAGE = format('append-only trigger blocked %s on %I', TG_OP, TG_TABLE_NAME),
-                        DETAIL = 'deleted_at is write-once and may only change from NULL to non-NULL.';
+                        MESSAGE = format(
+                            'append-only trigger blocked %s on %I',
+                            TG_OP,
+                            TG_TABLE_NAME
+                        ),
+                        DETAIL = (
+                            'deleted_at is write-once and may only change from NULL '
+                            'to non-NULL.'
+                        );
                 END IF;
 
                 RETURN NEW;
@@ -145,8 +163,15 @@ def _create_guard_functions() -> None:
             BEGIN
                 RAISE EXCEPTION USING
                     ERRCODE = '{APPEND_ONLY_SQLSTATE}',
-                    MESSAGE = format('append-only trigger blocked %s on %I', TG_OP, TG_TABLE_NAME),
-                    DETAIL = 'Protected lineage/history tables are append-only and cannot be truncated.';
+                    MESSAGE = format(
+                        'append-only trigger blocked %s on %I',
+                        TG_OP,
+                        TG_TABLE_NAME
+                    ),
+                    DETAIL = (
+                        'Protected lineage/history tables are append-only and '
+                        'cannot be truncated.'
+                    );
             END;
             $$
             """
@@ -189,8 +214,14 @@ def _drop_table_triggers() -> None:
     """Remove append-only triggers from protected tables."""
 
     for spec in _PROTECTED_TABLE_SPECS:
-        op.execute(sa.text(f'DROP TRIGGER IF EXISTS {_TRUNCATE_TRIGGER_NAME} ON "{spec.table_name}"'))
-        op.execute(sa.text(f'DROP TRIGGER IF EXISTS {_ROW_TRIGGER_NAME} ON "{spec.table_name}"'))
+        op.execute(
+            sa.text(
+                f'DROP TRIGGER IF EXISTS {_TRUNCATE_TRIGGER_NAME} ON "{spec.table_name}"'
+            )
+        )
+        op.execute(
+            sa.text(f'DROP TRIGGER IF EXISTS {_ROW_TRIGGER_NAME} ON "{spec.table_name}"')
+        )
 
 
 def _drop_guard_functions() -> None:
