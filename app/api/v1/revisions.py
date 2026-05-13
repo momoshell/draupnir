@@ -635,6 +635,7 @@ async def list_revision_entities(
     db: Annotated[AsyncSession, Depends(get_db)],
     limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
     cursor: str | None = Query(default=None),
+    entity_id: str | None = Query(default=None),
     entity_type: str | None = Query(default=None),
     layout_ref: str | None = Query(default=None),
     layer_ref: str | None = Query(default=None),
@@ -649,6 +650,8 @@ async def list_revision_entities(
     pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
 
     query = select(RevisionEntity).where(RevisionEntity.drawing_revision_id == revision_id)
+    if entity_id is not None:
+        query = query.where(RevisionEntity.entity_id == entity_id)
     if entity_type is not None:
         query = query.where(RevisionEntity.entity_type == entity_type)
     if layout_ref is not None:
@@ -691,6 +694,32 @@ async def list_revision_entities(
         items=[RevisionEntityRead.model_validate(row) for row in page],
         next_cursor=next_cursor,
     )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/entities/{entity_id:path}",
+    response_model=RevisionEntityRead,
+)
+async def get_revision_entity(
+    revision_id: UUID,
+    entity_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RevisionEntityRead:
+    """Return a materialized entity row for a drawing revision by entity identifier."""
+
+    await _get_active_revision_manifest_or_409(revision_id, db)
+
+    result = await db.execute(
+        select(RevisionEntity).where(
+            (RevisionEntity.drawing_revision_id == revision_id)
+            & (RevisionEntity.entity_id == entity_id)
+        )
+    )
+    entity = result.scalar_one_or_none()
+    if entity is None:
+        raise_not_found("Revision entity", entity_id)
+
+    return RevisionEntityRead.model_validate(entity)
 
 
 @revisions_router.get(

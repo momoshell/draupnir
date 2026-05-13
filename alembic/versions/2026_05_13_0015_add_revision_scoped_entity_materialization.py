@@ -140,7 +140,10 @@ def upgrade() -> None:
             "counts_json",
             sa.JSON(),
             nullable=False,
-            comment="Materialized normalized row counts keyed by layouts, layers, blocks, and entities",
+            comment=(
+                "Materialized normalized row counts keyed by layouts, layers, "
+                "blocks, and entities"
+            ),
         ),
         sa.Column(
             "created_at",
@@ -301,7 +304,10 @@ def upgrade() -> None:
                 ref_column,
                 sa.String(length=255),
                 nullable=False,
-                comment=f"Stable non-null {table_label} reference extracted from the canonical {table_label} payload",
+                comment=(
+                    f"Stable non-null {table_label} reference extracted from "
+                    f"the canonical {table_label} payload"
+                ),
             ),
             sa.Column(
                 "created_at",
@@ -363,9 +369,24 @@ def upgrade() -> None:
                 name=f"ck_{table_name}_sequence_index_ge_0",
             ),
         )
-        op.create_index(op.f(f"ix_{table_name}_adapter_run_output_id"), table_name, ["adapter_run_output_id"], unique=False)
-        op.create_index(op.f(f"ix_{table_name}_extraction_profile_id"), table_name, ["extraction_profile_id"], unique=False)
-        op.create_index(op.f(f"ix_{table_name}_project_id"), table_name, ["project_id"], unique=False)
+        op.create_index(
+            op.f(f"ix_{table_name}_adapter_run_output_id"),
+            table_name,
+            ["adapter_run_output_id"],
+            unique=False,
+        )
+        op.create_index(
+            op.f(f"ix_{table_name}_extraction_profile_id"),
+            table_name,
+            ["extraction_profile_id"],
+            unique=False,
+        )
+        op.create_index(
+            op.f(f"ix_{table_name}_project_id"),
+            table_name,
+            ["project_id"],
+            unique=False,
+        )
         op.create_index(
             op.f(f"ix_{table_name}_{ref_column}"),
             table_name,
@@ -446,7 +467,10 @@ def upgrade() -> None:
             "entity_id",
             sa.String(length=255),
             nullable=False,
-            comment="Stable non-null entity identifier extracted or derived from the canonical entity payload",
+            comment=(
+                "Stable non-null entity identifier extracted or derived from the "
+                "canonical entity payload"
+            ),
         ),
         sa.Column(
             "entity_type",
@@ -464,7 +488,10 @@ def upgrade() -> None:
             "parent_entity_ref",
             sa.String(length=255),
             nullable=True,
-            comment="Optional raw parent entity reference extracted from the canonical entity payload",
+            comment=(
+                "Optional raw parent entity reference extracted from the canonical "
+                "entity payload"
+            ),
         ),
         sa.Column(
             "confidence_score",
@@ -500,7 +527,10 @@ def upgrade() -> None:
             "canonical_entity_json",
             sa.JSON(),
             nullable=True,
-            comment="Optional full canonical entity payload retained alongside split contract fields",
+            comment=(
+                "Optional full canonical entity payload retained alongside split "
+                "contract fields"
+            ),
         ),
         sa.Column(
             "layout_ref",
@@ -524,7 +554,10 @@ def upgrade() -> None:
             "source_identity",
             sa.String(length=255),
             nullable=True,
-            comment="Stable source identity derived from canonical entity top-level or provenance refs",
+            comment=(
+                "Stable source identity derived from canonical entity top-level or "
+                "provenance refs"
+            ),
         ),
         sa.Column(
             "source_hash",
@@ -536,25 +569,37 @@ def upgrade() -> None:
             "layout_id",
             sa.Uuid(),
             nullable=True,
-            comment="Best-effort resolved materialized layout row for layout_ref within the same drawing revision",
+            comment=(
+                "Best-effort resolved materialized layout row for layout_ref within "
+                "the same drawing revision"
+            ),
         ),
         sa.Column(
             "layer_id",
             sa.Uuid(),
             nullable=True,
-            comment="Best-effort resolved materialized layer row for layer_ref within the same drawing revision",
+            comment=(
+                "Best-effort resolved materialized layer row for layer_ref within "
+                "the same drawing revision"
+            ),
         ),
         sa.Column(
             "block_id",
             sa.Uuid(),
             nullable=True,
-            comment="Best-effort resolved materialized block row for block_ref within the same drawing revision",
+            comment=(
+                "Best-effort resolved materialized block row for block_ref within "
+                "the same drawing revision"
+            ),
         ),
         sa.Column(
             "parent_entity_row_id",
             sa.Uuid(),
             nullable=True,
-            comment="Best-effort resolved materialized parent entity row for parent_entity_ref within the same drawing revision",
+            comment=(
+                "Best-effort resolved materialized parent entity row for "
+                "parent_entity_ref within the same drawing revision"
+            ),
         ),
         sa.Column(
             "created_at",
@@ -635,9 +680,15 @@ def upgrade() -> None:
             "sequence_index",
             name="uq_revision_entities_revision_sequence_index",
         ),
-        sa.CheckConstraint("sequence_index >= 0", name="ck_revision_entities_sequence_index_ge_0"),
         sa.CheckConstraint(
-            "source_hash IS NULL OR (length(source_hash) = 64 AND source_hash = lower(source_hash))",
+            "sequence_index >= 0",
+            name="ck_revision_entities_sequence_index_ge_0",
+        ),
+        sa.CheckConstraint(
+            (
+                "source_hash IS NULL OR (length(source_hash) = 64 AND "
+                "source_hash = lower(source_hash))"
+            ),
             name="ck_revision_entities_source_hash",
         ),
     )
