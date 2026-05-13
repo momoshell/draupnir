@@ -483,12 +483,13 @@ HTTP/status semantics:
 - `200` - report exists for the revision
 - `404` with `NOT_FOUND` - revision or report does not exist in scope
 
-#### Revision Materialization List Endpoints
+#### Revision Materialization Endpoints
 
 - `GET /v1/revisions/{revision_id}/layouts`
 - `GET /v1/revisions/{revision_id}/layers`
 - `GET /v1/revisions/{revision_id}/blocks`
 - `GET /v1/revisions/{revision_id}/entities`
+- `GET /v1/revisions/{revision_id}/entities/{entity_id}`
 
 These endpoints expose immutable revision-scoped normalized rows materialized by
 workers from adapter output for query and pagination. They do not rewrite the
@@ -502,6 +503,15 @@ List behavior:
   `layouts`, `layers`, `blocks`, and `entities`.
 - `GET /v1/revisions/{revision_id}/entities` returns entity items plus the same
   manifest/count metadata envelope.
+- `GET /v1/revisions/{revision_id}/entities?entity_id=...` is an exact-match
+  composable filter on the list endpoint. It uses the same response envelope and
+  can be combined with the normal list query shape when clients want the fully
+  general exact-match lookup form.
+- `GET /v1/revisions/{revision_id}/entities/{entity_id}` returns the singular
+  materialized entity row for an exact entity identifier match.
+- For path lookup, clients must percent-encode URL-reserved characters in
+  `{entity_id}`. The query filter form is the fully general exact-match option
+  when client-side encoding or intermediary path handling would be ambiguous.
 
 HTTP/status semantics:
 
@@ -510,6 +520,15 @@ HTTP/status semantics:
 - `409` with `NORMALIZED_ENTITIES_NOT_MATERIALIZED` - revision exists but its
   normalized materialization rows are unavailable, such as pre-existing
   revisions created before this materialization contract
+
+Entity lookup semantics:
+
+- `GET /v1/revisions/{revision_id}/entities/{entity_id}` returns `404` with
+  `NOT_FOUND` when the revision exists but the exact entity identifier is absent
+  from that revision.
+- `GET /v1/revisions/{revision_id}/entities?entity_id=...` remains a normal
+  list request, so `200` may return an empty `items` array when no exact-match
+  entity row exists.
 
 #### Quantity Behavior From Validation And Review State
 

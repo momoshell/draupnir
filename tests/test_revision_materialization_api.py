@@ -3,6 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -116,7 +117,7 @@ class TestRevisionMaterializationApi:
                         source_hash="a" * 64,
                     ),
                     _build_contract_entity(
-                        entity_id="entity-paper",
+                        entity_id="entity/paper",
                         entity_type="circle",
                         layout_ref="Paper",
                         layer_ref="A-WALL",
@@ -290,7 +291,7 @@ class TestRevisionMaterializationApi:
                         source_hash="a" * 64,
                     ),
                     _build_contract_entity(
-                        entity_id="entity-paper",
+                        entity_id="entity/paper",
                         entity_type="circle",
                         layout_ref="Paper",
                         layer_ref="A-WALL",
@@ -309,12 +310,13 @@ class TestRevisionMaterializationApi:
         drawing_revision = drawing_revisions[0]
 
         filter_cases = [
+            ({"entity_id": "entity-parent"}, ["entity-parent"]),
             ({"entity_type": "insert"}, ["entity-parent"]),
-            ({"layout_ref": "Paper"}, ["entity-paper"]),
+            ({"layout_ref": "Paper"}, ["entity/paper"]),
             ({"layer_ref": "A-DOOR"}, ["entity-parent"]),
             ({"block_ref": "DOOR-1"}, ["entity-parent"]),
             ({"parent_entity_ref": "entity-parent"}, ["entity-child"]),
-            ({"source_identity": "entity-source-paper"}, ["entity-paper"]),
+            ({"source_identity": "entity-source-paper"}, ["entity/paper"]),
             ({"source_hash": "a" * 64}, ["entity-child"]),
         ]
 
@@ -325,6 +327,19 @@ class TestRevisionMaterializationApi:
             )
             assert response.status_code == 200
             assert [item["entity_id"] for item in response.json()["items"]] == expected_entity_ids
+
+        combined_filter_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities",
+            params={
+                "entity_id": "entity/paper",
+                "layout_ref": "Paper",
+                "source_identity": "entity-source-paper",
+            },
+        )
+        assert combined_filter_response.status_code == 200
+        assert [item["entity_id"] for item in combined_filter_response.json()["items"]] == [
+            "entity/paper"
+        ]
 
         first_page_response = await async_client.get(
             f"/v1/revisions/{drawing_revision.id}/entities",
@@ -344,7 +359,7 @@ class TestRevisionMaterializationApi:
         )
         assert second_page_response.status_code == 200
         second_page = second_page_response.json()
-        assert [item["entity_id"] for item in second_page["items"]] == ["entity-paper"]
+        assert [item["entity_id"] for item in second_page["items"]] == ["entity/paper"]
         assert second_page["next_cursor"] is None
 
         invalid_cursor_response = await async_client.get(
@@ -356,6 +371,83 @@ class TestRevisionMaterializationApi:
             "error": {
                 "code": ErrorCode.INVALID_CURSOR.value,
                 "message": "Invalid cursor format",
+                "details": None,
+            }
+        }
+
+    async def test_revision_entity_lookup_supports_singular_reads_and_encoded_paths(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Singular entity reads should resolve exact entity identifiers.
+
+        Encoded slashes must round-trip through the path converter.
+        """
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_materialized_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[
+                    _build_contract_entity(
+                        entity_id="entity-parent",
+                        entity_type="insert",
+                        layer_ref="A-DOOR",
+                        source_id="entity-source-parent",
+                    ),
+                    _build_contract_entity(
+                        entity_id="entity/paper",
+                        entity_type="circle",
+                        layout_ref="Paper",
+                        layer_ref="A-WALL",
+                        source_id="entity-source-paper",
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_materialized_ingestion)
+
+        await process_ingest_job(job.id)
+
+        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
+            await _load_project_outputs(project["id"])
+        )
+        drawing_revision = drawing_revisions[0]
+
+        entity_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/entity-parent"
+        )
+        assert entity_response.status_code == 200
+        assert entity_response.json()["entity_id"] == "entity-parent"
+        assert entity_response.json()["entity_type"] == "insert"
+
+        encoded_entity_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/{quote('entity/paper', safe='')}"
+        )
+        assert encoded_entity_response.status_code == 200
+        assert encoded_entity_response.json()["entity_id"] == "entity/paper"
+        assert encoded_entity_response.json()["layout_ref"] == "Paper"
+
+        missing_entity_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/missing-entity"
+        )
+        assert missing_entity_response.status_code == 404
+        assert missing_entity_response.json() == {
+            "error": {
+                "code": ErrorCode.NOT_FOUND.value,
+                "message": "Revision entity with identifier 'missing-entity' not found",
                 "details": None,
             }
         }
@@ -384,6 +476,9 @@ class TestRevisionMaterializationApi:
 
         missing_revision_id = uuid.uuid4()
         missing_response = await async_client.get(f"/v1/revisions/{missing_revision_id}/layouts")
+        missing_entity_response = await async_client.get(
+            f"/v1/revisions/{missing_revision_id}/entities/entity-parent"
+        )
 
         assert missing_response.status_code == 404
         assert missing_response.json() == {
@@ -393,11 +488,16 @@ class TestRevisionMaterializationApi:
                 "details": None,
             }
         }
+        assert missing_entity_response.status_code == 404
+        assert missing_entity_response.json() == missing_response.json()
 
         delete_response = await async_client.delete(f"/v1/projects/{project['id']}")
         assert delete_response.status_code == 204
 
         inactive_response = await async_client.get(f"/v1/revisions/{drawing_revision.id}/layouts")
+        inactive_entity_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/entity-parent"
+        )
 
         assert inactive_response.status_code == 404
         assert inactive_response.json() == {
@@ -407,6 +507,8 @@ class TestRevisionMaterializationApi:
                 "details": None,
             }
         }
+        assert inactive_entity_response.status_code == 404
+        assert inactive_entity_response.json() == inactive_response.json()
 
     async def test_materialization_endpoints_return_409_when_manifest_missing(
         self,
@@ -497,6 +599,9 @@ class TestRevisionMaterializationApi:
             await session.commit()
 
         response = await async_client.get(f"/v1/revisions/{revision_id}/entities")
+        singular_response = await async_client.get(
+            f"/v1/revisions/{revision_id}/entities/missing-entity"
+        )
 
         assert response.status_code == 409
         assert response.json() == {
@@ -509,6 +614,8 @@ class TestRevisionMaterializationApi:
                 "details": None,
             }
         }
+        assert singular_response.status_code == 409
+        assert singular_response.json() == response.json()
 
     async def test_materialization_endpoints_return_empty_lists_for_empty_manifest(
         self,
