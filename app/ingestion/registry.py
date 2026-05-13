@@ -48,7 +48,7 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
         license_name="GPL-3.0-or-later",
         capabilities=AdapterCapabilities(
         ),
-        confidence_range=(0.95, 1.0),
+        confidence_range=(0.2, 0.72),
         probes=(
             ProbeRequirement(
                 kind=ProbeKind.BINARY,

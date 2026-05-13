@@ -153,6 +153,9 @@ async def test_system_capabilities_reflect_registry_availability_consistently(
     assert adapters_by_key["vtracer_tesseract"]["status"] == "degraded"
     assert adapters_by_key["vtracer_tesseract"]["availability_reason"] == "missing_binary"
 
+    libredwg_confidence_range = adapters_by_key["libredwg"]["confidence_range"]
+    assert libredwg_confidence_range == {"min": 0.2, "max": 0.72}
+
 
 @pytest.mark.asyncio
 async def test_system_health_returns_ok_and_200_when_all_checks_are_healthy(
