@@ -483,6 +483,34 @@ HTTP/status semantics:
 - `200` - report exists for the revision
 - `404` with `NOT_FOUND` - revision or report does not exist in scope
 
+#### Revision Materialization List Endpoints
+
+- `GET /v1/revisions/{revision_id}/layouts`
+- `GET /v1/revisions/{revision_id}/layers`
+- `GET /v1/revisions/{revision_id}/blocks`
+- `GET /v1/revisions/{revision_id}/entities`
+
+These endpoints expose immutable revision-scoped normalized rows materialized by
+workers from adapter output for query and pagination. They do not rewrite the
+revision's canonical JSON payload.
+
+List behavior:
+
+- Cursor pagination follows the global API convention: `?cursor=` and `?limit=`
+  returning `{ items, next_cursor }`, default limit 50, max 200.
+- Responses include revision manifest metadata with materialized counts for
+  `layouts`, `layers`, `blocks`, and `entities`.
+- `GET /v1/revisions/{revision_id}/entities` returns entity items plus the same
+  manifest/count metadata envelope.
+
+HTTP/status semantics:
+
+- `200` - revision-scoped normalized rows are materialized and available
+- `404` with `NOT_FOUND` - revision does not exist in scope
+- `409` with `NORMALIZED_ENTITIES_NOT_MATERIALIZED` - revision exists but its
+  normalized materialization rows are unavailable, such as pre-existing
+  revisions created before this materialization contract
+
 #### Quantity Behavior From Validation And Review State
 
 Quantity eligibility is derived from both `validation_status` and `review_state`.
@@ -623,8 +651,9 @@ Database ownership and append-only policy:
   initial lineage fields `initial_job_id` and `initial_extraction_profile_id`.
 - Database-level append-only enforcement protects lineage/history tables:
   `files`, `extraction_profiles`, `adapter_run_outputs`,
-  `drawing_revisions`, `validation_reports`, `generated_artifacts`, and
-  `job_events`.
+  `drawing_revisions`, `validation_reports`, `revision_entity_manifests`,
+  `revision_layouts`, `revision_layers`, `revision_blocks`,
+  `revision_entities`, `generated_artifacts`, and `job_events`.
 - Enforcement is implemented with shared PostgreSQL trigger functions plus
   per-table row and truncate triggers. Row comparison is JSON-safe: trigger
   checks compare `to_jsonb(OLD)` and `to_jsonb(NEW)` after removing any
@@ -677,6 +706,9 @@ or other historical children.
 - Errors use a single envelope: `{ "error": { "code": str, "message": str, "details": object? } }`.
 - List endpoints support cursor pagination via `?cursor=` and `?limit=` and return
   `{ items, next_cursor }`. Default limit 50, max 200.
+- Revision materialization list endpoints under
+  `/v1/revisions/{revision_id}/layouts|layers|blocks|entities` also include
+  revision manifest/count metadata in the response envelope.
 - Timestamps are ISO-8601 UTC.
 - Ids are opaque ULIDs or UUIDs; clients must not parse them.
 - Idempotent mutating endpoints accept `Idempotency-Key` headers and return the
@@ -720,6 +752,7 @@ codes:
 - `IDEMPOTENCY_CONFLICT` - duplicate idempotency key is in progress or mapped to a different request fingerprint
 - `REVISION_CONFLICT` - changeset or reprocess base revision is stale at
   apply/request/finalization time
+- `NORMALIZED_ENTITIES_NOT_MATERIALIZED` - revision exists but revision-scoped normalized entity rows have not been materialized yet
 - `JOB_CANCELLED` - cancelled by user before completion
 - `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
 

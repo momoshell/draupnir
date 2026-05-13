@@ -6,18 +6,31 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import raise_not_found
+from app.api.pagination import (
+    decode_cursor_payload,
+    encode_cursor_payload,
+    raise_invalid_cursor,
+)
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.project import Project
+from app.models.revision_materialization import (
+    RevisionBlock,
+    RevisionEntity,
+    RevisionEntityManifest,
+    RevisionLayer,
+    RevisionLayout,
+)
 from app.models.validation_report import ValidationReport
 from app.schemas.revision import (
     AdapterRunOutputRead,
@@ -25,6 +38,16 @@ from app.schemas.revision import (
     DrawingRevisionRead,
     GeneratedArtifactListResponse,
     GeneratedArtifactRead,
+    RevisionBlockListResponse,
+    RevisionBlockRead,
+    RevisionEntityListResponse,
+    RevisionEntityManifestRead,
+    RevisionEntityRead,
+    RevisionLayerListResponse,
+    RevisionLayerRead,
+    RevisionLayoutListResponse,
+    RevisionLayoutRead,
+    RevisionMaterializationCounts,
 )
 from app.schemas.validation_report import (
     ValidationReportResponse,
@@ -80,6 +103,43 @@ def _decode_artifact_cursor(cursor: str) -> _GeneratedArtifactCursor:
         raise HTTPException(status_code=422, detail="Invalid cursor") from exc
 
 
+def _encode_materialization_cursor(sequence_index: int, row_id: UUID) -> str:
+    """Encode a materialization cursor from sequence index and row identifier."""
+
+    return encode_cursor_payload(
+        {
+            "sequence_index": sequence_index,
+            "id": str(row_id),
+        }
+    )
+
+
+def _decode_materialization_cursor(cursor: str) -> tuple[int, UUID]:
+    """Decode a materialization cursor into typed values."""
+
+    try:
+        cursor_data = decode_cursor_payload(cursor)
+        return int(cursor_data["sequence_index"]), UUID(str(cursor_data["id"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
+
+
+def _raise_entities_not_materialized(revision_id: UUID) -> None:
+    """Raise the standard conflict when revision entities are not materialized."""
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=create_error_response(
+            code=ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED,
+            message=(
+                f"Normalized entities for drawing revision '{revision_id}' "
+                "have not been materialized"
+            ),
+            details=None,
+        ),
+    )
+
+
 async def _get_active_file(file_id: UUID, db: AsyncSession) -> File | None:
     """Return an active file visible through a non-deleted project."""
 
@@ -116,6 +176,46 @@ async def _get_active_revision(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def _get_revision_manifest(
+    revision_id: UUID,
+    db: AsyncSession,
+) -> RevisionEntityManifest | None:
+    """Return the persisted materialization manifest for a revision, if present."""
+
+    result = await db.execute(
+        select(RevisionEntityManifest).where(
+            RevisionEntityManifest.drawing_revision_id == revision_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_active_revision_manifest_or_409(
+    revision_id: UUID,
+    db: AsyncSession,
+) -> RevisionEntityManifest:
+    """Return an active revision manifest or raise the standard missing errors."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    manifest = await _get_revision_manifest(revision_id, db)
+    if manifest is None:
+        _raise_entities_not_materialized(revision_id)
+
+    assert manifest is not None
+    return manifest
+
+
+def _manifest_counts(
+    manifest: RevisionEntityManifest,
+) -> RevisionMaterializationCounts:
+    """Convert persisted manifest counts to the public schema."""
+
+    return RevisionMaterializationCounts.model_validate(manifest.counts_json)
 
 
 @revisions_router.get("/files/{file_id}/revisions", response_model=DrawingRevisionListResponse)
@@ -387,6 +487,208 @@ async def list_revision_generated_artifacts(
 
     return GeneratedArtifactListResponse(
         items=[GeneratedArtifactRead.model_validate(artifact) for artifact in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/layouts",
+    response_model=RevisionLayoutListResponse,
+)
+async def list_revision_layouts(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> RevisionLayoutListResponse:
+    """List materialized layout rows for a drawing revision."""
+
+    manifest = await _get_active_revision_manifest_or_409(revision_id, db)
+    pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
+
+    query = select(RevisionLayout).where(RevisionLayout.drawing_revision_id == revision_id)
+    if pagination_cursor is not None:
+        sequence_index, row_id = pagination_cursor
+        query = query.where(
+            (RevisionLayout.sequence_index > sequence_index)
+            | (
+                (RevisionLayout.sequence_index == sequence_index)
+                & (RevisionLayout.id > row_id)
+            )
+        )
+
+    result = await db.execute(
+        query.order_by(
+            RevisionLayout.sequence_index.asc(),
+            RevisionLayout.id.asc(),
+        ).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+
+    counts = _manifest_counts(manifest)
+    return RevisionLayoutListResponse(
+        manifest=RevisionEntityManifestRead.model_validate(manifest),
+        counts=counts,
+        items=[RevisionLayoutRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/layers",
+    response_model=RevisionLayerListResponse,
+)
+async def list_revision_layers(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> RevisionLayerListResponse:
+    """List materialized layer rows for a drawing revision."""
+
+    manifest = await _get_active_revision_manifest_or_409(revision_id, db)
+    pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
+
+    query = select(RevisionLayer).where(RevisionLayer.drawing_revision_id == revision_id)
+    if pagination_cursor is not None:
+        sequence_index, row_id = pagination_cursor
+        query = query.where(
+            (RevisionLayer.sequence_index > sequence_index)
+            | ((RevisionLayer.sequence_index == sequence_index) & (RevisionLayer.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(RevisionLayer.sequence_index.asc(), RevisionLayer.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+
+    counts = _manifest_counts(manifest)
+    return RevisionLayerListResponse(
+        manifest=RevisionEntityManifestRead.model_validate(manifest),
+        counts=counts,
+        items=[RevisionLayerRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/blocks",
+    response_model=RevisionBlockListResponse,
+)
+async def list_revision_blocks(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> RevisionBlockListResponse:
+    """List materialized block rows for a drawing revision."""
+
+    manifest = await _get_active_revision_manifest_or_409(revision_id, db)
+    pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
+
+    query = select(RevisionBlock).where(RevisionBlock.drawing_revision_id == revision_id)
+    if pagination_cursor is not None:
+        sequence_index, row_id = pagination_cursor
+        query = query.where(
+            (RevisionBlock.sequence_index > sequence_index)
+            | ((RevisionBlock.sequence_index == sequence_index) & (RevisionBlock.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(RevisionBlock.sequence_index.asc(), RevisionBlock.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+
+    counts = _manifest_counts(manifest)
+    return RevisionBlockListResponse(
+        manifest=RevisionEntityManifestRead.model_validate(manifest),
+        counts=counts,
+        items=[RevisionBlockRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/entities",
+    response_model=RevisionEntityListResponse,
+)
+async def list_revision_entities(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+    entity_type: str | None = Query(default=None),
+    layout_ref: str | None = Query(default=None),
+    layer_ref: str | None = Query(default=None),
+    block_ref: str | None = Query(default=None),
+    parent_entity_ref: str | None = Query(default=None),
+    source_identity: str | None = Query(default=None),
+    source_hash: str | None = Query(default=None),
+) -> RevisionEntityListResponse:
+    """List materialized entity rows for a drawing revision."""
+
+    manifest = await _get_active_revision_manifest_or_409(revision_id, db)
+    pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
+
+    query = select(RevisionEntity).where(RevisionEntity.drawing_revision_id == revision_id)
+    if entity_type is not None:
+        query = query.where(RevisionEntity.entity_type == entity_type)
+    if layout_ref is not None:
+        query = query.where(RevisionEntity.layout_ref == layout_ref)
+    if layer_ref is not None:
+        query = query.where(RevisionEntity.layer_ref == layer_ref)
+    if block_ref is not None:
+        query = query.where(RevisionEntity.block_ref == block_ref)
+    if parent_entity_ref is not None:
+        query = query.where(RevisionEntity.parent_entity_ref == parent_entity_ref)
+    if source_identity is not None:
+        query = query.where(RevisionEntity.source_identity == source_identity)
+    if source_hash is not None:
+        query = query.where(RevisionEntity.source_hash == source_hash)
+    if pagination_cursor is not None:
+        sequence_index, row_id = pagination_cursor
+        query = query.where(
+            (RevisionEntity.sequence_index > sequence_index)
+            | ((RevisionEntity.sequence_index == sequence_index) & (RevisionEntity.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(
+            RevisionEntity.sequence_index.asc(),
+            RevisionEntity.id.asc(),
+        ).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+
+    counts = _manifest_counts(manifest)
+    return RevisionEntityListResponse(
+        manifest=RevisionEntityManifestRead.model_validate(manifest),
+        counts=counts,
+        items=[RevisionEntityRead.model_validate(row) for row in page],
         next_cursor=next_cursor,
     )
 

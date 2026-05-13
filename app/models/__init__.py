@@ -16,4 +16,5 @@ from . import idempotency_key as idempotency_key
 from . import job as job
 from . import job_event as job_event
 from . import project as project
+from . import revision_materialization as revision_materialization
 from . import validation_report as validation_report

@@ -3,6 +3,7 @@
 import asyncio
 import uuid
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -13,7 +14,7 @@ from sqlalchemy import select
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
-from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
@@ -23,6 +24,13 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job
 from app.models.job_event import JobEvent
 from app.models.project import Project
+from app.models.revision_materialization import (
+    RevisionBlock,
+    RevisionEntity,
+    RevisionEntityManifest,
+    RevisionLayer,
+    RevisionLayout,
+)
 from app.models.validation_report import ValidationReport
 from app.storage.keys import build_generated_artifact_storage_key
 from tests.conftest import requires_database
@@ -53,7 +61,7 @@ def fake_ingestion_runner(
 
     async def _fake_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
         recorded_requests.append(request)
-        return _build_fake_ingest_payload(request)
+        return _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
 
     monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
     return recorded_requests
@@ -65,6 +73,114 @@ def _as_uuid(value: str | uuid.UUID) -> uuid.UUID:
         return value
 
     return uuid.UUID(value)
+
+
+def _build_contract_entity(
+    *,
+    entity_id: str,
+    entity_type: str,
+    layer_ref: str,
+    layout_ref: str = "Model",
+    block_ref: str | None = None,
+    parent_entity_ref: str | None = None,
+    source_id: str,
+    source_hash: str | None = None,
+    confidence_score: float = _FAKE_RUNNER_CONFIDENCE_SCORE,
+) -> dict[str, Any]:
+    """Build a canonical contract-shaped entity payload for materialization tests."""
+    provenance_json: dict[str, Any] = {"source_id": source_id}
+    if source_hash is not None:
+        provenance_json["normalized_source_hash"] = source_hash
+
+    entity: dict[str, Any] = {
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "layout_ref": layout_ref,
+        "layer_ref": layer_ref,
+        "confidence_score": confidence_score,
+        "confidence_json": {"score": confidence_score, "basis": "adapter"},
+        "geometry_json": {"type": entity_type, "coordinates": [[0.0, 0.0], [1.0, 1.0]]},
+        "properties_json": {"layer": layer_ref},
+        "provenance_json": provenance_json,
+    }
+    if block_ref is not None:
+        entity["block_ref"] = block_ref
+    if parent_entity_ref is not None:
+        entity["parent_entity_ref"] = parent_entity_ref
+
+    return entity
+
+
+def _replace_fake_canonical_payload(
+    payload: IngestFinalizationPayload,
+    *,
+    layouts: list[dict[str, Any]] | None = None,
+    layers: list[dict[str, Any]] | None = None,
+    blocks: list[dict[str, Any]] | None = None,
+    entities: list[dict[str, Any]] | None = None,
+) -> IngestFinalizationPayload:
+    """Replace fake runner canonical payload sections and refresh derived checksum/report counts."""
+    next_layouts = deepcopy(
+        layouts if layouts is not None else [{"layout_ref": "Model", "name": "Model"}]
+    )
+    next_layers = deepcopy(
+        layers if layers is not None else [{"layer_ref": "A-WALL", "name": "A-WALL"}]
+    )
+    next_blocks = deepcopy(blocks if blocks is not None else [])
+    next_entities = deepcopy(
+        entities
+        if entities is not None
+        else [
+            _build_contract_entity(
+                entity_id="entity-001",
+                entity_type="line",
+                layer_ref="A-WALL",
+                source_id="entity-source-001",
+            )
+        ]
+    )
+    entity_counts = {
+        "layouts": len(next_layouts),
+        "layers": len(next_layers),
+        "blocks": len(next_blocks),
+        "entities": len(next_entities),
+    }
+    canonical_json = {
+        **payload.canonical_json,
+        "canonical_entity_schema_version": payload.canonical_entity_schema_version,
+        "schema_version": payload.canonical_entity_schema_version,
+        "layouts": next_layouts,
+        "layers": next_layers,
+        "blocks": next_blocks,
+        "entities": next_entities,
+        "entity_counts": entity_counts,
+    }
+    report_json = {
+        **payload.report_json,
+        "summary": {
+            **payload.report_json["summary"],
+            "entity_counts": entity_counts,
+        },
+    }
+    result_envelope = {
+        "adapter_key": payload.adapter_key,
+        "adapter_version": payload.adapter_version,
+        "input_family": payload.input_family,
+        "canonical_entity_schema_version": payload.canonical_entity_schema_version,
+        "canonical_json": canonical_json,
+        "provenance_json": payload.provenance_json,
+        "confidence_json": payload.confidence_json,
+        "confidence_score": payload.confidence_score,
+        "warnings_json": payload.warnings_json,
+        "diagnostics_json": payload.diagnostics_json,
+    }
+    return replace(
+        payload,
+        canonical_json=canonical_json,
+        report_json=report_json,
+        result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
+    )
 
 
 def _assert_validation_report_json_matches_columns(report: ValidationReport) -> None:
@@ -240,6 +356,71 @@ async def _load_job_events(job_id: uuid.UUID) -> list[JobEvent]:
         )
 
 
+async def _load_project_materialization(
+    project_id: str | uuid.UUID,
+) -> tuple[
+    list[RevisionEntityManifest],
+    list[RevisionLayout],
+    list[RevisionLayer],
+    list[RevisionBlock],
+    list[RevisionEntity],
+]:
+    """Load revision-scoped normalized materialization rows for one project."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    normalized_project_id = _as_uuid(project_id)
+
+    async with session_maker() as session:
+        manifests = list(
+            (
+                await session.execute(
+                    select(RevisionEntityManifest)
+                    .where(RevisionEntityManifest.project_id == normalized_project_id)
+                    .order_by(RevisionEntityManifest.created_at, RevisionEntityManifest.id)
+                )
+            ).scalars()
+        )
+        layouts = list(
+            (
+                await session.execute(
+                    select(RevisionLayout)
+                    .where(RevisionLayout.project_id == normalized_project_id)
+                    .order_by(RevisionLayout.drawing_revision_id, RevisionLayout.sequence_index)
+                )
+            ).scalars()
+        )
+        layers = list(
+            (
+                await session.execute(
+                    select(RevisionLayer)
+                    .where(RevisionLayer.project_id == normalized_project_id)
+                    .order_by(RevisionLayer.drawing_revision_id, RevisionLayer.sequence_index)
+                )
+            ).scalars()
+        )
+        blocks = list(
+            (
+                await session.execute(
+                    select(RevisionBlock)
+                    .where(RevisionBlock.project_id == normalized_project_id)
+                    .order_by(RevisionBlock.drawing_revision_id, RevisionBlock.sequence_index)
+                )
+            ).scalars()
+        )
+        entities = list(
+            (
+                await session.execute(
+                    select(RevisionEntity)
+                    .where(RevisionEntity.project_id == normalized_project_id)
+                    .order_by(RevisionEntity.drawing_revision_id, RevisionEntity.sequence_index)
+                )
+            ).scalars()
+        )
+
+    return manifests, layouts, layers, blocks, entities
+
+
 @requires_database
 class TestIngestOutputPersistence:
     """Tests for durable ingest output persistence and finalization guards."""
@@ -278,6 +459,13 @@ class TestIngestOutputPersistence:
         drawing_revision = drawing_revisions[0]
         validation_report = validation_reports[0]
         generated_artifact = generated_artifacts[0]
+        manifests, layouts, layers, blocks, entities = await _load_project_materialization(
+            project["id"]
+        )
+        manifest = manifests[0]
+        layout = layouts[0]
+        layer = layers[0]
+        entity = entities[0]
 
         assert adapter_output.project_id == job.project_id
         assert adapter_output.source_file_id == job.file_id
@@ -293,10 +481,29 @@ class TestIngestOutputPersistence:
         assert adapter_output.canonical_json == {
             "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
             "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-            "layouts": [{"name": "Model"}],
-            "layers": [{"name": "A-WALL"}],
+            "layouts": [{"layout_ref": "Model", "name": "Model"}],
+            "layers": [{"layer_ref": "A-WALL", "name": "A-WALL"}],
             "blocks": [],
-            "entities": [{"kind": "line", "layer": "A-WALL"}],
+            "entities": [
+                {
+                    "entity_id": "entity-001",
+                    "entity_type": "line",
+                    "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    "layout_ref": "Model",
+                    "layer_ref": "A-WALL",
+                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                    "confidence_json": {
+                        "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "basis": "adapter",
+                    },
+                    "geometry_json": {
+                        "type": "line",
+                        "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                    },
+                    "properties_json": {"layer": "A-WALL"},
+                    "provenance_json": {"source_id": "entity-source-001"},
+                }
+            ],
             "entity_counts": {
                 "layouts": 1,
                 "layers": 1,
@@ -369,6 +576,476 @@ class TestIngestOutputPersistence:
             adapter_output=adapter_output,
             predecessor_artifact_id=None,
         )
+        assert len(manifests) == 1
+        assert len(layouts) == 1
+        assert len(layers) == 1
+        assert blocks == []
+        assert len(entities) == 1
+
+        assert manifest.project_id == job.project_id
+        assert manifest.source_file_id == job.file_id
+        assert manifest.extraction_profile_id == job.extraction_profile_id
+        assert manifest.source_job_id == job.id
+        assert manifest.drawing_revision_id == drawing_revision.id
+        assert manifest.adapter_run_output_id == adapter_output.id
+        assert manifest.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        assert manifest.counts_json == {"layouts": 1, "layers": 1, "blocks": 0, "entities": 1}
+
+        assert layout.project_id == job.project_id
+        assert layout.source_file_id == job.file_id
+        assert layout.extraction_profile_id == job.extraction_profile_id
+        assert layout.source_job_id == job.id
+        assert layout.drawing_revision_id == drawing_revision.id
+        assert layout.adapter_run_output_id == adapter_output.id
+        assert layout.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        assert layout.sequence_index == 0
+        assert layout.layout_ref == "Model"
+        assert layout.payload_json == {"layout_ref": "Model", "name": "Model"}
+
+        assert layer.project_id == job.project_id
+        assert layer.source_file_id == job.file_id
+        assert layer.extraction_profile_id == job.extraction_profile_id
+        assert layer.source_job_id == job.id
+        assert layer.drawing_revision_id == drawing_revision.id
+        assert layer.adapter_run_output_id == adapter_output.id
+        assert layer.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        assert layer.sequence_index == 0
+        assert layer.layer_ref == "A-WALL"
+        assert layer.payload_json == {"layer_ref": "A-WALL", "name": "A-WALL"}
+
+        assert entity.project_id == job.project_id
+        assert entity.source_file_id == job.file_id
+        assert entity.extraction_profile_id == job.extraction_profile_id
+        assert entity.source_job_id == job.id
+        assert entity.drawing_revision_id == drawing_revision.id
+        assert entity.adapter_run_output_id == adapter_output.id
+        assert entity.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        assert entity.sequence_index == 0
+        assert entity.entity_id == "entity-001"
+        assert entity.entity_type == "line"
+        assert entity.entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
+        assert entity.parent_entity_ref is None
+        assert entity.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert entity.confidence_json == {
+            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+            "basis": "adapter",
+        }
+        assert entity.geometry_json == {
+            "type": "line",
+            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+        }
+        assert entity.properties_json == {"layer": "A-WALL"}
+        assert entity.provenance_json == {"source_id": "entity-source-001"}
+        assert entity.layout_ref == "Model"
+        assert entity.layer_ref == "A-WALL"
+        assert entity.block_ref is None
+        assert entity.source_identity == "entity-source-001"
+        assert entity.source_hash is None
+        assert entity.layout_id == layout.id
+        assert entity.layer_id == layer.id
+        assert entity.block_id is None
+        assert entity.parent_entity_row_id is None
+        assert entity.canonical_entity_json == {
+            "entity_id": "entity-001",
+            "entity_type": "line",
+            "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "layout_ref": "Model",
+            "layer_ref": "A-WALL",
+            "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+            "confidence_json": {
+                "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                "basis": "adapter",
+            },
+            "geometry_json": {
+                "type": "line",
+                "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+            },
+            "properties_json": {"layer": "A-WALL"},
+            "provenance_json": {"source_id": "entity-source-001"},
+        }
+
+    async def test_revision_materialization_resolves_entity_relationship_columns(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Materialization should resolve best-effort layout/layer/block/parent foreign keys."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_relationship_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                blocks=[{"block_ref": "DOOR-1", "name": "DOOR-1"}],
+                entities=[
+                    _build_contract_entity(
+                        entity_id="entity-parent",
+                        entity_type="insert",
+                        layer_ref="A-WALL",
+                        block_ref="DOOR-1",
+                        source_id="entity-source-parent",
+                    ),
+                    _build_contract_entity(
+                        entity_id="entity-child",
+                        entity_type="line",
+                        layer_ref="A-WALL",
+                        parent_entity_ref="entity-parent",
+                        source_id="entity-source-child",
+                        source_hash="a" * 64,
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_relationship_ingestion)
+
+        await process_ingest_job(job.id)
+
+        manifests, layouts, layers, blocks, entities = await _load_project_materialization(
+            project["id"]
+        )
+
+        assert manifests[0].counts_json == {"layouts": 1, "layers": 1, "blocks": 1, "entities": 2}
+        assert len(layouts) == 1
+        assert len(layers) == 1
+        assert len(blocks) == 1
+        assert len(entities) == 2
+
+        parent_entity, child_entity = entities
+        layout = layouts[0]
+        layer = layers[0]
+        block = blocks[0]
+
+        assert parent_entity.entity_id == "entity-parent"
+        assert parent_entity.block_ref == "DOOR-1"
+        assert parent_entity.layout_id == layout.id
+        assert parent_entity.layer_id == layer.id
+        assert parent_entity.block_id == block.id
+        assert parent_entity.parent_entity_row_id is None
+
+        assert child_entity.entity_id == "entity-child"
+        assert child_entity.parent_entity_ref == "entity-parent"
+        assert child_entity.layout_id == layout.id
+        assert child_entity.layer_id == layer.id
+        assert child_entity.block_id is None
+        assert child_entity.parent_entity_row_id == parent_entity.id
+        assert child_entity.source_hash == "a" * 64
+
+    async def test_revision_materialization_accepts_numeric_legacy_confidence(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DXF-style numeric confidence should materialize as the entity score and JSON."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_numeric_confidence_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            entity = _build_contract_entity(
+                entity_id="entity-dxf-001",
+                entity_type="line",
+                layer_ref="A-WALL",
+                source_id="entity-source-dxf-001",
+            )
+            entity.pop("confidence_score")
+            entity.pop("confidence_json")
+            entity["confidence"] = 0.0
+            return _replace_fake_canonical_payload(payload, entities=[entity])
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_numeric_confidence_ingestion)
+
+        await process_ingest_job(job.id)
+
+        manifests, layouts, layers, blocks, entities = await _load_project_materialization(
+            project["id"]
+        )
+
+        assert len(manifests) == 1
+        assert len(layouts) == 1
+        assert len(layers) == 1
+        assert blocks == []
+        assert len(entities) == 1
+        assert entities[0].confidence_score == 0.0
+        assert entities[0].confidence_json == {"score": 0.0}
+        assert entities[0].canonical_entity_json is not None
+        assert entities[0].canonical_entity_json["confidence"] == 0.0
+
+    async def test_revision_materialization_avoids_fallback_ref_collisions(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Fallback refs should suffix collisions instead of reusing existing explicit refs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_collision_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "layout-000001", "name": "Primary"}, {}],
+                layers=[{"layer_ref": "layer-000001", "name": "Walls"}, {}],
+                blocks=[{"block_ref": "block-000001", "name": "Door"}, {}],
+                entities=[
+                    _build_contract_entity(
+                        entity_id="entity-000001",
+                        entity_type="insert",
+                        layer_ref="layer-000001",
+                        layout_ref="layout-000001",
+                        block_ref="block-000001",
+                        source_id="entity-source-001",
+                    ),
+                    {
+                        "entity_type": "line",
+                        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "confidence_json": {
+                            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                            "basis": "adapter",
+                        },
+                        "geometry_json": {
+                            "type": "line",
+                            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                        },
+                        "properties_json": {},
+                        "provenance_json": {},
+                    },
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_collision_ingestion)
+
+        await process_ingest_job(job.id)
+
+        _, layouts, layers, blocks, entities = await _load_project_materialization(project["id"])
+
+        assert [layout.layout_ref for layout in layouts] == ["layout-000001", "layout-000001-1"]
+        assert [layer.layer_ref for layer in layers] == ["layer-000001", "layer-000001-1"]
+        assert [block.block_ref for block in blocks] == ["block-000001", "block-000001-1"]
+        assert [entity.entity_id for entity in entities] == ["entity-000001", "entity-000001-1"]
+
+    async def test_revision_materialization_inserts_parent_before_children_across_chunks(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Entity inserts should satisfy immediate parent self-FKs even across chunk boundaries."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_large_hierarchy_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            child_entities = [
+                _build_contract_entity(
+                    entity_id=f"entity-child-{index:03d}",
+                    entity_type="line",
+                    layer_ref="A-WALL",
+                    parent_entity_ref="entity-parent",
+                    source_id=f"entity-source-child-{index:03d}",
+                )
+                for index in range(501)
+            ]
+            parent_entity = _build_contract_entity(
+                entity_id="entity-parent",
+                entity_type="insert",
+                layer_ref="A-WALL",
+                source_id="entity-source-parent",
+            )
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[*child_entities, parent_entity],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_large_hierarchy_ingestion)
+
+        await process_ingest_job(job.id)
+
+        manifests, layouts, layers, blocks, entities = await _load_project_materialization(
+            project["id"]
+        )
+
+        assert len(manifests) == 1
+        assert len(layouts) == 1
+        assert len(layers) == 1
+        assert blocks == []
+        assert len(entities) == 502
+
+        parent_entity = next(entity for entity in entities if entity.entity_id == "entity-parent")
+        child_entities = [entity for entity in entities if entity.entity_id != "entity-parent"]
+
+        assert parent_entity.sequence_index == 501
+        assert all(entity.parent_entity_row_id == parent_entity.id for entity in child_entities)
+
+    async def test_revision_materialization_manifest_distinguishes_empty_from_legacy_missing(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Valid empty revisions should persist a zero-count manifest while legacy rows do not."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        empty_project = await _create_project(async_client)
+        empty_uploaded = await _upload_file(async_client, empty_project["id"])
+        empty_job = await _get_job_for_file(str(empty_uploaded["id"]))
+
+        async def _run_empty_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[],
+                layers=[],
+                blocks=[],
+                entities=[],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_empty_ingestion)
+
+        await process_ingest_job(empty_job.id)
+
+        empty_outputs = await _load_project_outputs(empty_project["id"])
+        empty_materialization = await _load_project_materialization(empty_project["id"])
+
+        assert len(empty_outputs[1]) == 1
+        assert len(empty_materialization[0]) == 1
+        assert empty_materialization[0][0].drawing_revision_id == empty_outputs[1][0].id
+        assert empty_materialization[0][0].counts_json == {
+            "layouts": 0,
+            "layers": 0,
+            "blocks": 0,
+            "entities": 0,
+        }
+        assert empty_materialization[1] == []
+        assert empty_materialization[2] == []
+        assert empty_materialization[3] == []
+        assert empty_materialization[4] == []
+
+        legacy_project = await _create_project(async_client)
+        legacy_uploaded = await _upload_file(async_client, legacy_project["id"])
+        legacy_job = await _get_job_for_file(str(legacy_uploaded["id"]))
+        legacy_adapter_output_id = uuid.uuid4()
+        legacy_revision_id = uuid.uuid4()
+        assert legacy_job.extraction_profile_id is not None
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                AdapterRunOutput(
+                    id=legacy_adapter_output_id,
+                    project_id=legacy_job.project_id,
+                    source_file_id=legacy_job.file_id,
+                    extraction_profile_id=legacy_job.extraction_profile_id,
+                    source_job_id=legacy_job.id,
+                    adapter_key=_FAKE_RUNNER_ADAPTER_KEY,
+                    adapter_version=_FAKE_RUNNER_ADAPTER_VERSION,
+                    input_family="pdf_vector",
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    canonical_json={
+                        "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layouts": [],
+                        "layers": [],
+                        "blocks": [],
+                        "entities": [],
+                        "entity_counts": {
+                            "layouts": 0,
+                            "layers": 0,
+                            "blocks": 0,
+                            "entities": 0,
+                        },
+                    },
+                    provenance_json={
+                        "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "adapter": {
+                            "key": _FAKE_RUNNER_ADAPTER_KEY,
+                            "version": _FAKE_RUNNER_ADAPTER_VERSION,
+                        },
+                        "source": {
+                            "file_id": str(legacy_job.file_id),
+                            "job_id": str(legacy_job.id),
+                            "extraction_profile_id": str(legacy_job.extraction_profile_id),
+                            "input_family": "pdf_vector",
+                            "revision_kind": "ingest",
+                        },
+                        "records": [],
+                        "generated_at": "2026-01-02T03:04:05+00:00",
+                    },
+                    confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                    warnings_json=[],
+                    diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
+                    result_checksum_sha256="0" * 64,
+                )
+            )
+            session.add(
+                DrawingRevision(
+                    id=legacy_revision_id,
+                    project_id=legacy_job.project_id,
+                    source_file_id=legacy_job.file_id,
+                    extraction_profile_id=legacy_job.extraction_profile_id,
+                    source_job_id=legacy_job.id,
+                    adapter_run_output_id=legacy_adapter_output_id,
+                    predecessor_revision_id=None,
+                    revision_sequence=1,
+                    revision_kind="ingest",
+                    review_state=_FAKE_RUNNER_REVIEW_STATE,
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                )
+            )
+            await session.commit()
+
+        legacy_outputs = await _load_project_outputs(legacy_project["id"])
+        legacy_materialization = await _load_project_materialization(legacy_project["id"])
+
+        assert len(legacy_outputs[1]) == 1
+        assert legacy_outputs[1][0].id == legacy_revision_id
+        assert legacy_materialization[0] == []
+        assert legacy_materialization[1] == []
+        assert legacy_materialization[2] == []
+        assert legacy_materialization[3] == []
+        assert legacy_materialization[4] == []
 
     async def test_delete_project_soft_deletes_generated_artifacts_without_removing_rows(
         self,
@@ -432,7 +1109,7 @@ class TestIngestOutputPersistence:
         async def _run_ingestion_with_stale_report(
             request: IngestionRunRequest,
         ) -> IngestFinalizationPayload:
-            payload = _build_fake_ingest_payload(request)
+            payload = _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
             payload.report_json.pop("provenance", None)
             payload.report_json["confidence"] = {
                 "score": payload.confidence_score,
@@ -602,7 +1279,7 @@ class TestIngestOutputPersistence:
         async def _run_ingestion_with_trd_values(
             request: IngestionRunRequest,
         ) -> IngestFinalizationPayload:
-            payload = _build_fake_ingest_payload(request)
+            payload = _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
             validation_status = "valid_with_warnings"
             quantity_gate = "allowed_provisional"
             return replace(
@@ -956,7 +1633,7 @@ class TestIngestOutputPersistence:
             request: IngestionRunRequest,
         ) -> IngestFinalizationPayload:
             await _update_job(job.id, cancel_requested=True)
-            return _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
 
         monkeypatch.setattr(worker_module, "run_ingestion", _cancel_during_work)
 
@@ -1053,7 +1730,7 @@ class TestIngestOutputPersistence:
         original_emit_job_event = worker_module.emit_job_event
 
         async def _run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
-            return _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
 
         async def _fail_success_event(*args: Any, **kwargs: Any) -> None:
             if kwargs.get("message") == "Job succeeded":
@@ -1087,6 +1764,20 @@ class TestIngestOutputPersistence:
         assert drawing_revisions == []
         assert validation_reports == []
         assert generated_artifacts == []
+
+        (
+            manifests,
+            layouts,
+            layers,
+            blocks,
+            entities,
+        ) = await _load_project_materialization(project["id"])
+
+        assert manifests == []
+        assert layouts == []
+        assert layers == []
+        assert blocks == []
+        assert entities == []
 
     async def test_process_ingest_job_precommit_cancellation_cleans_storage_without_outputs(
         self,
@@ -1132,7 +1823,7 @@ class TestIngestOutputPersistence:
         original_emit_job_event = worker_module.emit_job_event
 
         async def _run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
-            return _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
 
         async def _cancel_success_event(*args: Any, **kwargs: Any) -> None:
             if kwargs.get("message") == "Job succeeded":
@@ -1166,3 +1857,17 @@ class TestIngestOutputPersistence:
         assert drawing_revisions == []
         assert validation_reports == []
         assert generated_artifacts == []
+
+        (
+            manifests,
+            layouts,
+            layers,
+            blocks,
+            entities,
+        ) = await _load_project_materialization(project["id"])
+
+        assert manifests == []
+        assert layouts == []
+        assert layers == []
+        assert blocks == []
+        assert entities == []

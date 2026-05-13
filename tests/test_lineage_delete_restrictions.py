@@ -26,7 +26,11 @@ from app.models.job import Job
 from app.models.project import Project
 from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
-from tests.test_ingest_output_persistence import _as_uuid, _load_project_outputs
+from tests.test_ingest_output_persistence import (
+    _as_uuid,
+    _load_project_outputs,
+    _replace_fake_canonical_payload,
+)
 from tests.test_jobs import (
     _build_fake_ingest_payload,
     _create_project,
@@ -200,6 +204,196 @@ _EXPECTED_LINEAGE_FOREIGN_KEYS: tuple[_ForeignKeyDeleteRule, ...] = (
         ("id",),
         "RESTRICT",
     ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("source_file_id", "project_id"),
+        "files",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("extraction_profile_id", "project_id"),
+        "extraction_profiles",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("adapter_run_output_id", "project_id"),
+        "adapter_run_outputs",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("drawing_revision_id", "project_id"),
+        "drawing_revisions",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("project_id",),
+        "projects",
+        ("id",),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entity_manifests",
+        ("source_job_id",),
+        "jobs",
+        ("id",),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layouts",
+        ("source_file_id", "project_id"),
+        "files",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layouts",
+        ("extraction_profile_id", "project_id"),
+        "extraction_profiles",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layouts",
+        ("adapter_run_output_id", "project_id"),
+        "adapter_run_outputs",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layouts",
+        ("drawing_revision_id", "project_id"),
+        "drawing_revisions",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule("revision_layouts", ("project_id",), "projects", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule("revision_layouts", ("source_job_id",), "jobs", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule(
+        "revision_layers",
+        ("source_file_id", "project_id"),
+        "files",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layers",
+        ("extraction_profile_id", "project_id"),
+        "extraction_profiles",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layers",
+        ("adapter_run_output_id", "project_id"),
+        "adapter_run_outputs",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_layers",
+        ("drawing_revision_id", "project_id"),
+        "drawing_revisions",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule("revision_layers", ("project_id",), "projects", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule("revision_layers", ("source_job_id",), "jobs", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule(
+        "revision_blocks",
+        ("source_file_id", "project_id"),
+        "files",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_blocks",
+        ("extraction_profile_id", "project_id"),
+        "extraction_profiles",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_blocks",
+        ("adapter_run_output_id", "project_id"),
+        "adapter_run_outputs",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_blocks",
+        ("drawing_revision_id", "project_id"),
+        "drawing_revisions",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule("revision_blocks", ("project_id",), "projects", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule("revision_blocks", ("source_job_id",), "jobs", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("source_file_id", "project_id"),
+        "files",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("extraction_profile_id", "project_id"),
+        "extraction_profiles",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("adapter_run_output_id", "project_id"),
+        "adapter_run_outputs",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("drawing_revision_id", "project_id"),
+        "drawing_revisions",
+        ("id", "project_id"),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule("revision_entities", ("project_id",), "projects", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule("revision_entities", ("source_job_id",), "jobs", ("id",), "RESTRICT"),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("layout_id",),
+        "revision_layouts",
+        ("id",),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("layer_id",),
+        "revision_layers",
+        ("id",),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("block_id",),
+        "revision_blocks",
+        ("id",),
+        "RESTRICT",
+    ),
+    _ForeignKeyDeleteRule(
+        "revision_entities",
+        ("parent_entity_row_id",),
+        "revision_entities",
+        ("id",),
+        "RESTRICT",
+    ),
 )
 
 
@@ -235,6 +429,44 @@ def _inspect_lineage_foreign_keys(
     return installed_rules
 
 
+def _inspect_materialization_schema(
+    sync_connection: sa.Connection,
+) -> dict[str, Any]:
+    """Inspect materialization columns, unique constraints, and indexes in PostgreSQL."""
+    inspector = sa.inspect(sync_connection)
+    tables = (
+        "revision_layouts",
+        "revision_layers",
+        "revision_blocks",
+        "revision_entities",
+    )
+    return {
+        "columns": {
+            table_name: {
+                str(column["name"]): {
+                    "nullable": bool(column["nullable"]),
+                }
+                for column in inspector.get_columns(table_name)
+            }
+            for table_name in tables
+        },
+        "unique_constraints": {
+            table_name: {
+                tuple(constraint["column_names"]): str(constraint["name"])
+                for constraint in inspector.get_unique_constraints(table_name)
+            }
+            for table_name in tables
+        },
+        "indexes": {
+            table_name: {
+                tuple(index["column_names"]): str(index["name"])
+                for index in inspector.get_indexes(table_name)
+            }
+            for table_name in tables
+        },
+    }
+
+
 async def _load_installed_lineage_foreign_keys(
 ) -> dict[tuple[str, tuple[str, ...], str, tuple[str, ...]], str]:
     """Inspect the migrated database instead of ORM metadata."""
@@ -247,6 +479,16 @@ async def _load_installed_lineage_foreign_keys(
         return await connection.run_sync(_inspect_lineage_foreign_keys)
 
 
+async def _load_materialization_schema() -> dict[str, Any]:
+    """Inspect the migrated materialization schema instead of ORM metadata."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        connection = await session.connection()
+        return await connection.run_sync(_inspect_materialization_schema)
+
+
 @pytest.fixture(autouse=True)
 def fake_ingestion_runner(
     monkeypatch: pytest.MonkeyPatch,
@@ -257,7 +499,7 @@ def fake_ingestion_runner(
 
     async def _fake_run_ingestion(request: IngestionRunRequest) -> IngestFinalizationPayload:
         recorded_requests.append(request)
-        return _build_fake_ingest_payload(request)
+        return _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
 
     monkeypatch.setattr(worker_module, "run_ingestion", _fake_run_ingestion)
     return recorded_requests
@@ -355,6 +597,68 @@ class TestLineageDeleteRestrictions:
             )
             assert edge in installed_rules
             assert installed_rules[edge] == expected_rule.ondelete
+
+    async def test_materialization_schema_matches_revision_contract(self) -> None:
+        """Materialization tables should expose the TRD contract columns and indexes."""
+        _ = self
+
+        schema = await _load_materialization_schema()
+        columns = schema["columns"]
+        unique_constraints = schema["unique_constraints"]
+        indexes = schema["indexes"]
+
+        for table_name, ref_column in (
+            ("revision_layouts", "layout_ref"),
+            ("revision_layers", "layer_ref"),
+            ("revision_blocks", "block_ref"),
+        ):
+            assert columns[table_name][ref_column]["nullable"] is False
+            assert ("drawing_revision_id", ref_column) in unique_constraints[table_name]
+
+        revision_entity_columns = columns["revision_entities"]
+        for required_column in (
+            "entity_id",
+            "entity_type",
+            "entity_schema_version",
+            "parent_entity_ref",
+            "confidence_score",
+            "confidence_json",
+            "geometry_json",
+            "properties_json",
+            "provenance_json",
+            "canonical_entity_json",
+            "layout_ref",
+            "layer_ref",
+            "block_ref",
+            "source_identity",
+            "source_hash",
+            "layout_id",
+            "layer_id",
+            "block_id",
+            "parent_entity_row_id",
+        ):
+            assert required_column in revision_entity_columns
+
+        for nullable_fk_column in ("layout_id", "layer_id", "block_id", "parent_entity_row_id"):
+            assert revision_entity_columns[nullable_fk_column]["nullable"] is True
+
+        assert ("drawing_revision_id", "entity_id") in unique_constraints["revision_entities"]
+        assert ("drawing_revision_id", "sequence_index") in unique_constraints["revision_entities"]
+        assert (
+            "drawing_revision_id",
+            "entity_type",
+            "sequence_index",
+            "id",
+        ) in indexes["revision_entities"]
+        for index_columns in (
+            ("drawing_revision_id", "layout_ref"),
+            ("drawing_revision_id", "layer_ref"),
+            ("drawing_revision_id", "block_ref"),
+            ("drawing_revision_id", "parent_entity_ref"),
+            ("drawing_revision_id", "source_hash"),
+            ("drawing_revision_id", "source_identity"),
+        ):
+            assert index_columns in indexes["revision_entities"]
 
     @pytest.mark.parametrize(
         "model_name",
