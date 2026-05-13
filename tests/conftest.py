@@ -28,6 +28,11 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "validation_reports",
     "generated_artifacts",
     "job_events",
+    "revision_entity_manifests",
+    "revision_layouts",
+    "revision_layers",
+    "revision_blocks",
+    "revision_entities",
 )
 APPEND_ONLY_ROW_TRIGGER_NAME = "trg_append_only_row_guard"
 APPEND_ONLY_TRUNCATE_TRIGGER_NAME = "trg_append_only_truncate_guard"

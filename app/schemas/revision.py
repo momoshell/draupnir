@@ -1,6 +1,7 @@
 """Pydantic schemas for revision discoverability endpoints."""
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -119,4 +120,220 @@ class GeneratedArtifactListResponse(BaseModel):
     next_cursor: str | None = Field(
         None,
         description="Opaque pagination cursor for the next artifact page when more results exist",
+    )
+
+
+class RevisionMaterializationCounts(BaseModel):
+    """Summary counts for revision-scoped normalized materialization rows."""
+
+    layouts: int = Field(..., ge=0, description="Total materialized layout rows")
+    layers: int = Field(..., ge=0, description="Total materialized layer rows")
+    blocks: int = Field(..., ge=0, description="Total materialized block rows")
+    entities: int = Field(..., ge=0, description="Total materialized entity rows")
+
+
+class RevisionEntityManifestRead(BaseModel):
+    """Schema for normalized-entity materialization manifest metadata."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(..., description="Unique revision entity materialization manifest identifier")
+    project_id: UUID = Field(..., description="Owning project identifier")
+    source_file_id: UUID = Field(..., description="Source file identifier")
+    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    source_job_id: UUID = Field(..., description="Source materialization job identifier")
+    drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
+    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    canonical_entity_schema_version: str = Field(
+        ...,
+        description="Canonical entity schema version used by the materialized revision",
+    )
+    counts: RevisionMaterializationCounts = Field(
+        validation_alias="counts_json",
+        description="Materialized normalized row counts for the revision",
+    )
+    created_at: datetime = Field(..., description="Manifest creation timestamp")
+
+
+class RevisionLayoutRead(BaseModel):
+    """Schema for reading a materialized revision layout row."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(..., description="Unique materialized layout row identifier")
+    project_id: UUID = Field(..., description="Owning project identifier")
+    source_file_id: UUID = Field(..., description="Source file identifier")
+    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    source_job_id: UUID = Field(..., description="Source materialization job identifier")
+    drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
+    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    canonical_entity_schema_version: str = Field(
+        ...,
+        description="Canonical entity schema version for this layout row",
+    )
+    sequence_index: int = Field(..., ge=0, description="Zero-based layout position")
+    layout_ref: str = Field(..., description="Stable layout reference")
+    payload: dict[str, Any] = Field(
+        validation_alias="payload_json",
+        description="Curated canonical layout payload",
+    )
+    created_at: datetime = Field(..., description="Materialization timestamp")
+
+
+class RevisionLayerRead(BaseModel):
+    """Schema for reading a materialized revision layer row."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(..., description="Unique materialized layer row identifier")
+    project_id: UUID = Field(..., description="Owning project identifier")
+    source_file_id: UUID = Field(..., description="Source file identifier")
+    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    source_job_id: UUID = Field(..., description="Source materialization job identifier")
+    drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
+    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    canonical_entity_schema_version: str = Field(
+        ...,
+        description="Canonical entity schema version for this layer row",
+    )
+    sequence_index: int = Field(..., ge=0, description="Zero-based layer position")
+    layer_ref: str = Field(..., description="Stable layer reference")
+    payload: dict[str, Any] = Field(
+        validation_alias="payload_json",
+        description="Curated canonical layer payload",
+    )
+    created_at: datetime = Field(..., description="Materialization timestamp")
+
+
+class RevisionBlockRead(BaseModel):
+    """Schema for reading a materialized revision block row."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(..., description="Unique materialized block row identifier")
+    project_id: UUID = Field(..., description="Owning project identifier")
+    source_file_id: UUID = Field(..., description="Source file identifier")
+    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    source_job_id: UUID = Field(..., description="Source materialization job identifier")
+    drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
+    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    canonical_entity_schema_version: str = Field(
+        ...,
+        description="Canonical entity schema version for this block row",
+    )
+    sequence_index: int = Field(..., ge=0, description="Zero-based block position")
+    block_ref: str = Field(..., description="Stable block reference")
+    payload: dict[str, Any] = Field(
+        validation_alias="payload_json",
+        description="Curated canonical block payload",
+    )
+    created_at: datetime = Field(..., description="Materialization timestamp")
+
+
+class RevisionEntityRead(BaseModel):
+    """Schema for reading a materialized revision entity row."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID = Field(..., description="Unique materialized entity row identifier")
+    project_id: UUID = Field(..., description="Owning project identifier")
+    source_file_id: UUID = Field(..., description="Source file identifier")
+    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    source_job_id: UUID = Field(..., description="Source materialization job identifier")
+    drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
+    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    canonical_entity_schema_version: str = Field(
+        ...,
+        description="Canonical entity schema version for this entity row",
+    )
+    sequence_index: int = Field(..., ge=0, description="Zero-based entity position")
+    entity_id: str = Field(..., description="Stable entity identifier")
+    entity_type: str = Field(..., description="Canonical entity type")
+    entity_schema_version: str = Field(..., description="Entity schema version")
+    parent_entity_ref: str | None = Field(
+        None,
+        description="Raw parent entity reference from the canonical payload",
+    )
+    confidence_score: float = Field(..., description="Entity confidence score")
+    confidence: dict[str, Any] = Field(
+        validation_alias="confidence_json",
+        description="Entity confidence payload",
+    )
+    geometry: dict[str, Any] = Field(
+        validation_alias="geometry_json",
+        description="Entity geometry payload",
+    )
+    properties: dict[str, Any] = Field(
+        validation_alias="properties_json",
+        description="Entity properties payload",
+    )
+    provenance: dict[str, Any] = Field(
+        validation_alias="provenance_json",
+        description="Entity provenance payload",
+    )
+    layout_ref: str | None = Field(None, description="Raw layout reference")
+    layer_ref: str | None = Field(None, description="Raw layer reference")
+    block_ref: str | None = Field(None, description="Raw block reference")
+    source_identity: str | None = Field(None, description="Stable source identity")
+    source_hash: str | None = Field(None, description="Stable source hash")
+    layout_id: UUID | None = Field(None, description="Resolved materialized layout row identifier")
+    layer_id: UUID | None = Field(None, description="Resolved materialized layer row identifier")
+    block_id: UUID | None = Field(None, description="Resolved materialized block row identifier")
+    parent_entity_row_id: UUID | None = Field(
+        None,
+        description="Resolved materialized parent entity row identifier",
+    )
+    created_at: datetime = Field(..., description="Materialization timestamp")
+
+
+class RevisionMaterializationListResponseBase(BaseModel):
+    """Shared metadata for revision materialization list responses."""
+
+    manifest: RevisionEntityManifestRead = Field(
+        ...,
+        description="Manifest metadata for the materialized revision",
+    )
+    counts: RevisionMaterializationCounts = Field(
+        ...,
+        description="Revision-level materialized row counts",
+    )
+    next_cursor: str | None = Field(
+        None,
+        description="Opaque pagination cursor for the next page when more results exist",
+    )
+
+
+class RevisionLayoutListResponse(RevisionMaterializationListResponseBase):
+    """Schema for revision layout list responses."""
+
+    items: list[RevisionLayoutRead] = Field(
+        default_factory=list,
+        description="Materialized layout rows for the requested revision",
+    )
+
+
+class RevisionLayerListResponse(RevisionMaterializationListResponseBase):
+    """Schema for revision layer list responses."""
+
+    items: list[RevisionLayerRead] = Field(
+        default_factory=list,
+        description="Materialized layer rows for the requested revision",
+    )
+
+
+class RevisionBlockListResponse(RevisionMaterializationListResponseBase):
+    """Schema for revision block list responses."""
+
+    items: list[RevisionBlockRead] = Field(
+        default_factory=list,
+        description="Materialized block rows for the requested revision",
+    )
+
+
+class RevisionEntityListResponse(RevisionMaterializationListResponseBase):
+    """Schema for revision entity list responses."""
+
+    items: list[RevisionEntityRead] = Field(
+        default_factory=list,
+        description="Materialized entity rows for the requested revision",
     )

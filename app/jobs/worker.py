@@ -1,6 +1,7 @@
 """Celery worker application and persisted job handlers."""
 
 import asyncio
+import heapq
 import inspect
 import uuid
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from uuid import UUID
 
 from celery import Celery
 from celery.signals import worker_ready
-from sqlalchemy import select
+from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -30,6 +31,13 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.project import Project
+from app.models.revision_materialization import (
+    RevisionBlock,
+    RevisionEntity,
+    RevisionEntityManifest,
+    RevisionLayer,
+    RevisionLayout,
+)
 from app.models.validation_report import ValidationReport
 from app.storage import get_storage
 from app.storage.keys import build_generated_artifact_storage_key
@@ -55,6 +63,7 @@ _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
 _DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
 _DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
 _DEBUG_OVERLAY_GENERATOR_VERSION = "1"
+_NORMALIZED_ENTITY_INSERT_CHUNK_SIZE = 500
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -91,6 +100,17 @@ class _QueuedJobEvent:
     level: str
     message: str
     data_json: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _RevisionMaterializationRows:
+    """Prepared normalized revision payload rows for DB insertion."""
+
+    counts_json: dict[str, int]
+    layouts: list[dict[str, Any]]
+    layers: list[dict[str, Any]]
+    blocks: list[dict[str, Any]]
+    entities: list[dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +706,585 @@ def _build_debug_overlay_generator_config(
     }
 
 
+def _materialized_payload_json(value: Any) -> dict[str, Any]:
+    """Coerce a canonical collection item into a persisted JSON object payload."""
+    if isinstance(value, dict):
+        return deepcopy(value)
+
+    return {"value": deepcopy(value)}
+
+
+def _canonical_payload_list(payload: IngestFinalizationPayload, key: str) -> list[Any]:
+    """Return a canonical collection list or an empty list when absent."""
+    raw_value = payload.canonical_json.get(key)
+    return list(raw_value) if isinstance(raw_value, list) else []
+
+
+def _string_ref(value: Any) -> str | None:
+    """Normalize a persisted ref string extracted from canonical payloads."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _hash_ref(value: Any) -> str | None:
+    """Normalize persisted hash refs to lowercase SHA-256 strings when valid."""
+    normalized = _string_ref(value)
+    if normalized is None:
+        return None
+
+    lowered = normalized.lower()
+    return lowered if len(lowered) == 64 else None
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    """Return a deep-copied JSON object or an empty object."""
+    if isinstance(value, dict):
+        return deepcopy(value)
+
+    return {}
+
+
+def _float_value(value: Any) -> float | None:
+    """Normalize persisted numeric fields to floats when possible."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+
+    return None
+
+
+def _allocate_unique_ref(
+    *,
+    candidates: list[Any],
+    prefix: str,
+    sequence_index: int,
+    used_values: set[str],
+) -> str:
+    """Allocate a deterministic unique ref from preferred candidates or a sequence fallback."""
+    for candidate in candidates:
+        normalized = _string_ref(candidate)
+        if normalized is not None and normalized not in used_values:
+            used_values.add(normalized)
+            return normalized
+
+    fallback_base = f"{prefix}-{sequence_index:06d}"
+    fallback = fallback_base
+    suffix = 1
+    while fallback in used_values:
+        fallback = f"{fallback_base}-{suffix}"
+        suffix += 1
+
+    used_values.add(fallback)
+    return fallback
+
+
+def _resolve_collection_ref(
+    payload_json: dict[str, Any],
+    *,
+    explicit_key: str,
+    fallback_keys: tuple[str, ...],
+    prefix: str,
+    sequence_index: int,
+    used_values: set[str],
+) -> str:
+    """Resolve a stable non-null unique collection ref for a materialized row."""
+    return _allocate_unique_ref(
+        candidates=[
+            payload_json.get(explicit_key),
+            *[payload_json.get(key) for key in fallback_keys],
+        ],
+        prefix=prefix,
+        sequence_index=sequence_index,
+        used_values=used_values,
+    )
+
+
+def _entity_provenance_json(entity_payload_json: dict[str, Any]) -> dict[str, Any]:
+    """Return canonical entity provenance JSON from contract or legacy payloads."""
+    provenance_json = entity_payload_json.get("provenance_json")
+    if isinstance(provenance_json, dict):
+        return deepcopy(provenance_json)
+
+    provenance = entity_payload_json.get("provenance")
+    if isinstance(provenance, dict):
+        return deepcopy(provenance)
+
+    return {}
+
+
+def _resolve_entity_source_identity(entity_payload_json: dict[str, Any]) -> str | None:
+    """Resolve the best-effort stable source identity for a materialized entity row."""
+    source_identity = _string_ref(entity_payload_json.get("source_identity"))
+    if source_identity is not None:
+        return source_identity
+
+    provenance = _entity_provenance_json(entity_payload_json)
+    if not provenance:
+        return None
+
+    source_handle = _string_ref(provenance.get("source_handle"))
+    if source_handle is not None:
+        return source_handle
+
+    return _string_ref(provenance.get("source_id"))
+
+
+def _resolve_entity_source_hash(entity_payload_json: dict[str, Any]) -> str | None:
+    """Resolve the best-effort stable source hash for a materialized entity row."""
+    source_hash = _hash_ref(entity_payload_json.get("source_hash"))
+    if source_hash is not None:
+        return source_hash
+
+    provenance = _entity_provenance_json(entity_payload_json)
+    if not provenance:
+        return None
+
+    return _hash_ref(provenance.get("normalized_source_hash"))
+
+
+def _resolve_entity_ref(
+    entity_payload_json: dict[str, Any],
+    *,
+    explicit_key: str,
+    legacy_key: str,
+) -> str | None:
+    """Resolve a raw entity relationship ref from contract or legacy payloads."""
+    explicit_ref = _string_ref(entity_payload_json.get(explicit_key))
+    if explicit_ref is not None:
+        return explicit_ref
+
+    legacy_ref = _string_ref(entity_payload_json.get(legacy_key))
+    if legacy_ref is not None:
+        return legacy_ref
+
+    provenance = _entity_provenance_json(entity_payload_json)
+    if not provenance:
+        return None
+
+    return _string_ref(provenance.get(explicit_key))
+
+
+def _resolve_entity_parent_ref(entity_payload_json: dict[str, Any]) -> str | None:
+    """Resolve a raw parent entity reference from contract or legacy payloads."""
+    parent_entity_ref = _string_ref(entity_payload_json.get("parent_entity_ref"))
+    if parent_entity_ref is not None:
+        return parent_entity_ref
+
+    parent_id = _string_ref(entity_payload_json.get("parent_id"))
+    if parent_id is not None:
+        return parent_id
+
+    provenance = _entity_provenance_json(entity_payload_json)
+    if not provenance:
+        return None
+
+    return _string_ref(provenance.get("parent_entity_ref")) or _string_ref(
+        provenance.get("parent_source_id")
+    )
+
+
+def _resolve_entity_id(
+    entity_payload_json: dict[str, Any],
+    *,
+    sequence_index: int,
+    used_values: set[str],
+) -> str:
+    """Resolve a stable non-null unique entity id for a materialized row."""
+    return _allocate_unique_ref(
+        candidates=[
+            entity_payload_json.get("entity_id"),
+            entity_payload_json.get("id"),
+            entity_payload_json.get("source_identity"),
+            _entity_provenance_json(entity_payload_json).get("source_handle"),
+            _entity_provenance_json(entity_payload_json).get("source_id"),
+        ],
+        prefix="entity",
+        sequence_index=sequence_index,
+        used_values=used_values,
+    )
+
+
+def _resolve_entity_type(entity_payload_json: dict[str, Any]) -> str:
+    """Resolve a stable non-null entity type from contract or legacy payloads."""
+    return (
+        _string_ref(entity_payload_json.get("entity_type"))
+        or _string_ref(entity_payload_json.get("kind"))
+        or "unknown"
+    )
+
+
+def _resolve_entity_schema_version(
+    entity_payload_json: dict[str, Any],
+    *,
+    default_schema_version: str,
+) -> str:
+    """Resolve the entity schema version from the payload or manifest default."""
+    return _string_ref(entity_payload_json.get("entity_schema_version")) or default_schema_version
+
+
+def _resolve_entity_confidence_score(
+    entity_payload_json: dict[str, Any],
+    *,
+    default_score: float,
+) -> float:
+    """Resolve the entity confidence score from contract payloads or a payload default."""
+    confidence_score = _float_value(entity_payload_json.get("confidence_score"))
+    if confidence_score is not None:
+        return confidence_score
+
+    for key in ("confidence_json", "confidence"):
+        confidence_payload = entity_payload_json.get(key)
+        nested_score = _float_value(confidence_payload)
+        if nested_score is not None:
+            return nested_score
+
+        confidence_json = _json_object(confidence_payload)
+        nested_score = _float_value(confidence_json.get("score"))
+        if nested_score is not None:
+            return nested_score
+
+    return default_score
+
+
+def _resolve_entity_confidence_json(
+    entity_payload_json: dict[str, Any],
+    *,
+    confidence_score: float,
+) -> dict[str, Any]:
+    """Resolve the entity confidence payload from contract or legacy payloads."""
+    for key in ("confidence_json", "confidence"):
+        confidence_payload = entity_payload_json.get(key)
+        confidence_json = _json_object(confidence_payload)
+        if confidence_json:
+            return confidence_json
+
+        numeric_confidence = _float_value(confidence_payload)
+        if numeric_confidence is not None:
+            return {"score": numeric_confidence}
+
+    return {"score": confidence_score}
+
+
+def _build_revision_materialization_rows(
+    payload: IngestFinalizationPayload,
+) -> _RevisionMaterializationRows:
+    """Build revision-scoped normalized payload rows from canonical JSON."""
+    layouts: list[dict[str, Any]] = []
+    used_layout_refs: set[str] = set()
+    for index, layout in enumerate(_canonical_payload_list(payload, "layouts")):
+        payload_json = _materialized_payload_json(layout)
+        layouts.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": index,
+                "payload_json": payload_json,
+                "layout_ref": _resolve_collection_ref(
+                    payload_json,
+                    explicit_key="layout_ref",
+                    fallback_keys=("name", "ref", "id"),
+                    prefix="layout",
+                    sequence_index=index,
+                    used_values=used_layout_refs,
+                ),
+            }
+        )
+
+    layers: list[dict[str, Any]] = []
+    used_layer_refs: set[str] = set()
+    for index, layer in enumerate(_canonical_payload_list(payload, "layers")):
+        payload_json = _materialized_payload_json(layer)
+        layers.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": index,
+                "payload_json": payload_json,
+                "layer_ref": _resolve_collection_ref(
+                    payload_json,
+                    explicit_key="layer_ref",
+                    fallback_keys=("name", "ref", "id"),
+                    prefix="layer",
+                    sequence_index=index,
+                    used_values=used_layer_refs,
+                ),
+            }
+        )
+
+    blocks: list[dict[str, Any]] = []
+    used_block_refs: set[str] = set()
+    for index, block in enumerate(_canonical_payload_list(payload, "blocks")):
+        payload_json = _materialized_payload_json(block)
+        blocks.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": index,
+                "payload_json": payload_json,
+                "block_ref": _resolve_collection_ref(
+                    payload_json,
+                    explicit_key="block_ref",
+                    fallback_keys=("name", "ref", "id"),
+                    prefix="block",
+                    sequence_index=index,
+                    used_values=used_block_refs,
+                ),
+            }
+        )
+
+    layout_ids_by_ref = {row["layout_ref"]: row["id"] for row in layouts}
+    layer_ids_by_ref = {row["layer_ref"]: row["id"] for row in layers}
+    block_ids_by_ref = {row["block_ref"]: row["id"] for row in blocks}
+
+    entities: list[dict[str, Any]] = []
+    used_entity_ids: set[str] = set()
+    for index, entity in enumerate(_canonical_payload_list(payload, "entities")):
+        payload_json = _materialized_payload_json(entity)
+        entity_id = _resolve_entity_id(
+            payload_json,
+            sequence_index=index,
+            used_values=used_entity_ids,
+        )
+        entity_type = _resolve_entity_type(payload_json)
+        entity_schema_version = _resolve_entity_schema_version(
+            payload_json,
+            default_schema_version=payload.canonical_entity_schema_version,
+        )
+        parent_entity_ref = _resolve_entity_parent_ref(payload_json)
+        confidence_score = _resolve_entity_confidence_score(
+            payload_json,
+            default_score=payload.confidence_score,
+        )
+        confidence_json = _resolve_entity_confidence_json(
+            payload_json,
+            confidence_score=confidence_score,
+        )
+        provenance_json = _entity_provenance_json(payload_json)
+        layout_ref = _resolve_entity_ref(
+            payload_json,
+            explicit_key="layout_ref",
+            legacy_key="layout",
+        )
+        layer_ref = _resolve_entity_ref(
+            payload_json,
+            explicit_key="layer_ref",
+            legacy_key="layer",
+        )
+        block_ref = _resolve_entity_ref(
+            payload_json,
+            explicit_key="block_ref",
+            legacy_key="block",
+        )
+        entities.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": index,
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "entity_schema_version": entity_schema_version,
+                "parent_entity_ref": parent_entity_ref,
+                "confidence_score": confidence_score,
+                "confidence_json": confidence_json,
+                "geometry_json": _json_object(
+                    payload_json.get("geometry_json")
+                    if "geometry_json" in payload_json
+                    else payload_json.get("geometry")
+                ),
+                "properties_json": _json_object(
+                    payload_json.get("properties_json")
+                    if "properties_json" in payload_json
+                    else payload_json.get("properties")
+                ),
+                "provenance_json": provenance_json,
+                "canonical_entity_json": payload_json,
+                "layout_ref": layout_ref,
+                "layer_ref": layer_ref,
+                "block_ref": block_ref,
+                "source_identity": _resolve_entity_source_identity(payload_json),
+                "source_hash": _resolve_entity_source_hash(payload_json),
+                "layout_id": layout_ids_by_ref.get(layout_ref) if layout_ref is not None else None,
+                "layer_id": layer_ids_by_ref.get(layer_ref) if layer_ref is not None else None,
+                "block_id": block_ids_by_ref.get(block_ref) if block_ref is not None else None,
+            }
+        )
+
+    entity_row_ids_by_entity_id = {row["entity_id"]: row["id"] for row in entities}
+    for row in entities:
+        parent_entity_ref = row["parent_entity_ref"]
+        row["parent_entity_row_id"] = (
+            entity_row_ids_by_entity_id.get(parent_entity_ref)
+            if parent_entity_ref is not None
+            else None
+        )
+
+    counts_json = {
+        "layouts": len(layouts),
+        "layers": len(layers),
+        "blocks": len(blocks),
+        "entities": len(entities),
+    }
+    return _RevisionMaterializationRows(
+        counts_json=counts_json,
+        layouts=layouts,
+        layers=layers,
+        blocks=blocks,
+        entities=entities,
+    )
+
+
+def _order_revision_entity_insert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order entity rows so parent self-FKs insert before children when possible."""
+    if len(rows) < 2:
+        return rows
+
+    row_by_id = {row["id"]: row for row in rows}
+    pending_parent_counts = {row["id"]: 0 for row in rows}
+    child_ids_by_parent: dict[UUID, list[UUID]] = {}
+    original_order_by_id = {row["id"]: index for index, row in enumerate(rows)}
+
+    for row in rows:
+        row_id = row["id"]
+        parent_row_id = row.get("parent_entity_row_id")
+        if isinstance(parent_row_id, UUID) and parent_row_id in row_by_id:
+            pending_parent_counts[row_id] += 1
+            child_ids_by_parent.setdefault(parent_row_id, []).append(row_id)
+
+    ready: list[tuple[int, int, UUID]] = []
+    for row in rows:
+        row_id = row["id"]
+        if pending_parent_counts[row_id] == 0:
+            heapq.heappush(
+                ready,
+                (int(row["sequence_index"]), original_order_by_id[row_id], row_id),
+            )
+
+    ordered_rows: list[dict[str, Any]] = []
+    while ready:
+        _, _, row_id = heapq.heappop(ready)
+        ordered_rows.append(row_by_id[row_id])
+        for child_row_id in child_ids_by_parent.get(row_id, []):
+            pending_parent_counts[child_row_id] -= 1
+            if pending_parent_counts[child_row_id] == 0:
+                child_row = row_by_id[child_row_id]
+                heapq.heappush(
+                    ready,
+                    (
+                        int(child_row["sequence_index"]),
+                        original_order_by_id[child_row_id],
+                        child_row_id,
+                    ),
+                )
+
+    if len(ordered_rows) == len(rows):
+        return ordered_rows
+
+    ordered_row_ids = {row["id"] for row in ordered_rows}
+    return [*ordered_rows, *[row for row in rows if row["id"] not in ordered_row_ids]]
+
+
+async def _bulk_insert_model_rows(
+    session: AsyncSession,
+    model: Any,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Insert prepared mappings in deterministic chunks."""
+    if not rows:
+        return
+
+    for start in range(0, len(rows), _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE):
+        chunk = rows[start : start + _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE]
+        await session.execute(insert(model), chunk)
+
+
+async def _persist_revision_materialization(
+    session: AsyncSession,
+    *,
+    job: Job,
+    source_file: File,
+    payload: IngestFinalizationPayload,
+    drawing_revision_id: UUID,
+    adapter_run_output_id: UUID,
+) -> UUID:
+    """Persist revision-scoped normalized entity rows and manifest atomically."""
+    if job.extraction_profile_id is None:
+        raise RuntimeError("Persisted ingest outputs require an extraction profile id.")
+
+    materialization_rows = _build_revision_materialization_rows(payload)
+    manifest_id = uuid.uuid4()
+    base_row = {
+        "project_id": job.project_id,
+        "source_file_id": source_file.id,
+        "extraction_profile_id": job.extraction_profile_id,
+        "source_job_id": job.id,
+        "drawing_revision_id": drawing_revision_id,
+        "adapter_run_output_id": adapter_run_output_id,
+        "canonical_entity_schema_version": payload.canonical_entity_schema_version,
+    }
+
+    session.add(
+        RevisionEntityManifest(
+            id=manifest_id,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            extraction_profile_id=job.extraction_profile_id,
+            source_job_id=job.id,
+            drawing_revision_id=drawing_revision_id,
+            adapter_run_output_id=adapter_run_output_id,
+            canonical_entity_schema_version=payload.canonical_entity_schema_version,
+            counts_json=materialization_rows.counts_json,
+        )
+    )
+
+    await _bulk_insert_model_rows(
+        session,
+        RevisionLayout,
+        [
+            {
+                **base_row,
+                **row,
+            }
+            for row in materialization_rows.layouts
+        ],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionLayer,
+        [
+            {
+                **base_row,
+                **row,
+            }
+            for row in materialization_rows.layers
+        ],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionBlock,
+        [
+            {
+                **base_row,
+                **row,
+            }
+            for row in materialization_rows.blocks
+        ],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionEntity,
+        _order_revision_entity_insert_rows(
+            [
+                {
+                    **base_row,
+                    **row,
+                }
+                for row in materialization_rows.entities
+            ]
+        ),
+    )
+
+    return manifest_id
+
+
 def _build_debug_overlay_lineage_json(
     *,
     source_file: File,
@@ -966,6 +1565,7 @@ async def _finalize_ingest_job(
         adapter_run_output_id = uuid.uuid4()
         drawing_revision_id = uuid.uuid4()
         validation_report_id = uuid.uuid4()
+        revision_entity_manifest_id = uuid.uuid4()
         debug_overlay_artifact_id = uuid.uuid4()
         finished_at = _utcnow()
         overlay_source_label = source_file.original_filename
@@ -1094,6 +1694,15 @@ async def _finalize_ingest_job(
                     ),
                 )
             )
+            await session.flush()
+            revision_entity_manifest_id = await _persist_revision_materialization(
+                session,
+                job=job,
+                source_file=source_file,
+                payload=payload,
+                drawing_revision_id=drawing_revision_id,
+                adapter_run_output_id=adapter_run_output_id,
+            )
 
             job.status = "succeeded"
             job.finished_at = finished_at
@@ -1110,6 +1719,7 @@ async def _finalize_ingest_job(
                     "adapter_run_output_id": str(adapter_run_output_id),
                     "drawing_revision_id": str(drawing_revision_id),
                     "validation_report_id": str(validation_report_id),
+                    "revision_entity_manifest_id": str(revision_entity_manifest_id),
                     "generated_artifact_id": str(debug_overlay_artifact_id),
                 },
                 session=session,

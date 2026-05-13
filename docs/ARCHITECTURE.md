@@ -73,6 +73,11 @@ Database-level append-only enforcement protects the core lineage/history tables:
 - `adapter_run_outputs`
 - `drawing_revisions`
 - `validation_reports`
+- `revision_entity_manifests`
+- `revision_layouts`
+- `revision_layers`
+- `revision_blocks`
+- `revision_entities`
 - `generated_artifacts`
 - `job_events`
 
@@ -180,6 +185,14 @@ Extraction profiles are immutable configuration records that capture the
 extraction contract for a run: unit overrides, layout mode, xref/block
 handling, text/dimension extraction policy, PDF page range, raster calibration,
 and any confidence threshold used to gate the output.
+
+After ingestion finalization, workers also materialize immutable
+revision-scoped query rows in `revision_entity_manifests`, `revision_layouts`,
+`revision_layers`, `revision_blocks`, and `revision_entities`. These rows are a
+derived query surface for `/v1/revisions/{revision_id}/layouts|layers|blocks|entities`:
+they are built from adapter output and canonical revision payloads, scoped to a
+single revision, and never rewrite the canonical JSON already stored on the
+drawing revision.
 
 Quantity workers must refuse to treat review-gated ingestion output as trusted
 source-of-truth input. Provisional quantity runs are allowed only when the
