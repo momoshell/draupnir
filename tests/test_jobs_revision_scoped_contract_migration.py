@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib.util
 import uuid
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import pytest
 import sqlalchemy as sa
@@ -309,6 +309,16 @@ async def _insert_job(
     )
 
 
+class _JobInsertParams(TypedDict):
+    job_id: uuid.UUID
+    project_id: uuid.UUID
+    file_id: uuid.UUID
+    extraction_profile_id: uuid.UUID | None
+    base_revision_id: uuid.UUID | None
+    parent_job_id: uuid.UUID | None
+    job_type: str
+
+
 @requires_database
 @pytest.mark.asyncio
 async def test_jobs_revision_scoped_contract_upgrade_enforces_revision_and_parent_guards() -> None:
@@ -453,7 +463,7 @@ async def test_jobs_revision_scoped_contract_upgrade_enforces_revision_and_paren
                 },
             }
 
-        invalid_cases = [
+        invalid_cases: list[_JobInsertParams] = [
             {
                 "job_id": uuid.uuid4(),
                 "project_id": ids["project_a"],
