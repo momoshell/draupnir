@@ -331,8 +331,33 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert entity["length"] == 5.0
     assert "quantity_hints" not in entity
     assert "adapter_native" not in entity
+    assert entity["provenance"]["origin"] == "adapter_normalized"
+    assert entity["provenance"]["adapter"] == {"key": "libredwg"}
+    assert entity["provenance"]["adapter_key"] == "libredwg"
+    assert entity["provenance"]["source_ref"] == "OBJECTS/LINE/1A"
+    assert entity["provenance"]["source_identity"] == "1A"
+    assert entity["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
+        {
+            "record_type": "LINE",
+            "handle": "1A",
+            "layer_name": "Walls",
+            "layout_name": "Model",
+            "block_name": None,
+            "geometry": {
+                "start": {"x": 1.0, "y": 2.0, "z": 0.0},
+                "end": {"x": 4.0, "y": 6.0, "z": 0.0},
+            },
+        }
+    )
+    assert entity["provenance"]["normalized_source_hash"] == entity["provenance"]["source_hash"]
+    assert entity["provenance"]["extraction_path"] == ["OBJECTS", "LINE"]
+    assert entity["provenance"]["notes"] == ["units_unconfirmed"]
     assert entity["provenance"]["source_locator"] == "OBJECTS/LINE/1A"
-    assert entity["provenance"]["record_hash"].startswith("sha256:")
+    assert len(entity["provenance"]["source_hash"]) == 64
+    assert all(
+        character in "0123456789abcdef" for character in entity["provenance"]["source_hash"]
+    )
+    assert entity["provenance"]["record_hash"] == f"sha256:{entity['provenance']['source_hash']}"
     assert entity["confidence"] == {
         "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
         "review_required": True,
@@ -529,7 +554,36 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "record_type": "CIRCLE",
         "handle": "20",
     }
-    assert entities[0]["provenance"]["record_hash"].startswith("sha256:")
+    assert entities[0]["provenance"]["origin"] == "adapter_normalized"
+    assert entities[0]["provenance"]["adapter"] == {"key": "libredwg"}
+    assert entities[0]["provenance"]["source_ref"] == "OBJECTS/CIRCLE/20"
+    assert entities[0]["provenance"]["source_identity"] == "20"
+    assert entities[0]["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
+        {
+            "record_type": "CIRCLE",
+            "handle": "20",
+            "layer_name": "Unsupported",
+            "layout_name": "Model",
+            "block_name": None,
+        }
+    )
+    assert (
+        entities[0]["provenance"]["normalized_source_hash"]
+        == entities[0]["provenance"]["source_hash"]
+    )
+    assert entities[0]["provenance"]["extraction_path"] == ("OBJECTS", "CIRCLE")
+    assert entities[0]["provenance"]["notes"] == (
+        "units_unconfirmed",
+        "unsupported_drawable_record",
+    )
+    assert len(entities[0]["provenance"]["source_hash"]) == 64
+    assert all(
+        character in "0123456789abcdef"
+        for character in entities[0]["provenance"]["source_hash"]
+    )
+    assert entities[0]["provenance"]["record_hash"] == (
+        f"sha256:{entities[0]['provenance']['source_hash']}"
+    )
     assert entities[0]["confidence"] == {
         "score": adapter_module._UNKNOWN_ENTITY_CONFIDENCE_SCORE,
         "review_required": True,
@@ -537,7 +591,6 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
     }
     _assert_score_within_libredwg_descriptor_range(entities[0]["confidence"]["score"])
     assert entities[0]["unknown_reason"] == "unsupported_drawable_record"
-    assert entities[0]["provenance"]["record_hash"].startswith("sha256:")
     assert [warning.code for warning in result.warnings] == [
         "libredwg.units_unconfirmed",
         "libredwg.unsupported_drawable_record",

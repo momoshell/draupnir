@@ -299,6 +299,15 @@ def _assert_common_entity_contract(
     assert "adapter_native" in properties
 
     provenance = _mapping(entity["provenance"])
+    assert provenance["origin"] == "adapter_normalized"
+    assert provenance["adapter"] == {"key": "ezdxf"}
+    assert provenance["adapter_key"] == "ezdxf"
+    assert provenance["source_ref"] == provenance["source_entity_ref"]
+    assert provenance["source"] == provenance["source_ref"]
+    assert provenance["source_identity"] == entity["handle"]
+    assert provenance["source_hash"] == provenance["normalized_source_hash"]
+    assert provenance["extraction_path"] == ("modelspace", str(properties["source_type"]))
+    assert isinstance(provenance["notes"], tuple)
     assert provenance["dxf_handle"] == entity["handle"]
     assert isinstance(provenance["normalized_source_hash"], str)
     assert len(provenance["normalized_source_hash"]) == 64

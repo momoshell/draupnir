@@ -114,7 +114,7 @@ async def test_contract_harness_applies_review_thresholds(
         result=build_result(
             adapter_key=adapter_key,
             score=score,
-            canonical=build_complete_canonical(),
+            canonical=build_complete_canonical(adapter_key=adapter_key),
         ),
         family=InputFamily.DXF,
         key=adapter_key,
@@ -153,7 +153,7 @@ async def test_contract_harness_asserts_warnings_and_diagnostics_shape(tmp_path:
         result=build_result(
             adapter_key=adapter_key,
             score=0.97,
-            canonical=build_complete_canonical(),
+            canonical=build_complete_canonical(adapter_key=adapter_key),
             warnings=warnings,
             diagnostics=diagnostics,
         ),
@@ -215,7 +215,7 @@ async def test_contract_harness_rejects_missing_entity_envelope_fields(tmp_path:
     source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
     source = build_contract_source(file_path=source_path)
     adapter_key = "fake-dxf"
-    canonical = build_complete_canonical()
+    canonical = build_complete_canonical(adapter_key=adapter_key)
     canonical["entities"] = (
         {
             "kind": "line",
@@ -256,7 +256,7 @@ async def test_contract_harness_rejects_empty_entities_without_explicit_reason(
     source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
     source = build_contract_source(file_path=source_path)
     adapter_key = "fake-dxf"
-    canonical = build_complete_canonical()
+    canonical = build_complete_canonical(adapter_key=adapter_key)
     canonical["entities"] = ()
     adapter = _ResultAdapter(
         result=build_result(
@@ -290,7 +290,7 @@ async def test_contract_harness_rejects_absent_geometry_without_explicit_reason(
     source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
     source = build_contract_source(file_path=source_path)
     adapter_key = "fake-dxf"
-    canonical = build_complete_canonical()
+    canonical = build_complete_canonical(adapter_key=adapter_key)
     entity = cast(tuple[dict[str, Any], ...], canonical["entities"])[0]
     canonical["entities"] = (
         {

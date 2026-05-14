@@ -156,6 +156,10 @@ def _canonical_entities(result: object) -> tuple[Mapping[str, object], ...]:
     return cast(tuple[Mapping[str, object], ...], cast(Any, result).canonical["entities"])
 
 
+def _entity_provenance(entity: Mapping[str, object]) -> Mapping[str, object]:
+    return cast(Mapping[str, object], entity["provenance"])
+
+
 def test_probe_reports_unavailable_without_ifcopenshell_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -275,17 +279,23 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
     assert entities[0]["entity_schema_version"] == "0.1"
     assert entities[0]["geometry"]["reason"] == "semantic_metadata_only"
     assert entities[0]["provenance"]["origin"] == "adapter_normalized"
-    assert entities[0]["provenance"]["adapter"] == "ifcopenshell"
+    assert entities[0]["provenance"]["adapter"] == {"key": "ifcopenshell"}
+    assert entities[0]["provenance"]["adapter_key"] == "ifcopenshell"
     assert entities[0]["provenance"]["source"] == "ifc://IfcWall/global-id:DUPLICATE/step-id:10"
+    assert entities[0]["provenance"]["source_ref"] == "ifc://IfcWall/global-id:DUPLICATE/step-id:10"
     assert (
         entities[0]["provenance"]["source_entity_ref"]
         == "ifc://IfcWall/global-id:DUPLICATE/step-id:10"
     )
     assert entities[0]["provenance"]["source_identity"] == "DUPLICATE"
     assert entities[0]["provenance"]["canonical_entity_ref"] == "entities.DUPLICATE"
+    assert entities[0]["provenance"]["source_hash"] == hashlib.sha256(
+        b"ifc://IfcWall/global-id:DUPLICATE"
+    ).hexdigest()
     assert entities[0]["provenance"]["normalized_source_hash"] == hashlib.sha256(
         b"ifc://IfcWall/global-id:DUPLICATE"
     ).hexdigest()
+    assert entities[0]["provenance"]["extraction_path"] == ["semantic_extract"]
     assert entities[0]["provenance"]["notes"] == ["semantic_ifc_metadata_only"]
     assert entities[0]["confidence"] == {
         "score": 0.4,
@@ -300,9 +310,13 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
         == "Body"
     )
     assert entities[2]["provenance"]["source"] == "ifc://IfcDoor/step-id:42"
+    assert entities[2]["provenance"]["source_ref"] == "ifc://IfcDoor/step-id:42"
     assert entities[2]["provenance"]["source_entity_ref"] == "ifc://IfcDoor/step-id:42"
     assert entities[2]["provenance"]["source_identity"] == "#42"
     assert entities[2]["provenance"]["canonical_entity_ref"] == "entities.#42"
+    assert entities[2]["provenance"]["source_hash"] == hashlib.sha256(
+        b"ifc://IfcDoor/step-id:42"
+    ).hexdigest()
     assert entities[2]["provenance"]["normalized_source_hash"] == hashlib.sha256(
         b"ifc://IfcDoor/step-id:42"
     ).hexdigest()
@@ -345,6 +359,13 @@ async def test_ifcopenshell_adapter_orders_duplicate_and_missing_ids_determinist
     assert [entity["id"] for entity in _canonical_entities(result)] == [
         "DUPLICATE",
         "DUPLICATE-2",
+        "#3",
+        "#7",
+    ]
+    entities = _canonical_entities(result)
+    assert [_entity_provenance(entity)["source_identity"] for entity in entities] == [
+        "DUPLICATE",
+        "DUPLICATE",
         "#3",
         "#7",
     ]

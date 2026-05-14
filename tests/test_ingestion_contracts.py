@@ -141,6 +141,11 @@ def _assert_no_nonfinite_numbers(value: object) -> None:
         assert math.isfinite(float(value))
 
 
+def _assert_canonical_source_hash(value: str) -> None:
+    assert len(value) == 64
+    assert all(character in "0123456789abcdef" for character in value)
+
+
 async def _ingest_fake_document(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -998,12 +1003,32 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
         "y_max": 90.0,
     }
     assert entity["properties"]["rect_like"] is False
-    assert entity["provenance"] == {
-        "page_number": 1,
-        "drawing_index": 0,
-        "item_indices": (0, 1),
-        "source": "pymupdf.get_drawings",
-    }
+    provenance = cast(dict[str, Any], entity["provenance"])
+    assert provenance["origin"] == "adapter_normalized"
+    assert provenance["adapter"] == {"key": "pymupdf"}
+    assert provenance["adapter_key"] == "pymupdf"
+    assert provenance["page_number"] == 1
+    assert provenance["drawing_index"] == 0
+    assert provenance["operator"] == "l"
+    assert provenance["item_indices"] == (0, 1)
+    assert provenance["source"] == "pymupdf.get_drawings"
+    assert provenance["source_ref"] == "pdf://page-1/drawing-0/l/items:0,1"
+    assert provenance["source_entity_ref"] == "pdf://page-1/drawing-0/l/items:0,1"
+    assert provenance["source_identity"] == "page-1:drawing-0:items-0,1"
+    locator_hash = pymupdf_adapter._entity_source_hash(
+        {
+            "page_number": 1,
+            "drawing_index": 0,
+            "operator": "l",
+            "item_indices": (0, 1),
+            "source": "pymupdf.get_drawings",
+        }
+    )
+    assert provenance["source_hash"] != locator_hash
+    assert provenance["normalized_source_hash"] == provenance["source_hash"]
+    _assert_canonical_source_hash(cast(str, provenance["source_hash"]))
+    assert provenance["extraction_path"] == ("get_drawings", "page-1", "drawing-0", "l")
+    assert provenance["notes"] == ("vector_pdf_unconfirmed_scale",)
 
     geometry = cast(dict[str, Any], entity["geometry"])
     assert geometry["kind"] == entity["entity_type"]
@@ -1576,21 +1601,20 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         _FakePoint(14.0, 4.0),
         _FakePoint(16.0, 0.0),
     )
+    drawing = {
+        "items": (
+            ("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),
+            unsupported_item,
+            ("l", _FakePoint(20.0, 0.0), _FakePoint(30.0, 0.0)),
+            ("l", _FakePoint(30.0, 0.0), _FakePoint(40.0, 10.0)),
+        ),
+        "width": 1.0,
+        "color": (0.1, 0.2, 0.3),
+    }
     document = _FakeDocument(
         [
             _FakePage(
-                drawings=[
-                    {
-                        "items": (
-                            ("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),
-                            unsupported_item,
-                            ("l", _FakePoint(20.0, 0.0), _FakePoint(30.0, 0.0)),
-                            ("l", _FakePoint(30.0, 0.0), _FakePoint(40.0, 10.0)),
-                        ),
-                        "width": 1.0,
-                        "color": (0.1, 0.2, 0.3),
-                    }
-                ]
+                drawings=[drawing]
             )
         ]
     )
@@ -1607,11 +1631,39 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
     first_entity, unknown_entity, final_entity = entities
     assert first_entity["entity_type"] == "line"
     assert first_entity["provenance"] == {
+        "origin": "adapter_normalized",
+        "adapter": {"key": "pymupdf"},
+        "adapter_key": "pymupdf",
         "page_number": 1,
         "drawing_index": 0,
+        "operator": "l",
         "item_indices": (0,),
         "source": "pymupdf.get_drawings",
+        "source_ref": "pdf://page-1/drawing-0/l/items:0",
+        "source_entity_ref": "pdf://page-1/drawing-0/l/items:0",
+        "source_identity": "page-1:drawing-0:items-0",
+        "source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="l",
+                drawing=drawing,
+                item_indices=(0,),
+                item_index=None,
+            )
+        ),
+        "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="l",
+                drawing=drawing,
+                item_indices=(0,),
+                item_index=None,
+            )
+        ),
+        "extraction_path": ("get_drawings", "page-1", "drawing-0", "l"),
+        "notes": ("vector_pdf_unconfirmed_scale",),
     }
+    _assert_canonical_source_hash(cast(str, first_entity["provenance"]["source_hash"]))
 
     assert unknown_entity["kind"] == "unknown"
     assert unknown_entity["entity_type"] == "unknown"
@@ -1640,13 +1692,39 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         "basis": "vector_pdf_unconfirmed_scale",
     }
     assert unknown_entity["provenance"] == {
+        "origin": "adapter_normalized",
+        "adapter": {"key": "pymupdf"},
+        "adapter_key": "pymupdf",
         "page_number": 1,
         "drawing_index": 0,
         "item_index": 1,
         "operator": "c",
         "source": "pymupdf.get_drawings",
-        "normalized_source_hash": pymupdf_adapter._normalized_source_hash(unsupported_item),
+        "source_ref": "pdf://page-1/drawing-0/c/item:1",
+        "source_entity_ref": "pdf://page-1/drawing-0/c/item:1",
+        "source_identity": "page-1:drawing-0:item-1",
+        "source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="c",
+                drawing=drawing,
+                item_indices=None,
+                item_index=1,
+            )
+        ),
+        "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="c",
+                drawing=drawing,
+                item_indices=None,
+                item_index=1,
+            )
+        ),
+        "extraction_path": ("get_drawings", "page-1", "drawing-0", "c"),
+        "notes": ("vector_pdf_unconfirmed_scale",),
     }
+    _assert_canonical_source_hash(cast(str, unknown_entity["provenance"]["source_hash"]))
 
     assert final_entity["entity_type"] == "polyline"
     assert final_entity["points"] == (
@@ -1655,11 +1733,39 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         {"x": 40.0, "y": 10.0},
     )
     assert final_entity["provenance"] == {
+        "origin": "adapter_normalized",
+        "adapter": {"key": "pymupdf"},
+        "adapter_key": "pymupdf",
         "page_number": 1,
         "drawing_index": 0,
+        "operator": "l",
         "item_indices": (2, 3),
         "source": "pymupdf.get_drawings",
+        "source_ref": "pdf://page-1/drawing-0/l/items:2,3",
+        "source_entity_ref": "pdf://page-1/drawing-0/l/items:2,3",
+        "source_identity": "page-1:drawing-0:items-2,3",
+        "source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="l",
+                drawing=drawing,
+                item_indices=(2, 3),
+                item_index=None,
+            )
+        ),
+        "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="l",
+                drawing=drawing,
+                item_indices=(2, 3),
+                item_index=None,
+            )
+        ),
+        "extraction_path": ("get_drawings", "page-1", "drawing-0", "l"),
+        "notes": ("vector_pdf_unconfirmed_scale",),
     }
+    _assert_canonical_source_hash(cast(str, final_entity["provenance"]["source_hash"]))
 
     assert result.warnings == (
         AdapterWarning(
@@ -1674,6 +1780,137 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         ),
     )
     _assert_no_nonfinite_numbers(result.canonical)
+
+
+@pytest.mark.asyncio
+async def test_pymupdf_ingest_emits_rect_entity_with_canonical_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    drawing = {
+        "items": (("re", _FakeRect(10.0, 20.0, 30.0, 40.0)),),
+        "width": 1.0,
+        "color": (0.1, 0.2, 0.3),
+    }
+    document = _FakeDocument(
+        [
+            _FakePage(
+                drawings=[drawing]
+            )
+        ]
+    )
+
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document)
+
+    entity = cast(tuple[dict[str, Any], ...], result.canonical["entities"])[0]
+    assert entity["entity_type"] == "polyline"
+    assert entity["properties"]["rect_like"] is True
+    assert entity["provenance"] == {
+        "origin": "adapter_normalized",
+        "adapter": {"key": "pymupdf"},
+        "adapter_key": "pymupdf",
+        "page_number": 1,
+        "drawing_index": 0,
+        "operator": "re",
+        "item_indices": (0,),
+        "source": "pymupdf.get_drawings",
+        "source_ref": "pdf://page-1/drawing-0/re/items:0",
+        "source_entity_ref": "pdf://page-1/drawing-0/re/items:0",
+        "source_identity": "page-1:drawing-0:items-0",
+        "source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="re",
+                drawing=drawing,
+                item_indices=(0,),
+                item_index=None,
+            )
+        ),
+        "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+            pymupdf_adapter._entity_source_payload(
+                page_number=1,
+                operator="re",
+                drawing=drawing,
+                item_indices=(0,),
+                item_index=None,
+            )
+        ),
+        "extraction_path": ("get_drawings", "page-1", "drawing-0", "re"),
+        "notes": ("vector_pdf_unconfirmed_scale",),
+    }
+    _assert_canonical_source_hash(cast(str, entity["provenance"]["source_hash"]))
+
+
+def test_pymupdf_source_hash_is_deterministic_for_identical_payloads() -> None:
+    drawing_one = {
+        "width": 1.0,
+        "color": (0.1, 0.2, 0.3),
+        "fill": None,
+        "items": (("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),),
+    }
+    drawing_two = {
+        "items": (("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),),
+        "fill": None,
+        "color": (0.1, 0.2, 0.3),
+        "width": 1.0,
+    }
+
+    first_hash = pymupdf_adapter._entity_source_hash(
+        pymupdf_adapter._entity_source_payload(
+            page_number=1,
+            operator="l",
+            drawing=drawing_one,
+            item_indices=(0,),
+            item_index=None,
+        )
+    )
+    second_hash = pymupdf_adapter._entity_source_hash(
+        pymupdf_adapter._entity_source_payload(
+            page_number=1,
+            operator="l",
+            drawing=drawing_two,
+            item_indices=(0,),
+            item_index=None,
+        )
+    )
+
+    assert first_hash == second_hash
+    _assert_canonical_source_hash(first_hash)
+
+
+def test_pymupdf_source_hash_changes_for_different_item_payloads_at_same_location() -> None:
+    base_drawing = {
+        "width": 1.0,
+        "color": (0.1, 0.2, 0.3),
+    }
+    first_hash = pymupdf_adapter._entity_source_hash(
+        pymupdf_adapter._entity_source_payload(
+            page_number=1,
+            operator="l",
+            drawing={
+                **base_drawing,
+                "items": (("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),),
+            },
+            item_indices=(0,),
+            item_index=None,
+        )
+    )
+    second_hash = pymupdf_adapter._entity_source_hash(
+        pymupdf_adapter._entity_source_payload(
+            page_number=1,
+            operator="l",
+            drawing={
+                **base_drawing,
+                "items": (("l", _FakePoint(0.0, 0.0), _FakePoint(15.0, 0.0)),),
+            },
+            item_indices=(0,),
+            item_index=None,
+        )
+    )
+
+    assert first_hash != second_hash
+    _assert_canonical_source_hash(first_hash)
+    _assert_canonical_source_hash(second_hash)
 
 
 @pytest.mark.asyncio

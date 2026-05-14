@@ -820,18 +820,22 @@ def _entity_provenance(
         step_id_token=step_id_token,
         fallback_identity=fallback_identity,
     )
+    source_hash = _normalized_source_hash(
+        ifc_type=ifc_type,
+        global_id=global_id,
+        step_id_token=step_id_token,
+        fallback_identity=fallback_identity,
+    )
     return {
         "origin": "adapter_normalized",
-        "adapter": _ADAPTER_KEY,
+        "adapter": {"key": _ADAPTER_KEY},
+        "adapter_key": _ADAPTER_KEY,
         "source": source_entity_ref,
+        "source_ref": source_entity_ref,
         "source_entity_ref": source_entity_ref,
         "source_identity": global_id or step_id_token or fallback_identity,
-        "normalized_source_hash": _normalized_source_hash(
-            ifc_type=ifc_type,
-            global_id=global_id,
-            step_id_token=step_id_token,
-            fallback_identity=fallback_identity,
-        ),
+        "source_hash": source_hash,
+        "normalized_source_hash": source_hash,
         "native_entity_type": ifc_type,
         "ifc_global_id": global_id,
         "ifc_step_id": step_id_token,
