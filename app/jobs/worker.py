@@ -64,6 +64,16 @@ _DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
 _DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
 _DEBUG_OVERLAY_GENERATOR_VERSION = "1"
 _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE = 500
+_CANONICAL_ENTITY_PROVENANCE_ORIGINS = frozenset(
+    {
+        "source_direct",
+        "adapter_normalized",
+        "inferred",
+        "user_created",
+        "agent_proposed",
+        "generated_export",
+    }
+)
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -738,12 +748,42 @@ def _hash_ref(value: Any) -> str | None:
     return lowered if len(lowered) == 64 else None
 
 
+def _first_string_ref(*values: Any) -> str | None:
+    """Return the first non-empty normalized string from candidate values."""
+    for value in values:
+        normalized = _string_ref(value)
+        if normalized is not None:
+            return normalized
+
+    return None
+
+
+def _first_hash_ref(*values: Any) -> str | None:
+    """Return the first valid normalized hash from candidate values."""
+    for value in values:
+        normalized = _hash_ref(value)
+        if normalized is not None:
+            return normalized
+
+    return None
+
+
 def _json_object(value: Any) -> dict[str, Any]:
     """Return a deep-copied JSON object or an empty object."""
     if isinstance(value, dict):
         return deepcopy(value)
 
     return {}
+
+
+def _json_array(value: Any) -> list[Any]:
+    """Return a deep-copied JSON array-like value or an empty list."""
+    if isinstance(value, list):
+        return deepcopy(value)
+    if isinstance(value, tuple):
+        return deepcopy(list(value))
+
+    return []
 
 
 def _float_value(value: Any) -> float | None:
@@ -805,44 +845,79 @@ def _resolve_collection_ref(
 def _entity_provenance_json(entity_payload_json: dict[str, Any]) -> dict[str, Any]:
     """Return canonical entity provenance JSON from contract or legacy payloads."""
     provenance_json = entity_payload_json.get("provenance_json")
-    if isinstance(provenance_json, dict):
-        return deepcopy(provenance_json)
+    provenance = provenance_json if isinstance(provenance_json, dict) else None
+    if provenance is None:
+        legacy_provenance = entity_payload_json.get("provenance")
+        provenance = legacy_provenance if isinstance(legacy_provenance, dict) else {}
 
-    provenance = entity_payload_json.get("provenance")
-    if isinstance(provenance, dict):
-        return deepcopy(provenance)
+    origin = _first_string_ref(provenance.get("origin"), entity_payload_json.get("origin"))
+    if origin is not None and origin not in _CANONICAL_ENTITY_PROVENANCE_ORIGINS:
+        raise ValueError(f"Invalid entity provenance origin '{origin}'")
 
-    return {}
+    extraction_path_value = (
+        provenance.get("extraction_path")
+        if "extraction_path" in provenance
+        else entity_payload_json.get("extraction_path")
+    )
+    notes_value = (
+        provenance.get("notes")
+        if "notes" in provenance
+        else entity_payload_json.get("notes")
+    )
+    adapter_json = provenance.get("adapter")
+    if isinstance(adapter_json, dict):
+        adapter = deepcopy(adapter_json)
+    elif adapter_json is None:
+        adapter = {}
+    else:
+        adapter = {"value": deepcopy(adapter_json)}
+
+    return {
+        "origin": origin or "adapter_normalized",
+        "adapter": adapter,
+        "source_ref": _first_string_ref(
+            provenance.get("source_ref"),
+            entity_payload_json.get("source_ref"),
+            provenance.get("source_entity_ref"),
+            entity_payload_json.get("source_entity_ref"),
+        ),
+        "source_identity": _first_string_ref(
+            provenance.get("source_identity"),
+            entity_payload_json.get("source_identity"),
+            provenance.get("source_handle"),
+            entity_payload_json.get("source_handle"),
+            provenance.get("dxf_handle"),
+            entity_payload_json.get("dxf_handle"),
+            provenance.get("source_entity_handle"),
+            entity_payload_json.get("source_entity_handle"),
+            provenance.get("native_handle"),
+            entity_payload_json.get("native_handle"),
+            provenance.get("source_id"),
+            entity_payload_json.get("source_id"),
+        ),
+        "source_hash": _first_hash_ref(
+            provenance.get("source_hash"),
+            entity_payload_json.get("source_hash"),
+            provenance.get("normalized_source_hash"),
+            entity_payload_json.get("normalized_source_hash"),
+            provenance.get("record_hash"),
+            entity_payload_json.get("record_hash"),
+        ),
+        "extraction_path": _json_array(extraction_path_value),
+        "notes": _json_array(notes_value),
+    }
 
 
 def _resolve_entity_source_identity(entity_payload_json: dict[str, Any]) -> str | None:
     """Resolve the best-effort stable source identity for a materialized entity row."""
-    source_identity = _string_ref(entity_payload_json.get("source_identity"))
-    if source_identity is not None:
-        return source_identity
-
     provenance = _entity_provenance_json(entity_payload_json)
-    if not provenance:
-        return None
-
-    source_handle = _string_ref(provenance.get("source_handle"))
-    if source_handle is not None:
-        return source_handle
-
-    return _string_ref(provenance.get("source_id"))
+    return _string_ref(provenance.get("source_identity"))
 
 
 def _resolve_entity_source_hash(entity_payload_json: dict[str, Any]) -> str | None:
     """Resolve the best-effort stable source hash for a materialized entity row."""
-    source_hash = _hash_ref(entity_payload_json.get("source_hash"))
-    if source_hash is not None:
-        return source_hash
-
     provenance = _entity_provenance_json(entity_payload_json)
-    if not provenance:
-        return None
-
-    return _hash_ref(provenance.get("normalized_source_hash"))
+    return _hash_ref(provenance.get("source_hash"))
 
 
 def _resolve_entity_ref(
@@ -893,13 +968,14 @@ def _resolve_entity_id(
     used_values: set[str],
 ) -> str:
     """Resolve a stable non-null unique entity id for a materialized row."""
+    provenance = _entity_provenance_json(entity_payload_json)
     return _allocate_unique_ref(
         candidates=[
             entity_payload_json.get("entity_id"),
             entity_payload_json.get("id"),
             entity_payload_json.get("source_identity"),
-            _entity_provenance_json(entity_payload_json).get("source_handle"),
-            _entity_provenance_json(entity_payload_json).get("source_id"),
+            provenance.get("source_identity"),
+            provenance.get("source_ref"),
         ],
         prefix="entity",
         sequence_index=sequence_index,

@@ -88,9 +88,15 @@ def _build_contract_entity(
     confidence_score: float = _FAKE_RUNNER_CONFIDENCE_SCORE,
 ) -> dict[str, Any]:
     """Build a canonical contract-shaped entity payload for materialization tests."""
-    provenance_json: dict[str, Any] = {"source_id": source_id}
-    if source_hash is not None:
-        provenance_json["normalized_source_hash"] = source_hash
+    provenance_json: dict[str, Any] = {
+        "origin": "adapter_normalized",
+        "adapter": {},
+        "source_ref": None,
+        "source_identity": source_id,
+        "source_hash": source_hash,
+        "extraction_path": [],
+        "notes": [],
+    }
 
     entity: dict[str, Any] = {
         "entity_id": entity_id,
@@ -501,7 +507,15 @@ class TestIngestOutputPersistence:
                         "coordinates": [[0.0, 0.0], [1.0, 1.0]],
                     },
                     "properties_json": {"layer": "A-WALL"},
-                    "provenance_json": {"source_id": "entity-source-001"},
+                    "provenance_json": {
+                        "origin": "adapter_normalized",
+                        "adapter": {},
+                        "source_ref": None,
+                        "source_identity": "entity-source-001",
+                        "source_hash": None,
+                        "extraction_path": [],
+                        "notes": [],
+                    },
                 }
             ],
             "entity_counts": {
@@ -635,7 +649,15 @@ class TestIngestOutputPersistence:
             "coordinates": [[0.0, 0.0], [1.0, 1.0]],
         }
         assert entity.properties_json == {"layer": "A-WALL"}
-        assert entity.provenance_json == {"source_id": "entity-source-001"}
+        assert entity.provenance_json == {
+            "origin": "adapter_normalized",
+            "adapter": {},
+            "source_ref": None,
+            "source_identity": "entity-source-001",
+            "source_hash": None,
+            "extraction_path": [],
+            "notes": [],
+        }
         assert entity.layout_ref == "Model"
         assert entity.layer_ref == "A-WALL"
         assert entity.block_ref is None
@@ -661,7 +683,285 @@ class TestIngestOutputPersistence:
                 "coordinates": [[0.0, 0.0], [1.0, 1.0]],
             },
             "properties_json": {"layer": "A-WALL"},
-            "provenance_json": {"source_id": "entity-source-001"},
+            "provenance_json": {
+                "origin": "adapter_normalized",
+                "adapter": {},
+                "source_ref": None,
+                "source_identity": "entity-source-001",
+                "source_hash": None,
+                "extraction_path": [],
+                "notes": [],
+            },
+        }
+
+    async def test_revision_materialization_canonicalizes_legacy_entity_provenance(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Legacy entity provenance payloads should persist in canonical contract shape."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_legacy_provenance_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[
+                    {
+                        "entity_id": "entity-dxf-legacy",
+                        "entity_type": "line",
+                        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layout_ref": "Model",
+                        "layer_ref": "A-WALL",
+                        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "confidence_json": {
+                            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                            "basis": "adapter",
+                        },
+                        "geometry_json": {
+                            "type": "line",
+                            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                        },
+                        "properties_json": {"layer": "A-WALL"},
+                        "provenance_json": {
+                            "source_handle": "A1",
+                            "source_entity_ref": "doc:entities/A1",
+                            "normalized_source_hash": "b" * 64,
+                            "adapter": {"family": "dxf"},
+                        },
+                    },
+                    {
+                        "entity_id": "entity-ifc-legacy",
+                        "entity_type": "polyline",
+                        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layout_ref": "Model",
+                        "layer_ref": "A-WALL",
+                        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "confidence_json": {
+                            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                            "basis": "adapter",
+                        },
+                        "geometry_json": {
+                            "type": "polyline",
+                            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                        },
+                        "properties_json": {"layer": "A-WALL"},
+                        "provenance": {
+                            "origin": "source_direct",
+                            "source_identity": "ifc-guid-001",
+                            "normalized_source_hash": "c" * 64,
+                            "extraction_path": ("IfcProject", "IfcWall", "Body"),
+                            "notes": ("ifc", "semantic"),
+                        },
+                    },
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_legacy_provenance_ingestion)
+
+        await process_ingest_job(job.id)
+
+        _, _, _, _, entities = await _load_project_materialization(project["id"])
+
+        legacy_dxf_entity, legacy_ifc_entity = entities
+        assert legacy_dxf_entity.provenance_json == {
+            "origin": "adapter_normalized",
+            "adapter": {"family": "dxf"},
+            "source_ref": "doc:entities/A1",
+            "source_identity": "A1",
+            "source_hash": "b" * 64,
+            "extraction_path": [],
+            "notes": [],
+        }
+        assert legacy_dxf_entity.source_identity == "A1"
+        assert legacy_dxf_entity.source_hash == "b" * 64
+        assert legacy_dxf_entity.canonical_entity_json is not None
+        assert legacy_dxf_entity.canonical_entity_json["provenance_json"] == {
+            "source_handle": "A1",
+            "source_entity_ref": "doc:entities/A1",
+            "normalized_source_hash": "b" * 64,
+            "adapter": {"family": "dxf"},
+        }
+
+        assert legacy_ifc_entity.provenance_json == {
+            "origin": "source_direct",
+            "adapter": {},
+            "source_ref": None,
+            "source_identity": "ifc-guid-001",
+            "source_hash": "c" * 64,
+            "extraction_path": ["IfcProject", "IfcWall", "Body"],
+            "notes": ["ifc", "semantic"],
+        }
+        assert legacy_ifc_entity.source_identity == "ifc-guid-001"
+        assert legacy_ifc_entity.source_hash == "c" * 64
+        assert legacy_ifc_entity.canonical_entity_json is not None
+        assert legacy_ifc_entity.canonical_entity_json["provenance"] == {
+            "origin": "source_direct",
+            "source_identity": "ifc-guid-001",
+            "normalized_source_hash": "c" * 64,
+            "extraction_path": ["IfcProject", "IfcWall", "Body"],
+            "notes": ["ifc", "semantic"],
+        }
+
+    async def test_revision_materialization_rejects_invalid_nonempty_entity_origin(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid non-empty provenance origins should fail before persisting outputs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_invalid_origin_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[
+                    {
+                        "entity_id": "entity-invalid-origin",
+                        "entity_type": "line",
+                        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layout_ref": "Model",
+                        "layer_ref": "A-WALL",
+                        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "confidence_json": {
+                            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                            "basis": "adapter",
+                        },
+                        "geometry_json": {
+                            "type": "line",
+                            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                        },
+                        "properties_json": {"layer": "A-WALL"},
+                        "provenance_json": {
+                            "origin": "legacy_adapter",
+                            "source_id": "entity-source-001",
+                        },
+                    }
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_invalid_origin_ingestion)
+
+        with pytest.raises(ValueError, match="Invalid entity provenance origin 'legacy_adapter'"):
+            await process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert updated_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
+
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        assert adapter_outputs == []
+        assert drawing_revisions == []
+        assert validation_reports == []
+        assert generated_artifacts == []
+
+        manifests, layouts, layers, blocks, entities = await _load_project_materialization(
+            project["id"]
+        )
+        assert manifests == []
+        assert layouts == []
+        assert layers == []
+        assert blocks == []
+        assert entities == []
+
+    async def test_revision_materialization_wraps_scalar_adapter_provenance(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Scalar legacy adapter provenance should be preserved in object form."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_scalar_adapter_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[
+                    {
+                        "entity_id": "entity-dwg-scalar-adapter",
+                        "entity_type": "line",
+                        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layout_ref": "Model",
+                        "layer_ref": "A-WALL",
+                        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                        "confidence_json": {
+                            "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                            "basis": "adapter",
+                        },
+                        "geometry_json": {
+                            "type": "line",
+                            "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                        },
+                        "properties_json": {"layer": "A-WALL"},
+                        "provenance_json": {
+                            "source_handle": "A1",
+                            "source_entity_ref": "doc:entities/A1",
+                            "normalized_source_hash": "b" * 64,
+                            "adapter": "libredwg",
+                        },
+                    }
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_scalar_adapter_ingestion)
+
+        await process_ingest_job(job.id)
+
+        _, _, _, _, entities = await _load_project_materialization(project["id"])
+
+        assert len(entities) == 1
+        entity = entities[0]
+        assert entity.provenance_json == {
+            "origin": "adapter_normalized",
+            "adapter": {"value": "libredwg"},
+            "source_ref": "doc:entities/A1",
+            "source_identity": "A1",
+            "source_hash": "b" * 64,
+            "extraction_path": [],
+            "notes": [],
+        }
+        assert entity.canonical_entity_json is not None
+        assert entity.canonical_entity_json["provenance_json"] == {
+            "source_handle": "A1",
+            "source_entity_ref": "doc:entities/A1",
+            "normalized_source_hash": "b" * 64,
+            "adapter": "libredwg",
         }
 
     async def test_revision_materialization_resolves_entity_relationship_columns(
