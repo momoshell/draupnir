@@ -50,6 +50,12 @@ class DrawingRevision(Base):
             name="uq_drawing_revisions_id_project_id",
         ),
         UniqueConstraint(
+            "id",
+            "project_id",
+            "source_file_id",
+            name="uq_drawing_revisions_id_project_id_source_file_id",
+        ),
+        UniqueConstraint(
             "adapter_run_output_id",
             name="uq_drawing_revisions_adapter_run_output_id",
         ),

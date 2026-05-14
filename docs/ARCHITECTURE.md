@@ -370,7 +370,8 @@ MVP does not perform automatic physical deletion. In particular:
 
 ## Job Pipeline Orchestration
 
-Jobs form a small DAG per uploaded file:
+Jobs form a small DAG per uploaded file, with `jobs.file_id` as the durable
+origin and lock anchor for the chain:
 
 ```text
 ingest(file)
@@ -379,12 +380,24 @@ ingest(file)
             -> [optional] export(...)
 ```
 
+`ingest(file)` produces a `drawing_revision` that becomes the pinned input for
+later revision-scoped work. A future `quantity_takeoff(drawing_revision)` job
+will run against exactly one persisted revision rather than against the mutable
+file head.
+
 For MVP every step is triggered explicitly via API. A later iteration may add an
 auto-chain configuration on the project that fires the next step on success.
+The quantity worker/API remains deferred; this DAG documents the persisted job
+shape and lineage model, not a shipped downstream quantity surface.
 
 Workers must:
 
 - record the parent job id when chaining
+- keep any optional `jobs.parent_job_id` in the same project/file lineage as the
+  child job
+- use `jobs.base_revision_id` to pin the exact input/base revision for
+  revision-scoped work; reprocess keeps its stale-base conflict fence as the
+  special current-revision check
 - never silently start downstream work on failure or partial output
 - surface the chain in `job_events` so clients can render a pipeline view
 - treat each attempt as an isolated execution context with any temporary staged

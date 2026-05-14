@@ -32,9 +32,10 @@ from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
 from app.ingestion.runner import (
     run_ingestion as real_run_ingestion,
 )
+from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
-from app.models.job import Job
+from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.project import Project
 from tests.conftest import requires_database
@@ -241,6 +242,60 @@ async def _get_job(job_id: uuid.UUID) -> Job:
 
     assert job is not None
     return job
+
+
+async def _get_latest_revision_for_file(file_id: uuid.UUID) -> DrawingRevision | None:
+    """Load the latest finalized drawing revision for a file."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        return (
+            await session.execute(
+                select(DrawingRevision)
+                .where(DrawingRevision.source_file_id == file_id)
+                .order_by(
+                    DrawingRevision.revision_sequence.desc(),
+                    DrawingRevision.id.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+
+async def _create_quantity_takeoff_job(
+    *,
+    project_id: uuid.UUID,
+    file_id: uuid.UUID,
+    base_revision_id: uuid.UUID,
+    parent_job_id: uuid.UUID,
+    status: str,
+    attempts: int = 0,
+    max_attempts: int = 3,
+) -> Job:
+    """Persist a quantity_takeoff job linked to an ingest lineage chain."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    quantity_job = Job(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        file_id=file_id,
+        extraction_profile_id=None,
+        base_revision_id=base_revision_id,
+        parent_job_id=parent_job_id,
+        job_type=JobType.QUANTITY_TAKEOFF.value,
+        status=status,
+        attempts=attempts,
+        max_attempts=max_attempts,
+        cancel_requested=False,
+    )
+
+    async with session_maker() as session:
+        session.add(quantity_job)
+        await session.commit()
+
+    return await _get_job(quantity_job.id)
 
 
 async def _update_job(
@@ -2320,6 +2375,47 @@ class TestJobs:
         assert updated_job.cancel_requested is True
         assert updated_job.status in {"pending", "cancelled"}
 
+    async def test_cancel_job_preserves_quantity_takeoff_lineage_fields(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Cancel should not rewrite quantity job lineage metadata."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+        original = await _get_job(quantity_job.id)
+        assert original.extraction_profile_id is None
+
+        response = await async_client.post(f"/v1/jobs/{quantity_job.id}/cancel")
+
+        assert response.status_code == 202
+        updated = await _get_job(quantity_job.id)
+        assert updated.cancel_requested is True
+        assert updated.project_id == original.project_id
+        assert updated.file_id == original.file_id
+        assert updated.job_type == original.job_type
+        assert updated.extraction_profile_id == original.extraction_profile_id
+        assert updated.extraction_profile_id is None
+        assert updated.base_revision_id == original.base_revision_id
+        assert updated.parent_job_id == original.parent_job_id
+
     async def test_cancel_job_returns_404_for_unknown_job(
         self,
         async_client: httpx.AsyncClient,
@@ -2524,6 +2620,285 @@ class TestJobs:
         updated = await _get_job(job.id)
         assert updated.status == "pending"
         assert updated.enqueue_status == "pending"
+
+    async def test_publish_job_enqueue_intent_skips_quantity_takeoff_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity jobs should never claim or publish the ingest worker outbox."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+        last_attempted_at = datetime.now(UTC) - timedelta(minutes=5)
+        unchanged_token = uuid.uuid4()
+        await _update_job(
+            quantity_job.id,
+            enqueue_status="pending",
+            enqueue_attempts=7,
+            enqueue_owner_token=unchanged_token,
+            enqueue_lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
+            enqueue_last_attempted_at=last_attempted_at,
+        )
+
+        published = await worker_module.publish_job_enqueue_intent(quantity_job.id)
+
+        assert published is False
+        updated = await _get_job(quantity_job.id)
+        assert updated.status == "pending"
+        assert updated.enqueue_status == "pending"
+        assert updated.extraction_profile_id is None
+        assert updated.enqueue_attempts == 7
+        assert updated.enqueue_owner_token == unchanged_token
+        assert updated.enqueue_lease_expires_at is not None
+        assert updated.enqueue_last_attempted_at == last_attempted_at
+        assert updated.enqueue_published_at is None
+
+    async def test_retry_job_noops_for_quantity_takeoff_without_ingest_publisher(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should return 202 without requeueing unsupported quantity jobs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            retried_job_ids.append(str(job_id))
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+        )
+        await _update_job(
+            quantity_job.id,
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message="quantity worker unavailable",
+            enqueue_status="pending",
+            enqueue_attempts=2,
+        )
+        original = await _get_job(quantity_job.id)
+        assert original.extraction_profile_id is None
+
+        response = await async_client.post(f"/v1/jobs/{quantity_job.id}/retry")
+
+        assert response.status_code == 202
+        assert retried_job_ids == []
+        unchanged = await _get_job(quantity_job.id)
+        assert unchanged.status == "failed"
+        assert unchanged.attempts == original.attempts
+        assert unchanged.error_code == original.error_code
+        assert unchanged.error_message == original.error_message
+        assert unchanged.enqueue_status == original.enqueue_status
+        assert unchanged.enqueue_attempts == original.enqueue_attempts
+        assert unchanged.project_id == original.project_id
+        assert unchanged.file_id == original.file_id
+        assert unchanged.job_type == original.job_type
+        assert unchanged.extraction_profile_id == original.extraction_profile_id
+        assert unchanged.extraction_profile_id is None
+        assert unchanged.base_revision_id == original.base_revision_id
+        assert unchanged.parent_job_id == original.parent_job_id
+
+    @pytest.mark.parametrize("status", ["pending", "running"])
+    async def test_recover_incomplete_ingest_jobs_skips_quantity_takeoff_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+    ) -> None:
+        """Startup recovery should ignore quantity jobs while no quantity worker exists."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        recovered_job_ids: list[str] = []
+
+        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+            recovered_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status=status,
+            attempts=1 if status == "running" else 0,
+        )
+
+        if status == "running":
+            await _update_job(
+                quantity_job.id,
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            session_maker = session_module.AsyncSessionLocal
+            assert session_maker is not None
+            async with session_maker() as session:
+                persisted_job = await session.get(Job, quantity_job.id)
+                assert persisted_job is not None
+                persisted_job.started_at = (
+                    datetime.now(UTC)
+                    - worker_module._RUNNING_JOB_STALE_AFTER
+                    - timedelta(seconds=1)
+                )
+                persisted_job.attempt_token = uuid.uuid4()
+                persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                await session.commit()
+        else:
+            await _update_job(
+                quantity_job.id,
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+
+        original = await _get_job(quantity_job.id)
+
+        requeued = await worker_module.recover_incomplete_ingest_jobs()
+
+        assert requeued == []
+        assert recovered_job_ids == []
+        unchanged = await _get_job(quantity_job.id)
+        assert unchanged.status == original.status
+        assert unchanged.attempts == original.attempts
+        assert unchanged.started_at == original.started_at
+        assert unchanged.attempt_token == original.attempt_token
+        assert unchanged.attempt_lease_expires_at == original.attempt_lease_expires_at
+        assert unchanged.enqueue_status == original.enqueue_status
+        assert unchanged.enqueue_attempts == original.enqueue_attempts
+        assert unchanged.project_id == original.project_id
+        assert unchanged.file_id == original.file_id
+        assert unchanged.job_type == original.job_type
+        assert unchanged.extraction_profile_id == original.extraction_profile_id
+        assert unchanged.extraction_profile_id is None
+        assert unchanged.base_revision_id == original.base_revision_id
+        assert unchanged.parent_job_id == original.parent_job_id
+
+    async def test_process_ingest_job_skips_quantity_takeoff_jobs_without_mutation(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Direct ingest-worker delivery should no-op for quantity jobs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+            attempts=1,
+        )
+        await _update_job(
+            quantity_job.id,
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message="quantity worker unavailable",
+            enqueue_status="pending",
+            enqueue_attempts=2,
+            enqueue_owner_token=uuid.uuid4(),
+            enqueue_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            enqueue_last_attempted_at=datetime.now(UTC) - timedelta(minutes=1),
+            enqueue_published_at=datetime.now(UTC) - timedelta(minutes=2),
+        )
+        original = await _get_job(quantity_job.id)
+        assert original.extraction_profile_id is None
+        assert original.attempt_token is None
+        assert original.attempt_lease_expires_at is None
+
+        await worker_module.process_ingest_job(quantity_job.id)
+
+        unchanged = await _get_job(quantity_job.id)
+        assert unchanged.status == original.status
+        assert unchanged.attempts == original.attempts
+        assert unchanged.started_at == original.started_at
+        assert unchanged.finished_at == original.finished_at
+        assert unchanged.attempt_token == original.attempt_token
+        assert unchanged.attempt_lease_expires_at == original.attempt_lease_expires_at
+        assert unchanged.cancel_requested == original.cancel_requested
+        assert unchanged.error_code == original.error_code
+        assert unchanged.error_message == original.error_message
+        assert unchanged.enqueue_status == original.enqueue_status
+        assert unchanged.enqueue_attempts == original.enqueue_attempts
+        assert unchanged.enqueue_owner_token == original.enqueue_owner_token
+        assert unchanged.enqueue_lease_expires_at == original.enqueue_lease_expires_at
+        assert unchanged.enqueue_last_attempted_at == original.enqueue_last_attempted_at
+        assert unchanged.enqueue_published_at == original.enqueue_published_at
+        assert unchanged.project_id == original.project_id
+        assert unchanged.file_id == original.file_id
+        assert unchanged.job_type == original.job_type
+        assert unchanged.extraction_profile_id == original.extraction_profile_id
+        assert unchanged.extraction_profile_id is None
+        assert unchanged.base_revision_id == original.base_revision_id
+        assert unchanged.parent_job_id == original.parent_job_id
 
     async def test_retry_job_succeeds_when_enqueue_claim_raises_after_commit(
         self,

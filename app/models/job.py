@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Integer,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,6 +26,7 @@ class JobType(StrEnum):
 
     INGEST = "ingest"
     REPROCESS = "reprocess"
+    QUANTITY_TAKEOFF = "quantity_takeoff"
 
 
 class JobStatus(StrEnum):
@@ -42,7 +44,10 @@ _JOB_STATUS_VALUES = tuple(status.value for status in JobStatus)
 _JOB_ERROR_CODE_VALUES = tuple(error_code.value for error_code in ErrorCode)
 _ENQUEUE_STATUS_VALUES = ("pending", "publishing", "published")
 _PROFILE_REQUIRED_JOB_TYPE_VALUES = (JobType.INGEST.value, JobType.REPROCESS.value)
-_BASE_REQUIRED_JOB_TYPE_VALUES = (JobType.REPROCESS.value,)
+_BASE_REQUIRED_JOB_TYPE_VALUES = (
+    JobType.REPROCESS.value,
+    JobType.QUANTITY_TAKEOFF.value,
+)
 
 
 def _sql_in_list(values: tuple[str, ...]) -> str:
@@ -67,6 +72,22 @@ class Job(Base):
             ["extraction_profiles.id", "extraction_profiles.project_id"],
             ondelete="RESTRICT",
             name="fk_jobs_extraction_profile_id_project_id_extraction_profiles",
+        ),
+        ForeignKeyConstraint(
+            ["base_revision_id", "project_id", "file_id"],
+            [
+                "drawing_revisions.id",
+                "drawing_revisions.project_id",
+                "drawing_revisions.source_file_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_jobs_base_revision_id_project_id_file_id_drawing_revisions",
+        ),
+        ForeignKeyConstraint(
+            ["parent_job_id", "project_id", "file_id"],
+            ["jobs.id", "jobs.project_id", "jobs.file_id"],
+            ondelete="RESTRICT",
+            name="fk_jobs_parent_job_id_project_id_file_id_jobs",
         ),
         CheckConstraint(
             f"job_type IN ({_sql_in_list(_JOB_TYPE_VALUES)})",
@@ -98,8 +119,23 @@ class Job(Base):
             name="ck_jobs_reprocess_base_revision_required",
         ),
         CheckConstraint(
+            f"job_type != '{JobType.QUANTITY_TAKEOFF.value}' "
+            "OR extraction_profile_id IS NULL",
+            name="ck_jobs_quantity_takeoff_extraction_profile_forbidden",
+        ),
+        CheckConstraint(
             f"job_type != '{JobType.INGEST.value}' OR base_revision_id IS NULL",
             name="ck_jobs_ingest_base_revision_forbidden",
+        ),
+        CheckConstraint(
+            "parent_job_id IS NULL OR parent_job_id != id",
+            name="ck_jobs_parent_job_id_not_self",
+        ),
+        UniqueConstraint(
+            "id",
+            "project_id",
+            "file_id",
+            name="uq_jobs_id_project_id_file_id",
         ),
     )
 
@@ -133,22 +169,25 @@ class Job(Base):
         ),
     )
     base_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey(
-            "drawing_revisions.id",
-            name="fk_jobs_base_revision_id_drawing_revisions",
-            ondelete="RESTRICT",
-        ),
         nullable=True,
         index=True,
         comment=(
-            "Pinned latest finalized drawing revision captured when a reprocess "
-            "job was created. Null for initial ingest jobs."
+            "Pinned latest finalized drawing revision captured when a revision-"
+            "scoped job was created. Null for initial ingest jobs."
+        ),
+    )
+    parent_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+        comment=(
+            "Optional parent job identifier for same-project, same-file job "
+            "lineage."
         ),
     )
     job_type: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="Job type (e.g. ingest)",
+        comment="Job type (e.g. ingest, reprocess, quantity_takeoff)",
     )
     status: Mapped[str] = mapped_column(
         String(32),

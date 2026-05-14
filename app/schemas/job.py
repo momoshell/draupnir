@@ -29,9 +29,13 @@ class JobRead(BaseModel):
     base_revision_id: uuid.UUID | None = Field(
         default=None,
         description=(
-            "Pinned latest finalized drawing revision captured when a reprocess "
-            "job was created. Null for initial ingest jobs."
+            "Pinned latest finalized drawing revision captured when a revision-"
+            "scoped job was created. Null for initial ingest jobs."
         ),
+    )
+    parent_job_id: uuid.UUID | None = Field(
+        default=None,
+        description="Optional parent job identifier for same-project, same-file job lineage.",
     )
     job_type: JobType = Field(..., description="Job type")
     status: JobStatus = Field(..., description="Job status")
