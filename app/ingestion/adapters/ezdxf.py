@@ -1045,19 +1045,33 @@ def _entity_provenance(
     entity_id: str,
     geometry: dict[str, JSONValue] | None,
 ) -> dict[str, JSONValue]:
+    source_entity_ref = f"entities.{native_type}:{handle or entity_id}"
+    source_hash = _entity_fingerprint(
+        native_type=native_type,
+        handle=handle,
+        layout_name=layout_name,
+        layer_name=layer_name,
+        geometry=geometry,
+    )
+    notes: tuple[str, ...] = ()
+    if geometry is None:
+        notes = ("unsupported_or_invalid_geometry",)
     return {
-        "source_entity_ref": f"entities.{native_type}:{handle or entity_id}",
+        "origin": "adapter_normalized",
+        "adapter": {"key": _DESCRIPTOR.key},
+        "adapter_key": _DESCRIPTOR.key,
+        "source": source_entity_ref,
+        "source_ref": source_entity_ref,
+        "source_entity_ref": source_entity_ref,
+        "source_identity": handle or entity_id,
+        "source_hash": source_hash,
         "dxf_handle": handle or None,
         "native_entity_type": native_type,
         "layout_name": layout_name,
         "layer_name": layer_name,
-        "normalized_source_hash": _entity_fingerprint(
-            native_type=native_type,
-            handle=handle,
-            layout_name=layout_name,
-            layer_name=layer_name,
-            geometry=geometry,
-        ),
+        "normalized_source_hash": source_hash,
+        "extraction_path": ("modelspace", native_type),
+        "notes": notes,
     }
 
 

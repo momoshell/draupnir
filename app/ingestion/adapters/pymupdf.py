@@ -9,7 +9,7 @@ import importlib.metadata
 import json
 import math
 import multiprocessing
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
@@ -775,12 +775,13 @@ def _build_lineish_entity(
         "layer": layer_name,
         "bbox": bbox,
         "properties": _entity_properties(drawing, closed=closed, rect_like=rect_like),
-        "provenance": {
-            "page_number": page_number,
-            "drawing_index": drawing_index,
-            "item_indices": item_indices,
-            "source": "pymupdf.get_drawings",
-        },
+        "provenance": _entity_provenance(
+            page_number=page_number,
+            drawing_index=drawing_index,
+            drawing=drawing,
+            item_indices=item_indices,
+            operator="re" if rect_like else "l",
+        ),
         "confidence": {
             "score": _VECTOR_CONFIDENCE_SCORE,
             "basis": "vector_path_segment",
@@ -882,15 +883,14 @@ def _build_unknown_entity(
     )
     bbox = _bbox_from_unsupported_item(item)
     provenance: dict[str, JSONValue] = {
-        "page_number": page_number,
-        "drawing_index": drawing_index,
-        "item_index": item_index,
-        "operator": operator,
-        "source": "pymupdf.get_drawings",
+        **_entity_provenance(
+            page_number=page_number,
+            drawing_index=drawing_index,
+            drawing=drawing,
+            item_index=item_index,
+            operator=operator,
+        ),
     }
-    normalized_source_hash = _normalized_source_hash(item)
-    if normalized_source_hash is not None:
-        provenance["normalized_source_hash"] = normalized_source_hash
 
     return {
         "entity_id": entity_id,
@@ -1004,6 +1004,159 @@ def _entity_properties(
         "rect_like": rect_like,
         "sequence_number": int(drawing.get("seqno", 0)),
     }
+
+
+def _entity_provenance(
+    *,
+    page_number: int,
+    drawing_index: int,
+    drawing: Mapping[str, Any],
+    operator: str,
+    item_indices: tuple[int, ...] | None = None,
+    item_index: int | None = None,
+) -> dict[str, JSONValue]:
+    location_payload = _entity_location_payload(
+        page_number=page_number,
+        drawing_index=drawing_index,
+        operator=operator,
+        item_indices=item_indices,
+        item_index=item_index,
+    )
+    source_ref = _entity_source_ref(location_payload)
+    source_hash = _entity_source_hash(
+        _entity_source_payload(
+            page_number=page_number,
+            operator=operator,
+            drawing=drawing,
+            item_indices=item_indices,
+            item_index=item_index,
+        )
+    )
+    provenance: dict[str, JSONValue] = {
+        "origin": "adapter_normalized",
+        "adapter": {"key": _DESCRIPTOR.key},
+        "adapter_key": _DESCRIPTOR.key,
+        "source": location_payload["source"],
+        "source_ref": source_ref,
+        "source_entity_ref": source_ref,
+        "source_identity": _entity_source_identity(location_payload),
+        "source_hash": source_hash,
+        "page_number": page_number,
+        "drawing_index": drawing_index,
+        "operator": operator,
+        "normalized_source_hash": source_hash,
+        "extraction_path": (
+            "get_drawings",
+            f"page-{page_number}",
+            f"drawing-{drawing_index}",
+            operator,
+        ),
+        "notes": ("vector_pdf_unconfirmed_scale",),
+    }
+    if item_indices is not None:
+        provenance["item_indices"] = item_indices
+    if item_index is not None:
+        provenance["item_index"] = item_index
+    return provenance
+
+
+def _entity_location_payload(
+    *,
+    page_number: int,
+    drawing_index: int,
+    operator: str,
+    item_indices: tuple[int, ...] | None,
+    item_index: int | None,
+) -> dict[str, JSONValue]:
+    payload: dict[str, JSONValue] = {
+        "page_number": page_number,
+        "drawing_index": drawing_index,
+        "operator": operator,
+        "source": "pymupdf.get_drawings",
+    }
+    if item_indices is not None:
+        payload["item_indices"] = item_indices
+    if item_index is not None:
+        payload["item_index"] = item_index
+    return payload
+
+
+def _entity_source_payload(
+    *,
+    page_number: int,
+    operator: str,
+    drawing: Mapping[str, Any],
+    item_indices: tuple[int, ...] | None,
+    item_index: int | None,
+) -> dict[str, Any]:
+    return {
+        "page_number": page_number,
+        "operator": operator,
+        "source": "pymupdf.get_drawings",
+        "drawing": _entity_source_drawing_payload(drawing),
+        "items": _entity_source_items(
+            drawing,
+            item_indices=item_indices,
+            item_index=item_index,
+        ),
+    }
+
+
+def _entity_source_ref(payload: Mapping[str, JSONValue]) -> str:
+    page_number = int(cast(int, payload["page_number"]))
+    drawing_index = int(cast(int, payload["drawing_index"]))
+    operator = str(payload["operator"])
+    if "item_indices" in payload:
+        indices = ",".join(
+            str(index) for index in cast(tuple[int, ...], payload["item_indices"])
+        )
+        return f"pdf://page-{page_number}/drawing-{drawing_index}/{operator}/items:{indices}"
+    item_index = int(cast(int, payload["item_index"]))
+    return f"pdf://page-{page_number}/drawing-{drawing_index}/{operator}/item:{item_index}"
+
+
+def _entity_source_identity(payload: Mapping[str, JSONValue]) -> str:
+    page_number = int(cast(int, payload["page_number"]))
+    drawing_index = int(cast(int, payload["drawing_index"]))
+    if "item_indices" in payload:
+        indices = ",".join(
+            str(index) for index in cast(tuple[int, ...], payload["item_indices"])
+        )
+        return f"page-{page_number}:drawing-{drawing_index}:items-{indices}"
+    return (
+        f"page-{page_number}:drawing-{drawing_index}:item-"
+        f"{int(cast(int, payload['item_index']))}"
+    )
+
+
+def _entity_source_hash(payload: Mapping[str, Any]) -> str:
+    source_hash = _normalized_source_hash(payload)
+    if source_hash is None:
+        raise TypeError("PyMuPDF source payload is not JSON-normalizable.")
+    return source_hash
+
+
+def _entity_source_drawing_payload(drawing: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in drawing.items() if key != "items"}
+
+
+def _entity_source_items(
+    drawing: Mapping[str, Any],
+    *,
+    item_indices: tuple[int, ...] | None,
+    item_index: int | None,
+) -> tuple[Any, ...]:
+    raw_items = drawing.get("items")
+    if not isinstance(raw_items, (tuple, list)):
+        return ()
+    items = tuple(raw_items)
+    if item_indices is not None:
+        return tuple(
+            items[index] for index in item_indices if 0 <= index < len(items)
+        )
+    if item_index is not None and 0 <= item_index < len(items):
+        return (items[item_index],)
+    return ()
 
 
 def _normalized_source_hash(value: Any) -> str | None:

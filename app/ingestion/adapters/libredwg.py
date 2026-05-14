@@ -781,17 +781,13 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
                 }
             },
         },
-        "provenance": {
-            "adapter": "libredwg",
-            "source_section": "OBJECTS",
-            "source_entity_ref": _source_locator(record, record_type="LINE"),
-            "source_locator": _source_locator(record, record_type="LINE"),
-            "source_ref": _source_locator(record, record_type="LINE"),
-            "entity_ref": _source_locator(record, record_type="LINE"),
-            "native_handle": source_handle,
-            "source_entity_handle": source_handle,
-            "record_hash": _hash_json_value(safe_projection),
-        },
+        "provenance": _entity_provenance(
+            record,
+            record_type="LINE",
+            source_handle=source_handle,
+            safe_projection=safe_projection,
+            notes=("units_unconfirmed",),
+        ),
         "confidence": {
             "score": _LINE_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
@@ -845,17 +841,13 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
             "record_type": record_type,
             "handle": source_handle,
         },
-        "provenance": {
-            "adapter": "libredwg",
-            "source_section": "OBJECTS",
-            "source_entity_ref": _source_locator(record, record_type=record_type),
-            "source_locator": _source_locator(record, record_type=record_type),
-            "source_ref": _source_locator(record, record_type=record_type),
-            "entity_ref": _source_locator(record, record_type=record_type),
-            "native_handle": source_handle,
-            "source_entity_handle": source_handle,
-            "record_hash": _hash_json_value(safe_projection),
-        },
+        "provenance": _entity_provenance(
+            record,
+            record_type=record_type,
+            source_handle=source_handle,
+            safe_projection=safe_projection,
+            notes=("units_unconfirmed", reason),
+        ),
         "confidence": {
             "score": _UNKNOWN_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
@@ -997,6 +989,37 @@ def _entity_id(record: Mapping[str, Any], *, record_type: str) -> str:
     return f"libredwg-{record_type}-{record_hash[:18]}"
 
 
+def _entity_provenance(
+    record: Mapping[str, Any],
+    *,
+    record_type: str,
+    source_handle: str | None,
+    safe_projection: _JSONDict,
+    notes: tuple[str, ...],
+) -> _JSONDict:
+    source_locator = _source_locator(record, record_type=record_type)
+    source_hash = _canonical_hash_json_value(safe_projection)
+    return {
+        "origin": "adapter_normalized",
+        "adapter": {"key": _DESCRIPTOR.key},
+        "adapter_key": _DESCRIPTOR.key,
+        "source": source_locator,
+        "source_section": "OBJECTS",
+        "source_ref": source_locator,
+        "source_entity_ref": source_locator,
+        "source_locator": source_locator,
+        "entity_ref": source_locator,
+        "source_identity": source_handle or _entity_id(record, record_type=record_type.lower()),
+        "source_hash": source_hash,
+        "normalized_source_hash": source_hash,
+        "native_handle": source_handle,
+        "source_entity_handle": source_handle,
+        "record_hash": _hash_json_value(safe_projection),
+        "extraction_path": ("OBJECTS", record_type),
+        "notes": notes,
+    }
+
+
 def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
     handle = _extract_handle(record)
     if handle is not None:
@@ -1083,12 +1106,18 @@ def _safe_record_projection(
 
 
 def _hash_json_value(value: JSONValue) -> str:
+    return f"sha256:{_canonical_hash_json_value(value)}"
+
+
+def _canonical_hash_json_value(value: JSONValue) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return f"sha256:{_hash_text(payload)}"
+    return _hash_text(payload)
 
 
 def _hash_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _source_ref(source: AdapterSource) -> str:
     candidate = (
         source.original_name.replace("\\", "/").split("/")[-1].strip()

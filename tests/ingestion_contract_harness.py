@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from app.ingestion.finalization import (
 _DEFAULT_CONTRACT_TIMEOUT = AdapterTimeout(seconds=0.5)
 _DEFAULT_FAILURE_TIMEOUT = AdapterTimeout(seconds=0.01)
 _CONTRACT_ENTITY_SCHEMA_VERSION = "0.1"
+_CANONICAL_SOURCE_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 _NULLABLE_LINKAGE_FIELDS = (
     "drawing_revision_id",
     "source_file_id",
@@ -95,7 +97,11 @@ def build_contract_source(
     )
 
 
-def build_complete_canonical(*, include_pdf_scale: bool = False) -> dict[str, JSONValue]:
+def build_complete_canonical(
+    *,
+    include_pdf_scale: bool = False,
+    adapter_key: str = "contract",
+) -> dict[str, JSONValue]:
     """Return a canonical payload that satisfies baseline validator checks."""
 
     canonical: dict[str, JSONValue] = {
@@ -135,6 +141,13 @@ def build_complete_canonical(*, include_pdf_scale: bool = False) -> dict[str, JS
                     "adapter_native": {"contract": {"layer": "A-WALL"}},
                 },
                 "provenance": {
+                    "origin": "adapter_normalized",
+                    "adapter": {"key": adapter_key},
+                    "source_ref": "entities.contract-entity-1",
+                    "source_identity": "ABC",
+                    "source_hash": "0" * 64,
+                    "extraction_path": ("contract",),
+                    "notes": (),
                     "source_entity_ref": "entities.contract-entity-1",
                     "normalized_source_hash": "0" * 64,
                 },
@@ -212,7 +225,11 @@ def assert_adapter_result_contract(
     if not entities:
         _assert_empty_entity_collection_reason(result.canonical)
     else:
-        _assert_entity_envelopes(entities, expected_schema_version=schema_version)
+        _assert_entity_envelopes(
+            entities,
+            expected_schema_version=schema_version,
+            expected_adapter_key=expected_adapter_key,
+        )
 
     for record in result.provenance:
         if not record.stage or not record.source_ref:
@@ -288,6 +305,7 @@ def _assert_entity_envelopes(
     entities: tuple[JSONValue, ...],
     *,
     expected_schema_version: str,
+    expected_adapter_key: str,
 ) -> None:
     seen_entity_ids: set[str] = set()
     for entity_payload in entities:
@@ -314,33 +332,52 @@ def _assert_entity_envelopes(
         provenance = entity_payload.get("provenance")
         if not isinstance(provenance, dict) or not provenance:
             raise AssertionError("Canonical entities must include provenance metadata.")
-        if not _has_stable_entity_provenance(provenance):
-            raise AssertionError(
-                "Canonical entity provenance must include a stable source locator."
-            )
+        _assert_canonical_entity_provenance(provenance, expected_adapter_key=expected_adapter_key)
 
         _assert_required_nullable_linkage_fields(entity_payload)
         _assert_entity_confidence(entity_payload.get("confidence"))
         _assert_geometry_reason_if_required(entity_payload)
 
 
-def _has_stable_entity_provenance(provenance: dict[str, JSONValue]) -> bool:
-    stable_keys = (
-        "source_entity_ref",
-        "normalized_source_hash",
-        "ifc_step_id",
-        "ifc_global_id",
-        "page_number",
-        "drawing_index",
-        "source",
-    )
-    for key in stable_keys:
-        value = provenance.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return True
-    return False
+def _assert_canonical_entity_provenance(
+    provenance: dict[str, JSONValue],
+    *,
+    expected_adapter_key: str,
+) -> None:
+    if provenance.get("origin") != "adapter_normalized":
+        raise AssertionError("Canonical entity provenance origin must be adapter_normalized.")
+
+    adapter = provenance.get("adapter")
+    if not isinstance(adapter, dict) or adapter.get("key") != expected_adapter_key:
+        raise AssertionError("Canonical entity provenance adapter.key must match the adapter.")
+
+    source_ref = provenance.get("source_ref")
+    if not isinstance(source_ref, str) or not source_ref.strip():
+        raise AssertionError("Canonical entity provenance must include source_ref.")
+
+    source_identity = provenance.get("source_identity")
+    if not isinstance(source_identity, str) or not source_identity.strip():
+        raise AssertionError("Canonical entity provenance must include source_identity.")
+
+    source_hash = provenance.get("source_hash")
+    if not isinstance(source_hash, str) or not _CANONICAL_SOURCE_HASH_PATTERN.fullmatch(
+        source_hash
+    ):
+        raise AssertionError(
+            "Canonical entity provenance source_hash must be lowercase 64-char SHA-256 hex."
+        )
+
+    extraction_path = provenance.get("extraction_path")
+    if not isinstance(extraction_path, (tuple, list)):
+        raise AssertionError("Canonical entity provenance must include extraction_path.")
+    if not all(isinstance(segment, str) and segment.strip() for segment in extraction_path):
+        raise AssertionError("Canonical entity provenance extraction_path must contain strings.")
+
+    notes = provenance.get("notes")
+    if not isinstance(notes, (tuple, list)):
+        raise AssertionError("Canonical entity provenance must include notes.")
+    if not all(isinstance(note, str) and note.strip() for note in notes):
+        raise AssertionError("Canonical entity provenance notes must contain non-empty strings.")
 
 
 def _assert_entity_confidence(confidence: JSONValue) -> None:
