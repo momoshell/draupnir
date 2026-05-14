@@ -697,6 +697,20 @@ Database ownership and append-only policy:
 - Mutable state must not be used to rewrite the payload, lineage, checksum, or
   source references of an already committed append-only record.
 
+Persisted job lineage rules:
+
+- `jobs.file_id` is the durable origin and lock anchor for the full downstream
+  job chain rooted at an uploaded file.
+- `jobs.base_revision_id` pins the exact drawing revision used as the input/base
+  revision for revision-scoped work. This supports downstream single-revision
+  jobs without introducing a separate `job_targets` table.
+- Reprocess remains a special case: its stale-base `REVISION_CONFLICT` fence is
+  checked against the current finalized file revision at request/finalization
+  time rather than treated as generic downstream chaining.
+- `jobs.parent_job_id` is optional lineage metadata when one job is spawned from
+  another, but any parent/child link must stay within the same project/file
+  lineage.
+
 ## MVP Retention And Deletion Policy
 
 For MVP, retention is conservative:
@@ -813,6 +827,13 @@ New codes require a docs change in this file.
   different completed job path.
 - Retrying a job that failed with `REVISION_CONFLICT` must return the unchanged
   failed job and must not enqueue a new attempt.
+- Persisted jobs are revision-scoped when needed: ingestion runs from `file_id`,
+  produces a `drawing_revision`, and later downstream work such as
+  `quantity_takeoff(drawing_revision)` pins that revision in
+  `jobs.base_revision_id` while still using `jobs.file_id` as the durable
+  origin/lock anchor.
+- The optional `jobs.parent_job_id` link is lineage only; it does not replace
+  the required same-project/same-file constraints on parent/child jobs.
 - Attempt-local staging is mutable until commit, but staged rows/objects are not
   authoritative product records. Only the atomic finalization step may publish
   new append-only records, and cancellation before that step must leave no new
@@ -1042,15 +1063,22 @@ Probe rules:
 
 ## Provenance And Confidence
 
-- Ingestion and downstream jobs must reference both `file_id` and
+- Ingestion and reprocessing jobs must reference both `file_id` and
   `extraction_profile_id`. The file identifies the immutable source upload; the
   extraction profile identifies the normalization/extraction settings used to
-  derive a revision.
+  derive a revision. Revision-scoped downstream jobs instead pin their input via
+  `jobs.base_revision_id` and inherit extraction settings through that revision
+  unless their own contract explicitly requires a profile.
+- For persisted jobs, `jobs.file_id` remains the durable origin and lock anchor,
+  while `jobs.base_revision_id` pins the exact drawing revision used by
+  revision-scoped downstream work.
 - Reprocessing is not an in-place rerun. Reprocessing creates a new drawing
   revision from an existing `file_id`, records the `extraction_profile_id` used
   for the run, and records the adapter name/version that produced the result.
 - Reprocess jobs also record the finalized base revision they were created
   against in `jobs.base_revision_id`.
+- Optional `jobs.parent_job_id` lineage must remain within the same project/file
+  as the child job.
 - The prior revision remains available for lineage, comparison, and audit even
   when the newer reprocessed revision supersedes it.
 - Reprocess API contract: `POST /v1/projects/{project_id}/files/{file_id}/reprocess`

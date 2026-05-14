@@ -30,6 +30,7 @@ from app.jobs.worker import (
     enqueue_ingest_job as _enqueue_ingest_job,
 )
 from app.jobs.worker import (
+    is_ingest_worker_job_type,
     prepare_job_enqueue_intent,
     publish_job_enqueue_intent,
 )
@@ -427,6 +428,19 @@ async def retry_job(
         return job
 
     if job.error_code == ErrorCode.REVISION_CONFLICT.value:
+        if reservation is not None:
+            body = JobRead.model_validate(job).model_dump(mode="json")
+            await mark_idempotency_completed(
+                db,
+                reservation,
+                status_code=status.HTTP_202_ACCEPTED,
+                response_body=body,
+            )
+            await db.commit()
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+        return job
+
+    if not is_ingest_worker_job_type(job.job_type):
         if reservation is not None:
             body = JobRead.model_validate(job).model_dump(mode="json")
             await mark_idempotency_completed(

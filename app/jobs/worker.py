@@ -84,6 +84,12 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
 )
 
 
+def is_ingest_worker_job_type(job_type: JobType | str) -> bool:
+    """Return whether a job type is published to the ingest worker."""
+    normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
+    return normalized_job_type in _RECOVERABLE_INGEST_JOB_TYPES
+
+
 class _InactiveSourceError(Exception):
     """Raised when a job source project or file is no longer active."""
 
@@ -2183,7 +2189,7 @@ async def _claim_job_enqueue_intent(job_id: UUID) -> _EnqueueIntentLease | None:
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        if job.job_type not in _RECOVERABLE_INGEST_JOB_TYPES or job.status != "pending":
+        if not is_ingest_worker_job_type(job.job_type) or job.status != "pending":
             return None
 
         if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHED:
@@ -2378,6 +2384,15 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
         )
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if not is_ingest_worker_job_type(job.job_type):
+            logger.info(
+                "ingest_job_unsupported_type_skipped",
+                job_id=str(job_id),
+                job_type=job.job_type,
+                status=job.status,
+            )
+            return None
 
         if job.status in _TERMINAL_JOB_STATUSES:
             logger.info(
