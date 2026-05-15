@@ -137,6 +137,14 @@ class Job(Base):
             "file_id",
             name="uq_jobs_id_project_id_file_id",
         ),
+        UniqueConstraint(
+            "id",
+            "project_id",
+            "file_id",
+            "base_revision_id",
+            "job_type",
+            name="uq_jobs_id_project_id_file_id_base_revision_id_job_type",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

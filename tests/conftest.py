@@ -28,6 +28,8 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "validation_reports",
     "generated_artifacts",
     "job_events",
+    "quantity_takeoffs",
+    "quantity_items",
     "revision_entity_manifests",
     "revision_layouts",
     "revision_layers",

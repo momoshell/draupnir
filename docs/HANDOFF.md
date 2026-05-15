@@ -16,6 +16,8 @@
 - Geometry validation engine (FreeCAD vs OCCT)
 - Webhook/SSE vs polling-only for MVP events
 - Materials: shared catalog vs per-project
+- Generated artifact quantity foreign key remains deferred even though docs now
+  describe append-only quantity takeoff persistence lineage.
 
 ## External Review Follow-Ups
 
