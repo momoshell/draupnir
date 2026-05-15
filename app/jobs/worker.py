@@ -2426,6 +2426,18 @@ async def _finalize_quantity_takeoff_job(
             return False
 
         quantity_takeoff_id = uuid.uuid4()
+        quantity_takeoff = QuantityTakeoff(
+            id=quantity_takeoff_id,
+            project_id=job.project_id,
+            source_file_id=job.file_id,
+            drawing_revision_id=execution.drawing_revision_id,
+            source_job_id=job.id,
+            source_job_type=JobType.QUANTITY_TAKEOFF.value,
+            review_state=execution.review_state,
+            validation_status=execution.validation_status,
+            quantity_gate=execution.quantity_gate,
+            trusted_totals=result.trusted_totals,
+        )
         quantity_items = _build_quantity_items(
             quantity_takeoff_id=quantity_takeoff_id,
             project_id=job.project_id,
@@ -2436,20 +2448,8 @@ async def _finalize_quantity_takeoff_job(
             result=result,
         )
 
-        session.add(
-            QuantityTakeoff(
-                id=quantity_takeoff_id,
-                project_id=job.project_id,
-                source_file_id=job.file_id,
-                drawing_revision_id=execution.drawing_revision_id,
-                source_job_id=job.id,
-                source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                review_state=execution.review_state,
-                validation_status=execution.validation_status,
-                quantity_gate=execution.quantity_gate,
-                trusted_totals=result.trusted_totals,
-            )
-        )
+        session.add(quantity_takeoff)
+        await session.flush()
         session.add_all(quantity_items)
 
         job.status = "succeeded"

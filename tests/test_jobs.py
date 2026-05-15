@@ -3204,13 +3204,18 @@ class TestJobs:
         assert takeoff.trusted_totals is trusted_totals
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
-        assert len(items) == 4
-        assert {item.item_kind for item in items} == {"aggregate", "contributor"}
+        assert len(items) == 5
+        assert {item.item_kind for item in items} == {
+            "aggregate",
+            "contributor",
+            "exclusion",
+        }
         assert all(item.review_state == review_state for item in items)
         assert all(item.validation_status == validation_status for item in items)
         assert all(item.quantity_gate == quantity_gate for item in items)
         assert sum(item.item_kind == "aggregate" for item in items) == 2
         assert sum(item.item_kind == "contributor" for item in items) == 2
+        assert sum(item.item_kind == "exclusion" for item in items) == 1
         contributor_quantity_types = {
             item.quantity_type for item in items if item.item_kind == "contributor"
         }
@@ -3222,8 +3227,11 @@ class TestJobs:
         assert all(":" in quantity_type for quantity_type in contributor_quantity_types)
         assert all(item.source_entity_id is None for item in items if item.item_kind == "aggregate")
         assert all(
-            item.source_entity_id is not None for item in items if item.item_kind == "contributor"
+            item.source_entity_id is not None
+            for item in items
+            if item.item_kind in {"contributor", "exclusion"}
         )
+        assert all(item.value is None for item in items if item.item_kind == "exclusion")
 
     @pytest.mark.parametrize(
         ("review_state", "validation_status", "quantity_gate"),
@@ -3557,7 +3565,10 @@ class TestJobs:
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
         assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert (
+            updated_job.error_code
+            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        )
         assert (
             updated_job.error_message
             == worker_module._QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE
@@ -3568,7 +3579,10 @@ class TestJobs:
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "failed"
-        assert event_payload["error_code"] == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert (
+            event_payload["error_code"]
+            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        )
         assert event_payload["details"]["drawing_revision_id"] == str(base_revision.id)
 
     async def test_process_quantity_takeoff_job_fails_materialization_mismatch_without_rows(
@@ -3607,12 +3621,19 @@ class TestJobs:
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
         assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert (
+            updated_job.error_code
+            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        )
         assert takeoffs == []
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
+        assert (
+            event_payload["error_code"]
+            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        )
         assert event_payload["details"] == {
             "drawing_revision_id": str(base_revision.id),
             "expected_entities": 1,
