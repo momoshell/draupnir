@@ -3,12 +3,13 @@
 import asyncio
 import heapq
 import inspect
+import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from celery import Celery
@@ -20,6 +21,13 @@ from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
+from app.estimating.quantities.contracts import (
+    GateStatus,
+    QuantityEngineResult,
+    RevisionEntityInput,
+    RevisionGateMetadata,
+)
+from app.estimating.quantities.engine import compute_quantities
 from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
@@ -31,6 +39,7 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.project import Project
+from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntity,
@@ -45,6 +54,11 @@ from app.storage.keys import build_generated_artifact_storage_key
 logger = get_logger(__name__)
 
 _RECOVERABLE_INGEST_JOB_TYPES = (JobType.INGEST.value, JobType.REPROCESS.value)
+_RECOVERABLE_ENQUEUE_JOB_TYPES = (
+    JobType.INGEST.value,
+    JobType.REPROCESS.value,
+    JobType.QUANTITY_TAKEOFF.value,
+)
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _ENQUEUE_STATUS_PENDING = "pending"
 _ENQUEUE_STATUS_PUBLISHING = "publishing"
@@ -57,6 +71,8 @@ _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
 _ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
+_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
+_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
 _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
@@ -64,6 +80,23 @@ _DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
 _DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
 _DEBUG_OVERLAY_GENERATOR_VERSION = "1"
 _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE = 500
+_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE = (
+    "Quantity takeoff is blocked by the revision validation gate."
+)
+_QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE = (
+    "Quantity takeoff detected conflicting contributor inputs."
+)
+_QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE = (
+    "Quantity takeoff base revision is missing its validation report."
+)
+_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE = (
+    "Quantity takeoff base revision is missing normalized entities."
+)
+_QUANTITY_CONFLICT_SUMMARY_LIMIT = 5
+_QUANTITY_CONFLICT_ENTITY_ID_LIMIT = 10
+_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT = 10
+_QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT = 3
+_QUANTITY_CONFLICT_TEXT_LIMIT = 200
 _CANONICAL_ENTITY_PROVENANCE_ORIGINS = frozenset(
     {
         "source_direct",
@@ -88,6 +121,23 @@ def is_ingest_worker_job_type(job_type: JobType | str) -> bool:
     """Return whether a job type is published to the ingest worker."""
     normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
     return normalized_job_type in _RECOVERABLE_INGEST_JOB_TYPES
+
+
+def is_recoverable_enqueue_job_type(job_type: JobType | str) -> bool:
+    """Return whether a job type participates in durable queue publication/recovery."""
+    normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
+    return normalized_job_type in _RECOVERABLE_ENQUEUE_JOB_TYPES
+
+
+def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None] | None:
+    """Return the queue publisher registered for a persisted worker job type."""
+    normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
+    registry: dict[str, Callable[[UUID], None]] = {
+        JobType.INGEST.value: enqueue_ingest_job,
+        JobType.REPROCESS.value: enqueue_ingest_job,
+        JobType.QUANTITY_TAKEOFF.value: enqueue_quantity_takeoff_job,
+    }
+    return registry.get(normalized_job_type)
 
 
 class _InactiveSourceError(Exception):
@@ -130,6 +180,18 @@ class _RevisionMaterializationRows:
 
 
 @dataclass(frozen=True, slots=True)
+class _QuantityTakeoffJobError(Exception):
+    """Raised for deterministic quantity takeoff failures."""
+
+    error_code: ErrorCode
+    message: str
+    details: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True, slots=True)
 class _JobAttemptLease:
     """Persisted ownership token for a claimed job attempt."""
 
@@ -143,6 +205,26 @@ class _EnqueueIntentLease:
 
     token: UUID
     lease_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimedJobEnqueueIntent:
+    """Persisted enqueue claim bundled with the routed worker job type."""
+
+    lease: _EnqueueIntentLease
+    job_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class _QuantityTakeoffExecutionInput:
+    """Loaded immutable quantity takeoff execution inputs."""
+
+    drawing_revision_id: UUID
+    review_state: str
+    validation_status: str
+    quantity_gate: str
+    gate: RevisionGateMetadata
+    entities: list[RevisionEntityInput]
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +556,18 @@ async def _get_existing_adapter_run_output(
     return result.scalar_one_or_none()
 
 
+async def _get_existing_quantity_takeoff(
+    session: AsyncSession,
+    *,
+    source_job_id: UUID,
+) -> QuantityTakeoff | None:
+    """Load an existing committed quantity takeoff for a job."""
+    result = await session.execute(
+        select(QuantityTakeoff).where(QuantityTakeoff.source_job_id == source_job_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _get_latest_drawing_revision(
     session: AsyncSession,
     *,
@@ -501,6 +595,60 @@ async def _get_drawing_revision(
     """Load a drawing revision row by identifier."""
 
     return await session.get(DrawingRevision, revision_id)
+
+
+async def _get_validation_report_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    drawing_revision_id: UUID,
+) -> ValidationReport | None:
+    """Load the canonical validation report for a drawing revision."""
+    result = await session.execute(
+        select(ValidationReport).where(
+            (ValidationReport.project_id == project_id)
+            & (ValidationReport.drawing_revision_id == drawing_revision_id)
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_revision_entity_manifest_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    source_file_id: UUID,
+    drawing_revision_id: UUID,
+) -> RevisionEntityManifest | None:
+    """Load the revision entity manifest for a drawing revision."""
+    result = await session.execute(
+        select(RevisionEntityManifest).where(
+            (RevisionEntityManifest.project_id == project_id)
+            & (RevisionEntityManifest.source_file_id == source_file_id)
+            & (RevisionEntityManifest.drawing_revision_id == drawing_revision_id)
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_revision_entities_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    source_file_id: UUID,
+    drawing_revision_id: UUID,
+) -> list[RevisionEntity]:
+    """Load deterministic materialized entities for a drawing revision."""
+    result = await session.execute(
+        select(RevisionEntity)
+        .where(
+            (RevisionEntity.project_id == project_id)
+            & (RevisionEntity.source_file_id == source_file_id)
+            & (RevisionEntity.drawing_revision_id == drawing_revision_id)
+        )
+        .order_by(RevisionEntity.sequence_index.asc(), RevisionEntity.id.asc())
+    )
+    return list(result.scalars().all())
 
 
 def _expected_revision_kind_for_job(job: Job) -> str:
@@ -1830,6 +1978,504 @@ async def _finalize_ingest_job(
     return True
 
 
+def _quantity_gate_details(
+    *,
+    drawing_revision_id: UUID,
+    review_state: str,
+    validation_status: str,
+    quantity_gate: str,
+) -> dict[str, Any]:
+    """Build stable structured metadata for quantity gate failures."""
+    return {
+        "drawing_revision_id": str(drawing_revision_id),
+        "review_state": review_state,
+        "validation_status": validation_status,
+        "quantity_gate": quantity_gate,
+    }
+
+
+def _manifest_entity_count(manifest: RevisionEntityManifest) -> int | None:
+    """Return the expected entity count when recorded on the manifest."""
+    raw_count = (
+        manifest.counts_json.get("entities")
+        if isinstance(manifest.counts_json, dict)
+        else None
+    )
+    return raw_count if isinstance(raw_count, int) else None
+
+
+def _build_quantity_gate_metadata(report: ValidationReport) -> RevisionGateMetadata:
+    """Build quantity engine gate metadata from the persisted validation report."""
+    return RevisionGateMetadata(
+        status=cast(GateStatus, report.quantity_gate),
+        validation_status=report.validation_status,
+        reason=report.review_state if report.quantity_gate in {"review_gated", "blocked"} else None,
+        details={
+            "drawing_revision_id": str(report.drawing_revision_id),
+            "review_state": report.review_state,
+            "effective_confidence": report.effective_confidence,
+        },
+    )
+
+
+def _build_revision_entity_input(entity: RevisionEntity) -> RevisionEntityInput:
+    """Map a materialized revision entity row to the quantity engine contract."""
+    return RevisionEntityInput(
+        entity_id=entity.entity_id,
+        entity_type=entity.entity_type,
+        sequence_index=entity.sequence_index,
+        geometry_json=entity.geometry_json,
+        properties_json=entity.properties_json,
+        provenance_json=entity.provenance_json,
+        canonical_entity_json=(
+            entity.canonical_entity_json if entity.canonical_entity_json is not None else {}
+        ),
+        source_identity=entity.source_identity,
+        source_hash=entity.source_hash,
+    )
+
+
+def _nonempty_quantity_type(value: str | None) -> str:
+    """Normalize persisted quantity type labels to non-empty strings."""
+    if value is None:
+        return "unknown"
+    normalized = value.strip()
+    return normalized or "unknown"
+
+
+def _nonempty_quantity_unit(value: str | None) -> str:
+    """Normalize persisted quantity units to non-empty strings."""
+    if value is None:
+        return "unknown"
+    normalized = value.strip()
+    return normalized or "unknown"
+
+
+def _duplicate_entity_ids_json(values: tuple[str, ...]) -> list[str]:
+    """Copy duplicate contributor lineage ids into a JSON-safe list."""
+    return [value for value in values if value]
+
+
+def _serialize_quantity_context(context: Any) -> str | None:
+    """Render quantity context as a deterministic persisted label suffix."""
+    if context is None:
+        return None
+    if isinstance(context, str):
+        normalized = context.strip()
+        return normalized or None
+
+    try:
+        serialized = json.dumps(context, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        serialized = str(context).strip()
+
+    return serialized or None
+
+
+def _quantity_item_type_label(quantity_type: str | None, context: Any) -> str:
+    """Persist the quantity type with stable quantity-context disambiguation."""
+    normalized_quantity_type = _nonempty_quantity_type(quantity_type)
+    serialized_context = _serialize_quantity_context(context)
+    if serialized_context is None:
+        return normalized_quantity_type
+
+    return f"{normalized_quantity_type}:{serialized_context}"
+
+
+def _bounded_conflict_text(value: Any) -> str | None:
+    """Return a bounded string payload for persisted conflict metadata."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    return normalized[:_QUANTITY_CONFLICT_TEXT_LIMIT]
+
+
+def _bounded_conflict_json(value: Any, *, depth: int = 0) -> Any:
+    """Bound persisted conflict details to stable JSON-safe payloads."""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value[:_QUANTITY_CONFLICT_TEXT_LIMIT]
+    if depth >= _QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT:
+        return _bounded_conflict_text(value)
+    if isinstance(value, dict):
+        bounded: dict[str, Any] = {}
+        for key, nested_value in list(value.items())[:_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT]:
+            normalized_key = _bounded_conflict_text(key)
+            if normalized_key is None:
+                continue
+            bounded[normalized_key] = _bounded_conflict_json(nested_value, depth=depth + 1)
+        return bounded
+    if isinstance(value, list | tuple):
+        return [
+            _bounded_conflict_json(item, depth=depth + 1)
+            for item in list(value)[:_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT]
+        ]
+    return _bounded_conflict_text(value)
+
+
+def _bounded_conflict_entity_ids(entity_ids: Any) -> list[str]:
+    """Copy contributor conflict entity ids into a bounded JSON-safe list."""
+    if not isinstance(entity_ids, tuple | list):
+        return []
+
+    bounded_ids: list[str] = []
+    for entity_id in entity_ids[:_QUANTITY_CONFLICT_ENTITY_ID_LIMIT]:
+        normalized = _bounded_conflict_text(entity_id)
+        if normalized is not None:
+            bounded_ids.append(normalized)
+    return bounded_ids
+
+
+def _build_quantity_conflict_summaries(conflicts: Sequence[Any]) -> list[dict[str, Any]]:
+    """Build bounded persisted summaries for deterministic quantity conflicts."""
+    summaries: list[dict[str, Any]] = []
+    for conflict in conflicts[:_QUANTITY_CONFLICT_SUMMARY_LIMIT]:
+        summaries.append(
+            {
+                "dedup_key": _bounded_conflict_text(getattr(conflict, "dedup_key", None)),
+                "entity_ids": _bounded_conflict_entity_ids(
+                    getattr(conflict, "entity_ids", ())
+                ),
+                "reason": _bounded_conflict_text(getattr(conflict, "reason", None)),
+                "details": _bounded_conflict_json(getattr(conflict, "details", None)),
+            }
+        )
+    return summaries
+
+
+def _build_quantity_items(
+    *,
+    quantity_takeoff_id: UUID,
+    project_id: UUID,
+    drawing_revision_id: UUID,
+    review_state: str,
+    validation_status: str,
+    quantity_gate: str,
+    result: QuantityEngineResult,
+) -> list[QuantityItem]:
+    """Build immutable quantity item rows for a takeoff result."""
+    items: list[QuantityItem] = []
+
+    for contributor in result.contributors:
+        items.append(
+            QuantityItem(
+                id=uuid.uuid4(),
+                quantity_takeoff_id=quantity_takeoff_id,
+                project_id=project_id,
+                drawing_revision_id=drawing_revision_id,
+                item_kind=QuantityItemKind.CONTRIBUTOR.value,
+                quantity_type=_quantity_item_type_label(
+                    contributor.quantity_type,
+                    getattr(contributor, "context", None),
+                ),
+                value=contributor.value,
+                unit=_nonempty_quantity_unit(contributor.unit),
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+                source_entity_id=contributor.entity_id,
+                excluded_source_entity_ids_json=_duplicate_entity_ids_json(
+                    contributor.duplicate_entity_ids
+                ),
+            )
+        )
+
+    for aggregate in result.aggregates:
+        items.append(
+            QuantityItem(
+                id=uuid.uuid4(),
+                quantity_takeoff_id=quantity_takeoff_id,
+                project_id=project_id,
+                drawing_revision_id=drawing_revision_id,
+                item_kind=QuantityItemKind.AGGREGATE.value,
+                quantity_type=_quantity_item_type_label(
+                    aggregate.quantity_type,
+                    getattr(aggregate, "context", None),
+                ),
+                value=aggregate.total,
+                unit=_nonempty_quantity_unit(aggregate.unit),
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+                source_entity_id=None,
+                excluded_source_entity_ids_json=[],
+            )
+        )
+
+    for exclusion in result.exclusions:
+        items.append(
+            QuantityItem(
+                id=uuid.uuid4(),
+                quantity_takeoff_id=quantity_takeoff_id,
+                project_id=project_id,
+                drawing_revision_id=drawing_revision_id,
+                item_kind=QuantityItemKind.EXCLUSION.value,
+                quantity_type=_quantity_item_type_label(
+                    exclusion.quantity_type,
+                    getattr(exclusion, "context", None),
+                ),
+                value=None,
+                unit="unknown",
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+                source_entity_id=exclusion.entity_id,
+                excluded_source_entity_ids_json=[],
+            )
+        )
+
+    return items
+
+
+async def _build_quantity_takeoff_execution_input(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _QuantityTakeoffExecutionInput:
+    """Load unlocked quantity engine inputs for a claimed persisted job."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await session.get(Job, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+        if job.job_type != JobType.QUANTITY_TAKEOFF.value:
+            raise ValueError(f"Unsupported quantity takeoff job type '{job.job_type}'")
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Quantity takeoff job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "current_revision_id": None,
+                },
+            )
+
+        drawing_revision = await _get_drawing_revision(session, revision_id=job.base_revision_id)
+        if drawing_revision is None:
+            raise _RevisionConflictError(
+                message="Quantity takeoff base revision no longer exists.",
+                details={
+                    "base_revision_id": str(job.base_revision_id),
+                    "current_revision_id": None,
+                },
+            )
+        if (
+            drawing_revision.project_id != job.project_id
+            or drawing_revision.source_file_id != job.file_id
+        ):
+            raise ValueError("Quantity takeoff base revision does not belong to the source file")
+
+        report = await _get_validation_report_for_revision(
+            session,
+            project_id=job.project_id,
+            drawing_revision_id=drawing_revision.id,
+        )
+        if report is None:
+            raise _QuantityTakeoffJobError(
+                error_code=ErrorCode.NOT_FOUND,
+                message=_QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE,
+                details={"drawing_revision_id": str(drawing_revision.id)},
+            )
+
+        if report.quantity_gate in {"review_gated", "blocked"}:
+            return _QuantityTakeoffExecutionInput(
+                drawing_revision_id=drawing_revision.id,
+                review_state=report.review_state,
+                validation_status=report.validation_status,
+                quantity_gate=report.quantity_gate,
+                gate=_build_quantity_gate_metadata(report),
+                entities=[],
+            )
+
+        manifest = await _get_revision_entity_manifest_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=job.file_id,
+            drawing_revision_id=drawing_revision.id,
+        )
+        if manifest is None:
+            raise _QuantityTakeoffJobError(
+                error_code=ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED,
+                message=_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,
+                details={"drawing_revision_id": str(drawing_revision.id)},
+            )
+
+        entities = await _get_revision_entities_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=job.file_id,
+            drawing_revision_id=drawing_revision.id,
+        )
+        expected_entity_count = _manifest_entity_count(manifest)
+        if expected_entity_count is not None and expected_entity_count != len(entities):
+            raise _QuantityTakeoffJobError(
+                error_code=ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED,
+                message=_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,
+                details={
+                    "drawing_revision_id": str(drawing_revision.id),
+                    "expected_entities": expected_entity_count,
+                    "loaded_entities": len(entities),
+                },
+            )
+
+        return _QuantityTakeoffExecutionInput(
+            drawing_revision_id=drawing_revision.id,
+            review_state=report.review_state,
+            validation_status=report.validation_status,
+            quantity_gate=report.quantity_gate,
+            gate=_build_quantity_gate_metadata(report),
+            entities=[_build_revision_entity_input(entity) for entity in entities],
+        )
+
+
+async def _finalize_quantity_takeoff_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    execution: _QuantityTakeoffExecutionInput,
+    result: QuantityEngineResult,
+) -> bool:
+    """Atomically publish quantity takeoff rows and terminal job success."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    if result.conflicts:
+        raise ValueError("Conflicting quantity results cannot be finalized")
+
+    async with session_maker() as session:
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "quantity_takeoff_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "quantity_takeoff_job_completion_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info("quantity_takeoff_job_cancelled", job_id=str(job_id))
+            return False
+
+        if job.status != "running":
+            logger.info(
+                "quantity_takeoff_job_completion_skipped_non_running_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("quantity_takeoff_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
+        if job.base_revision_id != execution.drawing_revision_id:
+            raise _RevisionConflictError(
+                message="Quantity takeoff base revision changed before finalization.",
+                details={
+                    "base_revision_id": (
+                        str(job.base_revision_id) if job.base_revision_id is not None else None
+                    ),
+                    "drawing_revision_id": str(execution.drawing_revision_id),
+                },
+            )
+
+        existing_takeoff = await _get_existing_quantity_takeoff(session, source_job_id=job.id)
+        if existing_takeoff is not None:
+            logger.info(
+                "quantity_takeoff_job_completion_skipped_existing_takeoff",
+                job_id=str(job_id),
+                quantity_takeoff_id=str(existing_takeoff.id),
+            )
+            return False
+
+        quantity_takeoff_id = uuid.uuid4()
+        quantity_items = _build_quantity_items(
+            quantity_takeoff_id=quantity_takeoff_id,
+            project_id=job.project_id,
+            drawing_revision_id=execution.drawing_revision_id,
+            review_state=execution.review_state,
+            validation_status=execution.validation_status,
+            quantity_gate=execution.quantity_gate,
+            result=result,
+        )
+
+        session.add(
+            QuantityTakeoff(
+                id=quantity_takeoff_id,
+                project_id=job.project_id,
+                source_file_id=job.file_id,
+                drawing_revision_id=execution.drawing_revision_id,
+                source_job_id=job.id,
+                source_job_type=JobType.QUANTITY_TAKEOFF.value,
+                review_state=execution.review_state,
+                validation_status=execution.validation_status,
+                quantity_gate=execution.quantity_gate,
+                trusted_totals=result.trusted_totals,
+            )
+        )
+        session.add_all(quantity_items)
+
+        job.status = "succeeded"
+        job.finished_at = _utcnow()
+        job.error_code = None
+        job.error_message = None
+        _clear_job_attempt_lease(job)
+        await emit_job_event(
+            job.id,
+            level="info",
+            message="Job succeeded",
+            data_json={
+                "status": "succeeded",
+                "attempts": job.attempts,
+                "quantity_takeoff_id": str(quantity_takeoff_id),
+                "quantity_item_count": len(quantity_items),
+                "trusted_totals": result.trusted_totals,
+                "quantity_gate": execution.quantity_gate,
+            },
+            session=session,
+        )
+        await session.commit()
+
+    return True
+
+
 async def emit_job_event(
     job_id: UUID,
     *,
@@ -2069,6 +2715,23 @@ async def _mark_job_failed(
             )
             return False
 
+        if attempt_token is not None and job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info(
+                "ingest_job_failure_mark_preferred_cancelled",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
         await _persist_job_failed(
             session,
             job,
@@ -2177,7 +2840,7 @@ async def _mark_job_failed_if_recovery_safe(
     return True
 
 
-async def _claim_job_enqueue_intent(job_id: UUID) -> _EnqueueIntentLease | None:
+async def _claim_job_enqueue_intent(job_id: UUID) -> _ClaimedJobEnqueueIntent | None:
     """Claim a durable enqueue intent for best-effort or recovery publication."""
     session_maker = get_session_maker()
     if session_maker is None:
@@ -2189,7 +2852,7 @@ async def _claim_job_enqueue_intent(job_id: UUID) -> _EnqueueIntentLease | None:
         if job is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        if not is_ingest_worker_job_type(job.job_type) or job.status != "pending":
+        if not is_recoverable_enqueue_job_type(job.job_type) or job.status != "pending":
             return None
 
         if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHED:
@@ -2203,7 +2866,7 @@ async def _claim_job_enqueue_intent(job_id: UUID) -> _EnqueueIntentLease | None:
 
         lease = _claim_enqueue_intent_lease(job, now=now)
         await session.commit()
-        return lease
+        return _ClaimedJobEnqueueIntent(lease=lease, job_type=job.job_type)
 
 
 async def _release_job_enqueue_intent(job_id: UUID, *, lease_token: UUID) -> bool:
@@ -2269,15 +2932,18 @@ async def publish_job_enqueue_intent(
 ) -> bool:
     """Best-effort publish for a durable enqueue intent recorded in Postgres."""
     try:
-        lease = await _claim_job_enqueue_intent(job_id)
-        if lease is None:
+        claimed_intent = await _claim_job_enqueue_intent(job_id)
+        if claimed_intent is None:
             return False
 
-        publish = publisher or enqueue_ingest_job
+        publish = publisher or get_job_enqueue_publisher(claimed_intent.job_type)
+        if publish is None:
+            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
+            return False
         try:
             publish(job_id)
         except Exception:
-            await _release_job_enqueue_intent(job_id, lease_token=lease.token)
+            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
             if recovery:
                 await _mark_recovery_enqueue_failed(job_id)
             else:
@@ -2288,7 +2954,7 @@ async def publish_job_enqueue_intent(
                 )
             return False
 
-        await _mark_job_enqueue_published(job_id, lease_token=lease.token)
+        await _mark_job_enqueue_published(job_id, lease_token=claimed_intent.lease.token)
         return True
     except Exception:
         if not suppress_exceptions:
@@ -2481,6 +3147,130 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
     return None
 
 
+async def _begin_or_resume_quantity_takeoff_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted quantity takeoff job under a row lock."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    now = _utcnow()
+
+    async with session_maker() as session:
+        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        if bootstrap is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        if project is None:
+            raise LookupError(
+                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+            )
+
+        job = await _get_job_for_update_with_metadata(
+            session,
+            job_id,
+            expected_project_id=bootstrap.project_id,
+            expected_file_id=bootstrap.file_id,
+        )
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if job.job_type != JobType.QUANTITY_TAKEOFF.value:
+            logger.info(
+                "quantity_takeoff_job_unsupported_type_skipped",
+                job_id=str(job_id),
+                job_type=job.job_type,
+                status=job.status,
+            )
+            return None
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "quantity_takeoff_job_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return None
+
+        if project.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("quantity_takeoff_job_cancelled_inactive_source", job_id=str(job_id))
+            return None
+
+        source_file = await _get_source_file(
+            session,
+            project_id=job.project_id,
+            file_id=job.file_id,
+            for_update=True,
+        )
+        if source_file is None or source_file.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("quantity_takeoff_job_cancelled_inactive_source", job_id=str(job_id))
+            return None
+
+        if not job.cancel_requested:
+            if job.status == "running":
+                if _is_stale_running_job(job, now=now):
+                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
+                    await emit_job_event(
+                        job.id,
+                        level="info",
+                        message="Job started",
+                        data_json={
+                            "status": "running",
+                            "attempts": job.attempts,
+                            "reclaimed": True,
+                        },
+                        session=session,
+                    )
+                    await session.commit()
+                    logger.warning(
+                        "quantity_takeoff_job_reclaimed_stale_running_status",
+                        job_id=str(job_id),
+                        status=job.status,
+                    )
+                    return lease
+
+                logger.info(
+                    "quantity_takeoff_job_duplicate_delivery_skipped_running_attempt",
+                    job_id=str(job_id),
+                    status=job.status,
+                )
+                return None
+
+            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
+            await emit_job_event(
+                job.id,
+                level="info",
+                message="Job started",
+                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
+                session=session,
+            )
+            await session.commit()
+            return lease
+
+        _finalize_job_cancelled(job)
+        await emit_job_event(
+            job.id,
+            level="warning",
+            message="Job cancelled",
+            data_json={"status": "cancelled"},
+            session=session,
+        )
+        await session.commit()
+
+    logger.info("quantity_takeoff_job_cancelled", job_id=str(job_id))
+    return None
+
+
 async def process_ingest_job(job_id: UUID) -> None:
     """Load a persisted ingest job, run ingestion, and persist state transitions."""
     session_maker = get_session_maker()
@@ -2622,7 +3412,7 @@ async def process_ingest_job(job_id: UUID) -> None:
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:
-    """Requeue incomplete persisted ingest/reprocess jobs on worker startup."""
+    """Requeue incomplete persisted ingest/reprocess/quantity jobs on worker startup."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -2633,7 +3423,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
         result = await session.execute(
             select(Job)
             .where(
-                (Job.job_type.in_(_RECOVERABLE_INGEST_JOB_TYPES))
+                (Job.job_type.in_(_RECOVERABLE_ENQUEUE_JOB_TYPES))
                 & (
                     (Job.status == "running")
                     | (
@@ -2692,7 +3482,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
 
 
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
-    """Requeue incomplete ingest/reprocess jobs when a worker starts."""
+    """Requeue incomplete ingest/reprocess/quantity jobs when a worker starts."""
     try:
         recovered_job_ids = asyncio.run(recover_incomplete_ingest_jobs())
     except Exception as exc:
@@ -2723,3 +3513,173 @@ def run_ingest_job(job_id: str) -> None:
 def enqueue_ingest_job(job_id: UUID) -> None:
     """Publish a persisted ingest job to Celery."""
     run_ingest_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+
+
+async def process_quantity_takeoff_job(job_id: UUID) -> None:
+    """Load a persisted quantity takeoff job and atomically persist its result."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    lease = await _begin_or_resume_quantity_takeoff_job(job_id)
+    if lease is None:
+        return
+
+    try:
+        execution = await _build_quantity_takeoff_execution_input(job_id, attempt_token=lease.token)
+        if execution.quantity_gate in {"review_gated", "blocked"}:
+            error_details = _quantity_gate_details(
+                drawing_revision_id=execution.drawing_revision_id,
+                review_state=execution.review_state,
+                validation_status=execution.validation_status,
+                quantity_gate=execution.quantity_gate,
+            )
+            await _mark_job_failed(
+                job_id,
+                error_message=_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE,
+                error_code=ErrorCode.INPUT_INVALID,
+                attempt_token=lease.token,
+                error_details=error_details,
+            )
+            logger.warning(
+                "quantity_takeoff_job_gate_blocked",
+                job_id=str(job_id),
+                error_code=ErrorCode.INPUT_INVALID.value,
+                **error_details,
+            )
+            return
+
+        result = compute_quantities(execution.gate, execution.entities)
+        if result.conflicts:
+            error_details = {
+                "drawing_revision_id": str(execution.drawing_revision_id),
+                "quantity_gate": execution.quantity_gate,
+                "conflict_count": len(result.conflicts),
+                "conflicts": _build_quantity_conflict_summaries(result.conflicts),
+            }
+            await _mark_job_failed(
+                job_id,
+                error_message=_QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE,
+                error_code=ErrorCode.INPUT_INVALID,
+                attempt_token=lease.token,
+                error_details=error_details,
+            )
+            logger.warning(
+                "quantity_takeoff_job_conflicts_detected",
+                job_id=str(job_id),
+                error_code=ErrorCode.INPUT_INVALID.value,
+                **error_details,
+            )
+            return
+    except _StaleJobAttemptError:
+        logger.info("quantity_takeoff_job_stale_attempt_skipped", job_id=str(job_id))
+        return
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "quantity_takeoff_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        return
+    except _QuantityTakeoffJobError as exc:
+        failure_details: dict[str, Any] | None = exc.details
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=exc.error_code,
+            attempt_token=lease.token,
+            error_details=failure_details,
+        )
+        logger.warning(
+            "quantity_takeoff_job_input_failed",
+            job_id=str(job_id),
+            error_code=exc.error_code.value,
+            **(failure_details or {}),
+        )
+        return
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
+        logger.info("quantity_takeoff_job_cancelled_during_execution", job_id=str(job_id))
+        raise
+    except Exception:
+        await _mark_job_failed(
+            job_id,
+            error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
+        logger.error(
+            "quantity_takeoff_job_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+            exc_info=True,
+        )
+        raise
+
+    try:
+        finalized = await _finalize_quantity_takeoff_job(
+            job_id,
+            attempt_token=lease.token,
+            execution=execution,
+            result=result,
+        )
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
+        logger.info("quantity_takeoff_job_cancelled_during_finalization", job_id=str(job_id))
+        raise
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "quantity_takeoff_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        return
+    except Exception:
+        await _mark_job_failed(
+            job_id,
+            error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
+        logger.error(
+            "quantity_takeoff_job_finalization_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+            exc_info=True,
+        )
+        raise
+
+    if finalized:
+        logger.info("quantity_takeoff_job_succeeded", job_id=str(job_id))
+
+
+@celery_app.task(
+    name="app.jobs.worker.run_quantity_takeoff_job",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def run_quantity_takeoff_job(job_id: str) -> None:
+    """Celery task wrapper for persisted quantity takeoff jobs."""
+    asyncio.run(process_quantity_takeoff_job(UUID(job_id)))
+
+
+def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
+    """Publish a persisted quantity takeoff job to Celery."""
+    run_quantity_takeoff_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)

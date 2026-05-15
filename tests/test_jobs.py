@@ -6,6 +6,7 @@ import types
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,6 +39,7 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.project import Project
+from app.models.quantity_takeoff import QuantityItem, QuantityTakeoff
 from tests.conftest import requires_database
 
 _FAKE_RUNNER_ADAPTER_KEY = "tests.fake_ingestion_runner"
@@ -219,6 +221,153 @@ def _build_fake_ingest_payload(
     )
 
 
+def _build_fake_contract_entity(
+    *,
+    entity_id: str,
+    entity_type: str,
+    layer_ref: str,
+    source_id: str,
+    source_hash: str | None = None,
+    geometry_json: dict[str, Any] | None = None,
+    properties_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a contract-shaped canonical entity payload for quantity tests."""
+    return {
+        "entity_id": entity_id,
+        "entity_type": entity_type,
+        "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+        "layout_ref": "Model",
+        "layer_ref": layer_ref,
+        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+        "confidence_json": {"score": _FAKE_RUNNER_CONFIDENCE_SCORE, "basis": "adapter"},
+        "geometry_json": deepcopy(geometry_json) if geometry_json is not None else {},
+        "properties_json": {"layer": layer_ref, **(properties_json or {})},
+        "provenance_json": {
+            "origin": "adapter_normalized",
+            "adapter": {"key": _FAKE_RUNNER_ADAPTER_KEY},
+            "source_ref": None,
+            "source_identity": source_id,
+            "source_hash": source_hash,
+            "extraction_path": [],
+            "notes": [],
+        },
+    }
+
+
+def _replace_fake_canonical_payload(
+    payload: IngestFinalizationPayload,
+    *,
+    entities: list[dict[str, Any]],
+) -> IngestFinalizationPayload:
+    """Replace canonical fake payload entities and refresh derived counts/checksum."""
+    canonical_json = {
+        **payload.canonical_json,
+        "canonical_entity_schema_version": payload.canonical_entity_schema_version,
+        "schema_version": payload.canonical_entity_schema_version,
+        "layouts": [{"layout_ref": "Model", "name": "Model"}],
+        "layers": [{"layer_ref": "A-WALL", "name": "A-WALL"}],
+        "blocks": [],
+        "entities": deepcopy(entities),
+        "entity_counts": {
+            "layouts": 1,
+            "layers": 1,
+            "blocks": 0,
+            "entities": len(entities),
+        },
+    }
+    report_json = deepcopy(payload.report_json)
+    summary = report_json.get("summary")
+    if isinstance(summary, dict):
+        report_json["summary"] = {
+            **summary,
+            "entity_counts": canonical_json["entity_counts"],
+        }
+    result_envelope = {
+        "adapter_key": payload.adapter_key,
+        "adapter_version": payload.adapter_version,
+        "input_family": payload.input_family,
+        "canonical_entity_schema_version": payload.canonical_entity_schema_version,
+        "canonical_json": canonical_json,
+        "provenance_json": payload.provenance_json,
+        "confidence_json": payload.confidence_json,
+        "confidence_score": payload.confidence_score,
+        "warnings_json": payload.warnings_json,
+        "diagnostics_json": payload.diagnostics_json,
+    }
+    return replace(
+        payload,
+        canonical_json=canonical_json,
+        report_json=report_json,
+        result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
+    )
+
+
+def _replace_fake_validation_outcome(
+    payload: IngestFinalizationPayload,
+    *,
+    review_state: str,
+    validation_status: str,
+    quantity_gate: str,
+) -> IngestFinalizationPayload:
+    """Replace fake validation gate metadata while preserving deterministic payload shape."""
+    confidence_json = {
+        **payload.confidence_json,
+        "review_state": review_state,
+        "effective_confidence": payload.effective_confidence,
+    }
+    report_json = deepcopy(payload.report_json)
+    summary = report_json.get("summary")
+    if isinstance(summary, dict):
+        report_json["summary"] = {
+            **summary,
+            "validation_status": validation_status,
+            "review_state": review_state,
+            "quantity_gate": quantity_gate,
+            "effective_confidence": payload.effective_confidence,
+        }
+    report_json["validation_status"] = validation_status
+    report_json["review_state"] = review_state
+    report_json["quantity_gate"] = quantity_gate
+    report_json["effective_confidence"] = payload.effective_confidence
+    return replace(
+        payload,
+        confidence_json=confidence_json,
+        validation_status=validation_status,
+        review_state=review_state,
+        quantity_gate=quantity_gate,
+        report_json=report_json,
+    )
+
+
+def _build_fake_quantity_ingest_payload(
+    request: IngestionRunRequest,
+    *,
+    review_state: str,
+    validation_status: str,
+    quantity_gate: str,
+    entities: list[dict[str, Any]] | None = None,
+) -> IngestFinalizationPayload:
+    """Build a quantity-friendly fake ingest payload with configurable gate semantics."""
+    payload = _replace_fake_canonical_payload(
+        _build_fake_ingest_payload(request),
+        entities=entities
+        or [
+            _build_fake_contract_entity(
+                entity_id="entity-quantity-001",
+                entity_type="line",
+                layer_ref="A-WALL",
+                source_id="entity-source-quantity-001",
+            )
+        ],
+    )
+    return _replace_fake_validation_outcome(
+        payload,
+        review_state=review_state,
+        validation_status=validation_status,
+        quantity_gate=quantity_gate,
+    )
+
+
 async def _get_job_for_file(file_id: str) -> Job:
     """Load the ingest job associated with a file id."""
     session_maker = session_module.AsyncSessionLocal
@@ -263,6 +412,40 @@ async def _get_latest_revision_for_file(file_id: uuid.UUID) -> DrawingRevision |
         ).scalar_one_or_none()
 
 
+async def _get_quantity_takeoffs_for_job(job_id: uuid.UUID) -> list[QuantityTakeoff]:
+    """Load persisted quantity takeoffs for a source job."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        takeoffs = (
+            await session.execute(
+                select(QuantityTakeoff)
+                .where(QuantityTakeoff.source_job_id == job_id)
+                .order_by(QuantityTakeoff.created_at.asc(), QuantityTakeoff.id.asc())
+            )
+        ).scalars().all()
+
+    return list(takeoffs)
+
+
+async def _get_quantity_items_for_takeoff(quantity_takeoff_id: uuid.UUID) -> list[QuantityItem]:
+    """Load persisted quantity items for a takeoff."""
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+
+    async with session_maker() as session:
+        items = (
+            await session.execute(
+                select(QuantityItem)
+                .where(QuantityItem.quantity_takeoff_id == quantity_takeoff_id)
+                .order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc())
+            )
+        ).scalars().all()
+
+    return list(items)
+
+
 async def _create_quantity_takeoff_job(
     *,
     project_id: uuid.UUID,
@@ -296,6 +479,28 @@ async def _create_quantity_takeoff_job(
         await session.commit()
 
     return await _get_job(quantity_job.id)
+
+
+async def _create_ready_quantity_takeoff_job(
+    async_client: httpx.AsyncClient,
+) -> tuple[dict[str, Any], dict[str, Any], Job, DrawingRevision, Job]:
+    """Create a project/file/revision and pending quantity job for worker tests."""
+    project = await _create_project(async_client)
+    uploaded = await _upload_file(async_client, project["id"])
+    ingest_job = await _get_job_for_file(str(uploaded["id"]))
+    await worker_module.process_ingest_job(ingest_job.id)
+    base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+    assert base_revision is not None
+
+    quantity_job = await _create_quantity_takeoff_job(
+        project_id=uuid.UUID(project["id"]),
+        file_id=uuid.UUID(uploaded["id"]),
+        base_revision_id=base_revision.id,
+        parent_job_id=ingest_job.id,
+        status="pending",
+    )
+
+    return project, uploaded, ingest_job, base_revision, quantity_job
 
 
 async def _update_job(
@@ -2621,16 +2826,29 @@ class TestJobs:
         assert updated.status == "pending"
         assert updated.enqueue_status == "pending"
 
-    async def test_publish_job_enqueue_intent_skips_quantity_takeoff_jobs(
+    async def test_publish_job_enqueue_intent_routes_quantity_takeoff_jobs(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Quantity jobs should never claim or publish the ingest worker outbox."""
+        """Quantity jobs should claim the durable outbox and use the quantity publisher."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
+
+        quantity_enqueued_job_ids: list[str] = []
+        ingest_enqueued_job_ids: list[str] = []
+
+        def _fake_quantity_enqueue(job_id: uuid.UUID) -> None:
+            quantity_enqueued_job_ids.append(str(job_id))
+
+        def _fake_ingest_enqueue(job_id: uuid.UUID) -> None:
+            ingest_enqueued_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(worker_module, "enqueue_quantity_takeoff_job", _fake_quantity_enqueue)
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_ingest_enqueue)
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
@@ -2659,25 +2877,28 @@ class TestJobs:
 
         published = await worker_module.publish_job_enqueue_intent(quantity_job.id)
 
-        assert published is False
+        assert published is True
+        assert quantity_enqueued_job_ids == [str(quantity_job.id)]
+        assert ingest_enqueued_job_ids == []
         updated = await _get_job(quantity_job.id)
         assert updated.status == "pending"
-        assert updated.enqueue_status == "pending"
+        assert updated.enqueue_status == "published"
         assert updated.extraction_profile_id is None
-        assert updated.enqueue_attempts == 7
-        assert updated.enqueue_owner_token == unchanged_token
-        assert updated.enqueue_lease_expires_at is not None
-        assert updated.enqueue_last_attempted_at == last_attempted_at
-        assert updated.enqueue_published_at is None
+        assert updated.enqueue_attempts == 8
+        assert updated.enqueue_owner_token is None
+        assert updated.enqueue_lease_expires_at is None
+        assert updated.enqueue_last_attempted_at is not None
+        assert updated.enqueue_last_attempted_at >= last_attempted_at
+        assert updated.enqueue_published_at is not None
 
-    async def test_retry_job_noops_for_quantity_takeoff_without_ingest_publisher(
+    async def test_retry_job_requeues_failed_quantity_takeoff_job(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Retry should return 202 without requeueing unsupported quantity jobs."""
+        """Retry should route failed quantity jobs through durable queue publication."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -2691,7 +2912,8 @@ class TestJobs:
             suppress_exceptions: bool = False,
             **kwargs: Any,
         ) -> bool:
-            _ = (publisher, suppress_exceptions, kwargs)
+            assert publisher is None
+            _ = (suppress_exceptions, kwargs)
             retried_job_ids.append(str(job_id))
             return True
 
@@ -2731,24 +2953,24 @@ class TestJobs:
         response = await async_client.post(f"/v1/jobs/{quantity_job.id}/retry")
 
         assert response.status_code == 202
-        assert retried_job_ids == []
-        unchanged = await _get_job(quantity_job.id)
-        assert unchanged.status == "failed"
-        assert unchanged.attempts == original.attempts
-        assert unchanged.error_code == original.error_code
-        assert unchanged.error_message == original.error_message
-        assert unchanged.enqueue_status == original.enqueue_status
-        assert unchanged.enqueue_attempts == original.enqueue_attempts
-        assert unchanged.project_id == original.project_id
-        assert unchanged.file_id == original.file_id
-        assert unchanged.job_type == original.job_type
-        assert unchanged.extraction_profile_id == original.extraction_profile_id
-        assert unchanged.extraction_profile_id is None
-        assert unchanged.base_revision_id == original.base_revision_id
-        assert unchanged.parent_job_id == original.parent_job_id
+        assert retried_job_ids == [str(quantity_job.id)]
+        retried = await _get_job(quantity_job.id)
+        assert retried.status == "pending"
+        assert retried.attempts == original.attempts
+        assert retried.error_code is None
+        assert retried.error_message is None
+        assert retried.enqueue_status == "pending"
+        assert retried.enqueue_attempts == 0
+        assert retried.project_id == original.project_id
+        assert retried.file_id == original.file_id
+        assert retried.job_type == original.job_type
+        assert retried.extraction_profile_id == original.extraction_profile_id
+        assert retried.extraction_profile_id is None
+        assert retried.base_revision_id == original.base_revision_id
+        assert retried.parent_job_id == original.parent_job_id
 
     @pytest.mark.parametrize("status", ["pending", "running"])
-    async def test_recover_incomplete_ingest_jobs_skips_quantity_takeoff_jobs(
+    async def test_recover_incomplete_ingest_jobs_requeues_quantity_takeoff_jobs(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
@@ -2756,17 +2978,26 @@ class TestJobs:
         monkeypatch: pytest.MonkeyPatch,
         status: str,
     ) -> None:
-        """Startup recovery should ignore quantity jobs while no quantity worker exists."""
+        """Startup recovery should route quantity jobs through the quantity publisher."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
 
-        recovered_job_ids: list[str] = []
+        quantity_recovered_job_ids: list[str] = []
+        ingest_recovered_job_ids: list[str] = []
 
-        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
-            recovered_job_ids.append(str(job_id))
+        def _fake_quantity_recovery_enqueue(job_id: uuid.UUID) -> None:
+            quantity_recovered_job_ids.append(str(job_id))
 
-        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+        def _fake_ingest_recovery_enqueue(job_id: uuid.UUID) -> None:
+            ingest_recovered_job_ids.append(str(job_id))
+
+        monkeypatch.setattr(
+            worker_module,
+            "enqueue_quantity_takeoff_job",
+            _fake_quantity_recovery_enqueue,
+        )
+        monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_ingest_recovery_enqueue)
 
         project = await _create_project(async_client)
         uploaded = await _upload_file(async_client, project["id"])
@@ -2814,23 +3045,24 @@ class TestJobs:
 
         requeued = await worker_module.recover_incomplete_ingest_jobs()
 
-        assert requeued == []
-        assert recovered_job_ids == []
-        unchanged = await _get_job(quantity_job.id)
-        assert unchanged.status == original.status
-        assert unchanged.attempts == original.attempts
-        assert unchanged.started_at == original.started_at
-        assert unchanged.attempt_token == original.attempt_token
-        assert unchanged.attempt_lease_expires_at == original.attempt_lease_expires_at
-        assert unchanged.enqueue_status == original.enqueue_status
-        assert unchanged.enqueue_attempts == original.enqueue_attempts
-        assert unchanged.project_id == original.project_id
-        assert unchanged.file_id == original.file_id
-        assert unchanged.job_type == original.job_type
-        assert unchanged.extraction_profile_id == original.extraction_profile_id
-        assert unchanged.extraction_profile_id is None
-        assert unchanged.base_revision_id == original.base_revision_id
-        assert unchanged.parent_job_id == original.parent_job_id
+        assert requeued == [quantity_job.id]
+        assert quantity_recovered_job_ids == [str(quantity_job.id)]
+        assert ingest_recovered_job_ids == []
+        recovered = await _get_job(quantity_job.id)
+        assert recovered.status == "pending"
+        assert recovered.attempts == original.attempts
+        assert recovered.started_at is None
+        assert recovered.attempt_token is None
+        assert recovered.attempt_lease_expires_at is None
+        assert recovered.enqueue_status == "published"
+        assert recovered.enqueue_attempts == 1
+        assert recovered.project_id == original.project_id
+        assert recovered.file_id == original.file_id
+        assert recovered.job_type == original.job_type
+        assert recovered.extraction_profile_id == original.extraction_profile_id
+        assert recovered.extraction_profile_id is None
+        assert recovered.base_revision_id == original.base_revision_id
+        assert recovered.parent_job_id == original.parent_job_id
 
     async def test_process_ingest_job_skips_quantity_takeoff_jobs_without_mutation(
         self,
@@ -2899,6 +3131,779 @@ class TestJobs:
         assert unchanged.extraction_profile_id is None
         assert unchanged.base_revision_id == original.base_revision_id
         assert unchanged.parent_job_id == original.parent_job_id
+
+    @pytest.mark.parametrize(
+        ("review_state", "validation_status", "quantity_gate", "trusted_totals"),
+        [
+            ("approved", "valid", "allowed", True),
+            ("provisional", "valid", "allowed_provisional", False),
+        ],
+    )
+    async def test_process_quantity_takeoff_job_persists_expected_takeoff(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        review_state: str,
+        validation_status: str,
+        quantity_gate: str,
+        trusted_totals: bool,
+    ) -> None:
+        """Quantity worker should persist trusted outputs for allowed gates."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "succeeded"
+        assert updated_job.attempts == 1
+        assert updated_job.error_code is None
+        assert updated_job.error_message is None
+        assert updated_job.finished_at is not None
+        assert len(takeoffs) == 1
+
+        takeoff = takeoffs[0]
+        assert takeoff.project_id == uuid.UUID(project["id"])
+        assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
+        assert takeoff.drawing_revision_id == base_revision.id
+        assert takeoff.source_job_id == quantity_job.id
+        assert takeoff.review_state == review_state
+        assert takeoff.validation_status == validation_status
+        assert takeoff.quantity_gate == quantity_gate
+        assert takeoff.trusted_totals is trusted_totals
+
+        items = await _get_quantity_items_for_takeoff(takeoff.id)
+        assert len(items) == 4
+        assert {item.item_kind for item in items} == {"aggregate", "contributor"}
+        assert all(item.review_state == review_state for item in items)
+        assert all(item.validation_status == validation_status for item in items)
+        assert all(item.quantity_gate == quantity_gate for item in items)
+        assert sum(item.item_kind == "aggregate" for item in items) == 2
+        assert sum(item.item_kind == "contributor" for item in items) == 2
+        contributor_quantity_types = {
+            item.quantity_type for item in items if item.item_kind == "contributor"
+        }
+        aggregate_quantity_types = {
+            item.quantity_type for item in items if item.item_kind == "aggregate"
+        }
+        assert len(contributor_quantity_types) == 2
+        assert aggregate_quantity_types == contributor_quantity_types
+        assert all(":" in quantity_type for quantity_type in contributor_quantity_types)
+        assert all(item.source_entity_id is None for item in items if item.item_kind == "aggregate")
+        assert all(
+            item.source_entity_id is not None for item in items if item.item_kind == "contributor"
+        )
+
+    @pytest.mark.parametrize(
+        ("review_state", "validation_status", "quantity_gate"),
+        [
+            ("review_required", "needs_review", "review_gated"),
+            ("rejected", "invalid", "blocked"),
+        ],
+    )
+    async def test_process_quantity_takeoff_job_short_circuits_gate_before_materialization(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        review_state: str,
+        validation_status: str,
+        quantity_gate: str,
+    ) -> None:
+        """Gate failures should not require normalized entity materialization lookups."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_review_gated_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+            )
+
+        async def _unexpected_manifest_lookup(*_: Any, **__: Any) -> None:
+            raise AssertionError("Quantity gate failures must short-circuit before materialization")
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_review_gated_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        monkeypatch.setattr(
+            worker_module,
+            "_get_revision_entity_manifest_for_revision",
+            _unexpected_manifest_lookup,
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
+        assert (
+            updated_job.error_message
+            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
+        )
+        assert takeoffs == []
+
+    @pytest.mark.parametrize(
+        ("review_state", "validation_status", "quantity_gate"),
+        [
+            ("review_required", "needs_review", "review_gated"),
+            ("rejected", "invalid", "blocked"),
+        ],
+    )
+    async def test_process_quantity_takeoff_job_fails_review_only_gate_without_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        review_state: str,
+        validation_status: str,
+        quantity_gate: str,
+    ) -> None:
+        """Quantity worker should fail terminally when validation gate blocks execution."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_review_gated_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_review_gated_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.attempts == 1
+        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
+        assert (
+            updated_job.error_message
+            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
+        )
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["status"] == "failed"
+        assert event_payload["error_code"] == ErrorCode.INPUT_INVALID.value
+        assert (
+            event_payload["error_message"]
+            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
+        )
+        assert event_payload["details"]["quantity_gate"] == quantity_gate
+
+    async def test_process_quantity_takeoff_job_fails_conflicts_without_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity worker should fail allowed jobs when dedup conflicts remain."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_conflicting_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            duplicate_hash = "a" * 64
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+                entities=[
+                    _build_fake_contract_entity(
+                        entity_id="entity-conflict-001",
+                        entity_type="line",
+                        layer_ref="A-WALL",
+                        source_id="entity-source-conflict-001",
+                        source_hash=duplicate_hash,
+                        properties_json={"label": "first"},
+                    ),
+                    _build_fake_contract_entity(
+                        entity_id="entity-conflict-002",
+                        entity_type="line",
+                        layer_ref="A-WALL",
+                        source_id="entity-source-conflict-002",
+                        source_hash=duplicate_hash,
+                        properties_json={"label": "second"},
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_conflicting_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.attempts == 1
+        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
+        assert updated_job.error_message == worker_module._QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["status"] == "failed"
+        assert event_payload["error_code"] == ErrorCode.INPUT_INVALID.value
+        assert (
+            event_payload["error_message"]
+            == worker_module._QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE
+        )
+        assert event_payload["details"]["conflict_count"] == 2
+        conflict_summaries = event_payload["details"]["conflicts"]
+        assert len(conflict_summaries) == 2
+        assert all(
+            set(summary) == {"dedup_key", "entity_ids", "reason", "details"}
+            for summary in conflict_summaries
+        )
+        assert any(summary["dedup_key"] is not None for summary in conflict_summaries)
+        assert any(
+            {"entity-conflict-001", "entity-conflict-002"}.issubset(set(summary["entity_ids"]))
+            for summary in conflict_summaries
+        )
+        assert all(summary["reason"] is not None for summary in conflict_summaries)
+        assert all(summary["details"] is not None for summary in conflict_summaries)
+
+    async def test_process_quantity_takeoff_job_fails_missing_validation_report(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity worker should surface missing validation reports as NOT_FOUND."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        async def _missing_validation_report(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            worker_module,
+            "_get_validation_report_for_revision",
+            _missing_validation_report,
+        )
+
+        quantity_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.attempts == 1
+        assert updated_job.error_code == ErrorCode.NOT_FOUND.value
+        assert (
+            updated_job.error_message
+            == worker_module._QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE
+        )
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["status"] == "failed"
+        assert event_payload["error_code"] == ErrorCode.NOT_FOUND.value
+        assert (
+            event_payload["error_message"]
+            == worker_module._QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE
+        )
+        assert event_payload["details"]["drawing_revision_id"] == str(base_revision.id)
+
+    async def test_process_quantity_takeoff_job_fails_missing_materialization_without_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity worker should fail safely when revision materialization is missing."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        async def _missing_manifest(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, _, _, base_revision, quantity_job = await _create_ready_quantity_takeoff_job(
+            async_client
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "_get_revision_entity_manifest_for_revision",
+            _missing_manifest,
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert (
+            updated_job.error_message
+            == worker_module._QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE
+        )
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["status"] == "failed"
+        assert event_payload["error_code"] == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert event_payload["details"]["drawing_revision_id"] == str(base_revision.id)
+
+    async def test_process_quantity_takeoff_job_fails_materialization_mismatch_without_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity worker should fail when manifest and entity rows disagree."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        async def _no_entities(*_: Any, **__: Any) -> list[Any]:
+            return []
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, _, _, base_revision, quantity_job = await _create_ready_quantity_takeoff_job(
+            async_client
+        )
+        monkeypatch.setattr(worker_module, "_get_revision_entities_for_revision", _no_entities)
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["details"] == {
+            "drawing_revision_id": str(base_revision.id),
+            "expected_entities": 1,
+            "loaded_entities": 0,
+        }
+
+    async def test_process_quantity_takeoff_job_honors_cancel_before_finalization(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity finalization should re-check cancellation before publishing output."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        original_build_execution_input = worker_module._build_quantity_takeoff_execution_input
+
+        async def _cancel_after_input_load(
+            job_id: uuid.UUID,
+            *,
+            attempt_token: uuid.UUID,
+        ) -> Any:
+            execution = await original_build_execution_input(job_id, attempt_token=attempt_token)
+            await _update_job(job_id, cancel_requested=True)
+            return execution
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        monkeypatch.setattr(
+            worker_module,
+            "_build_quantity_takeoff_execution_input",
+            _cancel_after_input_load,
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.attempts == 1
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        assert response.json()["items"][-1]["data_json"] == {"status": "cancelled"}
+
+    @pytest.mark.parametrize("failure_mode", ["gate", "conflict"])
+    async def test_process_quantity_takeoff_job_prefers_cancelled_for_deterministic_failures(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        failure_mode: str,
+    ) -> None:
+        """Cancel requests should win over deterministic gate and conflict failures."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        if failure_mode == "gate":
+
+            async def _run_test_ingestion(
+                request: IngestionRunRequest,
+            ) -> IngestFinalizationPayload:
+                return _build_fake_quantity_ingest_payload(
+                    request,
+                    review_state="rejected",
+                    validation_status="invalid",
+                    quantity_gate="blocked",
+                )
+
+        else:
+
+            async def _run_test_ingestion(
+                request: IngestionRunRequest,
+            ) -> IngestFinalizationPayload:
+                duplicate_hash = "b" * 64
+                return _build_fake_quantity_ingest_payload(
+                    request,
+                    review_state="approved",
+                    validation_status="valid",
+                    quantity_gate="allowed",
+                    entities=[
+                        _build_fake_contract_entity(
+                            entity_id="entity-conflict-cancel-001",
+                            entity_type="line",
+                            layer_ref="A-WALL",
+                            source_id="entity-source-conflict-cancel-001",
+                            source_hash=duplicate_hash,
+                        ),
+                        _build_fake_contract_entity(
+                            entity_id="entity-conflict-cancel-002",
+                            entity_type="line",
+                            layer_ref="A-WALL",
+                            source_id="entity-source-conflict-cancel-002",
+                            source_hash=duplicate_hash,
+                        ),
+                    ],
+                )
+
+        original_build_execution_input = worker_module._build_quantity_takeoff_execution_input
+
+        async def _cancel_after_input_load(
+            job_id: uuid.UUID,
+            *,
+            attempt_token: uuid.UUID,
+        ) -> Any:
+            execution = await original_build_execution_input(job_id, attempt_token=attempt_token)
+            await _update_job(job_id, cancel_requested=True)
+            return execution
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_test_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        monkeypatch.setattr(
+            worker_module,
+            "_build_quantity_takeoff_execution_input",
+            _cancel_after_input_load,
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.attempts == 1
+        assert updated_job.cancel_requested is True
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.error_message is None
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        assert response.json()["items"][-1]["data_json"] == {"status": "cancelled"}
+
+    async def test_process_quantity_takeoff_job_terminal_redelivery_does_not_duplicate_takeoff(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A duplicate delivery after success should not create another takeoff."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+        response_before = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response_before.status_code == 200
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        response_after = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response_after.status_code == 200
+        assert updated_job.status == "succeeded"
+        assert updated_job.attempts == 1
+        assert len(takeoffs) == 1
+        assert response_after.json()["items"] == response_before.json()["items"]
+
+    async def test_process_quantity_takeoff_job_rolls_back_partial_rows_on_item_failure(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity takeoff and items should commit atomically with no partial rows."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        def _invalid_quantity_items(**kwargs: Any) -> list[QuantityItem]:
+            return [
+                QuantityItem(
+                    id=uuid.uuid4(),
+                    quantity_takeoff_id=kwargs["quantity_takeoff_id"],
+                    project_id=kwargs["project_id"],
+                    drawing_revision_id=kwargs["drawing_revision_id"],
+                    item_kind="contributor",
+                    quantity_type="length",
+                    value=-1.0,
+                    unit="m",
+                    review_state=kwargs["review_state"],
+                    validation_status=kwargs["validation_status"],
+                    quantity_gate=kwargs["quantity_gate"],
+                    source_entity_id="missing-entity",
+                    excluded_source_entity_ids_json=[],
+                )
+            ]
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        monkeypatch.setattr(worker_module, "_build_quantity_items", _invalid_quantity_items)
+
+        with pytest.raises(IntegrityError):
+            await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert takeoffs == []
+
+    async def test_quantity_takeoff_source_job_uniqueness_remains_enforced(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The DB should still reject duplicate takeoffs for one source job."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        async def _run_quantity_ready_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state="approved",
+                validation_status="valid",
+                quantity_gate="allowed",
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
+        _, uploaded, _, base_revision, quantity_job = await _create_ready_quantity_takeoff_job(
+            async_client
+        )
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                QuantityTakeoff(
+                    id=uuid.uuid4(),
+                    project_id=quantity_job.project_id,
+                    source_file_id=uuid.UUID(uploaded["id"]),
+                    drawing_revision_id=base_revision.id,
+                    source_job_id=quantity_job.id,
+                    source_job_type=JobType.QUANTITY_TAKEOFF.value,
+                    review_state="approved",
+                    validation_status="valid",
+                    quantity_gate="allowed",
+                    trusted_totals=True,
+                )
+            )
+            with pytest.raises(IntegrityError):
+                await session.commit()
+
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert len(takeoffs) == 1
 
     async def test_retry_job_succeeds_when_enqueue_claim_raises_after_commit(
         self,
