@@ -78,6 +78,8 @@ Database-level append-only enforcement protects the core lineage/history tables:
 - `revision_layers`
 - `revision_blocks`
 - `revision_entities`
+- `quantity_takeoffs`
+- `quantity_items`
 - `generated_artifacts`
 - `job_events`
 
@@ -204,8 +206,22 @@ starting. A technically invalid revision is blocked even if its review state was
 previously approved. Revisions that are technically usable but have warnings or
 review-needed findings may still proceed only through the derived gate policy.
 
+When quantity persistence is present, workers append a `quantity_takeoffs`
+header row plus `quantity_items` detail rows for one pinned drawing revision.
+Those lineage tables are append-only: a rerun persists a new takeoff/result set
+instead of updating an earlier takeoff in place. Each persisted takeoff is tied
+to one unique `source_job_id`, and that source job must remain constrained to
+the same project, file, `base_revision_id`, and `quantity_takeoff` job type.
+
 Revisions marked `review_required`, `rejected`, or `superseded` are not eligible
 for quantity generation.
+
+Persisted quantity items distinguish included contributors from rolled-up totals
+and blocked inputs by kind: `contributor`, `aggregate`, `exclusion`, and
+`conflict`. Conflict rows must stay FK-backed to `revision_entities`, may use
+only `review_gated` or `blocked`, and inherit the parent takeoff gate through a
+composite FK contract. Only takeoffs with `quantity_gate = allowed` should be
+treated as trusted totals, so trusted takeoffs cannot persist conflict rows.
 
 ### Visual and Debug Overlay Artifacts
 
@@ -472,6 +488,8 @@ Rules:
 - Reproducibility is trace-based: the system must retain the lineage metadata
   required to rerun the same generator against the same stored source revision
   and changeset/takeoff/estimate inputs.
+- The documented quantity lineage slot does not, by itself, make generated
+  artifacts currently own a required quantity-takeoff foreign key.
 - Original uploads and generated artifacts remain separate immutable classes of
   stored objects.
 

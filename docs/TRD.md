@@ -279,6 +279,11 @@ Every computed quantity must include source entity references and units.
 Quantity generation must enforce ingestion review state and confidence policy,
 not just copy confidence metadata through to the output.
 
+Persisted quantity results are append-only lineage records. MVP persistence uses
+append-only `quantity_takeoffs` and `quantity_items` tables; re-running quantity
+generation creates a new takeoff and new item rows rather than mutating a prior
+result in place.
+
 Phase 6 quantity policy defaults:
 
 - quantity math runs in normalized internal units with full stored precision
@@ -339,6 +344,32 @@ Minimum quantity provenance fields:
 - validation_status
 - quantity_gate
 - provisional boolean or equivalent explicit status marker
+
+Persisted quantity takeoff lineage requirements:
+
+- Each quantity takeoff must point to exactly one `source_job_id`.
+- `source_job_id` must be unique across persisted quantity takeoffs.
+- The source job must be a `quantity_takeoff` job for the same project, file,
+  and pinned `base_revision_id` as the persisted takeoff.
+- Trusted totals require `quantity_gate = allowed`; other gate states may retain
+  quantity lineage, but they must not be documented as trusted totals.
+
+Persisted quantity item kinds:
+
+- `contributor` - a source contribution included in quantity math
+- `aggregate` - a rolled-up result derived from contributors
+- `exclusion` - a source candidate omitted by validation, review, or dedup rules
+- `conflict` - a source candidate or duplicate that requires review instead of
+  optimistic summation; persisted conflict items must be FK-backed to a source
+  entity and may be stored only with `quantity_gate = review_gated` or
+  `quantity_gate = blocked`
+
+Persisted quantity item gate rules:
+
+- each `quantity_items.quantity_gate` value must match its parent
+  `quantity_takeoffs.quantity_gate`
+- trusted `quantity_takeoffs` remain `quantity_gate = allowed`, so they cannot
+  contain persisted `conflict` items
 
 ### Canonical Validation Report v0.1
 
@@ -659,6 +690,9 @@ Rules:
 - Reproducibility means the system can trace which stored source revision,
   changeset/takeoff/estimate context, job, and generator configuration produced
   the artifact.
+- The existing future-facing `quantity_takeoff_id` lineage slot remains deferred
+  here; this TRD does not convert it into a current generated-artifact foreign
+  key requirement.
 - Original uploads and generated artifacts follow the same immutability rule but
   remain distinct storage classes and records.
 
@@ -672,7 +706,8 @@ Database ownership and append-only policy:
   `files`, `extraction_profiles`, `adapter_run_outputs`,
   `drawing_revisions`, `validation_reports`, `revision_entity_manifests`,
   `revision_layouts`, `revision_layers`, `revision_blocks`,
-  `revision_entities`, `generated_artifacts`, and `job_events`.
+  `revision_entities`, `quantity_takeoffs`, `quantity_items`,
+  `generated_artifacts`, and `job_events`.
 - Enforcement is implemented with shared PostgreSQL trigger functions plus
   per-table row and truncate triggers. Row comparison is JSON-safe: trigger
   checks compare `to_jsonb(OLD)` and `to_jsonb(NEW)` after removing any
