@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import AsyncGenerator
 from datetime import date
 from typing import Any, cast
 
 import pytest
+import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.estimating.catalog.contracts import (
@@ -21,6 +23,7 @@ from tests.test_estimation_catalog_persistence import (
     _build_material,
     _build_rate,
     _checksum,
+    _cleanup_catalog_tables,
     _create_project,
     _persist,
 )
@@ -29,6 +32,26 @@ requires_database = importlib.import_module(
     "tests.test_estimation_catalog_persistence"
 ).requires_database
 pytestmark = [pytest.mark.asyncio, cast(Any, requires_database)]
+
+
+@pytest_asyncio.fixture
+async def cleanup_estimation_catalog() -> AsyncGenerator[None, None]:
+    await _cleanup_catalog_tables()
+    yield
+    await _cleanup_catalog_tables()
+
+
+@pytest_asyncio.fixture
+async def db_session(cleanup_estimation_catalog: None) -> AsyncGenerator[AsyncSession, None]:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        yield session
+        await session.rollback()
 
 
 async def test_resolve_formula_explicit_ref_uses_row_uuid_and_returns_snapshot_metadata(
@@ -107,6 +130,8 @@ async def test_resolve_rate_rejects_stale_explicit_ref_and_falls_back_to_success
 ) -> None:
     predecessor = _build_rate(
         rate_key="labour.superseded",
+        effective_from=date(2025, 12, 1),
+        effective_to=date(2026, 1, 1),
         checksum_sha256=_checksum("rate-predecessor"),
     )
     successor = _build_rate(
