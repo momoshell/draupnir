@@ -27,10 +27,6 @@ from app.core.errors import ErrorCode
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import (
-    enqueue_ingest_job as _enqueue_ingest_job,
-)
-from app.jobs.worker import (
-    is_ingest_worker_job_type,
     prepare_job_enqueue_intent,
     publish_job_enqueue_intent,
 )
@@ -45,11 +41,6 @@ jobs_router = APIRouter()
 _DEFAULT_EVENTS_LIMIT = 50
 _MAX_EVENTS_LIMIT = 200
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
-
-
-def enqueue_ingest_job(job_id: UUID) -> None:
-    """Compatibility wrapper kept for test fixture patching."""
-    _enqueue_ingest_job(job_id)
 
 
 async def _get_job_or_404(db: AsyncSession, job_id: UUID) -> Job:
@@ -440,19 +431,6 @@ async def retry_job(
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
         return job
 
-    if not is_ingest_worker_job_type(job.job_type):
-        if reservation is not None:
-            body = JobRead.model_validate(job).model_dump(mode="json")
-            await mark_idempotency_completed(
-                db,
-                reservation,
-                status_code=status.HTTP_202_ACCEPTED,
-                response_body=body,
-            )
-            await db.commit()
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
-        return job
-
     job.status = "pending"
     job.cancel_requested = False
     job.error_code = None
@@ -474,11 +452,7 @@ async def retry_job(
         )
 
     await db.commit()
-    await publish_job_enqueue_intent(
-        job.id,
-        publisher=enqueue_ingest_job,
-        suppress_exceptions=True,
-    )
+    await publish_job_enqueue_intent(job.id, suppress_exceptions=True)
 
     if reservation is not None:
         assert success_body is not None

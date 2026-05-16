@@ -351,8 +351,11 @@ Persisted quantity takeoff lineage requirements:
 - `source_job_id` must be unique across persisted quantity takeoffs.
 - The source job must be a `quantity_takeoff` job for the same project, file,
   and pinned `base_revision_id` as the persisted takeoff.
-- Trusted totals require `quantity_gate = allowed`; other gate states may retain
-  quantity lineage, but they must not be documented as trusted totals.
+- Trusted totals require `quantity_gate = allowed`.
+- `allowed_provisional` runs may persist provisional quantity lineage, but they
+  must not be documented as trusted totals.
+- `review_gated` and `blocked` jobs fail without publishing trusted or persisted
+  quantity takeoff output.
 
 Persisted quantity item kinds:
 
@@ -1212,8 +1215,8 @@ Probe rules:
   - `allowed` revisions may publish normal quantity totals.
   - `allowed_provisional` revisions may publish quantities only with explicit
     provisional labeling and provenance.
-  - `review_gated` revisions may publish blockage metadata, but not trusted
-    quantity totals.
+  - `review_gated` and `blocked` revisions may publish blockage metadata, but
+    not trusted or persisted quantity takeoff totals.
   - entity-level exclusions caused by review/validation findings must remain
     traceable in provenance rather than silently disappearing.
 

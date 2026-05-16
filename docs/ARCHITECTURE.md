@@ -397,14 +397,15 @@ ingest(file)
 ```
 
 `ingest(file)` produces a `drawing_revision` that becomes the pinned input for
-later revision-scoped work. A future `quantity_takeoff(drawing_revision)` job
-will run against exactly one persisted revision rather than against the mutable
-file head.
+later revision-scoped work. `quantity_takeoff(drawing_revision)` worker
+execution runs against exactly one persisted revision rather than against the
+mutable file head.
 
 For MVP every step is triggered explicitly via API. A later iteration may add an
 auto-chain configuration on the project that fires the next step on success.
-The quantity worker/API remains deferred; this DAG documents the persisted job
-shape and lineage model, not a shipped downstream quantity surface.
+Quantity worker execution exists for this DAG and persisted lineage model, while
+manual/API creation and read surfaces for quantity takeoffs remain separate
+deferred work.
 
 Workers must:
 

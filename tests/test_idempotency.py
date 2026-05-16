@@ -920,10 +920,18 @@ class TestEndpointIdempotency:
             (await _upload_pdf(async_client, project_id=project["id"])).json(),
         )
 
-        def _record_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _record_retry_enqueue(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             enqueued_job_ids.append(str(job_id))
+            return True
 
-        monkeypatch.setattr(jobs_api, "enqueue_ingest_job", _record_retry_enqueue)
+        monkeypatch.setattr(jobs_api, "publish_job_enqueue_intent", _record_retry_enqueue)
 
         job = await _get_job_for_file(uploaded["id"])
         await _mark_job_failed(str(job.id))
@@ -958,10 +966,18 @@ class TestEndpointIdempotency:
             (await _upload_pdf(async_client, project_id=project["id"])).json(),
         )
 
-        def _record_retry_enqueue(job_id: uuid.UUID) -> None:
+        async def _record_retry_enqueue(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
             enqueued_job_ids.append(str(job_id))
+            return True
 
-        monkeypatch.setattr(jobs_api, "enqueue_ingest_job", _record_retry_enqueue)
+        monkeypatch.setattr(jobs_api, "publish_job_enqueue_intent", _record_retry_enqueue)
 
         job = await _get_job_for_file(uploaded["id"])
         await _mark_job_failed(
@@ -1007,10 +1023,19 @@ class TestEndpointIdempotency:
         await _mark_job_failed(str(job.id))
         key = "job-retry-enqueue-failure-1"
 
-        def _fail_enqueue(_: uuid.UUID, **__: Any) -> None:
+        async def _fail_enqueue(
+            _: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _unused = (publisher, suppress_exceptions, kwargs)
+            if suppress_exceptions:
+                return False
             raise RuntimeError("broker unavailable")
 
-        monkeypatch.setattr(jobs_api, "enqueue_ingest_job", _fail_enqueue)
+        monkeypatch.setattr(jobs_api, "publish_job_enqueue_intent", _fail_enqueue)
 
         first = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=_headers(key))
         second = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=_headers(key))
