@@ -599,6 +599,104 @@ Additional gate rules:
   entities/findings caused the block, but they must not publish trusted quantity
   totals.
 
+#### Revision-Scoped Quantity Takeoff Endpoints
+
+- `POST /v1/revisions/{revision_id}/quantity-takeoffs`
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs`
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}`
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/items`
+
+These endpoints expose explicit API-triggered quantity takeoff creation and
+readback for one pinned drawing revision. They do not imply automatic chaining
+from ingestion or validation.
+
+Create behavior:
+
+- `POST /v1/revisions/{revision_id}/quantity-takeoffs` enqueues a
+  revision-scoped quantity-takeoff job and returns `202 Accepted` with a
+  `JobRead` response.
+- Create idempotency is keyed by `Idempotency-Key`. Replaying the same key for
+  the same effective request fingerprint returns the original `JobRead`
+  response and prevents duplicate jobs from being created.
+- The endpoint does not search for an existing completed takeoff when no
+  `Idempotency-Key` is supplied.
+- The persisted takeoff remains append-only once finalized. A materially changed
+  request or rerun outside the same idempotent replay case produces a new
+  takeoff/result set rather than mutating an older one.
+
+List/read behavior:
+
+- Cursor pagination follows the global API convention: `?cursor=` and `?limit=`
+  returning `{ items, next_cursor }`, default limit 50, max 200.
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs` lists persisted takeoffs
+  for that exact revision.
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}` returns the
+  takeoff header/summary record for one persisted takeoff.
+- `GET /v1/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/items`
+  returns the paginated item rows for that takeoff using the same
+  `{ items, next_cursor }` envelope.
+
+Minimum takeoff header shape:
+
+```text
+{
+  id,
+  project_id,
+  source_file_id,
+  drawing_revision_id,
+  source_job_id,
+  source_job_type,
+  review_state,
+  validation_status,
+  quantity_gate,
+  trusted_totals,
+  created_at
+}
+```
+
+Minimum takeoff item shape:
+
+```text
+{
+  id,
+  quantity_takeoff_id,
+  project_id,
+  drawing_revision_id,
+  item_kind,
+  quantity_type,
+  value,
+  unit,
+  review_state,
+  validation_status,
+  quantity_gate,
+  source_entity_id,
+  excluded_source_entity_ids,
+  created_at
+}
+```
+
+HTTP/status semantics:
+
+- `200` - list/read succeeded
+- `202` - create accepted a new explicit quantity-takeoff request, or replayed
+  the original idempotent `JobRead` response
+- `404` with `NOT_FOUND` - revision or takeoff does not exist in scope
+- `400` with `INPUT_INVALID` - revision exists but is not eligible for enqueue
+  because `quantity_gate` is `review_gated` or `blocked`; details include
+  `quantity_gate`, `review_state`, and `validation_status`
+
+Gate semantics:
+
+- `review_gated` revisions are not eligible for a trusted takeoff create. The
+  API rejects the create before enqueue with `400 INPUT_INVALID` and details
+  including `quantity_gate`, `review_state`, and `validation_status`.
+- `blocked` revisions are not eligible for quantity generation at all.
+  The API rejects the create before enqueue with `400 INPUT_INVALID` and
+  details including `quantity_gate`, `review_state`, and
+  `validation_status`.
+- `allowed_provisional` takeoffs may be created, listed, and read, but their
+  provisional status must remain explicit in the returned takeoff/item data.
+
 ## Estimation Engine
 
 The estimation engine must be deterministic and auditable.

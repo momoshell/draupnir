@@ -213,6 +213,11 @@ instead of updating an earlier takeoff in place. Each persisted takeoff is tied
 to one unique `source_job_id`, and that source job must remain constrained to
 the same project, file, `base_revision_id`, and `quantity_takeoff` job type.
 
+The API now exposes explicit revision-scoped create/read surfaces for this
+persisted quantity data: clients may trigger `quantity_takeoff` for one pinned
+revision and later list/read the resulting takeoff headers and item rows. This
+remains an explicit API action in MVP rather than an automatic downstream chain.
+
 Revisions marked `review_required`, `rejected`, or `superseded` are not eligible
 for quantity generation.
 
@@ -403,9 +408,9 @@ mutable file head.
 
 For MVP every step is triggered explicitly via API. A later iteration may add an
 auto-chain configuration on the project that fires the next step on success.
-Quantity worker execution exists for this DAG and persisted lineage model, while
-manual/API creation and read surfaces for quantity takeoffs remain separate
-deferred work.
+Quantity takeoff creation and readback are available as explicit revision-scoped
+API surfaces layered on top of the same worker execution and persisted lineage
+model.
 
 Workers must:
 
