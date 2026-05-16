@@ -36,12 +36,25 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "revision_blocks",
     "revision_entities",
 )
+_PROJECT_TRUNCATE_CASCADE_CATALOG_TABLES: tuple[str, ...] = (
+    "formula_definition_supersessions",
+    "material_catalog_entry_supersessions",
+    "rate_catalog_entry_supersessions",
+    "formula_definitions",
+    "material_catalog_entries",
+    "rate_catalog_entries",
+)
+_PROJECT_TRUNCATE_CASCADE_APPEND_ONLY_TABLES: tuple[str, ...] = (
+    *APPEND_ONLY_PROTECTED_TABLES,
+    *_PROJECT_TRUNCATE_CASCADE_CATALOG_TABLES,
+)
 APPEND_ONLY_ROW_TRIGGER_NAME = "trg_append_only_row_guard"
 APPEND_ONLY_TRUNCATE_TRIGGER_NAME = "trg_append_only_truncate_guard"
-_APPEND_ONLY_TRIGGER_NAMES: tuple[str, ...] = (
+_LEGACY_APPEND_ONLY_TRIGGER_NAMES: tuple[str, ...] = (
     APPEND_ONLY_ROW_TRIGGER_NAME,
     APPEND_ONLY_TRUNCATE_TRIGGER_NAME,
 )
+_TEST_ONLY_CLEANUP_TABLES: tuple[str, ...] = ("idempotency_keys",)
 
 # Marker for tests that require a running database
 requires_database = pytest.mark.skipif(
@@ -133,14 +146,20 @@ async def _load_existing_append_only_triggers(
     """Return append-only triggers currently installed in the test database."""
 
     existing_triggers: list[tuple[str, str]] = []
-    for table_name in APPEND_ONLY_PROTECTED_TABLES:
-        for trigger_name in _APPEND_ONLY_TRIGGER_NAMES:
-            if await _append_only_trigger_exists(
-                session,
-                table_name=table_name,
-                trigger_name=trigger_name,
-            ):
-                existing_triggers.append((table_name, trigger_name))
+    for table_name in _PROJECT_TRUNCATE_CASCADE_APPEND_ONLY_TABLES:
+        trigger_names = await session.scalars(
+            text(
+                """
+                SELECT tgname
+                FROM pg_trigger
+                WHERE tgrelid = to_regclass(:table_name)
+                  AND tgname LIKE '%append_only%'
+                ORDER BY tgname
+                """
+            ),
+            {"table_name": table_name},
+        )
+        existing_triggers.extend((table_name, trigger_name) for trigger_name in trigger_names)
 
     return existing_triggers
 
@@ -184,8 +203,15 @@ async def _assert_append_only_triggers_enabled(
         assert normalized_state == "O"
 
 
+async def _truncate_test_only_cleanup_tables(session: AsyncSession) -> None:
+    """Truncate test-only standalone tables that do not cascade from projects."""
+
+    table_names = ", ".join(f'"{table_name}"' for table_name in _TEST_ONLY_CLEANUP_TABLES)
+    await session.execute(text(f"TRUNCATE TABLE {table_names}"))
+
+
 async def truncate_projects_cascade_for_cleanup() -> None:
-    """Hard-clean projects by temporarily disabling only append-only triggers."""
+    """Hard-clean test data, preserving append-only trigger handling for projects."""
 
     if not os.environ.get("DATABASE_URL"):
         return
@@ -209,6 +235,7 @@ async def truncate_projects_cascade_for_cleanup() -> None:
                         enabled=False,
                     )
                     triggers_disabled = True
+                await _truncate_test_only_cleanup_tables(session)
                 await session.execute(text("TRUNCATE TABLE projects CASCADE"))
             finally:
                 if triggers_disabled:
@@ -240,10 +267,12 @@ async def async_client(app: FastAPI) -> AsyncGenerator[httpx.AsyncClient, None]:
 
 @pytest_asyncio.fixture
 async def cleanup_projects() -> AsyncGenerator[None, None]:
-    """Truncate projects table after each test to ensure clean DB state."""
+    """Clean test DB state before and after each test when using DATABASE_URL."""
     if not os.environ.get("DATABASE_URL"):
         yield
         return
+
+    await truncate_projects_cascade_for_cleanup()
 
     yield
 

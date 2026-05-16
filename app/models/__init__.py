@@ -9,6 +9,7 @@ for Alembic autogenerate support. Example:
 
 from . import adapter_run_output as adapter_run_output
 from . import drawing_revision as drawing_revision
+from . import estimation_catalog as estimation_catalog
 from . import extraction_profile as extraction_profile
 from . import file as file
 from . import generated_artifact as generated_artifact
