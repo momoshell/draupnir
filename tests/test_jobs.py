@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import types
 import uuid
 from collections.abc import Callable
@@ -9,11 +10,13 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 import pytest
+import yaml  # type: ignore[import-untyped]
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -53,7 +56,148 @@ _FAKE_RUNNER_QUANTITY_GATE = "allowed_provisional"
 _FAKE_RUNNER_VALIDATOR_NAME = "tests.fake_ingestion_runner"
 _FAKE_RUNNER_VALIDATOR_VERSION = "1.0"
 _TEST_UPLOAD_BODY = b"%PDF-1.7\njob-test\n"
+_FIXTURE_MANIFEST_PATH = Path(__file__).with_name("fixtures") / "manifest.yaml"
 _UNSET = object()
+
+
+def _assert_json_object(value: Any, label: str) -> dict[str, Any]:
+    """Return a JSON object from fixture metadata or fail the test with context."""
+    assert isinstance(value, dict), f"{label} must be an object"
+    return cast(dict[str, Any], value)
+
+
+@lru_cache(maxsize=1)
+def _fixture_manifest_by_filename() -> dict[str, dict[str, Any]]:
+    """Load committed fixture manifest entries keyed by fixture filename."""
+    with _FIXTURE_MANIFEST_PATH.open("r", encoding="utf-8") as manifest_file:
+        manifest = yaml.safe_load(manifest_file)
+
+    root = _assert_json_object(manifest, "fixture manifest")
+    fixtures = root.get("fixtures")
+    assert isinstance(fixtures, list), "fixture manifest must contain a fixtures list"
+
+    by_filename: dict[str, dict[str, Any]] = {}
+    for raw_fixture in fixtures:
+        fixture = _assert_json_object(raw_fixture, "fixture entry")
+        filename = fixture.get("filename")
+        assert isinstance(filename, str), "fixture entry must contain a filename"
+        by_filename[filename] = fixture
+    return by_filename
+
+
+def _manifest_fixture(filename: str) -> dict[str, Any]:
+    """Return one manifest fixture entry by filename."""
+    fixture = _fixture_manifest_by_filename().get(filename)
+    assert fixture is not None, f"fixture {filename!r} is missing from manifest"
+    return fixture
+
+
+def _manifest_quantity_check(filename: str, quantity_name: str) -> dict[str, Any]:
+    """Return one manifest acceptance quantity check."""
+    fixture = _manifest_fixture(filename)
+    acceptance_checks = _assert_json_object(
+        fixture.get("acceptance_checks"),
+        f"{filename} acceptance_checks",
+    )
+    quantities = _assert_json_object(
+        acceptance_checks.get("quantities"),
+        f"{filename} quantity acceptance checks",
+    )
+    return _assert_json_object(
+        quantities.get(quantity_name),
+        f"{filename} quantity check {quantity_name}",
+    )
+
+
+def _manifest_expected_number(filename: str, quantity_name: str) -> float:
+    """Return the numeric expected value from a manifest quantity check."""
+    expected = _manifest_quantity_check(filename, quantity_name).get("expected")
+    assert isinstance(expected, int | float) and not isinstance(expected, bool)
+    return float(expected)
+
+
+def _manifest_expected_text(filename: str, field_name: str) -> str:
+    """Return a string field from a manifest fixture entry."""
+    value = _manifest_fixture(filename).get(field_name)
+    assert isinstance(value, str), f"{filename} {field_name} must be a string"
+    return value
+
+
+def _fixture_bytes(filename: str) -> bytes:
+    """Read committed fixture bytes for API upload tests."""
+    path = _FIXTURE_MANIFEST_PATH.parent / filename
+    assert path.is_file(), f"fixture file {filename!r} does not exist"
+    return path.read_bytes()
+
+
+def _manifest_dxf_line_expectations(filename: str = "dxf/simple-line.dxf") -> tuple[int, float]:
+    """Return manifest-driven DXF smoke line count and total length expectations."""
+    raw_line_count = _manifest_expected_number(filename, "line_count")
+    assert raw_line_count.is_integer(), "manifest line_count must be integral"
+    return int(raw_line_count), _manifest_expected_number(filename, "total_length")
+
+
+def _manifest_line_geometry(length: float) -> dict[str, Any]:
+    """Build a line geometry whose measured length comes from the fixture manifest."""
+    return {
+        "type": "line",
+        "start": [0.0, 0.0, 0.0],
+        "end": [length, 0.0, 0.0],
+        "units": {"normalized": "meter"},
+    }
+
+
+def _quantity_item_values_by_type(items: list[QuantityItem], *, item_kind: str) -> dict[str, float]:
+    """Return persisted quantity item values keyed by quantity type."""
+    values: dict[str, float] = {}
+    for item in items:
+        if item.item_kind != item_kind:
+            continue
+        assert item.value is not None
+        values[item.quantity_type] = item.value
+    return values
+
+
+def _quantity_length_total(values_by_type: dict[str, float]) -> float:
+    """Return the single length total regardless of future context suffixes."""
+    length_values = [
+        value
+        for quantity_type, value in values_by_type.items()
+        if quantity_type.startswith("length")
+    ]
+    assert len(length_values) == 1
+    return length_values[0]
+
+
+def _quantity_takeoff_semantic_payload(
+    takeoff: QuantityTakeoff,
+    items: list[QuantityItem],
+) -> dict[str, Any]:
+    """Return rerun-comparable quantity semantics, excluding volatile ids/timestamps."""
+    item_payloads = [
+        {
+            "item_kind": item.item_kind,
+            "quantity_type": item.quantity_type,
+            "value": item.value,
+            "unit": item.unit,
+            "review_state": item.review_state,
+            "validation_status": item.validation_status,
+            "quantity_gate": item.quantity_gate,
+            "source_entity_id": item.source_entity_id,
+            "excluded_source_entity_ids_json": item.excluded_source_entity_ids_json,
+        }
+        for item in items
+    ]
+    return {
+        "review_state": takeoff.review_state,
+        "validation_status": takeoff.validation_status,
+        "quantity_gate": takeoff.quantity_gate,
+        "trusted_totals": takeoff.trusted_totals,
+        "items": sorted(
+            item_payloads,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        ),
+    }
 
 
 class _AdapterModule(types.ModuleType):
@@ -80,11 +224,15 @@ async def _create_project(async_client: httpx.AsyncClient) -> dict[str, Any]:
 async def _upload_file(
     async_client: httpx.AsyncClient,
     project_id: str,
+    *,
+    filename: str = "plan.pdf",
+    content: bytes = _TEST_UPLOAD_BODY,
+    media_type: str = "application/pdf",
 ) -> dict[str, Any]:
     """Upload a supported file and return its payload."""
     response = await async_client.post(
         f"/v1/projects/{project_id}/files",
-        files={"file": ("plan.pdf", _TEST_UPLOAD_BODY, "application/pdf")},
+        files={"file": (filename, content, media_type)},
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
@@ -487,6 +635,35 @@ async def _create_ready_quantity_takeoff_job(
     """Create a project/file/revision and pending quantity job for worker tests."""
     project = await _create_project(async_client)
     uploaded = await _upload_file(async_client, project["id"])
+    ingest_job = await _get_job_for_file(str(uploaded["id"]))
+    await worker_module.process_ingest_job(ingest_job.id)
+    base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+    assert base_revision is not None
+
+    quantity_job = await _create_quantity_takeoff_job(
+        project_id=uuid.UUID(project["id"]),
+        file_id=uuid.UUID(uploaded["id"]),
+        base_revision_id=base_revision.id,
+        parent_job_id=ingest_job.id,
+        status="pending",
+    )
+
+    return project, uploaded, ingest_job, base_revision, quantity_job
+
+
+async def _create_real_dxf_quantity_takeoff_job(
+    async_client: httpx.AsyncClient,
+    fixture_filename: str,
+) -> tuple[dict[str, Any], dict[str, Any], Job, DrawingRevision, Job]:
+    """Create a pending quantity job from the committed DXF fixture via real ingestion."""
+    project = await _create_project(async_client)
+    uploaded = await _upload_file(
+        async_client,
+        project["id"],
+        filename=Path(fixture_filename).name,
+        content=_fixture_bytes(fixture_filename),
+        media_type="application/dxf",
+    )
     ingest_job = await _get_job_for_file(str(uploaded["id"]))
     await worker_module.process_ingest_job(ingest_job.id)
     base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
@@ -3232,6 +3409,249 @@ class TestJobs:
             if item.item_kind in {"contributor", "exclusion"}
         )
         assert all(item.value is None for item in items if item.item_kind == "exclusion")
+
+    async def test_process_quantity_takeoff_job_persists_manifest_backed_dxf_takeoff(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Approved DXF smoke fixture expectations should drive persisted takeoff values."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        fixture_filename = "dxf/simple-line.dxf"
+        expected_line_count, expected_total_length = _manifest_dxf_line_expectations(
+            fixture_filename
+        )
+        review_state = _manifest_expected_text(fixture_filename, "expected_review_state")
+        validation_status = _manifest_expected_text(
+            fixture_filename,
+            "expected_validation_status",
+        )
+        monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
+        project, uploaded, _, base_revision, quantity_job = (
+            await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
+        )
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "succeeded"
+        assert updated_job.error_code is None
+        assert len(takeoffs) == 1
+
+        takeoff = takeoffs[0]
+        assert takeoff.project_id == uuid.UUID(project["id"])
+        assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
+        assert takeoff.drawing_revision_id == base_revision.id
+        assert takeoff.review_state == review_state
+        assert takeoff.validation_status == validation_status
+        assert takeoff.quantity_gate == "allowed"
+        assert takeoff.trusted_totals is True
+
+        items = await _get_quantity_items_for_takeoff(takeoff.id)
+        assert all(item.review_state == review_state for item in items)
+        assert all(item.validation_status == validation_status for item in items)
+        assert all(item.quantity_gate == "allowed" for item in items)
+        assert all(item.item_kind != "exclusion" for item in items)
+
+        aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
+        assert aggregate_values["count:entity_count"] == pytest.approx(
+            float(expected_line_count)
+        )
+        assert aggregate_values["count:line_count"] == pytest.approx(float(expected_line_count))
+        assert _quantity_length_total(aggregate_values) == pytest.approx(expected_total_length)
+
+        length_contributors = [
+            item
+            for item in items
+            if item.item_kind == "contributor" and item.quantity_type.startswith("length")
+        ]
+        assert len(length_contributors) == expected_line_count
+        assert sum(item.value or 0.0 for item in length_contributors) == pytest.approx(
+            expected_total_length
+        )
+        assert all(item.source_entity_id is not None for item in length_contributors)
+
+    @pytest.mark.parametrize(
+        ("fixture_filename", "quantity_gate"),
+        [
+            ("ifc/smoke-minimal.ifc", "review_gated"),
+            ("pdf/vector-smoke.pdf", "review_gated"),
+            ("pdf/raster-smoke.pdf", "blocked"),
+            ("dwg/libredwg-wrapper-smoke.txt", "blocked"),
+        ],
+    )
+    async def test_process_quantity_takeoff_job_manifest_gate_fixtures_publish_no_trusted_totals(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        fixture_filename: str,
+        quantity_gate: str,
+    ) -> None:
+        """Non-DXF fixture manifest entries should deterministically keep totals untrusted."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        review_state = _manifest_expected_text(fixture_filename, "expected_review_state")
+        validation_status = _manifest_expected_text(
+            fixture_filename,
+            "expected_validation_status",
+        )
+        quantities = _assert_json_object(
+            _assert_json_object(
+                _manifest_fixture(fixture_filename).get("acceptance_checks"),
+                f"{fixture_filename} acceptance_checks",
+            ).get("quantities"),
+            f"{fixture_filename} quantities",
+        )
+        assert all(
+            _assert_json_object(check, f"{fixture_filename} quantity check").get("comparison")
+            == "review_gated"
+            for check in quantities.values()
+        )
+
+        async def _run_manifest_gated_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate=quantity_gate,
+                entities=[],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_manifest_gated_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
+        assert takeoffs == []
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        event_payload = response.json()["items"][-1]["data_json"]
+        assert event_payload["status"] == "failed"
+        assert event_payload["details"]["quantity_gate"] == quantity_gate
+        assert "trusted_totals" not in event_payload
+
+    async def test_process_quantity_takeoff_job_manifest_dxf_rerun_semantics_are_stable(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rerunning an approved DXF revision should preserve semantic takeoff payloads."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        fixture_filename = "dxf/simple-line.dxf"
+        monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
+        project, uploaded, ingest_job, base_revision, first_job = (
+            await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
+        )
+        second_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            status="pending",
+        )
+
+        await worker_module.process_quantity_takeoff_job(first_job.id)
+        await worker_module.process_quantity_takeoff_job(second_job.id)
+
+        first_takeoffs = await _get_quantity_takeoffs_for_job(first_job.id)
+        second_takeoffs = await _get_quantity_takeoffs_for_job(second_job.id)
+        assert len(first_takeoffs) == 1
+        assert len(second_takeoffs) == 1
+        assert first_takeoffs[0].id != second_takeoffs[0].id
+        assert first_takeoffs[0].source_job_id != second_takeoffs[0].source_job_id
+
+        first_items = await _get_quantity_items_for_takeoff(first_takeoffs[0].id)
+        second_items = await _get_quantity_items_for_takeoff(second_takeoffs[0].id)
+        assert _quantity_takeoff_semantic_payload(
+            first_takeoffs[0],
+            first_items,
+        ) == _quantity_takeoff_semantic_payload(second_takeoffs[0], second_items)
+
+    async def test_process_quantity_takeoff_job_manifest_dxf_dedups_duplicate_contributors(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Identical source contributors should not inflate manifest-backed DXF totals."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        fixture_filename = "dxf/simple-line.dxf"
+        expected_line_count, expected_total_length = _manifest_dxf_line_expectations(
+            fixture_filename
+        )
+        review_state = _manifest_expected_text(fixture_filename, "expected_review_state")
+        validation_status = _manifest_expected_text(
+            fixture_filename,
+            "expected_validation_status",
+        )
+        duplicate_hash = "b" * 64
+        duplicate_entity = _build_fake_contract_entity(
+            entity_id="manifest-dxf-duplicate-line",
+            entity_type="line",
+            layer_ref="0",
+            source_id="entities.LINE:0",
+            source_hash=duplicate_hash,
+            geometry_json=_manifest_line_geometry(expected_total_length),
+        )
+
+        async def _run_duplicate_manifest_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            return _build_fake_quantity_ingest_payload(
+                request,
+                review_state=review_state,
+                validation_status=validation_status,
+                quantity_gate="allowed",
+                entities=[deepcopy(duplicate_entity), deepcopy(duplicate_entity)],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_duplicate_manifest_ingestion)
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+
+        await worker_module.process_quantity_takeoff_job(quantity_job.id)
+
+        updated_job = await _get_job(quantity_job.id)
+        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
+        assert updated_job.status == "succeeded"
+        assert len(takeoffs) == 1
+
+        items = await _get_quantity_items_for_takeoff(takeoffs[0].id)
+        aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
+        assert aggregate_values["count:entity_count"] == pytest.approx(
+            float(expected_line_count)
+        )
+        assert aggregate_values["count:line_count"] == pytest.approx(float(expected_line_count))
+        assert _quantity_length_total(aggregate_values) == pytest.approx(expected_total_length)
+
+        length_contributors = [
+            item
+            for item in items
+            if item.item_kind == "contributor" and item.quantity_type.startswith("length")
+        ]
+        assert len(length_contributors) == 1
+        assert length_contributors[0].excluded_source_entity_ids_json != []
 
     @pytest.mark.parametrize(
         ("review_state", "validation_status", "quantity_gate"),
