@@ -138,10 +138,37 @@ Default MVP quantity policy:
 ## Estimation
 
 - Default currency: GBP.
+- No FX conversion in MVP; estimate inputs and outputs must already be in GBP.
+- Trusted estimate input requires `trusted_totals = true` and
+  `quantity_gate = allowed` on the referenced quantity takeoff.
+- `allowed_provisional` quantities are blocked from trusted estimation by
+  default; they remain explicit provisional data until a later contract says
+  otherwise.
 - Rates must be stored in a configurable catalog.
+- Catalog scope is global by default with project-specific overrides.
+- Auto-selection checks project-scoped matches first and falls back to global
+  entries only when zero project-scoped entries match; multiple matches in the
+  chosen scope fail.
 - Store rate source, unit, effective date, currency, and whether the rate is
   manual or imported.
+- `pricing_effective_date` is a date; when omitted it defaults from the job's
+  UTC enqueue timestamp by taking the UTC calendar date.
+- Effective-date intervals are half-open.
+- Explicit catalog item id + checksum selection may bypass auto-match, but it
+  must still validate scope, checksum, type, unit, currency, and lineage.
 - Estimate math must be deterministic.
+- Formula evaluation uses a restricted JSON AST Formula DSL v0 with required
+  formula id/version, output contract, declared inputs, AST root, rounding,
+  checksum, enumerated AST node categories, decimal string literals, and
+  allowlisted operators only.
+- Finalized estimates freeze quantity inputs, rates, materials, formulas,
+  assumptions, and rounded money outputs for reproducibility.
+- Monetary snapshot/output rounding defaults to GBP scale 2 with
+  `ROUND_HALF_UP`.
+- Non-money formula math keeps explicit higher precision until a field is frozen
+  as money.
+- Supersession is append-only: new estimate/catalog/formula versions replace old
+  ones through new versions or immutable lineage, not in-place edits.
 
 ## Jobs
 

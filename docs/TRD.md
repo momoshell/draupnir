@@ -701,6 +701,10 @@ Gate semantics:
 
 The estimation engine must be deterministic and auditable.
 
+Estimate execution inputs are pinned to one persisted quantity takeoff and must
+not infer or recompute quantity totals from live revision data during estimate
+finalization.
+
 Required data:
 
 - rate catalog
@@ -710,6 +714,112 @@ Required data:
 - quantity references
 - estimate line items
 - estimate versions
+
+### Estimation Input And Trust Rules
+
+- Trusted estimation input requires both `trusted_totals = true` and
+  `quantity_gate = allowed` on the referenced quantity takeoff.
+- `allowed_provisional` quantity takeoffs are blocked from trusted estimation by
+  default. They may only be used by a future explicitly provisional estimate
+  contract; MVP estimation does not silently upgrade provisional quantities into
+  trusted pricing paths.
+- `review_gated` and `blocked` quantity takeoffs are not estimate-eligible.
+- Estimate creation/recalculation must fail if the referenced quantity takeoff
+  is missing, out of scope, or not estimate-eligible.
+
+### Catalog, Selection, And Effective-Date Rules
+
+- Catalog data exists in two scopes: global catalogs plus project-scoped
+  overrides.
+- Auto-selection evaluates project scope first for the addressed project. Global
+  scope is considered only when zero project-scoped entries match the lookup.
+- If one or more project-scoped entries match, global entries are ignored for
+  that lookup.
+- Auto-selection must be deterministic over catalog scope, item type, unit,
+  currency, and effective date.
+- `pricing_effective_date` is a date, not a datetime.
+- When the request omits `pricing_effective_date`, the system derives it from
+  the estimate job enqueue timestamp by converting that timestamp to UTC and
+  taking the UTC calendar date.
+- When the request provides `pricing_effective_date`, selection uses that date
+  value directly with no time-of-day component.
+- Catalog effective intervals are half-open: an entry is eligible when
+  `effective_from <= pricing_effective_date < effective_to`, with `effective_to`
+  nullable for an open-ended current version.
+- Auto-selection must fail when zero entries match in project scope and zero
+  entries match in global scope.
+- Auto-selection must fail when more than one eligible entry remains within the
+  chosen scope after applying the deterministic selection rules. Multiple
+  matches in project scope are a conflict; multiple matches in global scope are
+  also a conflict.
+- The system must not merge scopes for one lookup and must not pick an arbitrary
+  fallback.
+- An explicit catalog item reference by stable id plus checksum bypasses
+  auto-selection, but the estimate worker must still validate scope,
+  checksum, item type, unit compatibility, currency, and lineage before use.
+
+### Currency And Rounding Defaults
+
+- MVP estimate currency defaults to GBP.
+- MVP does not perform FX conversion. Catalog entries and estimate outputs must
+  already be in the requested estimate currency.
+- Monetary values use scale 2 with `ROUND_HALF_UP` when freezing finalized
+  estimate fields or rendering/exporting money amounts.
+- Internal non-monetary formula math uses explicit decimal precision suitable
+  for deterministic replay and is not rounded to money scale unless a field is
+  defined as monetary.
+- Frozen money values in estimate snapshots and line items must apply the
+  explicit GBP scale 2 rounding rule.
+
+### Formula Contract
+
+- Formula evaluation uses Formula DSL v0, represented as a JSON AST.
+- Every formula definition must include at minimum: `formula_id`, `version`,
+  `name`, `output_contract`, `declared_inputs`, `ast`, `rounding`, and
+  `checksum`.
+- `output_contract` must declare the expected result shape at minimum,
+  including the output key and unit semantics the evaluator must satisfy.
+- `declared_inputs` is the complete allowlist of formula-visible inputs; the AST
+  may not reference anything outside that declaration.
+- Formula DSL v0 AST node categories are exactly: decimal literal nodes,
+  declared input reference nodes, unary operator nodes, binary operator nodes,
+  finite-list aggregate operator nodes, and round operator nodes.
+- Numeric literals in the DSL must be encoded as decimal strings, not binary
+  floating-point JSON numbers.
+- Decimal literal strings must use base-10 fixed or fractional notation with an
+  optional leading `-`, at least one digit before any decimal point, and no
+  exponent notation, `+` sign, `NaN`, `Infinity`, locale-specific suffixes, or
+  dynamic function names.
+- Allowed Formula DSL v0 operators are exactly:
+  `add`, `subtract`, `multiply`, `divide`, `negate`, `min`, `max`, `sum`, and
+  `round`.
+- Decimal literal nodes carry a decimal string value and must reject floats,
+  non-finite forms, exponent notation, locale-specific suffixes, and any other
+  non-canonical decimal encoding.
+- Declared input reference nodes may resolve only to declared estimate inputs
+  named in `declared_inputs`.
+- Unary operator nodes support only `negate`.
+- Binary operator nodes support only `add`, `subtract`, `multiply`, and
+  `divide`, with explicit left/right operands in the AST.
+- Finite-list aggregate operator nodes support only `min`, `max`, and `sum`
+  with an explicit finite ordered operand list in the AST.
+- `round` nodes must declare the child expression, target scale, and rounding
+  mode; MVP supports only `ROUND_HALF_UP`.
+- Any formula outside the Formula DSL v0 allowlist must fail validation rather
+  than execute dynamically.
+- Forbidden runtime behavior includes raw `eval`/`exec`, host-language code
+  generation, filesystem access, network access, clock access, randomness,
+  environment-variable reads, and implicit access to mutable live database
+  state.
+- Deterministic validation failures must be enumerated and return
+  `INPUT_INVALID` by default, including at minimum: missing required formula
+  fields, unknown node category, malformed AST shape, unknown operator,
+  malformed decimal literal, undeclared input reference, incompatible operand
+  arity, unsupported rounding mode, zero matches, multiple matches,
+  scope/checksum/type/key/unit/currency/lineage mismatches, divide-by-zero,
+  non-finite result, output mismatch, and any forbidden eval/import/globals/
+  file/network/time/randomness/loops/recursion/mutation/undeclared-context
+  behavior.
 
 Estimate reproducibility rules:
 
@@ -721,19 +831,28 @@ Estimate reproducibility rules:
   deterministic functions, and explicit unit/rounding rules.
 - Re-running the same estimate version against the same frozen inputs must
   produce the same estimate output.
+- Deterministic catalog and formula selection is part of reproducibility; the
+  same pinned takeoff, pricing date, catalog versions, and assumptions must
+  resolve to the same inputs every time.
 
 Estimate snapshots:
 
 - Finalized estimate versions must persist a frozen snapshot of the exact rates,
   materials, formulas, assumptions, and quantity inputs used to produce the
   estimate.
-- The snapshot must also preserve the catalog item identifiers/versions or other
-  lineage needed to trace each frozen value back to its source.
+- The snapshot must also preserve the exact source identifiers, versions, and
+  checksums needed to trace each frozen value back to its source.
 - Line items must reference the frozen snapshot entries they used, not only live
   catalog rows.
 - Finalized estimate versions are append-only records created by estimate
   workers; recalculation creates a new version rather than mutating a finalized
   one in place.
+- Frozen quantity inputs must record the exact source quantity takeoff id,
+  trusted/provisional posture, units, and values used during estimate
+  finalization.
+- The contract must not rely on mutable `is_active`, `is_current`,
+  `is_successor`, or backfilled successor-pointer fields to identify the chosen
+  snapshot, catalog row, formula, or estimate version.
 
 Catalog scope and mutation rules:
 
@@ -745,6 +864,10 @@ Catalog scope and mutation rules:
 - Later changes to global catalogs or project overrides must not change prior
   estimates, their line items, or any regenerated estimate artifact derived from
   that estimate version.
+- Append-only supersession applies to estimate inputs and outputs: replacing a
+  catalog entry, material, formula, or finalized estimate version must happen by
+  creating a new version or immutable supersession relation/event, never by
+  mutating the historical row or frozen snapshot in place.
 
 ## API Requirements
 

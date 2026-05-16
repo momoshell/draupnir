@@ -15,9 +15,16 @@
 - Final PDF report generator (WeasyPrint vs ReportLab)
 - Geometry validation engine (FreeCAD vs OCCT)
 - Webhook/SSE vs polling-only for MVP events
-- Materials: shared catalog vs per-project
 - Generated artifact quantity foreign key remains deferred even though docs now
   describe append-only quantity takeoff persistence lineage.
+
+## Resolved For Phase 7 Estimation Contracts
+
+- Materials catalog scope is global by default with project-specific overrides.
+- Project scope is evaluated first for eligible estimate lookups; global scope
+  is used only when zero project-scoped matches exist.
+- Catalog selection must fail on zero matches across both scopes or on multiple
+  matches inside the chosen scope; no cross-scope merge or arbitrary fallback.
 
 ## External Review Follow-Ups
 
