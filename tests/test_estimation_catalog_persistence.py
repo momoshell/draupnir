@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, Callable, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import pytest_asyncio
@@ -133,7 +133,7 @@ async def _create_project(session: AsyncSession) -> uuid.UUID:
     else:
         result = await session.execute(text("INSERT INTO projects DEFAULT VALUES RETURNING id"))
 
-    project_id = result.scalar_one()
+    project_id = cast(uuid.UUID, result.scalar_one())
     await session.commit()
     return project_id
 
