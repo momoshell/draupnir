@@ -4,13 +4,23 @@ import base64
 import binascii
 from datetime import datetime
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.idempotency import (
+    IdempotencyReplay,
+    IdempotencyReservation,
+    build_idempotency_fingerprint,
+    claim_idempotency,
+    get_idempotency_key,
+    mark_idempotency_completed,
+    replay_idempotency,
+)
 from app.api.pagination import (
     decode_cursor_payload,
     encode_cursor_payload,
@@ -19,11 +29,15 @@ from app.api.pagination import (
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
+from app.jobs.worker import enqueue_quantity_takeoff_job as _enqueue_quantity_takeoff_job
+from app.jobs.worker import prepare_job_enqueue_intent, publish_job_enqueue_intent
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
+from app.models.job import Job, JobType
 from app.models.project import Project
+from app.models.quantity_takeoff import QuantityGate, QuantityItem, QuantityTakeoff
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntity,
@@ -32,6 +46,13 @@ from app.models.revision_materialization import (
     RevisionLayout,
 )
 from app.models.validation_report import ValidationReport
+from app.schemas.job import JobRead
+from app.schemas.quantity_takeoff import (
+    QuantityItemListResponse,
+    QuantityItemRead,
+    QuantityTakeoffListResponse,
+    QuantityTakeoffRead,
+)
 from app.schemas.revision import (
     AdapterRunOutputRead,
     DrawingRevisionListResponse,
@@ -114,6 +135,30 @@ def _encode_materialization_cursor(sequence_index: int, row_id: UUID) -> str:
     )
 
 
+def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
+    """Compatibility wrapper kept for test fixture patching."""
+
+    _enqueue_quantity_takeoff_job(job_id)
+
+
+def _encode_timestamp_cursor(created_at: datetime, row_id: UUID) -> str:
+    """Encode an opaque timestamp/id pagination cursor."""
+
+    return encode_cursor_payload({"created_at": created_at.isoformat(), "id": str(row_id)})
+
+
+def _decode_timestamp_cursor(cursor: str) -> tuple[datetime, UUID]:
+    """Decode a timestamp/id pagination cursor."""
+
+    try:
+        cursor_data = decode_cursor_payload(cursor)
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
+            str(cursor_data["id"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
+
+
 def _decode_materialization_cursor(cursor: str) -> tuple[int, UUID]:
     """Decode a materialization cursor into typed values."""
 
@@ -158,10 +203,12 @@ async def _get_active_file(file_id: UUID, db: AsyncSession) -> File | None:
 async def _get_active_revision(
     revision_id: UUID,
     db: AsyncSession,
+    *,
+    for_update: bool = False,
 ) -> DrawingRevision | None:
     """Return an active revision visible through a non-deleted file and project."""
 
-    result = await db.execute(
+    query = (
         select(DrawingRevision)
         .join(
             File,
@@ -175,7 +222,57 @@ async def _get_active_revision(
             & (Project.deleted_at.is_(None))
         )
     )
+    if for_update:
+        query = query.with_for_update(
+            of=(DrawingRevision.__table__, File.__table__, Project.__table__)
+        )
+
+    result = await db.execute(query)
     return result.scalar_one_or_none()
+
+
+async def _get_active_validation_report(
+    revision_id: UUID,
+    db: AsyncSession,
+) -> ValidationReport | None:
+    """Return the persisted validation report for an active revision, if present."""
+
+    result = await db.execute(
+        select(ValidationReport)
+        .join(
+            DrawingRevision,
+            DrawingRevision.id == ValidationReport.drawing_revision_id,
+        )
+        .join(
+            File,
+            (File.id == DrawingRevision.source_file_id)
+            & (File.project_id == DrawingRevision.project_id),
+        )
+        .join(Project, Project.id == DrawingRevision.project_id)
+        .where(
+            (ValidationReport.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_active_validation_report_or_404(
+    revision_id: UUID,
+    db: AsyncSession,
+) -> ValidationReport:
+    """Return an active revision validation report or raise not found."""
+
+    report = await _get_active_validation_report(revision_id, db)
+    if report is None:
+        revision = await _get_active_revision(revision_id, db)
+        if revision is None:
+            raise_not_found("Drawing revision", str(revision_id))
+        raise_not_found("Validation report", str(revision_id))
+
+    assert report is not None
+    return report
 
 
 async def _get_revision_manifest(
@@ -216,6 +313,55 @@ def _manifest_counts(
     """Convert persisted manifest counts to the public schema."""
 
     return RevisionMaterializationCounts.model_validate(manifest.counts_json)
+
+
+def _raise_quantity_takeoff_gate_invalid(report: ValidationReport) -> None:
+    """Raise the standard pre-enqueue error for non-runnable quantity gates."""
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=create_error_response(
+            code=ErrorCode.INPUT_INVALID,
+            message=(
+                "Quantity takeoff requires a revision with an allowed quantity gate."
+            ),
+            details={
+                "quantity_gate": report.quantity_gate,
+                "review_state": report.review_state,
+                "validation_status": report.validation_status,
+            },
+        ),
+    )
+
+
+async def _get_revision_quantity_takeoff_or_404(
+    revision_id: UUID,
+    takeoff_id: UUID,
+    db: AsyncSession,
+) -> QuantityTakeoff:
+    """Return a committed quantity takeoff scoped to an active revision."""
+
+    result = await db.execute(
+        select(QuantityTakeoff)
+        .join(
+            File,
+            (File.id == QuantityTakeoff.source_file_id)
+            & (File.project_id == QuantityTakeoff.project_id),
+        )
+        .join(Project, Project.id == QuantityTakeoff.project_id)
+        .where(
+            (QuantityTakeoff.id == takeoff_id)
+            & (QuantityTakeoff.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    takeoff = result.scalar_one_or_none()
+    if takeoff is None:
+        raise_not_found("Quantity takeoff", str(takeoff_id))
+
+    assert takeoff is not None
+    return takeoff
 
 
 @revisions_router.get("/files/{file_id}/revisions", response_model=DrawingRevisionListResponse)
@@ -723,6 +869,245 @@ async def get_revision_entity(
 
 
 @revisions_router.get(
+    "/revisions/{revision_id}/quantity-takeoffs",
+    response_model=QuantityTakeoffListResponse,
+)
+async def list_revision_quantity_takeoffs(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> QuantityTakeoffListResponse:
+    """List committed quantity takeoffs for an active drawing revision."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    pagination_cursor = _decode_timestamp_cursor(cursor) if cursor else None
+    query = (
+        select(QuantityTakeoff)
+        .join(
+            File,
+            (File.id == QuantityTakeoff.source_file_id)
+            & (File.project_id == QuantityTakeoff.project_id),
+        )
+        .join(Project, Project.id == QuantityTakeoff.project_id)
+        .where(
+            (QuantityTakeoff.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    if pagination_cursor is not None:
+        created_at, row_id = pagination_cursor
+        query = query.where(
+            (QuantityTakeoff.created_at > created_at)
+            | ((QuantityTakeoff.created_at == created_at) & (QuantityTakeoff.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(QuantityTakeoff.created_at.asc(), QuantityTakeoff.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+
+    return QuantityTakeoffListResponse(
+        items=[QuantityTakeoffRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}",
+    response_model=QuantityTakeoffRead,
+)
+async def get_revision_quantity_takeoff(
+    revision_id: UUID,
+    takeoff_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> QuantityTakeoffRead:
+    """Return a committed quantity takeoff for an active drawing revision."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
+    return QuantityTakeoffRead.model_validate(takeoff)
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/items",
+    response_model=QuantityItemListResponse,
+)
+async def list_revision_quantity_takeoff_items(
+    revision_id: UUID,
+    takeoff_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> QuantityItemListResponse:
+    """List committed quantity items for a revision-scoped takeoff."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
+    pagination_cursor = _decode_timestamp_cursor(cursor) if cursor else None
+    query = (
+        select(QuantityItem)
+        .join(
+            QuantityTakeoff,
+            (QuantityTakeoff.id == QuantityItem.quantity_takeoff_id)
+            & (QuantityTakeoff.project_id == QuantityItem.project_id)
+            & (QuantityTakeoff.drawing_revision_id == QuantityItem.drawing_revision_id)
+            & (QuantityTakeoff.quantity_gate == QuantityItem.quantity_gate),
+        )
+        .join(
+            File,
+            (File.id == QuantityTakeoff.source_file_id)
+            & (File.project_id == QuantityTakeoff.project_id),
+        )
+        .join(Project, Project.id == QuantityTakeoff.project_id)
+        .where(
+            (QuantityItem.quantity_takeoff_id == takeoff_id)
+            & (QuantityItem.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    if pagination_cursor is not None:
+        created_at, row_id = pagination_cursor
+        query = query.where(
+            (QuantityItem.created_at > created_at)
+            | ((QuantityItem.created_at == created_at) & (QuantityItem.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+
+    return QuantityItemListResponse(
+        items=[QuantityItemRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.post(
+    "/revisions/{revision_id}/quantity-takeoffs",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_revision_quantity_takeoff(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Job | Response:
+    """Create a pending quantity takeoff job for an active drawing revision."""
+
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = build_idempotency_fingerprint(
+            f"revisions.quantity_takeoffs:{revision_id}",
+            {"revision_id": str(revision_id)},
+        )
+        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
+        if replay is not None:
+            return replay.response
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+    assert revision is not None
+    await _get_active_revision_manifest_or_409(revision_id, db)
+    report = await _get_active_validation_report_or_404(revision_id, db)
+    if report.quantity_gate in {
+        QuantityGate.REVIEW_GATED.value,
+        QuantityGate.BLOCKED.value,
+    }:
+        _raise_quantity_takeoff_gate_invalid(report)
+
+    locked_revision = await _get_active_revision(revision_id, db, for_update=True)
+    if locked_revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+    revision = locked_revision
+    assert revision is not None
+
+    if idempotency_key is not None:
+        assert fingerprint is not None
+        claim = await claim_idempotency(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+            method="POST",
+            path=f"/revisions/{revision_id}/quantity-takeoffs",
+        )
+        if isinstance(claim, IdempotencyReplay):
+            return claim.response
+        reservation = claim
+
+    quantity_job = Job(
+        id=uuid4(),
+        project_id=revision.project_id,
+        file_id=revision.source_file_id,
+        extraction_profile_id=None,
+        base_revision_id=revision.id,
+        parent_job_id=None,
+        job_type=JobType.QUANTITY_TAKEOFF.value,
+        status="pending",
+        attempts=0,
+        max_attempts=3,
+        enqueue_status="pending",
+        enqueue_attempts=0,
+        cancel_requested=False,
+        error_code=None,
+        error_message=None,
+        started_at=None,
+        finished_at=None,
+    )
+    db.add(quantity_job)
+    prepare_job_enqueue_intent(quantity_job)
+    await db.flush()
+    await db.refresh(quantity_job)
+
+    success_body: dict[str, object] | None = None
+    if reservation is not None:
+        success_body = JobRead.model_validate(quantity_job).model_dump(mode="json")
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status.HTTP_202_ACCEPTED,
+            response_body=success_body,
+        )
+
+    await db.commit()
+    await publish_job_enqueue_intent(
+        quantity_job.id,
+        publisher=enqueue_quantity_takeoff_job,
+        suppress_exceptions=True,
+    )
+
+    if reservation is not None:
+        assert success_body is not None
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
+
+    return quantity_job
+
+
+@revisions_router.get(
     "/revisions/{revision_id}/validation-report",
     response_model=ValidationReportResponse,
 )
@@ -731,45 +1116,5 @@ async def get_validation_report(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ValidationReportResponse:
     """Return the persisted canonical validation report for a drawing revision."""
-    result = await db.execute(
-        select(ValidationReport)
-        .join(
-            DrawingRevision,
-            DrawingRevision.id == ValidationReport.drawing_revision_id,
-        )
-        .join(
-            File,
-            (File.id == DrawingRevision.source_file_id)
-            & (File.project_id == DrawingRevision.project_id),
-        )
-        .join(Project, Project.id == DrawingRevision.project_id)
-        .where(
-            (ValidationReport.drawing_revision_id == revision_id)
-            & (File.deleted_at.is_(None))
-            & (Project.deleted_at.is_(None))
-        )
-    )
-    report = result.scalar_one_or_none()
-    if report is None:
-        revision_result = await db.execute(
-            select(DrawingRevision)
-            .join(
-                File,
-                (File.id == DrawingRevision.source_file_id)
-                & (File.project_id == DrawingRevision.project_id),
-            )
-            .join(Project, Project.id == DrawingRevision.project_id)
-            .where(
-                (DrawingRevision.id == revision_id)
-                & (File.deleted_at.is_(None))
-                & (Project.deleted_at.is_(None))
-            )
-        )
-        revision = revision_result.scalar_one_or_none()
-        if revision is None:
-            raise_not_found("Drawing revision", str(revision_id))
-        raise_not_found("Validation report", str(revision_id))
-
-    assert report is not None
-
+    report = await _get_active_validation_report_or_404(revision_id, db)
     return build_validation_report_response(report)
