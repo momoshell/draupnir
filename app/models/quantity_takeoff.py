@@ -164,6 +164,14 @@ class QuantityTakeoff(Base):
             name="uq_quantity_takeoffs_id_project_rev_gate",
         ),
         UniqueConstraint(
+            "id",
+            "project_id",
+            "drawing_revision_id",
+            "quantity_gate",
+            "trusted_totals",
+            name="uq_quantity_takeoffs_id_project_rev_gate_trusted",
+        ),
+        UniqueConstraint(
             "source_job_id",
             name="uq_quantity_takeoffs_source_job_id",
         ),
