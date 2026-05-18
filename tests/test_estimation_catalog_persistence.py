@@ -28,6 +28,8 @@ pytestmark = [pytest.mark.asyncio, requires_database]
 
 CatalogBuilder = Callable[..., Any]
 CATALOG_TABLES: tuple[str, ...] = (
+    "estimate_items",
+    "estimate_snapshot_entries",
     "formula_definition_supersessions",
     "material_catalog_entry_supersessions",
     "rate_catalog_entry_supersessions",
@@ -54,6 +56,8 @@ async def _cleanup_catalog_tables() -> None:
             await session.execute(
                 text(
                     "TRUNCATE TABLE "
+                    "estimate_items, "
+                    "estimate_snapshot_entries, "
                     "formula_definition_supersessions, "
                     "material_catalog_entry_supersessions, "
                     "rate_catalog_entry_supersessions, "
@@ -707,10 +711,15 @@ async def test_catalog_tables_reject_append_only_mutations(
     )
     await _assert_append_only_sql_mutation_fails(
         db_session,
-        f'TRUNCATE TABLE "{table_name}", "{supersession_table_name}"',
+        (
+            f'TRUNCATE TABLE "estimate_items", "estimate_snapshot_entries", '
+            f'"{table_name}", "{supersession_table_name}"'
+        ),
         table_name=table_name,
         operation="TRUNCATE",
         expected_substring=(
+            "append-only trigger blocked TRUNCATE on estimate_items",
+            "append-only trigger blocked TRUNCATE on estimate_snapshot_entries",
             f"append-only trigger blocked TRUNCATE on {table_name}",
             f"append-only trigger blocked TRUNCATE on {supersession_table_name}",
         ),
