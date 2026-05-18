@@ -593,6 +593,6 @@ async def test_estimate_versions_reject_append_only_mutations(
     )
     await _assert_append_only_sql_mutation_fails(
         db_session,
-        'TRUNCATE TABLE "estimate_versions"',
+        'TRUNCATE TABLE "estimate_versions" CASCADE',
         operation="TRUNCATE",
     )

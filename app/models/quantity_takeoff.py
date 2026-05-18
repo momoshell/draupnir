@@ -317,6 +317,13 @@ class QuantityItem(Base):
             "json_typeof(excluded_source_entity_ids_json) = 'array'",
             name="ck_quantity_items_excluded_source_entity_ids_json_array",
         ),
+        UniqueConstraint(
+            "id",
+            "quantity_takeoff_id",
+            "project_id",
+            "drawing_revision_id",
+            name="uq_quantity_items_id_takeoff_project_drawing_revision",
+        ),
         Index(
             "ix_quantity_items_drawing_revision_id_source_entity_id",
             "drawing_revision_id",
