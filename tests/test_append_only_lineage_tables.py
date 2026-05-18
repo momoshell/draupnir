@@ -22,6 +22,7 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
     APPEND_ONLY_PROTECTED_TABLES,
     APPEND_ONLY_ROW_TRIGGER_NAME,
@@ -63,6 +64,7 @@ class _ProtectedRowIds:
     validation_report_id: uuid.UUID
     generated_artifact_id: uuid.UUID
     job_event_id: uuid.UUID
+    estimate_version_id: uuid.UUID
     quantity_takeoff_id: uuid.UUID
     quantity_item_id: uuid.UUID
     revision_entity_manifest_id: uuid.UUID
@@ -163,6 +165,7 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "validation_reports": row_ids.validation_report_id,
         "generated_artifacts": row_ids.generated_artifact_id,
         "job_events": row_ids.job_event_id,
+        "estimate_versions": row_ids.estimate_version_id,
         "quantity_takeoffs": row_ids.quantity_takeoff_id,
         "quantity_items": row_ids.quantity_item_id,
         "revision_entity_manifests": row_ids.revision_entity_manifest_id,
@@ -186,6 +189,21 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         str(quantity_seed.project_id)
     )
     job_events = await _load_job_events(quantity_seed.ingest_job_id)
+    estimate_source_job_id = await estimate_version_persistence._create_estimate_source_job(
+        quantity_seed
+    )
+
+    estimate_version = estimate_version_persistence._build_estimate_version(
+        quantity_seed,
+        source_job_id=estimate_source_job_id,
+        quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
+    )
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    async with session_maker() as session:
+        session.add(estimate_version)
+        await session.commit()
 
     assert len(adapter_outputs) == 1
     assert len(drawing_revisions) == 1
@@ -208,6 +226,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         validation_report_id=validation_reports[0].id,
         generated_artifact_id=generated_artifacts[0].id,
         job_event_id=job_events[0].id,
+        estimate_version_id=estimate_version.id,
         quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
         quantity_item_id=quantity_seed.quantity_item_id,
         revision_entity_manifest_id=manifests[0].id,
@@ -1318,6 +1337,7 @@ class TestAppendOnlyLineageTables:
             ("validation_reports", "validator_version", "mutated"),
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
             ("job_events", "message", "mutated job event"),
+            ("estimate_versions", "total_amount", "121.00"),
             ("quantity_takeoffs", "review_state", "review_required"),
             ("quantity_items", "quantity_type", "mutated_quantity_type"),
             (
