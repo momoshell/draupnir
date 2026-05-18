@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from json import dumps
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
     APPEND_ONLY_PROTECTED_TABLES,
@@ -65,6 +67,8 @@ class _ProtectedRowIds:
     generated_artifact_id: uuid.UUID
     job_event_id: uuid.UUID
     estimate_version_id: uuid.UUID
+    estimate_snapshot_entry_id: uuid.UUID
+    estimate_item_id: uuid.UUID
     quantity_takeoff_id: uuid.UUID
     quantity_item_id: uuid.UUID
     revision_entity_manifest_id: uuid.UUID
@@ -166,6 +170,8 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "generated_artifacts": row_ids.generated_artifact_id,
         "job_events": row_ids.job_event_id,
         "estimate_versions": row_ids.estimate_version_id,
+        "estimate_snapshot_entries": row_ids.estimate_snapshot_entry_id,
+        "estimate_items": row_ids.estimate_item_id,
         "quantity_takeoffs": row_ids.quantity_takeoff_id,
         "quantity_items": row_ids.quantity_item_id,
         "revision_entity_manifests": row_ids.revision_entity_manifest_id,
@@ -198,11 +204,46 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         source_job_id=estimate_source_job_id,
         quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
     )
+    estimate_snapshot_entry = EstimateSnapshotEntry(
+        id=uuid.uuid4(),
+        estimate_version_id=estimate_version.id,
+        project_id=quantity_seed.project_id,
+        drawing_revision_id=quantity_seed.drawing_revision_id,
+        entry_type="assumption",
+        entry_key="assumption:append-only",
+        entry_label="Append-only assumption",
+        sort_order=1,
+        source_payload_json={"kind": "assumption", "value": "seed"},
+    )
+    estimate_item = EstimateItem(
+        id=uuid.uuid4(),
+        estimate_version_id=estimate_version.id,
+        project_id=quantity_seed.project_id,
+        drawing_revision_id=quantity_seed.drawing_revision_id,
+        line_type="assumption",
+        line_number=1,
+        line_key="line:assumption:append-only",
+        description="Append-only assumption line",
+        currency="GBP",
+        subtotal_amount=Decimal("0.00"),
+        tax_amount=Decimal("0.00"),
+        total_amount=Decimal("0.00"),
+        assumption_snapshot_entry_id=estimate_snapshot_entry.id,
+        quantity_snapshot_entry_type="quantity_input",
+        rate_snapshot_entry_type="rate",
+        material_snapshot_entry_type="material",
+        formula_snapshot_entry_type="formula",
+        assumption_snapshot_entry_type="assumption",
+    )
 
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
     async with session_maker() as session:
         session.add(estimate_version)
+        await session.flush()
+        session.add(estimate_snapshot_entry)
+        await session.flush()
+        session.add(estimate_item)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -227,6 +268,8 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         generated_artifact_id=generated_artifacts[0].id,
         job_event_id=job_events[0].id,
         estimate_version_id=estimate_version.id,
+        estimate_snapshot_entry_id=estimate_snapshot_entry.id,
+        estimate_item_id=estimate_item.id,
         quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
         quantity_item_id=quantity_seed.quantity_item_id,
         revision_entity_manifest_id=manifests[0].id,
@@ -1338,6 +1381,8 @@ class TestAppendOnlyLineageTables:
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
             ("job_events", "message", "mutated job event"),
             ("estimate_versions", "total_amount", "121.00"),
+            ("estimate_snapshot_entries", "entry_label", "mutated assumption"),
+            ("estimate_items", "description", "mutated estimate item"),
             ("quantity_takeoffs", "review_state", "review_required"),
             ("quantity_items", "quantity_type", "mutated_quantity_type"),
             (
