@@ -386,6 +386,7 @@ class _JobProgressEventBridge:
             finally:
                 self._queue.task_done()
 
+
 celery_app = Celery(
     "draupnir",
     broker=settings.broker_url,
@@ -520,9 +521,7 @@ async def _get_job_lock_bootstrap(
     job_id: UUID,
 ) -> _JobLockBootstrap | None:
     """Load job metadata without taking locks."""
-    result = await session.execute(
-        select(Job.project_id, Job.file_id).where(Job.id == job_id)
-    )
+    result = await session.execute(select(Job.project_id, Job.file_id).where(Job.id == job_id))
     row = result.one_or_none()
     if row is None:
         return None
@@ -554,11 +553,7 @@ async def _get_job_for_update_with_metadata(
     expected_file_id: UUID | None = None,
 ) -> Job | None:
     """Load and lock a persisted job row, revalidating stable metadata."""
-    result = await session.execute(
-        select(Job)
-        .where(Job.id == job_id)
-        .with_for_update(of=Job)
-    )
+    result = await session.execute(select(Job).where(Job.id == job_id).with_for_update(of=Job))
     job = result.scalar_one_or_none()
     if job is None:
         return None
@@ -578,10 +573,7 @@ async def _get_source_file(
     for_update: bool = False,
 ) -> File | None:
     """Load a source file row, optionally under a row lock."""
-    statement = select(File).where(
-        (File.project_id == project_id)
-        & (File.id == file_id)
-    )
+    statement = select(File).where((File.project_id == project_id) & (File.id == file_id))
     if for_update:
         statement = statement.with_for_update(of=File)
 
@@ -919,8 +911,7 @@ def _build_persisted_validation_report_json(
                 "code": "validation_report_persisted",
                 "status": "passed",
                 "message": (
-                    "Persisted validation report columns are attached to the "
-                    "canonical payload."
+                    "Persisted validation report columns are attached to the canonical payload."
                 ),
             }
         )
@@ -1286,7 +1277,10 @@ def _build_estimate_worker_mapping_v1(
     quantity_entries: list[_EstimateWorkerQuantityEntry] = []
     emitted_quantity_entry_keys: set[str] = set()
     for line in lines:
-        if line.quantity_entry_key is None or line.quantity_entry_key in emitted_quantity_entry_keys:
+        if (
+            line.quantity_entry_key is None
+            or line.quantity_entry_key in emitted_quantity_entry_keys
+        ):
             continue
         quantity_entries.append(quantity_entries_by_key[line.quantity_entry_key])
         emitted_quantity_entry_keys.add(line.quantity_entry_key)
@@ -1344,10 +1338,7 @@ def _estimate_formula_binding_tokens(
     bindings_payload = raw_bindings.get("bindings")
     if isinstance(bindings_payload, dict):
         if not all(
-            isinstance(key, str)
-            and key
-            and isinstance(value, str)
-            and value
+            isinstance(key, str) and key and isinstance(value, str) and value
             for key, value in bindings_payload.items()
         ):
             raise _build_estimate_job_input_error(
@@ -1588,7 +1579,9 @@ async def _build_estimate_engine_input(
         lines_by_key = {line.line_key: line for line in assembly.lines}
         quantity_entry_keys = {entry.entry_key for entry in quantity_entries}
         rate_entry_keys = {
-            line.catalog_entry_key for line in assembly.lines if line.rate_catalog_entry_id is not None
+            line.catalog_entry_key
+            for line in assembly.lines
+            if line.rate_catalog_entry_id is not None
         }
         material_entry_keys = {
             line.catalog_entry_key
@@ -1925,9 +1918,7 @@ def _entity_provenance_json(entity_payload_json: dict[str, Any]) -> dict[str, An
         else entity_payload_json.get("extraction_path")
     )
     notes_value = (
-        provenance.get("notes")
-        if "notes" in provenance
-        else entity_payload_json.get("notes")
+        provenance.get("notes") if "notes" in provenance else entity_payload_json.get("notes")
     )
     adapter_json = provenance.get("adapter")
     if isinstance(adapter_json, dict):
@@ -2908,9 +2899,7 @@ def _quantity_gate_details(
 def _manifest_entity_count(manifest: RevisionEntityManifest) -> int | None:
     """Return the expected entity count when recorded on the manifest."""
     raw_count = (
-        manifest.counts_json.get("entities")
-        if isinstance(manifest.counts_json, dict)
-        else None
+        manifest.counts_json.get("entities") if isinstance(manifest.counts_json, dict) else None
     )
     return raw_count if isinstance(raw_count, int) else None
 
@@ -3047,9 +3036,7 @@ def _build_quantity_conflict_summaries(conflicts: Sequence[Any]) -> list[dict[st
         summaries.append(
             {
                 "dedup_key": _bounded_conflict_text(getattr(conflict, "dedup_key", None)),
-                "entity_ids": _bounded_conflict_entity_ids(
-                    getattr(conflict, "entity_ids", ())
-                ),
+                "entity_ids": _bounded_conflict_entity_ids(getattr(conflict, "entity_ids", ())),
                 "reason": _bounded_conflict_text(getattr(conflict, "reason", None)),
                 "details": _bounded_conflict_json(getattr(conflict, "details", None)),
             }

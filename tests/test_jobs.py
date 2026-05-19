@@ -26,6 +26,8 @@ import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
+from app.estimating.engine.errors import EstimateEngineError
+from app.estimating.engine.service import compose_estimate as real_compose_estimate
 from app.ingestion.contracts import (
     AdapterFailureKind,
     CancellationHandle,
@@ -37,8 +39,6 @@ from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
 from app.ingestion.runner import (
     run_ingestion as real_run_ingestion,
 )
-from app.estimating.engine.service import compose_estimate as real_compose_estimate
-from app.estimating.engine.errors import EstimateEngineError
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -244,7 +244,9 @@ def _estimate_catalog_ref_stub(
         ref_type=ref_type,
         selection_key=selection_key,
         ref_order=ref_order,
-        rate_catalog_entry_id=rate_catalog_entry_id or (uuid.uuid4() if ref_type == "rate" else None),
+        rate_catalog_entry_id=(
+            rate_catalog_entry_id or (uuid.uuid4() if ref_type == "rate" else None)
+        ),
         material_catalog_entry_id=(
             material_catalog_entry_id or (uuid.uuid4() if ref_type == "material" else None)
         ),
@@ -636,12 +638,16 @@ async def _get_quantity_takeoffs_for_job(job_id: uuid.UUID) -> list[QuantityTake
 
     async with session_maker() as session:
         takeoffs = (
-            await session.execute(
-                select(QuantityTakeoff)
-                .where(QuantityTakeoff.source_job_id == job_id)
-                .order_by(QuantityTakeoff.created_at.asc(), QuantityTakeoff.id.asc())
+            (
+                await session.execute(
+                    select(QuantityTakeoff)
+                    .where(QuantityTakeoff.source_job_id == job_id)
+                    .order_by(QuantityTakeoff.created_at.asc(), QuantityTakeoff.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(takeoffs)
 
@@ -653,12 +659,16 @@ async def _get_quantity_items_for_takeoff(quantity_takeoff_id: uuid.UUID) -> lis
 
     async with session_maker() as session:
         items = (
-            await session.execute(
-                select(QuantityItem)
-                .where(QuantityItem.quantity_takeoff_id == quantity_takeoff_id)
-                .order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc())
+            (
+                await session.execute(
+                    select(QuantityItem)
+                    .where(QuantityItem.quantity_takeoff_id == quantity_takeoff_id)
+                    .order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(items)
 
@@ -670,12 +680,16 @@ async def _get_estimate_versions_for_job(job_id: uuid.UUID) -> list[EstimateVers
 
     async with session_maker() as session:
         versions = (
-            await session.execute(
-                select(EstimateVersion)
-                .where(EstimateVersion.source_job_id == job_id)
-                .order_by(EstimateVersion.created_at.asc(), EstimateVersion.id.asc())
+            (
+                await session.execute(
+                    select(EstimateVersion)
+                    .where(EstimateVersion.source_job_id == job_id)
+                    .order_by(EstimateVersion.created_at.asc(), EstimateVersion.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(versions)
 
@@ -689,12 +703,18 @@ async def _get_estimate_snapshot_entries_for_version(
 
     async with session_maker() as session:
         entries = (
-            await session.execute(
-                select(EstimateSnapshotEntry)
-                .where(EstimateSnapshotEntry.estimate_version_id == estimate_version_id)
-                .order_by(EstimateSnapshotEntry.created_at.asc(), EstimateSnapshotEntry.id.asc())
+            (
+                await session.execute(
+                    select(EstimateSnapshotEntry)
+                    .where(EstimateSnapshotEntry.estimate_version_id == estimate_version_id)
+                    .order_by(
+                        EstimateSnapshotEntry.created_at.asc(), EstimateSnapshotEntry.id.asc()
+                    )
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(entries)
 
@@ -706,12 +726,16 @@ async def _get_estimate_items_for_version(estimate_version_id: uuid.UUID) -> lis
 
     async with session_maker() as session:
         items = (
-            await session.execute(
-                select(EstimateItem)
-                .where(EstimateItem.estimate_version_id == estimate_version_id)
-                .order_by(EstimateItem.created_at.asc(), EstimateItem.id.asc())
+            (
+                await session.execute(
+                    select(EstimateItem)
+                    .where(EstimateItem.estimate_version_id == estimate_version_id)
+                    .order_by(EstimateItem.created_at.asc(), EstimateItem.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(items)
 
@@ -758,7 +782,9 @@ async def _persist_estimate_job_input(
                 ref_payload.get("formula_definition_id"),
             ),
             catalog_checksum_sha256=cast(str, ref_payload["catalog_checksum_sha256"]),
-            selection_context_json=deepcopy(cast(dict[str, Any], ref_payload["selection_context_json"])),
+            selection_context_json=deepcopy(
+                cast(dict[str, Any], ref_payload["selection_context_json"])
+            ),
         )
         for ref_payload in catalog_refs
     ]
@@ -772,7 +798,16 @@ async def _persist_estimate_job_input(
 async def _create_ready_estimate_execution_job(
     async_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[dict[str, Any], dict[str, Any], Job, DrawingRevision, Job, QuantityTakeoff, list[QuantityItem], Job]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    Job,
+    DrawingRevision,
+    Job,
+    QuantityTakeoff,
+    list[QuantityItem],
+    Job,
+]:
     """Create a pending estimate job with a finalized trusted allowed quantity takeoff."""
 
     async def _run_quantity_ready_ingestion(
@@ -786,9 +821,13 @@ async def _create_ready_estimate_execution_job(
         )
 
     monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
-    project, uploaded, ingest_job, base_revision, quantity_job = await _create_ready_quantity_takeoff_job(
-        async_client
-    )
+    (
+        project,
+        uploaded,
+        ingest_job,
+        base_revision,
+        quantity_job,
+    ) = await _create_ready_quantity_takeoff_job(async_client)
     await worker_module.process_quantity_takeoff_job(quantity_job.id)
     takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
     assert len(takeoffs) == 1
@@ -1057,12 +1096,16 @@ async def _get_generated_artifacts_for_job(job_id: uuid.UUID) -> list[GeneratedA
 
     async with session_maker() as session:
         artifacts = (
-            await session.execute(
-                select(GeneratedArtifact)
-                .where(GeneratedArtifact.job_id == job_id)
-                .order_by(GeneratedArtifact.created_at.asc(), GeneratedArtifact.id.asc())
+            (
+                await session.execute(
+                    select(GeneratedArtifact)
+                    .where(GeneratedArtifact.job_id == job_id)
+                    .order_by(GeneratedArtifact.created_at.asc(), GeneratedArtifact.id.asc())
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     return list(artifacts)
 
@@ -2181,9 +2224,7 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = old_attempt_token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -2225,9 +2266,7 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = old_attempt_token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -2665,9 +2704,7 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = old_attempt_token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -2725,9 +2762,7 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = stale_attempt_token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -3468,7 +3503,7 @@ class TestJobs:
     def test_build_estimate_worker_mapping_v1_maps_rate_material_and_formula_refs(
         self,
     ) -> None:
-        """Estimate mapping helper should derive defaults, sort lines, and dedup quantity entries."""
+        """Estimate mapping helper should derive defaults, sort lines, and dedup entries."""
         _ = self
         shared_quantity_item_id = uuid.uuid4()
         catalog_refs = [
@@ -3727,9 +3762,7 @@ class TestJobs:
         )
         monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_ingest_recovery_enqueue)
 
-        project, uploaded, ingest_job, base_revision, estimate_job = await _create_ready_estimate_job(
-            async_client
-        )
+        _, _, _, _, estimate_job = await _create_ready_estimate_job(async_client)
         await _update_job(
             estimate_job.id,
             status=status,
@@ -3845,9 +3878,7 @@ class TestJobs:
             persisted_job.status = "running"
             persisted_job.attempts = 1
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = old_attempt_token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -3958,9 +3989,7 @@ class TestJobs:
 
         worker_module.enqueue_estimate_job(job_id)
 
-        assert published == [
-            {"args": (str(job_id),), "task_id": str(job_id), "retry": False}
-        ]
+        assert published == [{"args": (str(job_id),), "task_id": str(job_id), "retry": False}]
 
     def test_run_estimate_job_dispatches_persisted_processor(
         self,
@@ -3988,7 +4017,7 @@ class TestJobs:
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Estimate worker should deterministically compose engine input before persistence lands."""
+        """Estimate worker should compose engine input before persistence lands."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -4032,9 +4061,7 @@ class TestJobs:
                     "ref_type": "formula",
                     "selection_key": "waste-10",
                     "ref_order": 30,
-                    "formula_definition_id": uuid.UUID(
-                        "00000000-0000-0000-0000-000000000202"
-                    ),
+                    "formula_definition_id": uuid.UUID("00000000-0000-0000-0000-000000000202"),
                     "catalog_checksum_sha256": "2" * 64,
                     "selection_context_json": {
                         "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
@@ -4048,9 +4075,7 @@ class TestJobs:
                     "ref_type": "material",
                     "selection_key": "paint-gallon",
                     "ref_order": 20,
-                    "material_catalog_entry_id": uuid.UUID(
-                        "00000000-0000-0000-0000-000000000203"
-                    ),
+                    "material_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000203"),
                     "catalog_checksum_sha256": "3" * 64,
                     "selection_context_json": {
                         "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
@@ -4065,7 +4090,10 @@ class TestJobs:
 
         fake_formula_definition = types.SimpleNamespace(
             declared_inputs=(
-                types.SimpleNamespace(name="rate_input", contract=types.SimpleNamespace(kind="rate")),
+                types.SimpleNamespace(
+                    name="rate_input",
+                    contract=types.SimpleNamespace(kind="rate"),
+                ),
             ),
         )
         captured_engine_inputs: list[Any] = []
@@ -4639,9 +4667,7 @@ class TestJobs:
             assert persisted_job is not None
             persisted_job.status = "running"
             persisted_job.started_at = (
-                datetime.now(UTC)
-                - worker_module._RUNNING_JOB_STALE_AFTER
-                - timedelta(seconds=1)
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
             )
             persisted_job.attempt_token = stale_lease.token
             persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -5232,9 +5258,13 @@ class TestJobs:
             "expected_validation_status",
         )
         monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
-        project, uploaded, _, base_revision, quantity_job = (
-            await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
-        )
+        (
+            project,
+            uploaded,
+            _,
+            base_revision,
+            quantity_job,
+        ) = await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
 
         await worker_module.process_quantity_takeoff_job(quantity_job.id)
 
@@ -5260,9 +5290,7 @@ class TestJobs:
         assert all(item.item_kind != "exclusion" for item in items)
 
         aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
-        assert aggregate_values["count:entity_count"] == pytest.approx(
-            float(expected_line_count)
-        )
+        assert aggregate_values["count:entity_count"] == pytest.approx(float(expected_line_count))
         assert aggregate_values["count:line_count"] == pytest.approx(float(expected_line_count))
         assert _quantity_length_total(aggregate_values) == pytest.approx(expected_total_length)
 
@@ -5359,9 +5387,13 @@ class TestJobs:
         _ = enqueued_job_ids
         fixture_filename = "dxf/simple-line.dxf"
         monkeypatch.setattr(worker_module, "run_ingestion", real_run_ingestion)
-        project, uploaded, ingest_job, base_revision, first_job = (
-            await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
-        )
+        (
+            project,
+            uploaded,
+            ingest_job,
+            base_revision,
+            first_job,
+        ) = await _create_real_dxf_quantity_takeoff_job(async_client, fixture_filename)
         second_job = await _create_quantity_takeoff_job(
             project_id=uuid.UUID(project["id"]),
             file_id=uuid.UUID(uploaded["id"]),
@@ -5440,9 +5472,7 @@ class TestJobs:
 
         items = await _get_quantity_items_for_takeoff(takeoffs[0].id)
         aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
-        assert aggregate_values["count:entity_count"] == pytest.approx(
-            float(expected_line_count)
-        )
+        assert aggregate_values["count:entity_count"] == pytest.approx(float(expected_line_count))
         assert aggregate_values["count:line_count"] == pytest.approx(float(expected_line_count))
         assert _quantity_length_total(aggregate_values) == pytest.approx(expected_total_length)
 
@@ -5504,8 +5534,7 @@ class TestJobs:
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
         assert (
-            updated_job.error_message
-            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
+            updated_job.error_message == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
         )
         assert takeoffs == []
 
@@ -5566,8 +5595,7 @@ class TestJobs:
         assert updated_job.attempts == 1
         assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
         assert (
-            updated_job.error_message
-            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
+            updated_job.error_message == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
         )
         assert takeoffs == []
 
@@ -5656,8 +5684,7 @@ class TestJobs:
         assert event_payload["status"] == "failed"
         assert event_payload["error_code"] == ErrorCode.INPUT_INVALID.value
         assert (
-            event_payload["error_message"]
-            == worker_module._QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE
+            event_payload["error_message"] == worker_module._QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE
         )
         assert event_payload["details"]["conflict_count"] == 2
         conflict_summaries = event_payload["details"]["conflicts"]
@@ -5786,10 +5813,7 @@ class TestJobs:
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
         assert updated_job.status == "failed"
-        assert (
-            updated_job.error_code
-            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
-        )
+        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
         assert (
             updated_job.error_message
             == worker_module._QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE
@@ -5800,10 +5824,7 @@ class TestJobs:
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "failed"
-        assert (
-            event_payload["error_code"]
-            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
-        )
+        assert event_payload["error_code"] == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
         assert event_payload["details"]["drawing_revision_id"] == str(base_revision.id)
 
     async def test_process_quantity_takeoff_job_fails_materialization_mismatch_without_rows(
@@ -5842,19 +5863,13 @@ class TestJobs:
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
         assert updated_job.status == "failed"
-        assert (
-            updated_job.error_code
-            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
-        )
+        assert updated_job.error_code == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
         assert takeoffs == []
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
-        assert (
-            event_payload["error_code"]
-            == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
-        )
+        assert event_payload["error_code"] == ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED.value
         assert event_payload["details"] == {
             "drawing_revision_id": str(base_revision.id),
             "expected_entities": 1,
@@ -6286,8 +6301,7 @@ class TestJobs:
         assert unchanged.status == "failed"
         assert unchanged.error_code == ErrorCode.REVISION_CONFLICT.value
         assert (
-            unchanged.error_message
-            == "Reprocess base revision became stale before finalization."
+            unchanged.error_message == "Reprocess base revision became stale before finalization."
         )
 
     async def test_retry_job_is_terminal_no_op_for_cancelled_job(
@@ -6479,9 +6493,7 @@ class TestJobs:
                 .with_for_update(of=Project)
             )
 
-            delete_task = asyncio.create_task(
-                async_client.delete(f"/v1/projects/{project['id']}")
-            )
+            delete_task = asyncio.create_task(async_client.delete(f"/v1/projects/{project['id']}"))
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
 
@@ -6650,9 +6662,7 @@ class TestJobs:
                 .with_for_update(of=Project)
             )
 
-            delete_task = asyncio.create_task(
-                async_client.delete(f"/v1/projects/{project['id']}")
-            )
+            delete_task = asyncio.create_task(async_client.delete(f"/v1/projects/{project['id']}"))
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
 
@@ -6701,9 +6711,7 @@ class TestJobs:
                 .with_for_update(of=Project)
             )
 
-            delete_task = asyncio.create_task(
-                async_client.delete(f"/v1/projects/{project['id']}")
-            )
+            delete_task = asyncio.create_task(async_client.delete(f"/v1/projects/{project['id']}"))
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(delete_task), timeout=0.2)
 
