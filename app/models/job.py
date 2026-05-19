@@ -27,6 +27,7 @@ class JobType(StrEnum):
     INGEST = "ingest"
     REPROCESS = "reprocess"
     QUANTITY_TAKEOFF = "quantity_takeoff"
+    ESTIMATE = "estimate"
 
 
 class JobStatus(StrEnum):
@@ -47,6 +48,11 @@ _PROFILE_REQUIRED_JOB_TYPE_VALUES = (JobType.INGEST.value, JobType.REPROCESS.val
 _BASE_REQUIRED_JOB_TYPE_VALUES = (
     JobType.REPROCESS.value,
     JobType.QUANTITY_TAKEOFF.value,
+    JobType.ESTIMATE.value,
+)
+_EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
+    JobType.QUANTITY_TAKEOFF.value,
+    JobType.ESTIMATE.value,
 )
 
 
@@ -116,12 +122,13 @@ class Job(Base):
             "job_type NOT IN "
             f"({_sql_in_list(_BASE_REQUIRED_JOB_TYPE_VALUES)}) "
             "OR base_revision_id IS NOT NULL",
-            name="ck_jobs_reprocess_base_revision_required",
+            name="ck_jobs_revision_scoped_base_revision_required",
         ),
         CheckConstraint(
-            f"job_type != '{JobType.QUANTITY_TAKEOFF.value}' "
+            "job_type NOT IN "
+            f"({_sql_in_list(_EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES)}) "
             "OR extraction_profile_id IS NULL",
-            name="ck_jobs_quantity_takeoff_extraction_profile_forbidden",
+            name="ck_jobs_revision_scoped_extraction_profile_forbidden",
         ),
         CheckConstraint(
             f"job_type != '{JobType.INGEST.value}' OR base_revision_id IS NULL",
@@ -195,7 +202,7 @@ class Job(Base):
     job_type: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="Job type (e.g. ingest, reprocess, quantity_takeoff)",
+        comment="Job type (e.g. ingest, reprocess, quantity_takeoff, estimate)",
     )
     status: Mapped[str] = mapped_column(
         String(32),

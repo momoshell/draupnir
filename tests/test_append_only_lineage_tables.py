@@ -7,6 +7,7 @@ import subprocess
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from json import dumps
 from pathlib import Path
@@ -23,7 +24,10 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
+from app.models.estimation_catalog import EstimationRate
+from app.models.job import Job, JobStatus, JobType
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
     APPEND_ONLY_PROTECTED_TABLES,
@@ -67,6 +71,8 @@ class _ProtectedRowIds:
     generated_artifact_id: uuid.UUID
     job_event_id: uuid.UUID
     estimate_version_id: uuid.UUID
+    estimate_job_input_id: uuid.UUID
+    estimate_job_input_catalog_ref_key: tuple[uuid.UUID, str, str]
     estimate_snapshot_entry_id: uuid.UUID
     estimate_item_id: uuid.UUID
     quantity_takeoff_id: uuid.UUID
@@ -170,6 +176,7 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "generated_artifacts": row_ids.generated_artifact_id,
         "job_events": row_ids.job_event_id,
         "estimate_versions": row_ids.estimate_version_id,
+        "estimate_job_inputs": row_ids.estimate_job_input_id,
         "estimate_snapshot_entries": row_ids.estimate_snapshot_entry_id,
         "estimate_items": row_ids.estimate_item_id,
         "quantity_takeoffs": row_ids.quantity_takeoff_id,
@@ -181,6 +188,33 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "revision_entities": row_ids.revision_entity_id,
     }
     return ids_by_table[table_name]
+
+
+def _row_filter_for_table(
+    row_ids: _ProtectedRowIds,
+    table_name: str,
+) -> tuple[str, dict[str, object]]:
+    """Return a WHERE clause and parameters for a protected table's seeded row."""
+
+    if table_name == "estimate_job_input_catalog_refs":
+        estimate_job_id, ref_type, selection_key = row_ids.estimate_job_input_catalog_ref_key
+        return (
+            "estimate_job_id = :estimate_job_id "
+            "AND ref_type = :ref_type "
+            "AND selection_key = :selection_key",
+            {
+                "estimate_job_id": estimate_job_id,
+                "ref_type": ref_type,
+                "selection_key": selection_key,
+            },
+        )
+    if table_name == "estimate_job_inputs":
+        return (
+            "estimate_job_id = :estimate_job_id",
+            {"estimate_job_id": row_ids.estimate_job_input_id},
+        )
+
+    return "id = :row_id", {"row_id": _row_id_for_table(row_ids, table_name)}
 
 
 async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRowIds:
@@ -235,10 +269,73 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         formula_snapshot_entry_type="formula",
         assumption_snapshot_entry_type="assumption",
     )
+    estimate_job_id = uuid.uuid4()
+    rate_id = uuid.uuid4()
+    rate_checksum = "d" * 64
+    estimate_job_input = EstimateJobInput(
+        estimate_job_id=estimate_job_id,
+        project_id=quantity_seed.project_id,
+        source_file_id=quantity_seed.file_id,
+        drawing_revision_id=quantity_seed.drawing_revision_id,
+        quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
+        source_job_type=JobType.ESTIMATE.value,
+        quantity_gate="allowed",
+        trusted_totals=True,
+        currency="GBP",
+        pricing_effective_date=date(2026, 1, 1),
+        pricing_mode="explicit",
+        assumptions_json={"source": "append-only"},
+    )
+    estimate_job_input_ref = EstimateJobInputCatalogRef(
+        estimate_job_id=estimate_job_id,
+        ref_type="rate",
+        selection_key="rate:append-only",
+        ref_order=1,
+        rate_catalog_entry_id=rate_id,
+        catalog_checksum_sha256=rate_checksum,
+        selection_context_json={"source": "append-only"},
+    )
 
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
     async with session_maker() as session:
+        session.add(
+            EstimationRate(
+                id=rate_id,
+                scope_type="project",
+                project_id=quantity_seed.project_id,
+                rate_key="append-only:rate",
+                source="test",
+                metadata_json={"source": "append-only"},
+                name="Append-only rate",
+                item_type="linear_length",
+                per_unit="m",
+                currency="GBP",
+                amount=Decimal("1.000000"),
+                effective_from=date(2026, 1, 1),
+                checksum_sha256=rate_checksum,
+            )
+        )
+        await session.flush()
+        session.add(
+            Job(
+                id=estimate_job_id,
+                project_id=quantity_seed.project_id,
+                file_id=quantity_seed.file_id,
+                extraction_profile_id=None,
+                base_revision_id=quantity_seed.drawing_revision_id,
+                job_type=JobType.ESTIMATE.value,
+                status=JobStatus.SUCCEEDED.value,
+                enqueue_status="published",
+                enqueue_attempts=0,
+                cancel_requested=False,
+            )
+        )
+        await session.flush()
+        session.add(estimate_job_input)
+        await session.flush()
+        session.add(estimate_job_input_ref)
+        await session.flush()
         session.add(estimate_version)
         await session.flush()
         session.add(estimate_snapshot_entry)
@@ -268,6 +365,12 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         generated_artifact_id=generated_artifacts[0].id,
         job_event_id=job_events[0].id,
         estimate_version_id=estimate_version.id,
+        estimate_job_input_id=estimate_job_input.estimate_job_id,
+        estimate_job_input_catalog_ref_key=(
+            estimate_job_input_ref.estimate_job_id,
+            estimate_job_input_ref.ref_type,
+            estimate_job_input_ref.selection_key,
+        ),
         estimate_snapshot_entry_id=estimate_snapshot_entry.id,
         estimate_item_id=estimate_item.id,
         quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
@@ -1381,6 +1484,12 @@ class TestAppendOnlyLineageTables:
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
             ("job_events", "message", "mutated job event"),
             ("estimate_versions", "total_amount", "121.00"),
+            ("estimate_job_inputs", "currency", "USD"),
+            (
+                "estimate_job_input_catalog_refs",
+                "catalog_checksum_sha256",
+                "e" * 64,
+            ),
             ("estimate_snapshot_entries", "entry_label", "mutated assumption"),
             ("estimate_items", "description", "mutated estimate item"),
             ("quantity_takeoffs", "review_state", "review_required"),
@@ -1397,14 +1506,15 @@ class TestAppendOnlyLineageTables:
         )
 
         for table_name, column_name, replacement_value in update_cases:
+            row_filter, row_params = _row_filter_for_table(row_ids, table_name)
             await _run_sql_and_expect_append_only_failure(
                 (
                     f'UPDATE "{table_name}" SET "{column_name}" = :replacement_value '
-                    "WHERE id = :row_id"
+                    f"WHERE {row_filter}"
                 ),
-                {
+                row_params
+                | {
                     "replacement_value": replacement_value,
-                    "row_id": _row_id_for_table(row_ids, table_name),
                 },
                 operation="UPDATE",
                 table_name=table_name,
@@ -1581,9 +1691,10 @@ class TestAppendOnlyLineageTables:
         row_ids = await _seed_protected_rows(async_client)
 
         for table_name in APPEND_ONLY_PROTECTED_TABLES:
+            row_filter, row_params = _row_filter_for_table(row_ids, table_name)
             await _run_sql_and_expect_append_only_failure(
-                f'DELETE FROM "{table_name}" WHERE id = :row_id',
-                {"row_id": _row_id_for_table(row_ids, table_name)},
+                f'DELETE FROM "{table_name}" WHERE {row_filter}',
+                row_params,
                 operation="DELETE",
                 table_name=table_name,
             )
