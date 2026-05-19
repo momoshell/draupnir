@@ -854,6 +854,49 @@ Estimate snapshots:
   `is_successor`, or backfilled successor-pointer fields to identify the chosen
   snapshot, catalog row, formula, or estimate version.
 
+### Worker Mapping Contract For Estimate Finalization
+
+- Estimate finalization remains worker-only. The worker that owns finalization is
+  the only writer allowed to map staged selection results into committed
+  estimate-version rows, and it must do so atomically with terminal success.
+- The worker must persist `selection_context_json` with
+  `worker_mapping_version = "estimate-line-v1"` for each finalized estimate
+  line.
+- Explicit refs are required. MVP estimate finalization must not auto-select or
+  infer missing refs inside the worker mapping step.
+- The referenced quantity takeoff must remain trusted estimation input at
+  finalization time: `trusted_totals = true` and `quantity_gate = allowed` are
+  required.
+- Invalid mapping, missing required refs, or nontrusted/non-eligible quantity
+  takeoff input must fail closed as `INPUT_INVALID` and produce no committed
+  estimate output.
+
+`selection_context_json` mapping version `estimate-line-v1` must record:
+
+- `worker_mapping_version` - exactly `"estimate-line-v1"`
+- `line_key` - stable finalized line key
+- `line_type` - finalized line kind for the mapped ref
+- `description` - finalized human-readable line description
+- `quantity_item_id` - required for rate and material refs; the pinned source
+  quantity item for that line
+- `quantity_entry_key` - optional quantity snapshot entry key used by the
+  finalized line; if absent the worker derives `quantity:<quantity_item_id>`
+- `catalog_entry_key` - optional key for the resolved frozen catalog entry used
+  by the finalized line; when absent the worker derives `<ref_type>:<selection_key>`
+- `formula_inputs` - required for formula refs; structured declared input
+  bindings to snapshot entry keys used for the finalized formula evaluation
+
+Worker mapping cardinality and ordering rules:
+
+- One explicit ref produces exactly one finalized estimate line.
+- Finalized line order is deterministic: sort by `ref_order`, then by
+  `ref_type`, then by `selection_key`.
+- When one estimate request mixes quantity-backed and catalog-backed refs,
+  quantity-backed entries must be deduplicated and sorted before catalog-backed
+  entries are mapped into finalized lines.
+- Invalid bindings must fail closed. The worker must not drop a bad binding,
+  reorder around it, or publish a partial finalized estimate version.
+
 Catalog scope and mutation rules:
 
 - Catalog data may exist at a global scope and at a project override scope.

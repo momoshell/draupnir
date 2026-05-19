@@ -1,14 +1,17 @@
 """Celery worker application and persisted job handlers."""
 
 import asyncio
+import hashlib
 import heapq
 import inspect
 import json
+import math
 import uuid
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 from uuid import UUID
 
@@ -21,6 +24,21 @@ from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
+from app.estimating.catalog import CatalogFormulaRef, CatalogMaterialRef, CatalogRateRef
+from app.estimating.catalog.resolver import resolve_formula, resolve_material, resolve_rate
+from app.estimating.catalog.selection import CatalogSelectionError
+from app.estimating.engine import formula_definition_from_selected_formula
+from app.estimating.engine.contracts import (
+    EstimateEngineInput,
+    EstimateEngineOutput,
+    EstimateFormulaEntryInput,
+    EstimateLineInputSpec,
+    EstimateMaterialEntryInput,
+    EstimateQuantityEntryInput,
+    EstimateRateEntryInput,
+)
+from app.estimating.engine.errors import EstimateEngineError
+from app.estimating.engine.service import compose_estimate
 from app.estimating.quantities.contracts import (
     GateStatus,
     QuantityEngineResult,
@@ -34,6 +52,8 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
+from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
+from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
@@ -58,8 +78,9 @@ _RECOVERABLE_ENQUEUE_JOB_TYPES = (
     JobType.INGEST.value,
     JobType.REPROCESS.value,
     JobType.QUANTITY_TAKEOFF.value,
+    JobType.ESTIMATE.value,
 )
-_KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = frozenset({JobType.ESTIMATE.value})
+_KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER: frozenset[str] = frozenset()
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _ENQUEUE_STATUS_PENDING = "pending"
 _ENQUEUE_STATUS_PUBLISHING = "publishing"
@@ -73,7 +94,9 @@ _ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
+_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to finalize estimate job"
 _PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexpectedly."
+_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE = "Estimate job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
 _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
@@ -93,6 +116,8 @@ _QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE = (
 _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE = (
     "Quantity takeoff base revision is missing normalized entities."
 )
+_ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE = "Estimate job input mapping is invalid."
+_ESTIMATE_WORKER_MAPPING_VERSION = "estimate-line-v1"
 _QUANTITY_CONFLICT_SUMMARY_LIMIT = 5
 _QUANTITY_CONFLICT_ENTITY_ID_LIMIT = 10
 _QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT = 10
@@ -140,6 +165,7 @@ def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None]
         JobType.INGEST.value: enqueue_ingest_job,
         JobType.REPROCESS.value: enqueue_ingest_job,
         JobType.QUANTITY_TAKEOFF.value: enqueue_quantity_takeoff_job,
+        JobType.ESTIMATE.value: enqueue_estimate_job,
     }
     return registry.get(normalized_job_type)
 
@@ -196,6 +222,18 @@ class _QuantityTakeoffJobError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class _EstimateJobInputError(Exception):
+    """Raised for deterministic estimate input mapping failures."""
+
+    error_code: ErrorCode
+    message: str
+    details: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True, slots=True)
 class _JobAttemptLease:
     """Persisted ownership token for a claimed job attempt."""
 
@@ -229,6 +267,42 @@ class _QuantityTakeoffExecutionInput:
     quantity_gate: str
     gate: RevisionGateMetadata
     entities: list[RevisionEntityInput]
+
+
+@dataclass(frozen=True, slots=True)
+class _EstimateWorkerQuantityEntry:
+    """Deduped quantity entry dependency for estimate worker assembly."""
+
+    entry_key: str
+    quantity_item_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _EstimateWorkerLineInput:
+    """Normalized worker line assembled from one explicit catalog ref."""
+
+    line_key: str
+    line_type: str
+    description: str
+    ref_type: str
+    selection_key: str
+    catalog_entry_key: str
+    ref_order: int
+    catalog_checksum_sha256: str
+    rate_catalog_entry_id: UUID | None
+    material_catalog_entry_id: UUID | None
+    formula_definition_id: UUID | None
+    quantity_entry_key: str | None
+    quantity_item_id: UUID | None
+    formula_inputs: dict[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EstimateWorkerAssemblyInput:
+    """Estimate worker-ready line and quantity-entry inputs."""
+
+    lines: list[_EstimateWorkerLineInput]
+    quantity_entries: list[_EstimateWorkerQuantityEntry]
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +642,18 @@ async def _get_existing_quantity_takeoff(
     """Load an existing committed quantity takeoff for a job."""
     result = await session.execute(
         select(QuantityTakeoff).where(QuantityTakeoff.source_job_id == source_job_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_existing_estimate_version(
+    session: AsyncSession,
+    *,
+    source_job_id: UUID,
+) -> EstimateVersion | None:
+    """Load an existing committed estimate version for a job."""
+    result = await session.execute(
+        select(EstimateVersion).where(EstimateVersion.source_job_id == source_job_id)
     )
     return result.scalar_one_or_none()
 
@@ -942,6 +1028,827 @@ def _json_array(value: Any) -> list[Any]:
         return deepcopy(list(value))
 
     return []
+
+
+def _build_estimate_job_input_error(
+    reason: str,
+    *,
+    ref_index: int | None = None,
+    ref_type: str | None = None,
+    selection_key: str | None = None,
+    line_key: str | None = None,
+    extra_details: dict[str, Any] | None = None,
+) -> _EstimateJobInputError:
+    """Build a sanitized deterministic estimate input mapping error."""
+    details: dict[str, Any] = {"reason": reason}
+    if ref_index is not None:
+        details["ref_index"] = ref_index
+    if ref_type is not None:
+        details["ref_type"] = ref_type
+    if selection_key is not None:
+        details["selection_key"] = selection_key
+    if line_key is not None:
+        details["line_key"] = line_key
+    if extra_details:
+        details.update(extra_details)
+    return _EstimateJobInputError(
+        error_code=ErrorCode.INPUT_INVALID,
+        message=_ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
+        details=details,
+    )
+
+
+def _estimate_mapping_uuid(
+    value: Any,
+    *,
+    reason: str,
+    ref_index: int,
+    ref_type: str,
+    selection_key: str,
+    line_key: str,
+    field_name: str,
+) -> UUID:
+    """Parse one required UUID field from estimate mapping context."""
+    normalized = _string_ref(value)
+    if normalized is None:
+        raise _build_estimate_job_input_error(
+            reason,
+            ref_index=ref_index,
+            ref_type=ref_type,
+            selection_key=selection_key,
+            line_key=line_key,
+            extra_details={"field": field_name},
+        )
+    try:
+        return UUID(normalized)
+    except ValueError as exc:
+        raise _build_estimate_job_input_error(
+            reason,
+            ref_index=ref_index,
+            ref_type=ref_type,
+            selection_key=selection_key,
+            line_key=line_key,
+            extra_details={"field": field_name},
+        ) from exc
+
+
+def _build_estimate_worker_mapping_v1(
+    catalog_refs: Sequence[Any],
+) -> _EstimateWorkerAssemblyInput:
+    """Assemble deterministic estimate worker mapping inputs from catalog refs."""
+    pending_lines: list[_EstimateWorkerLineInput] = []
+    quantity_entries_by_key: dict[str, _EstimateWorkerQuantityEntry] = {}
+    seen_line_keys: set[str] = set()
+
+    for ref_index, catalog_ref in enumerate(catalog_refs):
+        ref_type = _string_ref(getattr(catalog_ref, "ref_type", None))
+        selection_key = _string_ref(getattr(catalog_ref, "selection_key", None))
+        context = _json_object(getattr(catalog_ref, "selection_context_json", None))
+
+        if context.get("worker_mapping_version") != _ESTIMATE_WORKER_MAPPING_VERSION:
+            raise _build_estimate_job_input_error(
+                "missing_worker_mapping_version",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                extra_details={
+                    "expected_worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
+                },
+            )
+
+        line_key = _string_ref(context.get("line_key"))
+        line_type = _string_ref(context.get("line_type"))
+        description = _string_ref(context.get("description"))
+        if (
+            line_key is None
+            or line_type is None
+            or description is None
+            or ref_type is None
+            or selection_key is None
+        ):
+            raise _build_estimate_job_input_error(
+                "missing_required_mapping_field",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+            )
+
+        if line_type != ref_type:
+            raise _build_estimate_job_input_error(
+                "mismatched_line_ref_type",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+                extra_details={"line_type": line_type},
+            )
+
+        raw_ref_order = getattr(catalog_ref, "ref_order", None)
+        if isinstance(raw_ref_order, bool) or not isinstance(raw_ref_order, int):
+            raise _build_estimate_job_input_error(
+                "invalid_ref_order",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+            )
+
+        if line_key in seen_line_keys:
+            raise _build_estimate_job_input_error(
+                "duplicate_line_key",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+            )
+        seen_line_keys.add(line_key)
+
+        quantity_entry_key = _string_ref(context.get("quantity_entry_key"))
+        catalog_checksum_sha256 = _hash_ref(getattr(catalog_ref, "catalog_checksum_sha256", None))
+        if catalog_checksum_sha256 is None:
+            raise _build_estimate_job_input_error(
+                "invalid_catalog_checksum",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+            )
+        catalog_entry_key = _first_string_ref(
+            context.get("catalog_entry_key"),
+            f"{ref_type}:{selection_key}",
+        )
+        assert catalog_entry_key is not None
+        rate_catalog_entry_id: UUID | None = None
+        material_catalog_entry_id: UUID | None = None
+        formula_definition_id: UUID | None = None
+        quantity_item_id: UUID | None = None
+        formula_inputs: dict[str, Any] | None = None
+
+        if ref_type in {"rate", "material"}:
+            quantity_item_id = _estimate_mapping_uuid(
+                context.get("quantity_item_id"),
+                reason="missing_quantity_item_id",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+                field_name="quantity_item_id",
+            )
+            if quantity_entry_key is None:
+                quantity_entry_key = f"quantity:{quantity_item_id}"
+            existing_quantity_entry = quantity_entries_by_key.get(quantity_entry_key)
+            if existing_quantity_entry is None:
+                quantity_entries_by_key[quantity_entry_key] = _EstimateWorkerQuantityEntry(
+                    entry_key=quantity_entry_key,
+                    quantity_item_id=quantity_item_id,
+                )
+            elif existing_quantity_entry.quantity_item_id != quantity_item_id:
+                raise _build_estimate_job_input_error(
+                    "mismatched_quantity_entry",
+                    ref_index=ref_index,
+                    ref_type=ref_type,
+                    selection_key=selection_key,
+                    line_key=line_key,
+                    extra_details={"quantity_entry_key": quantity_entry_key},
+                )
+            if ref_type == "rate":
+                rate_catalog_entry_id = _estimate_mapping_uuid(
+                    getattr(catalog_ref, "rate_catalog_entry_id", None),
+                    reason="missing_catalog_entry_id",
+                    ref_index=ref_index,
+                    ref_type=ref_type,
+                    selection_key=selection_key,
+                    line_key=line_key,
+                    field_name="rate_catalog_entry_id",
+                )
+            else:
+                material_catalog_entry_id = _estimate_mapping_uuid(
+                    getattr(catalog_ref, "material_catalog_entry_id", None),
+                    reason="missing_catalog_entry_id",
+                    ref_index=ref_index,
+                    ref_type=ref_type,
+                    selection_key=selection_key,
+                    line_key=line_key,
+                    field_name="material_catalog_entry_id",
+                )
+        elif ref_type == "formula":
+            if not isinstance(context.get("formula_inputs"), dict):
+                raise _build_estimate_job_input_error(
+                    "missing_formula_inputs",
+                    ref_index=ref_index,
+                    ref_type=ref_type,
+                    selection_key=selection_key,
+                    line_key=line_key,
+                )
+            formula_inputs = _json_object(context.get("formula_inputs"))
+            formula_definition_id = _estimate_mapping_uuid(
+                getattr(catalog_ref, "formula_definition_id", None),
+                reason="missing_catalog_entry_id",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+                field_name="formula_definition_id",
+            )
+        else:
+            raise _build_estimate_job_input_error(
+                "unsupported_ref_type",
+                ref_index=ref_index,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                line_key=line_key,
+            )
+
+        pending_lines.append(
+            _EstimateWorkerLineInput(
+                line_key=line_key,
+                line_type=line_type,
+                description=description,
+                ref_type=ref_type,
+                selection_key=selection_key,
+                catalog_entry_key=catalog_entry_key,
+                ref_order=raw_ref_order,
+                catalog_checksum_sha256=catalog_checksum_sha256,
+                rate_catalog_entry_id=rate_catalog_entry_id,
+                material_catalog_entry_id=material_catalog_entry_id,
+                formula_definition_id=formula_definition_id,
+                quantity_entry_key=quantity_entry_key,
+                quantity_item_id=quantity_item_id,
+                formula_inputs=formula_inputs,
+            )
+        )
+
+    lines = sorted(
+        pending_lines,
+        key=lambda line: (line.ref_order, line.ref_type, line.selection_key),
+    )
+    quantity_entries: list[_EstimateWorkerQuantityEntry] = []
+    emitted_quantity_entry_keys: set[str] = set()
+    for line in lines:
+        if line.quantity_entry_key is None or line.quantity_entry_key in emitted_quantity_entry_keys:
+            continue
+        quantity_entries.append(quantity_entries_by_key[line.quantity_entry_key])
+        emitted_quantity_entry_keys.add(line.quantity_entry_key)
+
+    return _EstimateWorkerAssemblyInput(lines=lines, quantity_entries=quantity_entries)
+
+
+def _estimate_input_checksum(payload: dict[str, Any]) -> str:
+    """Build a deterministic checksum for worker-synthesized estimate inputs."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _estimate_decimal(
+    value: Any,
+    *,
+    reason: str,
+    extra_details: dict[str, Any] | None = None,
+) -> Decimal:
+    """Parse one persisted estimate numeric input as a finite Decimal."""
+    if isinstance(value, bool):
+        raise _build_estimate_job_input_error(reason, extra_details=extra_details)
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise _build_estimate_job_input_error(reason, extra_details=extra_details) from exc
+    if not decimal_value.is_finite():
+        raise _build_estimate_job_input_error(reason, extra_details=extra_details)
+    return decimal_value
+
+
+def _estimate_tax_rate(assumptions_json: dict[str, Any]) -> Decimal:
+    """Load the persisted estimate tax rate with a default of zero."""
+    raw_tax_rate = assumptions_json.get("tax_rate", 0)
+    tax_rate = _estimate_decimal(
+        raw_tax_rate,
+        reason="invalid_tax_rate",
+        extra_details={"field": "tax_rate"},
+    )
+    if tax_rate < 0:
+        raise _build_estimate_job_input_error(
+            "invalid_tax_rate",
+            extra_details={"field": "tax_rate"},
+        )
+    return tax_rate
+
+
+def _estimate_formula_binding_tokens(
+    raw_bindings: dict[str, Any],
+    *,
+    line: _EstimateWorkerLineInput,
+    declared_input_names: tuple[str, ...],
+) -> dict[str, str]:
+    """Normalize persisted formula-binding payloads into declared-input tokens."""
+    bindings_payload = raw_bindings.get("bindings")
+    if isinstance(bindings_payload, dict):
+        if not all(
+            isinstance(key, str)
+            and key
+            and isinstance(value, str)
+            and value
+            for key, value in bindings_payload.items()
+        ):
+            raise _build_estimate_job_input_error(
+                "invalid_formula_input_binding",
+                ref_type=line.ref_type,
+                selection_key=line.selection_key,
+                line_key=line.line_key,
+            )
+        return cast(dict[str, str], dict(bindings_payload))
+
+    if raw_bindings and all(
+        isinstance(key, str) and key and isinstance(value, str) and value
+        for key, value in raw_bindings.items()
+    ):
+        return cast(dict[str, str], dict(raw_bindings))
+
+    operand_line_keys = raw_bindings.get("operand_line_keys")
+    if isinstance(operand_line_keys, list) and len(operand_line_keys) == len(declared_input_names):
+        if not all(isinstance(value, str) and value for value in operand_line_keys):
+            raise _build_estimate_job_input_error(
+                "invalid_formula_input_binding",
+                ref_type=line.ref_type,
+                selection_key=line.selection_key,
+                line_key=line.line_key,
+            )
+        return dict(zip(declared_input_names, operand_line_keys, strict=True))
+
+    raise _build_estimate_job_input_error(
+        "invalid_formula_input_binding",
+        ref_type=line.ref_type,
+        selection_key=line.selection_key,
+        line_key=line.line_key,
+    )
+
+
+def _resolve_formula_binding_snapshot_key(
+    token: str,
+    *,
+    line: _EstimateWorkerLineInput,
+    contract_kind: str,
+    lines_by_key: dict[str, _EstimateWorkerLineInput],
+    quantity_entry_keys: set[str],
+    rate_entry_keys: set[str],
+    material_entry_keys: set[str],
+) -> str:
+    """Resolve one persisted formula-binding token into an engine snapshot entry key."""
+    if contract_kind == "quantity" and token in quantity_entry_keys:
+        return token
+    if contract_kind == "rate" and token in rate_entry_keys | material_entry_keys:
+        return token
+
+    bound_line = lines_by_key.get(token)
+    if bound_line is None:
+        raise _build_estimate_job_input_error(
+            "invalid_formula_input_binding",
+            ref_type=line.ref_type,
+            selection_key=line.selection_key,
+            line_key=line.line_key,
+            extra_details={"binding": token, "contract_kind": contract_kind},
+        )
+
+    if contract_kind == "quantity" and bound_line.quantity_entry_key is not None:
+        return bound_line.quantity_entry_key
+    if contract_kind == "rate":
+        if bound_line.rate_catalog_entry_id is not None:
+            return bound_line.catalog_entry_key
+        if bound_line.material_catalog_entry_id is not None:
+            return bound_line.catalog_entry_key
+
+    raise _build_estimate_job_input_error(
+        "invalid_formula_input_binding",
+        ref_type=line.ref_type,
+        selection_key=line.selection_key,
+        line_key=line.line_key,
+        extra_details={"binding": token, "contract_kind": contract_kind},
+    )
+
+
+async def _build_estimate_engine_input(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> EstimateEngineInput:
+    """Load deterministic engine inputs for a claimed persisted estimate job."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await session.get(Job, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+        if job.job_type != JobType.ESTIMATE.value:
+            raise ValueError(f"Unsupported estimate job type '{job.job_type}'")
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Estimate job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "current_revision_id": None,
+                },
+            )
+
+        estimate_input = await session.get(EstimateJobInput, job.id)
+        if estimate_input is None:
+            raise _build_estimate_job_input_error("missing_estimate_job_input")
+        if (
+            estimate_input.project_id != job.project_id
+            or estimate_input.source_file_id != job.file_id
+            or estimate_input.drawing_revision_id != job.base_revision_id
+        ):
+            raise _build_estimate_job_input_error(
+                "estimate_input_lineage_mismatch",
+                extra_details={
+                    "drawing_revision_id": str(estimate_input.drawing_revision_id),
+                    "base_revision_id": str(job.base_revision_id),
+                },
+            )
+
+        quantity_takeoff = await session.get(QuantityTakeoff, estimate_input.quantity_takeoff_id)
+        if quantity_takeoff is None:
+            raise _build_estimate_job_input_error(
+                "missing_quantity_takeoff",
+                extra_details={"quantity_takeoff_id": str(estimate_input.quantity_takeoff_id)},
+            )
+        if (
+            quantity_takeoff.project_id != job.project_id
+            or quantity_takeoff.source_file_id != job.file_id
+            or quantity_takeoff.drawing_revision_id != job.base_revision_id
+            or quantity_takeoff.id != estimate_input.quantity_takeoff_id
+            or quantity_takeoff.quantity_gate != estimate_input.quantity_gate
+            or quantity_takeoff.trusted_totals is not estimate_input.trusted_totals
+            or quantity_takeoff.source_job_type != estimate_input.source_job_type
+        ):
+            raise _build_estimate_job_input_error(
+                "quantity_takeoff_lineage_mismatch",
+                extra_details={
+                    "quantity_takeoff_id": str(quantity_takeoff.id),
+                    "drawing_revision_id": str(quantity_takeoff.drawing_revision_id),
+                },
+            )
+
+        catalog_refs_result = await session.execute(
+            select(EstimateJobInputCatalogRef)
+            .where(EstimateJobInputCatalogRef.estimate_job_id == job.id)
+            .order_by(
+                EstimateJobInputCatalogRef.ref_order.asc(),
+                EstimateJobInputCatalogRef.ref_type.asc(),
+                EstimateJobInputCatalogRef.selection_key.asc(),
+            )
+        )
+        catalog_refs = list(catalog_refs_result.scalars().all())
+        assembly = _build_estimate_worker_mapping_v1(catalog_refs)
+
+        quantity_items_result = await session.execute(
+            select(QuantityItem)
+            .where(QuantityItem.quantity_takeoff_id == quantity_takeoff.id)
+            .order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc())
+        )
+        quantity_items = list(quantity_items_result.scalars().all())
+        quantity_items_by_id = {item.id: item for item in quantity_items}
+
+        next_snapshot_sort_order = 1
+
+        def _next_snapshot_sort_order() -> int:
+            nonlocal next_snapshot_sort_order
+            sort_order = next_snapshot_sort_order
+            next_snapshot_sort_order += 1
+            return sort_order
+
+        quantity_entries: list[EstimateQuantityEntryInput] = []
+        for quantity_dependency in assembly.quantity_entries:
+            quantity_item = quantity_items_by_id.get(quantity_dependency.quantity_item_id)
+            if quantity_item is None:
+                raise _build_estimate_job_input_error(
+                    "missing_quantity_item",
+                    extra_details={
+                        "quantity_item_id": str(quantity_dependency.quantity_item_id),
+                        "quantity_entry_key": quantity_dependency.entry_key,
+                    },
+                )
+            if quantity_item.item_kind in {
+                QuantityItemKind.EXCLUSION.value,
+                QuantityItemKind.CONFLICT.value,
+            }:
+                raise _build_estimate_job_input_error(
+                    "invalid_quantity_item_kind",
+                    extra_details={
+                        "quantity_item_id": str(quantity_item.id),
+                        "item_kind": quantity_item.item_kind,
+                    },
+                )
+            if quantity_item.quantity_gate != "allowed":
+                raise _build_estimate_job_input_error(
+                    "quantity_item_gate_not_allowed",
+                    extra_details={
+                        "quantity_item_id": str(quantity_item.id),
+                        "quantity_gate": quantity_item.quantity_gate,
+                    },
+                )
+            if quantity_item.value is None or not math.isfinite(quantity_item.value):
+                raise _build_estimate_job_input_error(
+                    "invalid_quantity_value",
+                    extra_details={"quantity_item_id": str(quantity_item.id)},
+                )
+
+            quantity_payload = {
+                "quantity_takeoff_id": str(quantity_takeoff.id),
+                "quantity_item_id": str(quantity_item.id),
+                "item_kind": quantity_item.item_kind,
+                "quantity_type": quantity_item.quantity_type,
+                "value": quantity_item.value,
+                "unit": quantity_item.unit,
+                "review_state": quantity_item.review_state,
+                "validation_status": quantity_item.validation_status,
+                "quantity_gate": quantity_item.quantity_gate,
+                "source_entity_id": quantity_item.source_entity_id,
+                "excluded_source_entity_ids_json": deepcopy(
+                    quantity_item.excluded_source_entity_ids_json
+                ),
+            }
+            quantity_entries.append(
+                EstimateQuantityEntryInput(
+                    entry_key=quantity_dependency.entry_key,
+                    entry_label=quantity_item.quantity_type,
+                    sort_order=_next_snapshot_sort_order(),
+                    source_quantity_item_id=quantity_item.id,
+                    source_checksum_sha256=_estimate_input_checksum(quantity_payload),
+                    quantity_value=Decimal(str(quantity_item.value)),
+                    unit=quantity_item.unit,
+                    source_quantity_takeoff_id=quantity_takeoff.id,
+                    source_payload=quantity_payload,
+                )
+            )
+
+        lines_by_key = {line.line_key: line for line in assembly.lines}
+        quantity_entry_keys = {entry.entry_key for entry in quantity_entries}
+        rate_entry_keys = {
+            line.catalog_entry_key for line in assembly.lines if line.rate_catalog_entry_id is not None
+        }
+        material_entry_keys = {
+            line.catalog_entry_key
+            for line in assembly.lines
+            if line.material_catalog_entry_id is not None
+        }
+        rate_entries: list[EstimateRateEntryInput] = []
+        material_entries: list[EstimateMaterialEntryInput] = []
+        formula_entries: list[EstimateFormulaEntryInput] = []
+        line_inputs: list[EstimateLineInputSpec] = []
+        emitted_catalog_entry_sources: dict[str, tuple[str, UUID, str]] = {}
+
+        def _register_catalog_entry_source(
+            *,
+            line: _EstimateWorkerLineInput,
+            source_id: UUID,
+            source_checksum_sha256: str,
+        ) -> bool:
+            candidate = (line.ref_type, source_id, source_checksum_sha256)
+            existing = emitted_catalog_entry_sources.get(line.catalog_entry_key)
+            if existing is None:
+                emitted_catalog_entry_sources[line.catalog_entry_key] = candidate
+                return True
+            if existing != candidate:
+                existing_ref_type, existing_source_id, existing_checksum = existing
+                raise _build_estimate_job_input_error(
+                    "colliding_catalog_entry_key",
+                    ref_type=line.ref_type,
+                    selection_key=line.selection_key,
+                    line_key=line.line_key,
+                    extra_details={
+                        "catalog_entry_key": line.catalog_entry_key,
+                        "existing_ref_type": existing_ref_type,
+                        "existing_source_id": str(existing_source_id),
+                        "existing_checksum_sha256": existing_checksum,
+                    },
+                )
+            return False
+
+        for line in assembly.lines:
+            if line.ref_type == "rate":
+                assert line.rate_catalog_entry_id is not None
+                try:
+                    matched_rate = await resolve_rate(
+                        session,
+                        ref=CatalogRateRef(
+                            id=line.rate_catalog_entry_id,
+                            checksum_sha256=line.catalog_checksum_sha256,
+                        ),
+                    )
+                except CatalogSelectionError as exc:
+                    raise _build_estimate_job_input_error(
+                        "catalog_ref_unresolved",
+                        ref_type=line.ref_type,
+                        selection_key=line.selection_key,
+                        line_key=line.line_key,
+                        extra_details={
+                            "conflict_count": len(exc.conflicting_candidate_ids),
+                        },
+                    ) from exc
+
+                if _register_catalog_entry_source(
+                    line=line,
+                    source_id=matched_rate.id,
+                    source_checksum_sha256=matched_rate.checksum_sha256,
+                ):
+                    rate_entries.append(
+                        EstimateRateEntryInput(
+                            entry_key=line.catalog_entry_key,
+                            entry_label=line.description,
+                            sort_order=_next_snapshot_sort_order(),
+                            source_rate_id=matched_rate.id,
+                            source_checksum_sha256=matched_rate.checksum_sha256,
+                            unit=matched_rate.unit,
+                            effective_date=matched_rate.effective_start,
+                            unit_amount=matched_rate.value,
+                            source_payload={
+                                "selection_key": line.selection_key,
+                                "rate_key": matched_rate.rate_key,
+                                "item_type": matched_rate.item_type,
+                                "metadata": deepcopy(matched_rate.metadata or {}),
+                            },
+                            currency=cast(Any, matched_rate.currency),
+                        )
+                    )
+
+                line_inputs.append(
+                    EstimateLineInputSpec(
+                        line_key=line.line_key,
+                        line_type=cast(Any, line.line_type),
+                        description=line.description,
+                        quantity_entry_key=line.quantity_entry_key,
+                        rate_entry_key=line.catalog_entry_key,
+                    )
+                )
+                continue
+
+            if line.ref_type == "material":
+                assert line.material_catalog_entry_id is not None
+                try:
+                    matched_material = await resolve_material(
+                        session,
+                        ref=CatalogMaterialRef(
+                            id=line.material_catalog_entry_id,
+                            checksum_sha256=line.catalog_checksum_sha256,
+                        ),
+                    )
+                except CatalogSelectionError as exc:
+                    raise _build_estimate_job_input_error(
+                        "catalog_ref_unresolved",
+                        ref_type=line.ref_type,
+                        selection_key=line.selection_key,
+                        line_key=line.line_key,
+                        extra_details={
+                            "conflict_count": len(exc.conflicting_candidate_ids),
+                        },
+                    ) from exc
+
+                if _register_catalog_entry_source(
+                    line=line,
+                    source_id=matched_material.id,
+                    source_checksum_sha256=matched_material.checksum_sha256,
+                ):
+                    material_entries.append(
+                        EstimateMaterialEntryInput(
+                            entry_key=line.catalog_entry_key,
+                            entry_label=line.description,
+                            sort_order=_next_snapshot_sort_order(),
+                            source_material_id=matched_material.id,
+                            source_checksum_sha256=matched_material.checksum_sha256,
+                            unit=matched_material.unit,
+                            effective_date=matched_material.effective_start,
+                            unit_amount=matched_material.value,
+                            source_payload={
+                                "selection_key": line.selection_key,
+                                "material_key": matched_material.material_key,
+                                "metadata": deepcopy(matched_material.metadata or {}),
+                            },
+                            currency=cast(Any, matched_material.currency),
+                        )
+                    )
+
+                line_inputs.append(
+                    EstimateLineInputSpec(
+                        line_key=line.line_key,
+                        line_type=cast(Any, line.line_type),
+                        description=line.description,
+                        quantity_entry_key=line.quantity_entry_key,
+                        material_entry_key=line.catalog_entry_key,
+                    )
+                )
+                continue
+
+            assert line.formula_definition_id is not None
+            try:
+                selected_formula = await resolve_formula(
+                    session,
+                    ref=CatalogFormulaRef(
+                        id=line.formula_definition_id,
+                        checksum_sha256=line.catalog_checksum_sha256,
+                    ),
+                )
+            except CatalogSelectionError as exc:
+                raise _build_estimate_job_input_error(
+                    "catalog_ref_unresolved",
+                    ref_type=line.ref_type,
+                    selection_key=line.selection_key,
+                    line_key=line.line_key,
+                    extra_details={
+                        "conflict_count": len(exc.conflicting_candidate_ids),
+                    },
+                ) from exc
+
+            try:
+                formula_definition = formula_definition_from_selected_formula(selected_formula)
+            except Exception as exc:
+                raise _build_estimate_job_input_error(
+                    "invalid_formula_definition",
+                    ref_type=line.ref_type,
+                    selection_key=line.selection_key,
+                    line_key=line.line_key,
+                ) from exc
+            if _register_catalog_entry_source(
+                line=line,
+                source_id=selected_formula.definition_id,
+                source_checksum_sha256=selected_formula.checksum_sha256,
+            ):
+                formula_entries.append(
+                    EstimateFormulaEntryInput(
+                        entry_key=line.catalog_entry_key,
+                        entry_label=line.description,
+                        sort_order=_next_snapshot_sort_order(),
+                        source_formula_id=selected_formula.definition_id,
+                        source_checksum_sha256=selected_formula.checksum_sha256,
+                        definition=formula_definition,
+                        source_payload={
+                            "selection_key": line.selection_key,
+                            "formula_id": selected_formula.formula_id,
+                            "formula_version": selected_formula.version,
+                        },
+                    )
+                )
+
+            raw_formula_inputs = line.formula_inputs or {}
+            declared_input_names = tuple(
+                declared_input.name for declared_input in formula_definition.declared_inputs
+            )
+            binding_tokens = _estimate_formula_binding_tokens(
+                raw_formula_inputs,
+                line=line,
+                declared_input_names=declared_input_names,
+            )
+            for declared_input_name in declared_input_names:
+                if declared_input_name not in binding_tokens:
+                    raise _build_estimate_job_input_error(
+                        "missing_formula_input_binding",
+                        ref_type=line.ref_type,
+                        selection_key=line.selection_key,
+                        line_key=line.line_key,
+                        extra_details={"input": declared_input_name},
+                    )
+            resolved_formula_inputs = {
+                declared_input.name: _resolve_formula_binding_snapshot_key(
+                    binding_tokens[declared_input.name],
+                    line=line,
+                    contract_kind=declared_input.contract.kind,
+                    lines_by_key=lines_by_key,
+                    quantity_entry_keys=quantity_entry_keys,
+                    rate_entry_keys=rate_entry_keys,
+                    material_entry_keys=material_entry_keys,
+                )
+                for declared_input in formula_definition.declared_inputs
+            }
+            line_inputs.append(
+                EstimateLineInputSpec(
+                    line_key=line.line_key,
+                    line_type=cast(Any, line.line_type),
+                    description=line.description,
+                    formula_entry_key=line.catalog_entry_key,
+                    formula_inputs=resolved_formula_inputs,
+                )
+            )
+
+        return EstimateEngineInput(
+            estimate_job_id=job.id,
+            project_id=job.project_id,
+            file_id=job.file_id,
+            source_job_id=job.id,
+            drawing_revision_id=estimate_input.drawing_revision_id,
+            quantity_takeoff_id=quantity_takeoff.id,
+            currency=cast(Any, estimate_input.currency),
+            quantity_gate=cast(Any, estimate_input.quantity_gate),
+            trusted_totals=estimate_input.trusted_totals,
+            tax_rate=_estimate_tax_rate(estimate_input.assumptions_json),
+            quantity_entries=tuple(quantity_entries),
+            rate_entries=tuple(rate_entries),
+            material_entries=tuple(material_entries),
+            formula_entries=tuple(formula_entries),
+            line_inputs=tuple(line_inputs),
+        )
 
 
 def _float_value(value: Any) -> float | None:
@@ -2480,6 +3387,129 @@ async def _finalize_quantity_takeoff_job(
     return True
 
 
+async def _finalize_estimate_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    output: EstimateEngineOutput,
+) -> bool:
+    """Atomically publish estimate rows and terminal job success."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    estimate_version_kwargs = output.estimate_version_model_kwargs()
+    snapshot_entry_kwargs = list(output.snapshot_entry_model_kwargs())
+    line_item_kwargs = list(output.line_item_model_kwargs())
+
+    async with session_maker() as session:
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "estimate_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "estimate_job_completion_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info("estimate_job_cancelled", job_id=str(job_id))
+            return False
+
+        if job.status != "running":
+            logger.info(
+                "estimate_job_completion_skipped_non_running_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
+        output_revision_id = cast(UUID | None, estimate_version_kwargs.get("drawing_revision_id"))
+        if job.base_revision_id != output_revision_id:
+            raise _RevisionConflictError(
+                message="Estimate base revision changed before finalization.",
+                details={
+                    "base_revision_id": (
+                        str(job.base_revision_id) if job.base_revision_id is not None else None
+                    ),
+                    "drawing_revision_id": str(output_revision_id) if output_revision_id else None,
+                },
+            )
+
+        existing_version = await _get_existing_estimate_version(session, source_job_id=job.id)
+        if existing_version is not None:
+            logger.info(
+                "estimate_job_completion_skipped_existing_version",
+                job_id=str(job_id),
+                estimate_version_id=str(existing_version.id),
+            )
+            return False
+
+        estimate_version = EstimateVersion(**estimate_version_kwargs)
+        snapshot_entries = [EstimateSnapshotEntry(**kwargs) for kwargs in snapshot_entry_kwargs]
+        line_items = [EstimateItem(**kwargs) for kwargs in line_item_kwargs]
+
+        session.add(estimate_version)
+        await session.flush()
+        session.add_all(snapshot_entries)
+        session.add_all(line_items)
+
+        job.status = "succeeded"
+        job.finished_at = _utcnow()
+        job.error_code = None
+        job.error_message = None
+        _clear_job_attempt_lease(job)
+        await emit_job_event(
+            job.id,
+            level="info",
+            message="Job succeeded",
+            data_json={
+                "status": "succeeded",
+                "attempts": job.attempts,
+                "estimate_version_id": str(estimate_version.id),
+                "snapshot_entry_count": len(snapshot_entries),
+                "line_item_count": len(line_items),
+            },
+            session=session,
+        )
+        await session.commit()
+
+    return True
+
+
 async def emit_job_event(
     job_id: UUID,
     *,
@@ -3275,6 +4305,130 @@ async def _begin_or_resume_quantity_takeoff_job(job_id: UUID) -> _JobAttemptLeas
     return None
 
 
+async def _begin_or_resume_estimate_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted estimate job under a row lock."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    now = _utcnow()
+
+    async with session_maker() as session:
+        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        if bootstrap is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        if project is None:
+            raise LookupError(
+                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
+            )
+
+        job = await _get_job_for_update_with_metadata(
+            session,
+            job_id,
+            expected_project_id=bootstrap.project_id,
+            expected_file_id=bootstrap.file_id,
+        )
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        if job.job_type != JobType.ESTIMATE.value:
+            logger.info(
+                "estimate_job_unsupported_type_skipped",
+                job_id=str(job_id),
+                job_type=job.job_type,
+                status=job.status,
+            )
+            return None
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "estimate_job_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return None
+
+        if project.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
+            return None
+
+        source_file = await _get_source_file(
+            session,
+            project_id=job.project_id,
+            file_id=job.file_id,
+            for_update=True,
+        )
+        if source_file is None or source_file.deleted_at is not None:
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+            )
+            logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
+            return None
+
+        if not job.cancel_requested:
+            if job.status == "running":
+                if _is_stale_running_job(job, now=now):
+                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
+                    await emit_job_event(
+                        job.id,
+                        level="info",
+                        message="Job started",
+                        data_json={
+                            "status": "running",
+                            "attempts": job.attempts,
+                            "reclaimed": True,
+                        },
+                        session=session,
+                    )
+                    await session.commit()
+                    logger.warning(
+                        "estimate_job_reclaimed_stale_running_status",
+                        job_id=str(job_id),
+                        status=job.status,
+                    )
+                    return lease
+
+                logger.info(
+                    "estimate_job_duplicate_delivery_skipped_running_attempt",
+                    job_id=str(job_id),
+                    status=job.status,
+                )
+                return None
+
+            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
+            await emit_job_event(
+                job.id,
+                level="info",
+                message="Job started",
+                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
+                session=session,
+            )
+            await session.commit()
+            return lease
+
+        _finalize_job_cancelled(job)
+        await emit_job_event(
+            job.id,
+            level="warning",
+            message="Job cancelled",
+            data_json={"status": "cancelled"},
+            session=session,
+        )
+        await session.commit()
+
+    logger.info("estimate_job_cancelled", job_id=str(job_id))
+    return None
+
+
 async def process_ingest_job(job_id: UUID) -> None:
     """Load a persisted ingest job, run ingestion, and persist state transitions."""
     session_maker = get_session_maker()
@@ -3416,7 +4570,7 @@ async def process_ingest_job(job_id: UUID) -> None:
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:
-    """Requeue incomplete persisted ingest/reprocess/quantity jobs on worker startup."""
+    """Requeue incomplete persisted ingest/reprocess/quantity/estimate jobs on worker startup."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -3486,7 +4640,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
 
 
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
-    """Requeue incomplete ingest/reprocess/quantity jobs when a worker starts."""
+    """Requeue incomplete ingest/reprocess/quantity/estimate jobs when a worker starts."""
     try:
         recovered_job_ids = asyncio.run(recover_incomplete_ingest_jobs())
     except Exception as exc:
@@ -3687,3 +4841,155 @@ def run_quantity_takeoff_job(job_id: str) -> None:
 def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
     """Publish a persisted quantity takeoff job to Celery."""
     run_quantity_takeoff_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+
+
+async def process_estimate_job(job_id: UUID) -> None:
+    """Load a persisted estimate job and assemble deterministic engine inputs."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    lease = await _begin_or_resume_estimate_job(job_id)
+    if lease is None:
+        return
+
+    try:
+        engine_input = await _build_estimate_engine_input(job_id, attempt_token=lease.token)
+        estimate_output = compose_estimate(engine_input)
+    except _StaleJobAttemptError:
+        logger.info("estimate_job_stale_attempt_skipped", job_id=str(job_id))
+        return
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "estimate_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        return
+    except _EstimateJobInputError as exc:
+        failure_details = exc.details
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=exc.error_code,
+            attempt_token=lease.token,
+            error_details=failure_details,
+        )
+        logger.warning(
+            "estimate_job_input_failed",
+            job_id=str(job_id),
+            error_code=exc.error_code.value,
+            **(failure_details or {}),
+        )
+        return
+    except EstimateEngineError as exc:
+        failure_details = {"reason": exc.reason}
+        await _mark_job_failed(
+            job_id,
+            error_message=_ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
+            error_code=ErrorCode.INPUT_INVALID,
+            attempt_token=lease.token,
+            error_details=failure_details,
+        )
+        logger.warning(
+            "estimate_job_input_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INPUT_INVALID.value,
+            **failure_details,
+        )
+        return
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
+        logger.info("estimate_job_cancelled_during_execution", job_id=str(job_id))
+        raise
+    except Exception:
+        await _mark_job_failed(
+            job_id,
+            error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
+        logger.error(
+            "estimate_job_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
+            exc_info=True,
+        )
+        raise
+
+    logger.info(
+        "estimate_job_composed_pending_finalization",
+        job_id=str(job_id),
+        quantity_entry_count=len(engine_input.quantity_entries),
+        rate_entry_count=len(engine_input.rate_entries),
+        material_entry_count=len(engine_input.material_entries),
+        formula_entry_count=len(engine_input.formula_entries),
+        line_count=len(engine_input.line_inputs),
+    )
+
+    try:
+        finalized = await _finalize_estimate_job(
+            job_id,
+            attempt_token=lease.token,
+            output=estimate_output,
+        )
+    except asyncio.CancelledError:
+        await _mark_job_cancelled(job_id, attempt_token=lease.token)
+        logger.info("estimate_job_cancelled_during_finalization", job_id=str(job_id))
+        raise
+    except _RevisionConflictError as exc:
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=ErrorCode.REVISION_CONFLICT,
+            attempt_token=lease.token,
+            error_details=exc.details,
+        )
+        logger.warning(
+            "estimate_job_revision_conflict",
+            job_id=str(job_id),
+            error_code=ErrorCode.REVISION_CONFLICT.value,
+            **exc.details,
+        )
+        return
+    except Exception:
+        await _mark_job_failed(
+            job_id,
+            error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
+            attempt_token=lease.token,
+        )
+        logger.error(
+            "estimate_job_finalization_failed",
+            job_id=str(job_id),
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
+            exc_info=True,
+        )
+        raise
+
+    if finalized:
+        logger.info("estimate_job_succeeded", job_id=str(job_id))
+
+
+@celery_app.task(
+    name="app.jobs.worker.run_estimate_job",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def run_estimate_job(job_id: str) -> None:
+    """Celery task wrapper for persisted estimate jobs."""
+    asyncio.run(process_estimate_job(UUID(job_id)))
+
+
+def enqueue_estimate_job(job_id: UUID) -> None:
+    """Publish a persisted estimate job to Celery."""
+    run_estimate_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
