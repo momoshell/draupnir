@@ -362,7 +362,9 @@ def _formula_definition_json(definition: FormulaDefinition) -> dict[str, JSONVal
         "checksum": definition.checksum,
         "output_key": definition.output_key,
         "output_contract": _value_contract_json(definition.output_contract),
-        "declared_inputs": [_formula_input_definition_json(item) for item in definition.declared_inputs],
+        "declared_inputs": [
+            _formula_input_definition_json(item) for item in definition.declared_inputs
+        ],
         "expression": _formula_node_json(definition.expression),
         "rounding": _rounding_json(definition.rounding),
     }

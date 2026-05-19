@@ -197,7 +197,9 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
 
     result = compose_estimate(engine_input)
 
-    assert result.estimate_version_id == deterministic_estimate_version_id(engine_input.estimate_job_id)
+    assert result.estimate_version_id == deterministic_estimate_version_id(
+        engine_input.estimate_job_id
+    )
     assert result.header is not None
     assert result.header.file_id == engine_input.file_id
     assert result.header.source_job_id == engine_input.source_job_id
@@ -274,10 +276,14 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
         payload for payload in snapshot_payloads if payload["entry_key"] == "formula:rounded_markup"
     )
     assumption_snapshot_payload = next(
-        payload for payload in snapshot_payloads if payload["entry_key"] == "assumption:mobilisation"
+        payload
+        for payload in snapshot_payloads
+        if payload["entry_key"] == "assumption:mobilisation"
     )
     formula_line_payload = next(
-        payload for payload in result.line_item_model_kwargs() if payload["line_key"] == "line:formula"
+        payload
+        for payload in result.line_item_model_kwargs()
+        if payload["line_key"] == "line:formula"
     )
 
     assert result.estimate_version_model_kwargs()["quantity_gate"] == "allowed"
@@ -290,8 +296,19 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
             "output_key": "estimate.rounded_markup",
             "output_contract": {"kind": "money", "currency": "GBP", "unit": None, "per_unit": None},
             "declared_inputs": [
-                {"name": "rate", "contract": {"kind": "rate", "currency": "GBP", "unit": None, "per_unit": "m"}},
-                {"name": "quantity", "contract": {"kind": "quantity", "currency": None, "unit": "m", "per_unit": None}},
+                {
+                    "name": "rate",
+                    "contract": {"kind": "rate", "currency": "GBP", "unit": None, "per_unit": "m"},
+                },
+                {
+                    "name": "quantity",
+                    "contract": {
+                        "kind": "quantity",
+                        "currency": None,
+                        "unit": "m",
+                        "per_unit": None,
+                    },
+                },
             ],
             "expression": {
                 "kind": "multiply",
@@ -299,7 +316,13 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
                 "name": None,
                 "args": [
                     {"kind": "input", "value": None, "name": "rate", "args": [], "rounding": None},
-                    {"kind": "input", "value": None, "name": "quantity", "args": [], "rounding": None},
+                    {
+                        "kind": "input",
+                        "value": None,
+                        "name": "quantity",
+                        "args": [],
+                        "rounding": None,
+                    },
                 ],
                 "rounding": None,
             },

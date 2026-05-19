@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -25,7 +25,12 @@ from app.estimating.engine.contracts import (
     deterministic_snapshot_entry_id,
 )
 from app.estimating.engine.errors import raise_input_invalid
-from app.estimating.formulas import FormulaValue, RoundingSpec, ValueContract, evaluate_formula
+from app.estimating.formulas import (
+    FormulaValue,
+    RoundingSpec,
+    ValueContract,
+    evaluate_formula,
+)
 
 type _SnapshotValueType = Literal["quantity_input", "rate", "material", "assumption"]
 
@@ -100,7 +105,9 @@ def compose_estimate(engine_input: EstimateEngineInput) -> EstimateEngineOutput:
             value_type="assumption",
         )
 
-    ordered_snapshot_entries = tuple(sorted(snapshot_entries, key=lambda entry: (entry.sort_order, entry.entry_key)))
+    ordered_snapshot_entries = tuple(
+        sorted(snapshot_entries, key=lambda entry: (entry.sort_order, entry.entry_key))
+    )
 
     line_keys: set[str] = set()
     line_items: list[EstimateLineSpec] = []
@@ -163,7 +170,10 @@ def _validate_engine_input(engine_input: EstimateEngineInput) -> None:
             message="estimate input must include file_id and source_job_id lineage fields",
         )
     if engine_input.currency != "GBP":
-        raise_input_invalid(reason="unsupported_currency", message="estimate engine supports GBP only")
+        raise_input_invalid(
+            reason="unsupported_currency",
+            message="estimate engine supports GBP only",
+        )
     if engine_input.quantity_gate != "allowed":
         raise_input_invalid(
             reason="quantity_gate_not_allowed",
@@ -177,7 +187,10 @@ def _validate_engine_input(engine_input: EstimateEngineInput) -> None:
     if engine_input.tax_rate < 0:
         raise_input_invalid(reason="negative_tax_rate", message="tax_rate must be nonnegative")
     if not engine_input.line_inputs:
-        raise_input_invalid(reason="missing_line_items", message="estimate input requires line_inputs")
+        raise_input_invalid(
+            reason="missing_line_items",
+            message="estimate input requires line_inputs",
+        )
 
 
 def _build_quantity_snapshot(
@@ -188,14 +201,20 @@ def _build_quantity_snapshot(
     _validate_non_empty_text("entry_label", quantity_entry.entry_label)
     _validate_non_empty_text("unit", quantity_entry.unit)
     _validate_checksum(quantity_entry.source_checksum_sha256)
-    if quantity_entry.source_quantity_takeoff_id is not None and quantity_entry.source_quantity_takeoff_id != engine_input.quantity_takeoff_id:
+    if (
+        quantity_entry.source_quantity_takeoff_id is not None
+        and quantity_entry.source_quantity_takeoff_id != engine_input.quantity_takeoff_id
+    ):
         raise_input_invalid(
             reason="quantity_takeoff_mismatch",
             message="quantity entry lineage must match estimate input quantity_takeoff_id",
         )
     quantity_value = _quantity_decimal(quantity_entry.quantity_value)
     if quantity_value < 0:
-        raise_input_invalid(reason="negative_quantity", message="quantity values must be nonnegative")
+        raise_input_invalid(
+            reason="negative_quantity",
+            message="quantity values must be nonnegative",
+        )
     return EstimateSnapshotEntrySpec(
         id=deterministic_snapshot_entry_id(engine_input.estimate_job_id, quantity_entry.entry_key),
         entry_type="quantity_input",
@@ -215,7 +234,14 @@ def _build_rate_snapshot(
     engine_input: EstimateEngineInput,
     rate_entry: EstimateRateEntryInput,
 ) -> EstimateSnapshotEntrySpec:
-    _validate_money_rate_entry(rate_entry.entry_key, rate_entry.entry_label, rate_entry.source_checksum_sha256, rate_entry.unit, rate_entry.currency, rate_entry.unit_amount)
+    _validate_money_rate_entry(
+        rate_entry.entry_key,
+        rate_entry.entry_label,
+        rate_entry.source_checksum_sha256,
+        rate_entry.unit,
+        rate_entry.currency,
+        rate_entry.unit_amount,
+    )
     return EstimateSnapshotEntrySpec(
         id=deterministic_snapshot_entry_id(engine_input.estimate_job_id, rate_entry.entry_key),
         entry_type="rate",
@@ -267,7 +293,10 @@ def _build_formula_snapshot(
     _validate_entry_key(formula_entry.entry_key)
     _validate_non_empty_text("entry_label", formula_entry.entry_label)
     _validate_checksum(formula_entry.source_checksum_sha256)
-    if formula_entry.definition.output_contract.kind != "money" or formula_entry.definition.output_contract.currency != "GBP":
+    if (
+        formula_entry.definition.output_contract.kind != "money"
+        or formula_entry.definition.output_contract.currency != "GBP"
+    ):
         raise_input_invalid(
             reason="unsupported_formula_output",
             message="formula entries must resolve to GBP money outputs",
@@ -299,11 +328,20 @@ def _build_assumption_snapshot(
     _validate_non_empty_text("entry_label", assumption_entry.entry_label)
     _validate_checksum(assumption_entry.source_checksum_sha256)
     if assumption_entry.currency != "GBP":
-        raise_input_invalid(reason="unsupported_currency", message="estimate engine supports GBP only")
+        raise_input_invalid(
+            reason="unsupported_currency",
+            message="estimate engine supports GBP only",
+        )
     if assumption_entry.amount < 0:
-        raise_input_invalid(reason="negative_money", message="assumption amounts must be nonnegative")
+        raise_input_invalid(
+            reason="negative_money",
+            message="assumption amounts must be nonnegative",
+        )
     return EstimateSnapshotEntrySpec(
-        id=deterministic_snapshot_entry_id(engine_input.estimate_job_id, assumption_entry.entry_key),
+        id=deterministic_snapshot_entry_id(
+            engine_input.estimate_job_id,
+            assumption_entry.entry_key,
+        ),
         entry_type="assumption",
         entry_key=assumption_entry.entry_key,
         entry_label=assumption_entry.entry_label,
@@ -326,8 +364,16 @@ def _build_line_item(
     _validate_non_empty_text("description", line_input.description)
 
     if line_input.line_type == "rate":
-        quantity_value = _resolve_snapshot_value(snapshot_values, line_input.quantity_entry_key, expected_type="quantity_input")
-        rate_value = _resolve_snapshot_value(snapshot_values, line_input.rate_entry_key, expected_type="rate")
+        quantity_value = _resolve_snapshot_value(
+            snapshot_values,
+            line_input.quantity_entry_key,
+            expected_type="quantity_input",
+        )
+        rate_value = _resolve_snapshot_value(
+            snapshot_values,
+            line_input.rate_entry_key,
+            expected_type="rate",
+        )
         _validate_rate_unit_match(quantity_value, rate_value)
         subtotal_amount = _money(rate_value.amount * quantity_value.amount)
         return _finalize_line_item(
@@ -344,8 +390,16 @@ def _build_line_item(
         )
 
     if line_input.line_type == "material":
-        quantity_value = _resolve_snapshot_value(snapshot_values, line_input.quantity_entry_key, expected_type="quantity_input")
-        material_value = _resolve_snapshot_value(snapshot_values, line_input.material_entry_key, expected_type="material")
+        quantity_value = _resolve_snapshot_value(
+            snapshot_values,
+            line_input.quantity_entry_key,
+            expected_type="quantity_input",
+        )
+        material_value = _resolve_snapshot_value(
+            snapshot_values,
+            line_input.material_entry_key,
+            expected_type="material",
+        )
         _validate_rate_unit_match(quantity_value, material_value)
         subtotal_amount = _money(material_value.amount * quantity_value.amount)
         return _finalize_line_item(
@@ -362,7 +416,11 @@ def _build_line_item(
         )
 
     if line_input.line_type == "assumption":
-        assumption_value = _resolve_snapshot_value(snapshot_values, line_input.assumption_entry_key, expected_type="assumption")
+        assumption_value = _resolve_snapshot_value(
+            snapshot_values,
+            line_input.assumption_entry_key,
+            expected_type="assumption",
+        )
         subtotal_amount = _money(assumption_value.amount)
         return _finalize_line_item(
             engine_input=engine_input,
@@ -411,7 +469,11 @@ def _build_line_item(
             formula_entries=formula_entries,
         )
 
-    raise_input_invalid(reason="unsupported_line_type", message=f"unsupported line type: {line_input.line_type}")
+    raise_input_invalid(
+        reason="unsupported_line_type",
+        message=f"unsupported line type: {line_input.line_type}",
+    )
+    raise AssertionError("unreachable")
 
 
 def _build_formula_line_item(
@@ -425,7 +487,10 @@ def _build_formula_line_item(
     formula_entry_key = _required_key("formula_entry_key", line_input.formula_entry_key)
     formula_entry = formula_entries.get(formula_entry_key)
     if formula_entry is None:
-        raise_input_invalid(reason="line_reference_missing", message="formula line references unknown formula entry")
+        raise_input_invalid(
+            reason="line_reference_missing",
+            message="formula line references unknown formula entry",
+        )
     resolved_formula_entry = formula_entry
 
     formula_inputs: dict[str, FormulaValue] = {}
@@ -441,10 +506,16 @@ def _build_formula_line_item(
             )
         snapshot_value = snapshot_values.get(snapshot_key)
         if snapshot_value is None:
-            raise_input_invalid(reason="line_reference_missing", message="formula line references unknown snapshot entry")
+            raise_input_invalid(
+                reason="line_reference_missing",
+                message="formula line references unknown snapshot entry",
+            )
         resolved_snapshot_value = snapshot_value
         if not _contracts_match(resolved_snapshot_value.contract, declared_input.contract):
-            raise_input_invalid(reason="unit_mismatch", message="formula input contract does not match bound snapshot")
+            raise_input_invalid(
+                reason="unit_mismatch",
+                message="formula input contract does not match bound snapshot",
+            )
         formula_inputs[declared_input.name] = FormulaValue(
             amount=resolved_snapshot_value.amount,
             contract=resolved_snapshot_value.contract,
@@ -454,16 +525,25 @@ def _build_formula_line_item(
             quantity_snapshot = resolved_snapshot_value
 
     formula_result = evaluate_formula(resolved_formula_entry.definition, formula_inputs)
-    if formula_result.value.contract.kind != "money" or formula_result.value.contract.currency != "GBP":
-        raise_input_invalid(reason="unsupported_formula_output", message="formula lines must resolve to GBP money outputs")
+    if (
+        formula_result.value.contract.kind != "money"
+        or formula_result.value.contract.currency != "GBP"
+    ):
+        raise_input_invalid(
+            reason="unsupported_formula_output",
+            message="formula lines must resolve to GBP money outputs",
+        )
 
     pre_round_amount = formula_result.value.amount
     evaluated_amount = _apply_formula_rounding(formula_result.value.amount, formula_result.rounding)
     if evaluated_amount < 0:
-        raise_input_invalid(reason="negative_money", message="formula lines must resolve to nonnegative money")
+        raise_input_invalid(
+            reason="negative_money",
+            message="formula lines must resolve to nonnegative money",
+        )
 
     subtotal_amount = _money(evaluated_amount)
-    bound_input_keys_json: list[JSONValue] = [key for key in bound_keys]
+    bound_input_keys_json: list[JSONValue] = list(bound_keys)
     details: dict[str, JSONValue] = {
         "formula_id": resolved_formula_entry.definition.formula_id,
         "formula_version": resolved_formula_entry.definition.version,
@@ -483,8 +563,13 @@ def _build_formula_line_item(
         line_input=line_input,
         line_number=line_number,
         subtotal_amount=subtotal_amount,
-        quantity_snapshot_entry_id=quantity_snapshot.snapshot.id if quantity_snapshot is not None else None,
-        formula_snapshot_entry_id=deterministic_snapshot_entry_id(engine_input.estimate_job_id, resolved_formula_entry.entry_key),
+        quantity_snapshot_entry_id=(
+            quantity_snapshot.snapshot.id if quantity_snapshot is not None else None
+        ),
+        formula_snapshot_entry_id=deterministic_snapshot_entry_id(
+            engine_input.estimate_job_id,
+            resolved_formula_entry.entry_key,
+        ),
         quantity_value=quantity_snapshot.amount if quantity_snapshot is not None else None,
         quantity_unit=quantity_snapshot.snapshot.unit if quantity_snapshot is not None else None,
         rounding=formula_result.rounding,
@@ -539,7 +624,10 @@ def _finalize_line_item(
 
 def _register_snapshot(snapshot_keys: set[str], snapshot: EstimateSnapshotEntrySpec) -> None:
     if snapshot.entry_key in snapshot_keys:
-        raise_input_invalid(reason="duplicate_snapshot_entry_key", message="snapshot entry keys must be unique")
+        raise_input_invalid(
+            reason="duplicate_snapshot_entry_key",
+            message="snapshot entry keys must be unique",
+        )
     snapshot_keys.add(snapshot.entry_key)
 
 
@@ -558,16 +646,25 @@ def _resolve_snapshot_value(
     key = _required_key("entry_key", entry_key)
     snapshot_value = snapshot_values.get(key)
     if snapshot_value is None:
-        raise_input_invalid(reason="line_reference_missing", message="line references unknown snapshot entry")
+        raise_input_invalid(
+            reason="line_reference_missing",
+            message="line references unknown snapshot entry",
+        )
     resolved_snapshot_value = snapshot_value
     if resolved_snapshot_value.value_type != expected_type:
-        raise_input_invalid(reason="line_reference_type_mismatch", message="line references incompatible snapshot entry type")
+        raise_input_invalid(
+            reason="line_reference_type_mismatch",
+            message="line references incompatible snapshot entry type",
+        )
     return resolved_snapshot_value
 
 
 def _validate_rate_unit_match(quantity_value: _SnapshotValue, rate_value: _SnapshotValue) -> None:
     if rate_value.contract.per_unit != quantity_value.contract.unit:
-        raise_input_invalid(reason="unit_mismatch", message="estimate engine does not support unit conversion")
+        raise_input_invalid(
+            reason="unit_mismatch",
+            message="estimate engine does not support unit conversion",
+        )
 
 
 def _apply_formula_rounding(amount: Decimal, rounding_spec: RoundingSpec | None) -> Decimal:
@@ -598,7 +695,10 @@ def _validate_money_rate_entry(
     _validate_checksum(source_checksum_sha256)
     _validate_non_empty_text("unit", unit)
     if currency != "GBP":
-        raise_input_invalid(reason="unsupported_currency", message="estimate engine supports GBP only")
+        raise_input_invalid(
+            reason="unsupported_currency",
+            message="estimate engine supports GBP only",
+        )
     if unit_amount < 0:
         raise_input_invalid(reason="negative_money", message="unit amounts must be nonnegative")
     if unit_amount.quantize(_CATALOG_QUANTUM) != unit_amount:
@@ -610,7 +710,10 @@ def _validate_money_rate_entry(
 
 def _validate_checksum(checksum: str) -> None:
     if not _CHECKSUM_PATTERN.fullmatch(checksum):
-        raise_input_invalid(reason="invalid_checksum", message="source checksums must be lowercase sha256 hex")
+        raise_input_invalid(
+            reason="invalid_checksum",
+            message="source checksums must be lowercase sha256 hex",
+        )
 
 
 def _validate_entry_key(entry_key: str) -> None:
@@ -643,9 +746,14 @@ def _required_uuid(name: str, value: UUID | None) -> UUID:
     return value
 
 
-def _required_quantity_gate(value: str | None) -> Literal["allowed", "provisional", "review_gated", "blocked"]:
+def _required_quantity_gate(
+    value: str | None,
+) -> Literal["allowed", "provisional", "review_gated", "blocked"]:
     if value is None:
-        raise_input_invalid(reason="quantity_gate_not_allowed", message="quantity_gate is required")
+        raise_input_invalid(
+            reason="quantity_gate_not_allowed",
+            message="quantity_gate is required",
+        )
     return value  # type: ignore[return-value]
 
 
@@ -671,7 +779,13 @@ def _resolve_adjustment_anchor(
                 reason="line_reference_missing",
                 message="adjustment line references unknown formula entry",
             )
-        return deterministic_snapshot_entry_id(engine_input.estimate_job_id, formula_entry.entry_key), None
+        return (
+            deterministic_snapshot_entry_id(
+                engine_input.estimate_job_id,
+                formula_entry.entry_key,
+            ),
+            None,
+        )
 
     assumption_value = _resolve_snapshot_value(
         snapshot_values,

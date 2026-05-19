@@ -65,12 +65,25 @@ def formula_definition_from_json(
 
 def _value_contract_from_json(payload: Mapping[str, object], *, path: str) -> ValueContract:
     _reject_legacy_shape(payload, path=path, legacy_key="type", reason="legacy_contract_shape")
-    _reject_unknown_keys(payload, allowed_keys=_CONTRACT_KEYS, path=path, reason="contract_unknown_keys")
+    _reject_unknown_keys(
+        payload,
+        allowed_keys=_CONTRACT_KEYS,
+        path=path,
+        reason="contract_unknown_keys",
+    )
 
     kind = _require_str(payload.get("kind"), path=f"{path}.kind", reason="contract_kind_invalid")
-    currency = _optional_str(payload.get("currency"), path=f"{path}.currency", reason="contract_currency_invalid")
+    currency = _optional_str(
+        payload.get("currency"),
+        path=f"{path}.currency",
+        reason="contract_currency_invalid",
+    )
     unit = _optional_str(payload.get("unit"), path=f"{path}.unit", reason="contract_unit_invalid")
-    per_unit = _optional_str(payload.get("per_unit"), path=f"{path}.per_unit", reason="contract_per_unit_invalid")
+    per_unit = _optional_str(
+        payload.get("per_unit"),
+        path=f"{path}.per_unit",
+        reason="contract_per_unit_invalid",
+    )
 
     if kind in _GBP_ONLY_KINDS and currency != "GBP":
         raise_unsupported_formula_json(
@@ -81,7 +94,9 @@ def _value_contract_from_json(payload: Mapping[str, object], *, path: str) -> Va
     return ValueContract(kind=cast(Any, kind), currency=currency, unit=unit, per_unit=per_unit)
 
 
-def _input_definition_from_json(payload: Mapping[str, object], *, path: str) -> FormulaInputDefinition:
+def _input_definition_from_json(
+    payload: Mapping[str, object], *, path: str
+) -> FormulaInputDefinition:
     _reject_legacy_shape(payload, path=path, legacy_key="key", reason="legacy_input_shape")
     _reject_unknown_keys(payload, allowed_keys=_INPUT_KEYS, path=path, reason="input_unknown_keys")
 
@@ -135,11 +150,19 @@ def _rounding_from_json(
     if payload is None:
         return None
     mapping = _require_mapping(payload, path=path, reason="rounding_invalid")
-    _reject_unknown_keys(mapping, allowed_keys=_ROUNDING_KEYS, path=path, reason="rounding_unknown_keys")
+    _reject_unknown_keys(
+        mapping,
+        allowed_keys=_ROUNDING_KEYS,
+        path=path,
+        reason="rounding_unknown_keys",
+    )
 
     scale = mapping.get("scale")
     if not isinstance(scale, int) or isinstance(scale, bool):
-        raise_unsupported_formula_json("rounding_scale_invalid", f"{path}.scale must be an integer.")
+        raise_unsupported_formula_json(
+            "rounding_scale_invalid",
+            f"{path}.scale must be an integer.",
+        )
 
     mode = _require_str(mapping.get("mode"), path=f"{path}.mode", reason="rounding_mode_invalid")
     return RoundingSpec(scale=scale, mode=cast(Any, mode))
@@ -179,7 +202,10 @@ def _reject_legacy_shape(
     reason: str,
 ) -> None:
     if legacy_key in payload and "kind" not in payload:
-        raise_unsupported_formula_json(reason, f"{path} uses unsupported legacy '{legacy_key}' JSON.")
+        raise_unsupported_formula_json(
+            reason,
+            f"{path} uses unsupported legacy '{legacy_key}' JSON.",
+        )
 
 
 def _reject_unknown_keys(

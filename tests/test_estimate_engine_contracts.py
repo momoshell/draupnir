@@ -102,8 +102,9 @@ def test_engine_contracts_expose_deterministic_ids_and_frozen_specs() -> None:
 
     assert engine_input.currency == "GBP"
     assert engine_output.line_items[0].id == item_id
+    field_name = "description"
     with pytest.raises(FrozenInstanceError):
-        line.description = "mutated"
+        setattr(line, field_name, "mutated")
 
 
 def test_formula_definition_from_json_maps_dataclass_equivalent_json() -> None:
@@ -197,9 +198,24 @@ def test_formula_definition_from_selected_formula_uses_selected_formula_payloads
 @pytest.mark.parametrize(
     ("declared_inputs_json", "expression_json", "output_contract_json", "reason"),
     [
-        ([{"key": "quantity", "type": "decimal"}], {"kind": "literal", "value": "1"}, {"kind": "money", "currency": "GBP"}, "legacy_input_shape"),
-        ([{"name": "base", "contract": {"kind": "scalar"}}], {"op": "literal", "value": "1"}, {"kind": "money", "currency": "GBP"}, "legacy_node_shape"),
-        ([{"name": "base", "contract": {"kind": "scalar"}}], {"kind": "literal", "value": "1"}, {"kind": "money", "currency": "USD"}, "unsupported_currency"),
+        (
+            [{"key": "quantity", "type": "decimal"}],
+            {"kind": "literal", "value": "1"},
+            {"kind": "money", "currency": "GBP"},
+            "legacy_input_shape",
+        ),
+        (
+            [{"name": "base", "contract": {"kind": "scalar"}}],
+            {"op": "literal", "value": "1"},
+            {"kind": "money", "currency": "GBP"},
+            "legacy_node_shape",
+        ),
+        (
+            [{"name": "base", "contract": {"kind": "scalar"}}],
+            {"kind": "literal", "value": "1"},
+            {"kind": "money", "currency": "USD"},
+            "unsupported_currency",
+        ),
     ],
 )
 def test_formula_definition_from_json_rejects_legacy_and_unsupported_shapes(

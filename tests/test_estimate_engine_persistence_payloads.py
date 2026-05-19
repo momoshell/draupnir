@@ -297,7 +297,10 @@ async def test_engine_output_persists_and_replays_with_orm_payloads(
 ) -> None:
     seed = await quantity_takeoff_persistence._seed_quantity_lineage(async_client)
     estimate_job_id = await _create_estimate_job(db_session, seed)
-    installer_rate, formula_rate, material, formula = await _create_catalog_rows(db_session, seed.project_id)
+    installer_rate, formula_rate, material, formula = await _create_catalog_rows(
+        db_session,
+        seed.project_id,
+    )
     engine_input = _build_engine_input(
         seed,
         estimate_job_id=estimate_job_id,
@@ -315,7 +318,9 @@ async def test_engine_output_persists_and_replays_with_orm_payloads(
     assert result.line_item_model_kwargs() == replay.line_item_model_kwargs()
 
     estimate_version = EstimateVersion(**result.estimate_version_model_kwargs())
-    snapshot_entries = [EstimateSnapshotEntry(**payload) for payload in result.snapshot_entry_model_kwargs()]
+    snapshot_entries = [
+        EstimateSnapshotEntry(**payload) for payload in result.snapshot_entry_model_kwargs()
+    ]
     line_items = [EstimateItem(**payload) for payload in result.line_item_model_kwargs()]
 
     db_session.add(estimate_version)
@@ -343,9 +348,15 @@ async def test_engine_output_persists_and_replays_with_orm_payloads(
     assert len(persisted_snapshots) == 7
     assert len(persisted_items) == 5
 
-    quantity_snapshot = next(entry for entry in persisted_snapshots if entry.entry_key == "quantity:labour")
-    formula_snapshot = next(entry for entry in persisted_snapshots if entry.entry_key == "formula:rounded_markup")
-    assumption_snapshot = next(entry for entry in persisted_snapshots if entry.entry_key == "assumption:mobilisation")
+    quantity_snapshot = next(
+        entry for entry in persisted_snapshots if entry.entry_key == "quantity:labour"
+    )
+    formula_snapshot = next(
+        entry for entry in persisted_snapshots if entry.entry_key == "formula:rounded_markup"
+    )
+    assumption_snapshot = next(
+        entry for entry in persisted_snapshots if entry.entry_key == "assumption:mobilisation"
+    )
     formula_item = next(item for item in persisted_items if item.line_key == "line:formula")
     adjustment_item = next(item for item in persisted_items if item.line_key == "line:adjustment")
 
@@ -358,8 +369,19 @@ async def test_engine_output_persists_and_replays_with_orm_payloads(
         "output_key": "estimate.rounded_markup",
         "output_contract": {"kind": "money", "currency": "GBP", "unit": None, "per_unit": None},
         "declared_inputs": [
-            {"name": "rate", "contract": {"kind": "rate", "currency": "GBP", "unit": None, "per_unit": "m"}},
-            {"name": "quantity", "contract": {"kind": "quantity", "currency": None, "unit": "m", "per_unit": None}},
+            {
+                "name": "rate",
+                "contract": {"kind": "rate", "currency": "GBP", "unit": None, "per_unit": "m"},
+            },
+            {
+                "name": "quantity",
+                "contract": {
+                    "kind": "quantity",
+                    "currency": None,
+                    "unit": "m",
+                    "per_unit": None,
+                },
+            },
         ],
         "expression": {
             "kind": "multiply",
@@ -461,7 +483,9 @@ async def test_engine_output_replays_rate_lines_from_persisted_quantity_scale(
     replay = compose_estimate(_engine_input(Decimal("0.290000")))
 
     estimate_version = EstimateVersion(**result.estimate_version_model_kwargs())
-    snapshot_entries = [EstimateSnapshotEntry(**payload) for payload in result.snapshot_entry_model_kwargs()]
+    snapshot_entries = [
+        EstimateSnapshotEntry(**payload) for payload in result.snapshot_entry_model_kwargs()
+    ]
     line_items = [EstimateItem(**payload) for payload in result.line_item_model_kwargs()]
 
     db_session.add(estimate_version)
@@ -474,7 +498,9 @@ async def test_engine_output_replays_rate_lines_from_persisted_quantity_scale(
     persisted_snapshot = await db_session.scalar(
         select(EstimateSnapshotEntry).where(EstimateSnapshotEntry.entry_key == "quantity:labour")
     )
-    persisted_item = await db_session.scalar(select(EstimateItem).where(EstimateItem.line_key == "line:replay"))
+    persisted_item = await db_session.scalar(
+        select(EstimateItem).where(EstimateItem.line_key == "line:replay")
+    )
 
     assert persisted_snapshot is not None
     assert persisted_item is not None
