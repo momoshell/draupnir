@@ -174,6 +174,22 @@ def _quantity_length_total(values_by_type: dict[str, float]) -> float:
     return length_values[0]
 
 
+def _select_eligible_aggregate_quantity_item(quantity_items: list[QuantityItem]) -> QuantityItem:
+    """Return one deterministic aggregate quantity item eligible for estimate mapping."""
+    eligible_items = sorted(
+        (
+            item
+            for item in quantity_items
+            if item.item_kind == "aggregate"
+            and item.value is not None
+            and item.quantity_gate in {"allowed", "allowed_provisional"}
+        ),
+        key=lambda item: (item.quantity_type, str(item.id)),
+    )
+    assert eligible_items, "expected at least one eligible aggregate quantity item"
+    return eligible_items[0]
+
+
 def _quantity_takeoff_semantic_payload(
     takeoff: QuantityTakeoff,
     items: list[QuantityItem],
@@ -762,7 +778,7 @@ async def _persist_estimate_job_input(
         trusted_totals=quantity_takeoff.trusted_totals,
         currency="GBP",
         pricing_effective_date=date(2026, 1, 2),
-        pricing_mode="explicit_refs",
+        pricing_mode="explicit",
         assumptions_json=deepcopy(assumptions_json),
     )
 
@@ -4032,11 +4048,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4213,11 +4225,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4307,11 +4315,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4419,11 +4423,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4513,11 +4513,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4608,11 +4604,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4713,11 +4705,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4808,11 +4796,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -4895,11 +4879,7 @@ class TestJobs:
             quantity_items,
             estimate_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=estimate_job,
@@ -5001,11 +4981,7 @@ class TestJobs:
             quantity_items,
             engine_invalid_job,
         ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
-        quantity_item = next(
-            item
-            for item in quantity_items
-            if item.item_kind == "aggregate" and item.quantity_type.startswith("length")
-        )
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
 
         await _persist_estimate_job_input(
             estimate_job=engine_invalid_job,

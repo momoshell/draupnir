@@ -309,12 +309,11 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
     foreign_keys = schema["foreign_keys"]
 
     assert "estimate" in check_constraints["jobs"]["ck_jobs_job_type_valid"]
-    assert "estimate" in check_constraints["jobs"][
-        "ck_jobs_revision_scoped_base_revision_required"
-    ]
-    assert "estimate" in check_constraints["jobs"][
-        "ck_jobs_revision_scoped_extraction_profile_forbidden"
-    ]
+    assert "estimate" in check_constraints["jobs"]["ck_jobs_revision_scoped_base_revision_required"]
+    assert (
+        "estimate"
+        in check_constraints["jobs"]["ck_jobs_revision_scoped_extraction_profile_forbidden"]
+    )
 
     for required_column in (
         "estimate_job_id",
@@ -351,9 +350,7 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
         "ref_type",
         "selection_key",
     )
-    assert ("estimate_job_id", "ref_order") in unique_constraints[
-        "estimate_job_input_catalog_refs"
-    ]
+    assert ("estimate_job_id", "ref_order") in unique_constraints["estimate_job_input_catalog_refs"]
 
     for constraint_name in (
         "ck_estimate_job_inputs_source_job_type_estimate",
@@ -462,20 +459,25 @@ async def test_estimate_job_input_persists_lineage_catalog_refs_and_worker_bound
     assert persisted_input.assumptions_json == {"waste_factor": "10%"}
 
     refs = (
-        await db_session.execute(
-            select(EstimateJobInputCatalogRef)
-            .where(EstimateJobInputCatalogRef.estimate_job_id == estimate_job_id)
-            .order_by(EstimateJobInputCatalogRef.ref_order.asc())
+        (
+            await db_session.execute(
+                select(EstimateJobInputCatalogRef)
+                .where(EstimateJobInputCatalogRef.estimate_job_id == estimate_job_id)
+                .order_by(EstimateJobInputCatalogRef.ref_order.asc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert [(ref.ref_type, ref.selection_key, ref.ref_order) for ref in refs] == [
         ("rate", "labour:installer", 0),
         ("material", "cable:standard", 1),
         ("formula", "waste-factor:v1", 2),
     ]
 
-    assert worker_module.is_recoverable_enqueue_job_type(JobType.ESTIMATE) is False
-    assert worker_module.get_job_enqueue_publisher(JobType.ESTIMATE) is None
+    publisher = worker_module.get_job_enqueue_publisher(JobType.ESTIMATE)
+    assert worker_module.is_recoverable_enqueue_job_type(JobType.ESTIMATE) is True
+    assert publisher is not None
 
 
 async def test_estimate_job_contract_rejects_ambiguous_job_inputs(
