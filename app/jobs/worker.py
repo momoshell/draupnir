@@ -59,6 +59,7 @@ _RECOVERABLE_ENQUEUE_JOB_TYPES = (
     JobType.REPROCESS.value,
     JobType.QUANTITY_TAKEOFF.value,
 )
+_KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = frozenset({JobType.ESTIMATE.value})
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _ENQUEUE_STATUS_PENDING = "pending"
 _ENQUEUE_STATUS_PUBLISHING = "publishing"
@@ -132,6 +133,9 @@ def is_recoverable_enqueue_job_type(job_type: JobType | str) -> bool:
 def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None] | None:
     """Return the queue publisher registered for a persisted worker job type."""
     normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
+    if normalized_job_type in _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER:
+        return None
+
     registry: dict[str, Callable[[UUID], None]] = {
         JobType.INGEST.value: enqueue_ingest_job,
         JobType.REPROCESS.value: enqueue_ingest_job,

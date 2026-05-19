@@ -601,6 +601,7 @@ async def _create_quantity_takeoff_job(
     base_revision_id: uuid.UUID,
     parent_job_id: uuid.UUID,
     status: str,
+    job_type: str = JobType.QUANTITY_TAKEOFF.value,
     attempts: int = 0,
     max_attempts: int = 3,
 ) -> Job:
@@ -615,7 +616,7 @@ async def _create_quantity_takeoff_job(
         extraction_profile_id=None,
         base_revision_id=base_revision_id,
         parent_job_id=parent_job_id,
-        job_type=JobType.QUANTITY_TAKEOFF.value,
+        job_type=job_type,
         status=status,
         attempts=attempts,
         max_attempts=max_attempts,
@@ -3145,6 +3146,79 @@ class TestJobs:
         assert retried.extraction_profile_id is None
         assert retried.base_revision_id == original.base_revision_id
         assert retried.parent_job_id == original.parent_job_id
+
+    async def test_retry_job_noops_for_unrecoverable_estimate_job(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should no-op for failed estimate jobs without enqueue recovery."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            retried_job_ids.append(str(job_id))
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        ingest_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(ingest_job.id)
+        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
+        assert base_revision is not None
+
+        estimate_job = await _create_quantity_takeoff_job(
+            project_id=uuid.UUID(project["id"]),
+            file_id=uuid.UUID(uploaded["id"]),
+            base_revision_id=base_revision.id,
+            parent_job_id=ingest_job.id,
+            job_type=JobType.ESTIMATE.value,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+        )
+        await _update_job(
+            estimate_job.id,
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message="estimate worker unavailable",
+            enqueue_status="pending",
+            enqueue_attempts=2,
+        )
+
+        response = await async_client.post(f"/v1/jobs/{estimate_job.id}/retry")
+
+        assert response.status_code == 202
+        assert retried_job_ids == []
+        unchanged = await _get_job(estimate_job.id)
+        assert unchanged.status == "failed"
+        assert unchanged.attempts == estimate_job.attempts
+        assert unchanged.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert unchanged.error_message == "estimate worker unavailable"
+        assert unchanged.enqueue_status == "pending"
+        assert unchanged.enqueue_attempts == 2
+        assert unchanged.job_type == JobType.ESTIMATE.value
+        assert unchanged.extraction_profile_id is None
+        assert unchanged.base_revision_id == base_revision.id
+        assert unchanged.parent_job_id == ingest_job.id
 
     @pytest.mark.parametrize("status", ["pending", "running"])
     async def test_recover_incomplete_ingest_jobs_requeues_quantity_takeoff_jobs(
