@@ -3572,8 +3572,9 @@ class TestJobs:
             attempts=1,
             max_attempts=3,
         )
-        await _update_job(
+        original = await _update_job(
             estimate_job.id,
+            cancel_requested=True,
             error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message="estimate worker unavailable",
             enqueue_status="pending",
@@ -3586,15 +3587,19 @@ class TestJobs:
         assert retried_job_ids == [str(estimate_job.id)]
         retried = await _get_job(estimate_job.id)
         assert retried.status == "pending"
-        assert retried.attempts == estimate_job.attempts
+        assert retried.attempts == original.attempts
+        assert retried.cancel_requested is False
         assert retried.error_code is None
         assert retried.error_message is None
         assert retried.enqueue_status == "pending"
         assert retried.enqueue_attempts == 0
-        assert retried.job_type == JobType.ESTIMATE.value
+        assert retried.project_id == original.project_id
+        assert retried.file_id == original.file_id
+        assert retried.job_type == original.job_type
+        assert retried.extraction_profile_id == original.extraction_profile_id
         assert retried.extraction_profile_id is None
-        assert retried.base_revision_id == base_revision.id
-        assert retried.parent_job_id == ingest_job.id
+        assert retried.base_revision_id == original.base_revision_id
+        assert retried.parent_job_id == original.parent_job_id
 
     def test_build_estimate_worker_mapping_v1_maps_rate_material_and_formula_refs(
         self,
@@ -4571,6 +4576,114 @@ class TestJobs:
         assert response.status_code == 200
         assert response.json()["items"][-1]["data_json"] == {"status": "cancelled"}
 
+    @pytest.mark.parametrize("failure_mode", ["mapping", "engine"])
+    async def test_process_estimate_job_prefers_cancelled_for_deterministic_failures(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        failure_mode: str,
+    ) -> None:
+        """Cancel requests should win over deterministic estimate mapping and engine failures."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            quantity_takeoff,
+            quantity_items,
+            estimate_job,
+        ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
+
+        await _persist_estimate_job_input(
+            estimate_job=estimate_job,
+            quantity_takeoff=quantity_takeoff,
+            assumptions_json={},
+            catalog_refs=[
+                {
+                    "ref_type": "rate",
+                    "selection_key": "paint-labor",
+                    "ref_order": 20,
+                    "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000234"),
+                    "catalog_checksum_sha256": "a" * 64,
+                    "selection_context_json": {
+                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "line_key": "line-rate",
+                        "line_type": "rate",
+                        "description": "Paint labor",
+                        "quantity_item_id": str(quantity_item.id),
+                    },
+                }
+            ],
+        )
+
+        async def _resolve_rate(*args: Any, **kwargs: Any) -> Any:
+            _ = (args, kwargs)
+            return types.SimpleNamespace(
+                id=uuid.UUID("00000000-0000-0000-0000-000000000234"),
+                rate_key="paint-labor",
+                item_type="labor",
+                unit=quantity_item.unit,
+                currency="GBP",
+                value=Decimal("12.50"),
+                effective_start=date(2026, 1, 2),
+                checksum_sha256="a" * 64,
+                metadata={},
+            )
+
+        original_build_execution_input = worker_module._build_estimate_engine_input
+
+        async def _cancel_with_failure(
+            job_id: uuid.UUID,
+            *,
+            attempt_token: uuid.UUID,
+        ) -> Any:
+            engine_input = await original_build_execution_input(job_id, attempt_token=attempt_token)
+            await _update_job(job_id, cancel_requested=True)
+            if failure_mode == "mapping":
+                raise worker_module._build_estimate_job_input_error(
+                    "missing_worker_mapping_version"
+                )
+            return engine_input
+
+        def _raise_engine_input_invalid(_: Any) -> Any:
+            raise EstimateEngineError(
+                cast(Any, "INPUT_INVALID"),
+                "engine_input_invalid",
+                "engine rejected input",
+            )
+
+        monkeypatch.setattr(worker_module, "resolve_rate", _resolve_rate)
+        monkeypatch.setattr(
+            worker_module,
+            "_build_estimate_engine_input",
+            _cancel_with_failure,
+        )
+        if failure_mode == "engine":
+            monkeypatch.setattr(worker_module, "compose_estimate", _raise_engine_input_invalid)
+
+        await worker_module.process_estimate_job(estimate_job.id)
+
+        updated_job = await _get_job(estimate_job.id)
+        estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
+        assert updated_job.status == "cancelled"
+        assert updated_job.attempts == 1
+        assert updated_job.cancel_requested is True
+        assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated_job.error_message is None
+        assert estimate_versions == []
+
+        response = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
+        assert response.status_code == 200
+        assert response.json()["items"][-1]["data_json"] == {"status": "cancelled"}
+
     async def test_finalize_estimate_job_skips_existing_output_without_duplicates(
         self,
         async_client: httpx.AsyncClient,
@@ -4636,6 +4749,12 @@ class TestJobs:
         await worker_module.process_estimate_job(estimate_job.id)
         estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
         assert len(estimate_versions) == 1
+        estimate_version = estimate_versions[0]
+        line_item_ids_before = [
+            item.id for item in await _get_estimate_items_for_version(estimate_version.id)
+        ]
+        response_before = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
+        assert response_before.status_code == 200
 
         duplicate_attempt_token = uuid.uuid4()
         session_maker = session_module.AsyncSessionLocal
@@ -4658,9 +4777,27 @@ class TestJobs:
             attempt_token=duplicate_attempt_token,
             output=real_compose_estimate(engine_input),
         )
+        finalized_repeat = await worker_module._finalize_estimate_job(
+            estimate_job.id,
+            attempt_token=duplicate_attempt_token,
+            output=real_compose_estimate(engine_input),
+        )
 
         assert finalized is False
-        assert len(await _get_estimate_versions_for_job(estimate_job.id)) == 1
+        assert finalized_repeat is False
+        estimate_versions_after = await _get_estimate_versions_for_job(estimate_job.id)
+        assert len(estimate_versions_after) == 1
+        assert estimate_versions_after[0].id == estimate_version.id
+        assert [
+            item.id for item in await _get_estimate_items_for_version(estimate_version.id)
+        ] == line_item_ids_before
+        response_after = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
+        assert response_after.status_code == 200
+        assert response_after.json()["items"] == response_before.json()["items"]
+        updated_job = await _get_job(estimate_job.id)
+        assert updated_job.status == "running"
+        assert updated_job.attempts == 1
+        assert updated_job.attempt_token == duplicate_attempt_token
 
     async def test_finalize_estimate_job_skips_stale_attempt_without_output(
         self,
@@ -4763,6 +4900,95 @@ class TestJobs:
         assert updated_job.attempt_token == current_lease.token
         assert updated_job.finished_at is None
 
+    async def test_process_estimate_job_terminal_redelivery_does_not_duplicate_output(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A duplicate delivery after success should not create another estimate output."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            quantity_takeoff,
+            quantity_items,
+            estimate_job,
+        ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
+
+        await _persist_estimate_job_input(
+            estimate_job=estimate_job,
+            quantity_takeoff=quantity_takeoff,
+            assumptions_json={"tax_rate": "0.20"},
+            catalog_refs=[
+                {
+                    "ref_type": "rate",
+                    "selection_key": "paint-labor",
+                    "ref_order": 20,
+                    "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000239"),
+                    "catalog_checksum_sha256": "f" * 64,
+                    "selection_context_json": {
+                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "line_key": "line-rate",
+                        "line_type": "rate",
+                        "description": "Paint labor",
+                        "quantity_item_id": str(quantity_item.id),
+                    },
+                }
+            ],
+        )
+
+        async def _resolve_rate(*args: Any, **kwargs: Any) -> Any:
+            _ = (args, kwargs)
+            return types.SimpleNamespace(
+                id=uuid.UUID("00000000-0000-0000-0000-000000000239"),
+                rate_key="paint-labor",
+                item_type="labor",
+                unit=quantity_item.unit,
+                currency="GBP",
+                value=Decimal("12.50"),
+                effective_start=date(2026, 1, 2),
+                checksum_sha256="f" * 64,
+                metadata={"crew": "A"},
+            )
+
+        monkeypatch.setattr(worker_module, "resolve_rate", _resolve_rate)
+
+        await worker_module.process_estimate_job(estimate_job.id)
+        response_before = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
+        assert response_before.status_code == 200
+        versions_before = await _get_estimate_versions_for_job(estimate_job.id)
+        assert len(versions_before) == 1
+        version_before = versions_before[0]
+        item_ids_before = [
+            item.id for item in await _get_estimate_items_for_version(version_before.id)
+        ]
+
+        await worker_module.process_estimate_job(estimate_job.id)
+
+        updated_job = await _get_job(estimate_job.id)
+        versions_after = await _get_estimate_versions_for_job(estimate_job.id)
+        assert len(versions_after) == 1
+        version_after = versions_after[0]
+        item_ids_after = [
+            item.id for item in await _get_estimate_items_for_version(version_after.id)
+        ]
+        response_after = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
+        assert response_after.status_code == 200
+        assert updated_job.status == "succeeded"
+        assert updated_job.attempts == 1
+        assert version_after.id == version_before.id
+        assert item_ids_after == item_ids_before
+        assert response_after.json()["items"] == response_before.json()["items"]
+
     async def test_process_estimate_job_fails_revision_drift_without_output(
         self,
         async_client: httpx.AsyncClient,
@@ -4854,14 +5080,14 @@ class TestJobs:
         assert updated_job.error_code == ErrorCode.REVISION_CONFLICT.value
         assert estimate_versions == []
 
-    async def test_process_estimate_job_rolls_back_outputs_when_insert_fails(
+    async def test_process_estimate_job_rollback_clears_staged_outputs_when_item_insert_fails(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Estimate finalization failures should roll back outputs and terminal success."""
+        """Estimate finalization rollback should remove staged rows and success events."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -4914,28 +5140,102 @@ class TestJobs:
                 metadata={},
             )
 
-        def _raise_insert_failure(*args: Any, **kwargs: Any) -> Any:
-            _ = (args, kwargs)
-            raise IntegrityError("insert into estimate_items", {}, RuntimeError("boom"))
+        class _InvalidLineItemOutput:
+            def __init__(self, output: Any) -> None:
+                self._output = output
+
+            def estimate_version_model_kwargs(self) -> dict[str, Any]:
+                return cast(dict[str, Any], self._output.estimate_version_model_kwargs())
+
+            def snapshot_entry_model_kwargs(self) -> Any:
+                return self._output.snapshot_entry_model_kwargs()
+
+            def line_item_model_kwargs(self) -> Any:
+                line_item_kwargs = [
+                    dict(kwargs) for kwargs in self._output.line_item_model_kwargs()
+                ]
+                assert line_item_kwargs != []
+                assert "estimate_version_id" in line_item_kwargs[0]
+                line_item_kwargs[0]["estimate_version_id"] = uuid.uuid4()
+                return line_item_kwargs
+
+        def _compose_invalid_line_item(engine_input: Any) -> Any:
+            return _InvalidLineItemOutput(real_compose_estimate(engine_input))
 
         monkeypatch.setattr(worker_module, "resolve_rate", _resolve_rate)
-        monkeypatch.setattr(worker_module, "EstimateItem", _raise_insert_failure)
+        monkeypatch.setattr(worker_module, "compose_estimate", _compose_invalid_line_item)
 
         with pytest.raises(IntegrityError):
             await worker_module.process_estimate_job(estimate_job.id)
 
         updated_job = await _get_job(estimate_job.id)
-        estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
         assert updated_job.status == "failed"
+        assert updated_job.attempts == 1
+        assert updated_job.attempts < updated_job.max_attempts
         assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
         assert updated_job.error_message == worker_module._FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE
-        assert estimate_versions == []
 
         response = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
         assert response.status_code == 200
-        event_payload = response.json()["items"][-1]["data_json"]
+        event_items = response.json()["items"]
+        event_payload = event_items[-1]["data_json"]
         assert event_payload["status"] == "failed"
         assert event_payload["error_code"] == ErrorCode.INTERNAL_ERROR.value
+        assert event_payload["error_message"] == worker_module._FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE
+        assert all(
+            item["data_json"].get("status") != "succeeded"
+            for item in event_items
+            if isinstance(item.get("data_json"), dict)
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            estimate_versions = (
+                (
+                    await session.execute(
+                        select(EstimateVersion)
+                        .where(EstimateVersion.source_job_id == estimate_job.id)
+                        .order_by(EstimateVersion.created_at.asc(), EstimateVersion.id.asc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            snapshot_entries = (
+                (
+                    await session.execute(
+                        select(EstimateSnapshotEntry).where(
+                            EstimateSnapshotEntry.estimate_version_id.in_(
+                                select(EstimateVersion.id).where(
+                                    EstimateVersion.source_job_id == estimate_job.id
+                                )
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            line_items = (
+                (
+                    await session.execute(
+                        select(EstimateItem).where(
+                            EstimateItem.estimate_version_id.in_(
+                                select(EstimateVersion.id).where(
+                                    EstimateVersion.source_job_id == estimate_job.id
+                                )
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        assert list(estimate_versions) == []
+        assert list(snapshot_entries) == []
+        assert list(line_items) == []
 
     async def test_process_estimate_job_fails_invalid_mapping_without_output_rows(
         self,
@@ -6404,6 +6704,100 @@ class TestJobs:
         unchanged = await _get_job(job.id)
         assert unchanged.status == "cancelled"
         assert unchanged.attempts == 1
+
+    @pytest.mark.parametrize(
+        ("status", "attempts", "max_attempts", "error_code", "error_message"),
+        [
+            pytest.param(
+                "failed",
+                3,
+                3,
+                None,
+                "maxed out",
+                id="attempt-limit",
+            ),
+            pytest.param(
+                "failed",
+                1,
+                3,
+                ErrorCode.REVISION_CONFLICT.value,
+                "Estimate base revision changed before finalization.",
+                id="revision-conflict",
+            ),
+            pytest.param(
+                "cancelled",
+                1,
+                3,
+                ErrorCode.JOB_CANCELLED.value,
+                None,
+                id="cancelled",
+            ),
+        ],
+    )
+    async def test_retry_job_noops_for_non_retryable_estimate_states(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+        attempts: int,
+        max_attempts: int,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> None:
+        """Estimate retry should preserve lineage and skip non-retryable terminal states."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            retried_job_ids.append(str(job_id))
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
+            raising=False,
+        )
+
+        _, uploaded, ingest_job, base_revision, estimate_job = await _create_ready_estimate_job(
+            async_client
+        )
+        original = await _update_job(
+            estimate_job.id,
+            status=status,
+            attempts=attempts,
+            max_attempts=max_attempts,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+        response = await async_client.post(f"/v1/jobs/{estimate_job.id}/retry")
+
+        assert response.status_code == 202
+        assert retried_job_ids == []
+        unchanged = await _get_job(estimate_job.id)
+        assert unchanged.status == original.status
+        assert unchanged.attempts == original.attempts
+        assert unchanged.max_attempts == original.max_attempts
+        assert unchanged.error_code == original.error_code
+        assert unchanged.error_message == original.error_message
+        assert unchanged.project_id == original.project_id
+        assert unchanged.file_id == uuid.UUID(uploaded["id"])
+        assert unchanged.job_type == JobType.ESTIMATE.value
+        assert unchanged.base_revision_id == base_revision.id
+        assert unchanged.parent_job_id == ingest_job.id
 
     async def test_retry_job_returns_404_for_unknown_job(
         self,
