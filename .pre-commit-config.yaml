@@ -1,7 +1,7 @@
 # =============================================================================
 # Draupnir — Pre-commit Hooks
 # =============================================================================
-# Install:  uv sync --extra db --extra jobs --extra dev --extra test && uv run pre-commit install
+# Install:  uv sync --extra db --extra jobs --extra dev --extra test && make hooks
 # Run all:  uv run pre-commit run --all-files
 # =============================================================================
 
