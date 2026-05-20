@@ -773,7 +773,7 @@ async def _persist_estimate_job_input(
         source_file_id=estimate_job.file_id,
         drawing_revision_id=quantity_takeoff.drawing_revision_id,
         quantity_takeoff_id=quantity_takeoff.id,
-        source_job_type=quantity_takeoff.source_job_type,
+        source_job_type="estimate",
         quantity_gate=quantity_takeoff.quantity_gate,
         trusted_totals=quantity_takeoff.trusted_totals,
         currency="GBP",

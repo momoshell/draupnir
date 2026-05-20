@@ -1473,7 +1473,8 @@ async def _build_estimate_engine_input(
             or quantity_takeoff.id != estimate_input.quantity_takeoff_id
             or quantity_takeoff.quantity_gate != estimate_input.quantity_gate
             or quantity_takeoff.trusted_totals is not estimate_input.trusted_totals
-            or quantity_takeoff.source_job_type != estimate_input.source_job_type
+            or quantity_takeoff.source_job_type != JobType.QUANTITY_TAKEOFF.value
+            or estimate_input.source_job_type != JobType.ESTIMATE.value
         ):
             raise _build_estimate_job_input_error(
                 "quantity_takeoff_lineage_mismatch",
