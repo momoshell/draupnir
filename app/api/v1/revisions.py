@@ -33,6 +33,7 @@ from app.jobs.worker import enqueue_quantity_takeoff_job as _enqueue_quantity_ta
 from app.jobs.worker import prepare_job_enqueue_intent, publish_job_enqueue_intent
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
+from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
@@ -46,6 +47,14 @@ from app.models.revision_materialization import (
     RevisionLayout,
 )
 from app.models.validation_report import ValidationReport
+from app.schemas.estimate import (
+    EstimateItemListResponse,
+    EstimateItemRead,
+    EstimateSnapshotEntryListResponse,
+    EstimateSnapshotEntryRead,
+    EstimateVersionListResponse,
+    EstimateVersionRead,
+)
 from app.schemas.job import JobRead
 from app.schemas.quantity_takeoff import (
     QuantityItemListResponse,
@@ -99,9 +108,11 @@ class _GeneratedArtifactCursor(BaseModel):
 def _encode_cursor(payload: BaseModel) -> str:
     """Encode a pagination cursor payload as an opaque token."""
 
-    return base64.urlsafe_b64encode(payload.model_dump_json().encode("utf-8")).decode(
-        "utf-8"
-    ).rstrip("=")
+    return (
+        base64.urlsafe_b64encode(payload.model_dump_json().encode("utf-8"))
+        .decode("utf-8")
+        .rstrip("=")
+    )
 
 
 def _decode_revision_cursor(cursor: str) -> _DrawingRevisionCursor:
@@ -147,14 +158,44 @@ def _encode_timestamp_cursor(created_at: datetime, row_id: UUID) -> str:
     return encode_cursor_payload({"created_at": created_at.isoformat(), "id": str(row_id)})
 
 
+def _encode_estimate_item_cursor(line_number: int, row_id: UUID) -> str:
+    """Encode an opaque line-number/id pagination cursor."""
+
+    return encode_cursor_payload({"line_number": line_number, "id": str(row_id)})
+
+
+def _encode_estimate_snapshot_entry_cursor(sort_order: int, row_id: UUID) -> str:
+    """Encode an opaque sort-order/id pagination cursor."""
+
+    return encode_cursor_payload({"sort_order": sort_order, "id": str(row_id)})
+
+
 def _decode_timestamp_cursor(cursor: str) -> tuple[datetime, UUID]:
     """Decode a timestamp/id pagination cursor."""
 
     try:
         cursor_data = decode_cursor_payload(cursor)
-        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
-            str(cursor_data["id"])
-        )
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(str(cursor_data["id"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
+
+
+def _decode_estimate_item_cursor(cursor: str) -> tuple[int, UUID]:
+    """Decode a line-number/id pagination cursor."""
+
+    try:
+        cursor_data = decode_cursor_payload(cursor)
+        return int(cursor_data["line_number"]), UUID(str(cursor_data["id"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise_invalid_cursor(exc)
+
+
+def _decode_estimate_snapshot_entry_cursor(cursor: str) -> tuple[int, UUID]:
+    """Decode a sort-order/id pagination cursor."""
+
+    try:
+        cursor_data = decode_cursor_payload(cursor)
+        return int(cursor_data["sort_order"]), UUID(str(cursor_data["id"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise_invalid_cursor(exc)
 
@@ -191,11 +232,7 @@ async def _get_active_file(file_id: UUID, db: AsyncSession) -> File | None:
     result = await db.execute(
         select(File)
         .join(Project, Project.id == File.project_id)
-        .where(
-            (File.id == file_id)
-            & (File.deleted_at.is_(None))
-            & (Project.deleted_at.is_(None))
-        )
+        .where((File.id == file_id) & (File.deleted_at.is_(None)) & (Project.deleted_at.is_(None)))
     )
     return result.scalar_one_or_none()
 
@@ -322,9 +359,7 @@ def _raise_quantity_takeoff_gate_invalid(report: ValidationReport) -> None:
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=create_error_response(
             code=ErrorCode.INPUT_INVALID,
-            message=(
-                "Quantity takeoff requires a revision with an allowed quantity gate."
-            ),
+            message=("Quantity takeoff requires a revision with an allowed quantity gate."),
             details={
                 "quantity_gate": report.quantity_gate,
                 "review_state": report.review_state,
@@ -362,6 +397,36 @@ async def _get_revision_quantity_takeoff_or_404(
 
     assert takeoff is not None
     return takeoff
+
+
+async def _get_revision_estimate_version_or_404(
+    revision_id: UUID,
+    estimate_version_id: UUID,
+    db: AsyncSession,
+) -> EstimateVersion:
+    """Return a committed estimate version scoped to an active revision."""
+
+    result = await db.execute(
+        select(EstimateVersion)
+        .join(
+            File,
+            (File.id == EstimateVersion.source_file_id)
+            & (File.project_id == EstimateVersion.project_id),
+        )
+        .join(Project, Project.id == EstimateVersion.project_id)
+        .where(
+            (EstimateVersion.id == estimate_version_id)
+            & (EstimateVersion.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    estimate_version = result.scalar_one_or_none()
+    if estimate_version is None:
+        raise_not_found("Estimate version", str(estimate_version_id))
+
+    assert estimate_version is not None
+    return estimate_version
 
 
 @revisions_router.get("/files/{file_id}/revisions", response_model=DrawingRevisionListResponse)
@@ -409,13 +474,11 @@ async def list_file_revisions(
         )
 
     result = await db.execute(
-        query
-        .order_by(
+        query.order_by(
             DrawingRevision.revision_sequence.asc(),
             DrawingRevision.created_at.asc(),
             DrawingRevision.id.asc(),
-        )
-        .limit(limit + 1)
+        ).limit(limit + 1)
     )
     revisions = result.scalars().all()
     page = revisions[:limit]
@@ -657,10 +720,7 @@ async def list_revision_layouts(
         sequence_index, row_id = pagination_cursor
         query = query.where(
             (RevisionLayout.sequence_index > sequence_index)
-            | (
-                (RevisionLayout.sequence_index == sequence_index)
-                & (RevisionLayout.id > row_id)
-            )
+            | ((RevisionLayout.sequence_index == sequence_index) & (RevisionLayout.id > row_id))
         )
 
     result = await db.execute(
@@ -1001,6 +1061,212 @@ async def list_revision_quantity_takeoff_items(
 
     return QuantityItemListResponse(
         items=[QuantityItemRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/estimates",
+    response_model=EstimateVersionListResponse,
+)
+async def list_revision_estimates(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> EstimateVersionListResponse:
+    """List committed estimate versions for an active drawing revision."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    pagination_cursor = _decode_timestamp_cursor(cursor) if cursor else None
+    query = (
+        select(EstimateVersion)
+        .join(
+            File,
+            (File.id == EstimateVersion.source_file_id)
+            & (File.project_id == EstimateVersion.project_id),
+        )
+        .join(Project, Project.id == EstimateVersion.project_id)
+        .where(
+            (EstimateVersion.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    if pagination_cursor is not None:
+        created_at, row_id = pagination_cursor
+        query = query.where(
+            (EstimateVersion.created_at > created_at)
+            | ((EstimateVersion.created_at == created_at) & (EstimateVersion.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(EstimateVersion.created_at.asc(), EstimateVersion.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+
+    return EstimateVersionListResponse(
+        items=[EstimateVersionRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/estimates/{estimate_version_id}",
+    response_model=EstimateVersionRead,
+)
+async def get_revision_estimate(
+    revision_id: UUID,
+    estimate_version_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> EstimateVersionRead:
+    """Return a committed estimate version for an active drawing revision."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    estimate_version = await _get_revision_estimate_version_or_404(
+        revision_id, estimate_version_id, db
+    )
+    return EstimateVersionRead.model_validate(estimate_version)
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/estimates/{estimate_version_id}/items",
+    response_model=EstimateItemListResponse,
+)
+async def list_revision_estimate_items(
+    revision_id: UUID,
+    estimate_version_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> EstimateItemListResponse:
+    """List committed estimate items for a revision-scoped estimate version."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    await _get_revision_estimate_version_or_404(revision_id, estimate_version_id, db)
+    pagination_cursor = _decode_estimate_item_cursor(cursor) if cursor else None
+    query = (
+        select(EstimateItem)
+        .join(
+            EstimateVersion,
+            (EstimateVersion.id == EstimateItem.estimate_version_id)
+            & (EstimateVersion.project_id == EstimateItem.project_id)
+            & (EstimateVersion.drawing_revision_id == EstimateItem.drawing_revision_id),
+        )
+        .join(
+            File,
+            (File.id == EstimateVersion.source_file_id)
+            & (File.project_id == EstimateVersion.project_id),
+        )
+        .join(Project, Project.id == EstimateVersion.project_id)
+        .where(
+            (EstimateItem.estimate_version_id == estimate_version_id)
+            & (EstimateItem.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    if pagination_cursor is not None:
+        line_number, row_id = pagination_cursor
+        query = query.where(
+            (EstimateItem.line_number > line_number)
+            | ((EstimateItem.line_number == line_number) & (EstimateItem.id > row_id))
+        )
+
+    result = await db.execute(
+        query.order_by(EstimateItem.line_number.asc(), EstimateItem.id.asc()).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_estimate_item_cursor(last_row.line_number, last_row.id)
+
+    return EstimateItemListResponse(
+        items=[EstimateItemRead.model_validate(row) for row in page],
+        next_cursor=next_cursor,
+    )
+
+
+@revisions_router.get(
+    "/revisions/{revision_id}/estimates/{estimate_version_id}/snapshot-entries",
+    response_model=EstimateSnapshotEntryListResponse,
+)
+async def list_revision_estimate_snapshot_entries(
+    revision_id: UUID,
+    estimate_version_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=_MAX_PAGE_SIZE)] = _DEFAULT_PAGE_SIZE,
+    cursor: str | None = Query(default=None),
+) -> EstimateSnapshotEntryListResponse:
+    """List committed estimate snapshot entries for a revision-scoped estimate version."""
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+
+    await _get_revision_estimate_version_or_404(revision_id, estimate_version_id, db)
+    pagination_cursor = _decode_estimate_snapshot_entry_cursor(cursor) if cursor else None
+    query = (
+        select(EstimateSnapshotEntry)
+        .join(
+            EstimateVersion,
+            (EstimateVersion.id == EstimateSnapshotEntry.estimate_version_id)
+            & (EstimateVersion.project_id == EstimateSnapshotEntry.project_id)
+            & (EstimateVersion.drawing_revision_id == EstimateSnapshotEntry.drawing_revision_id),
+        )
+        .join(
+            File,
+            (File.id == EstimateVersion.source_file_id)
+            & (File.project_id == EstimateVersion.project_id),
+        )
+        .join(Project, Project.id == EstimateVersion.project_id)
+        .where(
+            (EstimateSnapshotEntry.estimate_version_id == estimate_version_id)
+            & (EstimateSnapshotEntry.drawing_revision_id == revision_id)
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    if pagination_cursor is not None:
+        sort_order, row_id = pagination_cursor
+        query = query.where(
+            (EstimateSnapshotEntry.sort_order > sort_order)
+            | (
+                (EstimateSnapshotEntry.sort_order == sort_order)
+                & (EstimateSnapshotEntry.id > row_id)
+            )
+        )
+
+    result = await db.execute(
+        query.order_by(
+            EstimateSnapshotEntry.sort_order.asc(), EstimateSnapshotEntry.id.asc()
+        ).limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last_row = page[-1]
+        next_cursor = _encode_estimate_snapshot_entry_cursor(last_row.sort_order, last_row.id)
+
+    return EstimateSnapshotEntryListResponse(
+        items=[EstimateSnapshotEntryRead.model_validate(row) for row in page],
         next_cursor=next_cursor,
     )
 
