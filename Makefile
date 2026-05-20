@@ -11,7 +11,7 @@
 #   make test        — Run pytest
 #   make format      — Run ruff formatter on app/ and tests/
 #   make check       — Run lint + typecheck + test
-#   make hooks       — Install pre-commit hooks via uv
+#   make hooks       — Install pre-commit + adaptive pre-push hooks
 #   make up          — Start Docker Compose stack
 #   make down        — Stop Docker Compose stack
 #   make logs        — Follow Docker Compose logs
@@ -22,6 +22,8 @@
 # =============================================================================
 
 UV_SYNC_ARGS = --extra db --extra jobs --extra dev --extra test
+PRE_PUSH_HOOK = .git/hooks/pre-push
+PRE_PUSH_HOOK_VERSION = v1
 
 .PHONY: sync lint typecheck test format check hooks up down logs ps shell-api shell-worker migrate
 
@@ -44,6 +46,9 @@ check: lint typecheck test
 
 hooks:
 	uv run pre-commit install
+	@mkdir -p "$(dir $(PRE_PUSH_HOOK))"
+	@printf '%s\n' '#!/bin/sh' '# draupnir pre-push ci-parity $(PRE_PUSH_HOOK_VERSION)' 'exec uv run python scripts/pre_push_check.py "$$@"' > "$(PRE_PUSH_HOOK)"
+	@chmod +x "$(PRE_PUSH_HOOK)"
 
 # ---------------------------------------------------------------------------
 # Docker Compose targets
