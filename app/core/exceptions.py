@@ -1,5 +1,6 @@
 """Custom exception handlers and error response utilities."""
 
+from collections.abc import Mapping, Sequence
 from http import HTTPStatus
 from typing import Any
 
@@ -26,6 +27,19 @@ class APIErrorResponse(BaseModel):
     error: APIError
 
 
+def _sanitize_error_details(details: Any) -> Any:
+    """Convert arbitrary detail payloads into JSON-serializable values."""
+    if details is None or isinstance(details, (str, int, float, bool)):
+        return details
+    if isinstance(details, BaseException):
+        return str(details)
+    if isinstance(details, Mapping):
+        return {str(key): _sanitize_error_details(value) for key, value in details.items()}
+    if isinstance(details, Sequence) and not isinstance(details, str):
+        return [_sanitize_error_details(value) for value in details]
+    return str(details)
+
+
 def create_error_response(
     code: ErrorCode,
     message: str,
@@ -42,7 +56,11 @@ def create_error_response(
         Dictionary matching the APIErrorResponse schema
     """
     return APIErrorResponse(
-        error=APIError(code=code, message=message, details=details)
+        error=APIError(
+            code=code,
+            message=message,
+            details=_sanitize_error_details(details),
+        )
     ).model_dump(mode="json")
 
 

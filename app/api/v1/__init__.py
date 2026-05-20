@@ -1,5 +1,6 @@
 """API v1 routers."""
 
+from app.api.v1.estimation import estimation_router
 from app.api.v1.files import files_router
 from app.api.v1.health import health_router
 from app.api.v1.jobs import jobs_router
@@ -8,6 +9,7 @@ from app.api.v1.revisions import revisions_router
 from app.api.v1.system import system_router
 
 __all__ = [
+    "estimation_router",
     "files_router",
     "health_router",
     "jobs_router",

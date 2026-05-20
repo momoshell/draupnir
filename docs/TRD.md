@@ -920,6 +920,69 @@ Catalog scope and mutation rules:
 - Job progress should be observable through polling first, events later.
 - API-key auth should be easy to add later.
 
+### Estimation Catalog And Formula APIs
+
+MVP estimation API scope here is limited to catalog and formula definition
+management. This section does not define estimate creation, estimate generation,
+or any UI/CLI workflow.
+
+Endpoint families under `/v1`:
+
+- `POST /v1/estimation/catalog/rates`
+- `GET /v1/estimation/catalog/rates`
+- `GET /v1/estimation/catalog/rates/{rate_id}`
+- `POST /v1/estimation/catalog/materials`
+- `GET /v1/estimation/catalog/materials`
+- `GET /v1/estimation/catalog/materials/{material_id}`
+- `POST /v1/estimation/formulas`
+- `GET /v1/estimation/formulas`
+- `GET /v1/estimation/formulas/{formula_definition_id}`
+
+Shared write/read invariants:
+
+- Create endpoints are append-only and immutable. Replacements happen by writing
+  a new row, not by mutating an existing row in place.
+- Write endpoints may accept an optional `Idempotency-Key` header.
+- The server derives and persists checksums; clients must not be the source of
+  truth for stored checksum values.
+- Read responses for rates, materials, and formulas must include the persisted
+  checksum and any supersession metadata.
+- Supersession metadata is optional and must support append-only lineage such as
+  `supersedes_*` and `superseded_by_*` relationships without rewriting history.
+- Missing or soft-deleted project scope must be treated as not found rather than
+  silently falling back to another scope.
+
+List endpoint behavior:
+
+- List endpoints use cursor pagination.
+- `include_superseded` defaults to `false`.
+- Rates and materials support filtering by scope, project, stable key, source,
+  unit, currency, and `as_of`.
+- `as_of` filtering for rates and materials uses half-open effective-date logic:
+  `effective_from <= as_of < effective_to`, with `effective_to` nullable for an
+  open-ended current row.
+- Formula list endpoints support filters for scope, project, formula id,
+  version, DSL version, and output key.
+
+Resource semantics:
+
+- Rate and material create/read/list APIs must expose global rows and
+  project-scoped rows without collapsing them into one mutable current record.
+- Formula create/read/list APIs must expose immutable versioned definitions,
+  including the Formula DSL payload and output contract metadata.
+- Read-by-id endpoints return one immutable resource row by durable id and do
+  not perform estimate execution or preview generation.
+
+Standard error behavior:
+
+- Errors use the standard envelope `{error:{code,message,details}}`.
+- Return `404` when the addressed project is missing or soft-deleted, or when
+  the requested catalog/formula resource does not exist.
+- Return `422` with `INPUT_INVALID` for invalid Formula DSL payloads or invalid
+  request shape.
+- Return `409` with `DB_CONFLICT` for uniqueness conflicts, effective-date
+  overlap conflicts, or invalid supersession/conflict cases.
+
 ## Non-Functional Requirements
 
 - Local development must work through Docker Compose.
