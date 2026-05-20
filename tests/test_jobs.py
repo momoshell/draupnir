@@ -35,13 +35,22 @@ from app.ingestion.contracts import (
     ProgressUpdate,
 )
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
-from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
+from app.ingestion.runner import (
+    IngestionRunnerError,
+    IngestionRunRequest,
+)
 from app.ingestion.runner import (
     run_ingestion as real_run_ingestion,
 )
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
+from app.models.estimation_catalog import (
+    CatalogScopeType,
+    EstimationFormula,
+    EstimationMaterial,
+    EstimationRate,
+)
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
@@ -782,6 +791,75 @@ async def _persist_estimate_job_input(
         assumptions_json=deepcopy(assumptions_json),
     )
 
+    catalog_rows: list[EstimationRate | EstimationMaterial | EstimationFormula] = []
+    for ref_payload in catalog_refs:
+        ref_type = cast(str, ref_payload["ref_type"])
+        selection_key = cast(str, ref_payload["selection_key"])
+        checksum = cast(str, ref_payload["catalog_checksum_sha256"])
+
+        if ref_type == "rate":
+            rate_id = cast(uuid.UUID, ref_payload["rate_catalog_entry_id"])
+            catalog_rows.append(
+                EstimationRate(
+                    id=rate_id,
+                    scope_type=CatalogScopeType.PROJECT,
+                    project_id=estimate_job.project_id,
+                    rate_key=selection_key,
+                    source="tests.test_jobs",
+                    metadata_json={},
+                    name=selection_key,
+                    item_type="labor",
+                    per_unit="meter",
+                    currency="GBP",
+                    amount=Decimal("1.00"),
+                    effective_from=estimate_input.pricing_effective_date,
+                    effective_to=None,
+                    checksum_sha256=checksum,
+                )
+            )
+            continue
+
+        if ref_type == "material":
+            material_id = cast(uuid.UUID, ref_payload["material_catalog_entry_id"])
+            catalog_rows.append(
+                EstimationMaterial(
+                    id=material_id,
+                    scope_type=CatalogScopeType.PROJECT,
+                    project_id=estimate_job.project_id,
+                    material_key=selection_key,
+                    source="tests.test_jobs",
+                    metadata_json={},
+                    name=selection_key,
+                    unit="meter",
+                    currency="GBP",
+                    unit_cost=Decimal("1.00"),
+                    effective_from=estimate_input.pricing_effective_date,
+                    effective_to=None,
+                    checksum_sha256=checksum,
+                )
+            )
+            continue
+
+        if ref_type == "formula":
+            formula_id = cast(uuid.UUID, ref_payload["formula_definition_id"])
+            catalog_rows.append(
+                EstimationFormula(
+                    id=formula_id,
+                    scope_type=CatalogScopeType.PROJECT,
+                    project_id=estimate_job.project_id,
+                    formula_id=selection_key,
+                    version=1,
+                    name=selection_key,
+                    dsl_version="1.0",
+                    output_key=f"formula:{selection_key}",
+                    output_contract_json={"kind": "money", "currency": "GBP"},
+                    declared_inputs_json=[],
+                    expression_json={"kind": "constant", "value": "1"},
+                    rounding_json=None,
+                    checksum_sha256=checksum,
+                )
+            )
+
     ref_rows = [
         EstimateJobInputCatalogRef(
             estimate_job_id=estimate_job.id,
@@ -807,6 +885,8 @@ async def _persist_estimate_job_input(
 
     async with session_maker() as session:
         session.add(estimate_input)
+        session.add_all(catalog_rows)
+        await session.flush()
         session.add_all(ref_rows)
         await session.commit()
 
@@ -4086,7 +4166,7 @@ class TestJobs:
                 {
                     "ref_type": "material",
                     "selection_key": "paint-gallon",
-                    "ref_order": 20,
+                    "ref_order": 10,
                     "material_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000203"),
                     "catalog_checksum_sha256": "3" * 64,
                     "selection_context_json": {
