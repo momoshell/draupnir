@@ -288,7 +288,7 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             effective_date=None,
             unit_amount=None,
             source_payload_json={"text": "Include preliminaries"},
-            rounding_json=None,
+            rounding_json={},
             source_rate_id=None,
             source_material_id=None,
             source_formula_id=None,
