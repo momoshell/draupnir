@@ -3473,6 +3473,7 @@ async def _finalize_estimate_job(
         session.add(estimate_version)
         await session.flush()
         session.add_all(snapshot_entries)
+        await session.flush()
         session.add_all(line_items)
 
         job.status = "succeeded"

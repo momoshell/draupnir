@@ -855,7 +855,7 @@ async def _persist_estimate_job_input(
                     output_contract_json={"kind": "money", "currency": "GBP"},
                     declared_inputs_json=[],
                     expression_json={"kind": "constant", "value": "1"},
-                    rounding_json=None,
+                    rounding_json={},
                     checksum_sha256=checksum,
                 )
             )
