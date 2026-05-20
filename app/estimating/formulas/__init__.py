@@ -8,7 +8,11 @@ from .contracts import (
     RoundingSpec,
     ValueContract,
 )
-from .evaluator import evaluate_formula
+from .evaluator import (
+    evaluate_formula,
+    validate_formula_definition,
+    validate_formula_definition_json,
+)
 
 __all__ = [
     "FormulaDefinition",
@@ -20,4 +24,6 @@ __all__ = [
     "RoundingSpec",
     "ValueContract",
     "evaluate_formula",
+    "validate_formula_definition",
+    "validate_formula_definition_json",
 ]

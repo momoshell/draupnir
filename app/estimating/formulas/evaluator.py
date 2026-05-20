@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import (
     ROUND_HALF_EVEN,
@@ -101,6 +101,48 @@ def evaluate_formula(
             reason="decimal_invalid",
             message="Invalid decimal operation during formula evaluation.",
         ) from exc
+
+
+def validate_formula_definition(definition: FormulaDefinition) -> FormulaDefinition:
+    with localcontext(_EVALUATION_CONTEXT):
+        _validate_definition(definition)
+    return definition
+
+
+def validate_formula_definition_json(
+    *,
+    formula_id: str,
+    name: str,
+    version: int,
+    checksum: str,
+    output_key: str,
+    output_contract_json: Mapping[str, object],
+    declared_inputs_json: Sequence[Mapping[str, object]],
+    expression_json: Mapping[str, object],
+    rounding_json: Mapping[str, object] | None = None,
+) -> FormulaDefinition:
+    from app.estimating.engine.errors import EstimateEngineError
+    from app.estimating.engine.formula_adapter import formula_definition_from_json
+
+    try:
+        definition = formula_definition_from_json(
+            formula_id=formula_id,
+            name=name,
+            version=version,
+            checksum=checksum,
+            output_key=output_key,
+            output_contract_json=output_contract_json,
+            declared_inputs_json=declared_inputs_json,
+            expression_json=expression_json,
+            rounding_json=rounding_json,
+        )
+    except EstimateEngineError as exc:
+        raise FormulaEvaluationError(
+            code=_INPUT_INVALID,
+            reason=exc.reason,
+            message=exc.message,
+        ) from exc
+    return validate_formula_definition(definition)
 
 
 def _validate_definition(definition: FormulaDefinition) -> None:
