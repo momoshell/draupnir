@@ -1663,15 +1663,6 @@ async def create_revision_estimate_version(
     if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
         _raise_estimate_takeoff_gate_invalid(takeoff)
 
-    pricing_mode, pricing_effective_date = _resolve_estimate_pricing_contract(request)
-    normalized_refs = await _resolve_estimate_catalog_refs(
-        revision,
-        takeoff,
-        request.catalog_refs,
-        pricing_effective_date,
-        db,
-    )
-
     locked_revision = await _get_active_revision(revision_id, db, for_update=True)
     if locked_revision is None:
         raise_not_found("Drawing revision", str(revision_id))
@@ -1680,6 +1671,19 @@ async def create_revision_estimate_version(
     takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
     if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
         _raise_estimate_takeoff_gate_invalid(takeoff)
+
+    job_created_at = datetime.now(UTC)
+    pricing_mode, pricing_effective_date = _resolve_estimate_pricing_contract(
+        request,
+        job_created_at=job_created_at,
+    )
+    normalized_refs = await _resolve_estimate_catalog_refs(
+        revision,
+        takeoff,
+        request.catalog_refs,
+        pricing_effective_date,
+        db,
+    )
 
     if idempotency_key is not None:
         assert fingerprint is not None
@@ -1717,6 +1721,7 @@ async def create_revision_estimate_version(
         error_message=None,
         started_at=None,
         finished_at=None,
+        created_at=job_created_at,
     )
     db.add(estimate_job)
     prepare_job_enqueue_intent(estimate_job)
