@@ -7,7 +7,80 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class EstimateVersionCreatePricing(BaseModel):
+    """Pricing selection for a queued estimate job."""
+
+    currency: str = "GBP"
+    effective_date: date | None = Field(
+        default=None,
+        validation_alias=AliasChoices("effective_date", "pricing_date"),
+    )
+
+    @field_validator("currency")
+    @classmethod
+    def _normalize_currency(cls, value: str) -> str:
+        return value.strip().upper()
+
+
+class EstimateVersionCreateCatalogRef(BaseModel):
+    """Catalog/formula selection used to build estimate worker input."""
+
+    ref_type: str = Field(validation_alias=AliasChoices("ref_type", "line_type"))
+    selection_id: UUID = Field(
+        validation_alias=AliasChoices("selection_id", "catalog_entry_id", "ref_id")
+    )
+    selection_key: str = Field(
+        validation_alias=AliasChoices("selection_key", "entry_key", "ref_key")
+    )
+    selection_checksum_sha256: str = Field(
+        validation_alias=AliasChoices(
+            "selection_checksum_sha256",
+            "checksum_sha256",
+            "checksum",
+        )
+    )
+    description: str
+    line_key: str | None = None
+    quantity_item_id: UUID | None = None
+    formula_inputs: dict[str, Any] | None = None
+
+    @field_validator("ref_type")
+    @classmethod
+    def _normalize_ref_type(cls, value: str) -> str:
+        return value.strip().lower()
+
+
+class EstimateVersionCreateRequest(BaseModel):
+    """Create-request payload for estimate job enqueue."""
+
+    pricing: EstimateVersionCreatePricing = Field(default_factory=EstimateVersionCreatePricing)
+    assumptions: dict[str, Any] = Field(default_factory=dict)
+    catalog_refs: list[EstimateVersionCreateCatalogRef] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("catalog_refs", "refs", "line_refs"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_flat_pricing(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+
+        payload = dict(value)
+        if "pricing" not in payload:
+            pricing: dict[str, Any] = {}
+            if "currency" in payload:
+                pricing["currency"] = payload.pop("currency")
+            if "pricing_date" in payload:
+                pricing["pricing_date"] = payload.pop("pricing_date")
+            if "effective_date" in payload:
+                pricing["effective_date"] = payload.pop("effective_date")
+            if pricing:
+                payload["pricing"] = pricing
+        return payload
 
 
 class EstimateVersionRead(BaseModel):

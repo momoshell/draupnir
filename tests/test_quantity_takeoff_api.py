@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import IdempotencyReplay, IdempotencyReservation
@@ -24,6 +26,12 @@ from app.db import session as session_module
 from app.db.session import get_db
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
+from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
+from app.models.estimation_catalog import (
+    EstimationFormula,
+    EstimationRate,
+    EstimationRateSupersession,
+)
 from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File
 from app.models.job import Job, JobType
@@ -34,6 +42,7 @@ from app.models.quantity_takeoff import (
     QuantityItemKind,
     QuantityTakeoff,
 )
+from app.models.revision_materialization import RevisionEntity
 from tests.conftest import requires_database
 
 
@@ -78,12 +87,26 @@ class _AsyncSessionStub:
         self.commits += 1
 
 
+def _response_error_code(response: Any) -> str:
+    body = response.json()
+    error = body.get("error")
+    if error is None:
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            error = detail.get("error")
+    assert isinstance(error, dict)
+    code = error.get("code")
+    assert isinstance(code, str)
+    return code
+
+
 @dataclass(slots=True)
 class _QuantityLineageSeed:
     project_id: UUID
     file_id: UUID
     revision_id: UUID
     takeoff_id: UUID
+    quantity_item_id: UUID
 
 
 def _build_app(session: _AsyncSessionStub) -> FastAPI:
@@ -111,6 +134,56 @@ def _build_validation_report(*, quantity_gate: str = QuantityGate.ALLOWED.value)
         review_state="approved",
         validation_status="valid",
     )
+
+
+def _build_takeoff(
+    revision: SimpleNamespace,
+    *,
+    takeoff_id: UUID | None = None,
+    quantity_gate: str = QuantityGate.ALLOWED.value,
+    trusted_totals: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=takeoff_id or uuid4(),
+        project_id=revision.project_id,
+        source_file_id=revision.source_file_id,
+        drawing_revision_id=revision.id,
+        source_job_id=uuid4(),
+        source_job_type=JobType.QUANTITY_TAKEOFF.value,
+        review_state="approved",
+        validation_status="valid",
+        quantity_gate=quantity_gate,
+        trusted_totals=trusted_totals,
+    )
+
+
+def _build_estimate_request_body(
+    *, quantity_item_id: UUID, currency: str = "GBP"
+) -> dict[str, Any]:
+    return {
+        "pricing": {"currency": currency},
+        "assumptions": {"crew": "default"},
+        "catalog_refs": [
+            {
+                "ref_type": "rate",
+                "selection_id": str(uuid4()),
+                "selection_key": "labour:install",
+                "selection_checksum_sha256": "a" * 64,
+                "description": "Install labour",
+                "line_key": "line-rate-1",
+                "quantity_item_id": str(quantity_item_id),
+            },
+            {
+                "ref_type": "formula",
+                "selection_id": str(uuid4()),
+                "selection_key": "formula:waste",
+                "selection_checksum_sha256": "b" * 64,
+                "description": "Waste uplift",
+                "line_key": "line-formula-2",
+                "formula_inputs": {"waste_factor": "0.10"},
+            },
+        ],
+    }
 
 
 async def _seed_quantity_lineage() -> _QuantityLineageSeed:
@@ -281,6 +354,7 @@ async def _seed_quantity_lineage() -> _QuantityLineageSeed:
         file_id=file_id,
         revision_id=revision_id,
         takeoff_id=takeoff_id,
+        quantity_item_id=item.id,
     )
 
 
@@ -298,6 +372,55 @@ async def _soft_delete_lineage(seed: _QuantityLineageSeed, *, target: str) -> No
             assert project is not None
             project.deleted_at = datetime.now(UTC)
         await db.commit()
+
+
+def _build_rate_catalog_entry(
+    *,
+    scope_type: str,
+    project_id: UUID | None,
+    rate_key: str,
+    checksum_sha256: str,
+    effective_from: date,
+    effective_to: date | None = None,
+) -> EstimationRate:
+    return EstimationRate(
+        scope_type=scope_type,
+        project_id=project_id,
+        rate_key=rate_key,
+        source="fixture",
+        metadata_json={},
+        name="Install labour",
+        item_type="labour",
+        per_unit="sq_ft",
+        currency="GBP",
+        amount=Decimal("12.340000"),
+        effective_from=effective_from,
+        effective_to=effective_to,
+        checksum_sha256=checksum_sha256,
+    )
+
+
+def _build_formula_definition(
+    *,
+    scope_type: str,
+    project_id: UUID | None,
+    formula_id: str,
+    checksum_sha256: str,
+) -> EstimationFormula:
+    return EstimationFormula(
+        scope_type=scope_type,
+        project_id=project_id,
+        formula_id=formula_id,
+        version=1,
+        name="Waste uplift",
+        dsl_version="1.0.0",
+        output_key="total",
+        output_contract_json={"type": "number"},
+        declared_inputs_json=[{"key": "waste_factor", "type": "number"}],
+        expression_json={"kind": "literal", "value": "1.10"},
+        rounding_json={},
+        checksum_sha256=checksum_sha256,
+    )
 
 
 def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatch: Any) -> None:
@@ -461,6 +584,1146 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
     assert len(session.added) == 1
 
 
+def test_create_revision_estimate_version_replays_idempotent_response(monkeypatch: Any) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision)
+    quantity_item_id = uuid4()
+    request_body = _build_estimate_request_body(quantity_item_id=quantity_item_id)
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    idempotency_state: dict[str, dict[str, Any]] = {}
+    enqueued_job_ids: list[UUID] = []
+
+    class _EstimateJobInputRecord:
+        pass
+
+    class _EstimateJobInputCatalogRefRecord:
+        pass
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_resolve_estimate_catalog_refs(
+        revision_value: Any,
+        takeoff_value: Any,
+        request_refs: Any,
+        pricing_effective_date: date,
+        db: AsyncSession,
+    ) -> list[Any]:
+        _ = (revision_value, takeoff_value, pricing_effective_date, db)
+        return [
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[0].ref_type,
+                selection_id=request_refs[0].selection_id,
+                selection_key=request_refs[0].selection_key,
+                selection_checksum_sha256=request_refs[0].selection_checksum_sha256,
+                description=request_refs[0].description,
+                line_key=request_refs[0].line_key,
+                quantity_item_id=request_refs[0].quantity_item_id,
+                formula_inputs=request_refs[0].formula_inputs,
+            ),
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[1].ref_type,
+                selection_id=request_refs[1].selection_id,
+                selection_key=request_refs[1].selection_key,
+                selection_checksum_sha256=request_refs[1].selection_checksum_sha256,
+                description=request_refs[1].description,
+                line_key=request_refs[1].line_key,
+                quantity_item_id=request_refs[1].quantity_item_id,
+                formula_inputs=request_refs[1].formula_inputs,
+            ),
+        ]
+
+    async def fake_replay_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+    ) -> IdempotencyReplay | None:
+        _ = db
+        record = idempotency_state.get(key)
+        if record is None or record["fingerprint"] != fingerprint or not record["completed"]:
+            return None
+        return IdempotencyReplay(
+            response=JSONResponse(
+                status_code=record["status_code"],
+                content=record["response_body"],
+            )
+        )
+
+    async def fake_claim_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation:
+        _ = (db, method, path)
+        record = idempotency_state.get(key)
+        if record is None:
+            idempotency_state[key] = {"fingerprint": fingerprint, "completed": False}
+        return IdempotencyReservation(record_id=uuid4())
+
+    async def fake_mark_idempotency_completed(
+        db: AsyncSession,
+        reservation: IdempotencyReservation,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> None:
+        _ = (db, reservation)
+        idempotency_state["estimate-1"].update(
+            completed=True,
+            status_code=status_code,
+            response_body=response_body,
+        )
+
+    def fake_prepare_job_enqueue_intent(job: Any) -> None:
+        _ = job
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = suppress_exceptions
+        assert publisher is revisions_module.enqueue_estimate_job
+        publisher(job_id)
+
+    def fake_enqueue_estimate_job(job_id: UUID) -> None:
+        enqueued_job_ids.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_catalog_refs",
+        fake_resolve_estimate_catalog_refs,
+    )
+    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
+    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
+    monkeypatch.setattr(
+        revisions_module,
+        "mark_idempotency_completed",
+        fake_mark_idempotency_completed,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "prepare_job_enqueue_intent",
+        fake_prepare_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_job_model_classes",
+        lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_build_mapped_instance",
+        lambda _model_class, values: type("StubRecord", (), values.copy())(),
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=request_body,
+    )
+
+    assert response.status_code == 202
+    first_body = response.json()
+    assert first_body["job_type"] == "estimate"
+    assert first_body["base_revision_id"] == str(revision.id)
+    assert first_body["parent_job_id"] == str(takeoff.source_job_id)
+    assert len(session.added) == 4
+    estimate_job = session.added[0]
+    estimate_input = session.added[1]
+    assert estimate_input.estimate_job_id == estimate_job.id
+    assert estimate_input.source_job_type == JobType.ESTIMATE.value
+    assert estimate_input.currency == "GBP"
+    assert estimate_input.pricing_mode == "derived_from_job_created_at_utc"
+    assert estimate_input.pricing_effective_date == estimate_job.created_at.date()
+    assert estimate_input.assumptions_json == {"crew": "default"}
+    first_ref = session.added[2]
+    second_ref = session.added[3]
+    assert first_ref.ref_order == 1
+    assert first_ref.estimate_job_id == estimate_job.id
+    assert first_ref.rate_catalog_entry_id == UUID(request_body["catalog_refs"][0]["selection_id"])
+    assert first_ref.catalog_checksum_sha256 == "a" * 64
+    assert first_ref.selection_context_json["worker_mapping_version"] == "estimate-line-v1"
+    assert first_ref.selection_context_json["quantity_item_id"] == str(quantity_item_id)
+    assert second_ref.ref_order == 2
+    assert second_ref.formula_definition_id == UUID(request_body["catalog_refs"][1]["selection_id"])
+    assert second_ref.catalog_checksum_sha256 == "b" * 64
+    assert second_ref.selection_context_json["formula_inputs"] == {"waste_factor": "0.10"}
+    assert enqueued_job_ids == [UUID(first_body["id"])]
+
+    replay_response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=request_body,
+    )
+
+    assert replay_response.status_code == 202
+    assert replay_response.json() == first_body
+    assert len(session.added) == 4
+
+
+def test_create_revision_estimate_version_rejects_idempotency_reuse_with_different_payload(
+    monkeypatch: Any,
+) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision)
+    quantity_item_id = uuid4()
+    request_body = _build_estimate_request_body(quantity_item_id=quantity_item_id)
+    conflicting_request_body = _build_estimate_request_body(quantity_item_id=quantity_item_id)
+    conflicting_request_body["assumptions"] = {"crew": "alternate"}
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    idempotency_state: dict[str, dict[str, Any]] = {}
+    enqueued_job_ids: list[UUID] = []
+
+    class _EstimateJobInputRecord:
+        pass
+
+    class _EstimateJobInputCatalogRefRecord:
+        pass
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_resolve_estimate_catalog_refs(
+        revision_value: Any,
+        takeoff_value: Any,
+        request_refs: Any,
+        pricing_effective_date: date,
+        db: AsyncSession,
+    ) -> list[Any]:
+        _ = (revision_value, takeoff_value, pricing_effective_date, db)
+        return [
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[0].ref_type,
+                selection_id=request_refs[0].selection_id,
+                selection_key=request_refs[0].selection_key,
+                selection_checksum_sha256=request_refs[0].selection_checksum_sha256,
+                description=request_refs[0].description,
+                line_key=request_refs[0].line_key,
+                quantity_item_id=request_refs[0].quantity_item_id,
+                formula_inputs=request_refs[0].formula_inputs,
+            ),
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[1].ref_type,
+                selection_id=request_refs[1].selection_id,
+                selection_key=request_refs[1].selection_key,
+                selection_checksum_sha256=request_refs[1].selection_checksum_sha256,
+                description=request_refs[1].description,
+                line_key=request_refs[1].line_key,
+                quantity_item_id=request_refs[1].quantity_item_id,
+                formula_inputs=request_refs[1].formula_inputs,
+            ),
+        ]
+
+    async def fake_replay_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+    ) -> IdempotencyReplay | None:
+        _ = db
+        record = idempotency_state.get(key)
+        if record is None:
+            return None
+        if record["fingerprint"] != fingerprint:
+            return IdempotencyReplay(
+                response=JSONResponse(
+                    status_code=409,
+                    content={
+                        "detail": {
+                            "error": {
+                                "code": "IDEMPOTENCY_CONFLICT",
+                                "message": "Idempotency-Key already used with different payload.",
+                                "details": None,
+                            }
+                        }
+                    },
+                )
+            )
+        if not record["completed"]:
+            return None
+        return IdempotencyReplay(
+            response=JSONResponse(
+                status_code=record["status_code"],
+                content=record["response_body"],
+            )
+        )
+
+    async def fake_claim_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation:
+        _ = (db, method, path)
+        record = idempotency_state.get(key)
+        if record is None:
+            idempotency_state[key] = {"fingerprint": fingerprint, "completed": False}
+        return IdempotencyReservation(record_id=uuid4())
+
+    async def fake_mark_idempotency_completed(
+        db: AsyncSession,
+        reservation: IdempotencyReservation,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> None:
+        _ = (db, reservation)
+        idempotency_state["estimate-1"].update(
+            completed=True,
+            status_code=status_code,
+            response_body=response_body,
+        )
+
+    def fake_prepare_job_enqueue_intent(job: Any) -> None:
+        _ = job
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = suppress_exceptions
+        assert publisher is revisions_module.enqueue_estimate_job
+        publisher(job_id)
+
+    def fake_enqueue_estimate_job(job_id: UUID) -> None:
+        enqueued_job_ids.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_catalog_refs",
+        fake_resolve_estimate_catalog_refs,
+    )
+    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
+    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
+    monkeypatch.setattr(
+        revisions_module,
+        "mark_idempotency_completed",
+        fake_mark_idempotency_completed,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "prepare_job_enqueue_intent",
+        fake_prepare_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_job_model_classes",
+        lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_build_mapped_instance",
+        lambda _model_class, values: type("StubRecord", (), values.copy())(),
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=request_body,
+    )
+
+    assert response.status_code == 202
+    first_body = response.json()
+    assert len(session.added) == 4
+    assert session.commits == 1
+    assert enqueued_job_ids == [UUID(first_body["id"])]
+
+    conflict_response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=conflicting_request_body,
+    )
+
+    assert conflict_response.status_code == 409
+    assert _response_error_code(conflict_response) == "IDEMPOTENCY_CONFLICT"
+    assert len(session.added) == 4
+    assert session.commits == 1
+    assert enqueued_job_ids == [UUID(first_body["id"])]
+
+
+def test_create_revision_estimate_version_rejects_non_gbp(monkeypatch: Any) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision)
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    publish_calls: list[UUID] = []
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        json=_build_estimate_request_body(quantity_item_id=uuid4(), currency="USD"),
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert session.added == []
+    assert session.commits == 0
+    assert publish_calls == []
+
+
+def test_create_revision_estimate_version_rejects_non_allowed_quantity_gate_before_enqueue(
+    monkeypatch: Any,
+) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision, quantity_gate=QuantityGate.REVIEW_GATED.value)
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    publish_calls: list[UUID] = []
+    enqueue_calls: list[UUID] = []
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    def fake_enqueue_estimate_job(job_id: UUID) -> None:
+        enqueue_calls.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        json=_build_estimate_request_body(quantity_item_id=uuid4()),
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert session.added == []
+    assert session.commits == 0
+    assert publish_calls == []
+    assert enqueue_calls == []
+
+
+def test_create_revision_estimate_version_rejects_untrusted_takeoff(monkeypatch: Any) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision, trusted_totals=False)
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    publish_calls: list[UUID] = []
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        json=_build_estimate_request_body(quantity_item_id=uuid4()),
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert session.added == []
+    assert session.commits == 0
+    assert publish_calls == []
+
+
+def test_create_revision_estimate_version_rejects_catalog_validation_before_enqueue(
+    monkeypatch: Any,
+) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision)
+    quantity_item_id = uuid4()
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    publish_calls: list[UUID] = []
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_resolve_estimate_catalog_refs(
+        revision_value: Any,
+        takeoff_value: Any,
+        request_refs: Any,
+        pricing_effective_date: date,
+        db: AsyncSession,
+    ) -> list[Any]:
+        _ = (revision_value, takeoff_value, request_refs, pricing_effective_date, db)
+        revisions_module._raise_estimate_input_invalid(
+            "Estimate refs must use the current catalog selection checksum.",
+            details={"selection_checksum_sha256": "mismatch"},
+        )
+        raise AssertionError("unreachable")
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_catalog_refs",
+        fake_resolve_estimate_catalog_refs,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        json=_build_estimate_request_body(quantity_item_id=quantity_item_id),
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert session.added == []
+    assert session.commits == 0
+    assert publish_calls == []
+
+
+@pytest.mark.anyio
+@requires_database
+async def test_create_revision_estimate_version_persists_mapped_input_fields_and_allows_global_refs(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+) -> None:
+    seed = await _seed_quantity_lineage()
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    request_body["pricing"]["effective_date"] = "2026-05-20"
+    publish_calls: list[UUID] = []
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    rate = _build_rate_catalog_entry(
+        scope_type="global",
+        project_id=None,
+        rate_key="labour:install",
+        checksum_sha256="a" * 64,
+        effective_from=date(2026, 1, 1),
+    )
+    formula = _build_formula_definition(
+        scope_type="global",
+        project_id=None,
+        formula_id="formula:waste",
+        checksum_sha256="b" * 64,
+    )
+
+    async with session_factory() as db:
+        db.add(rate)
+        db.add(formula)
+        await db.commit()
+
+    request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
+    request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 202
+    estimate_job_id = UUID(response.json()["id"])
+    assert publish_calls == [estimate_job_id]
+
+    async with session_factory() as db:
+        estimate_input = await db.get(EstimateJobInput, estimate_job_id)
+        assert estimate_input is not None
+        assert estimate_input.estimate_job_id == estimate_job_id
+        assert estimate_input.project_id == seed.project_id
+        assert estimate_input.source_file_id == seed.file_id
+        assert estimate_input.drawing_revision_id == seed.revision_id
+        assert estimate_input.quantity_takeoff_id == seed.takeoff_id
+        assert estimate_input.source_job_type == JobType.ESTIMATE.value
+        assert estimate_input.currency == "GBP"
+        assert estimate_input.pricing_mode == "explicit"
+        assert estimate_input.pricing_effective_date == date(2026, 5, 20)
+        assert estimate_input.assumptions_json == {"crew": "default"}
+
+        ref_rows = (
+            (
+                await db.execute(
+                    select(EstimateJobInputCatalogRef)
+                    .where(EstimateJobInputCatalogRef.estimate_job_id == estimate_job_id)
+                    .order_by(EstimateJobInputCatalogRef.ref_order.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(ref_rows) == 2
+    assert ref_rows[0].ref_type == "rate"
+    assert ref_rows[0].selection_key == "labour:install"
+    assert ref_rows[0].rate_catalog_entry_id == rate.id
+    assert ref_rows[0].material_catalog_entry_id is None
+    assert ref_rows[0].formula_definition_id is None
+    assert ref_rows[0].catalog_checksum_sha256 == "a" * 64
+    assert ref_rows[0].selection_context_json["line_key"] == "line-rate-1"
+    assert ref_rows[0].selection_context_json["quantity_item_id"] == str(seed.quantity_item_id)
+    assert ref_rows[1].ref_type == "formula"
+    assert ref_rows[1].selection_key == "formula:waste"
+    assert ref_rows[1].rate_catalog_entry_id is None
+    assert ref_rows[1].formula_definition_id == formula.id
+    assert ref_rows[1].catalog_checksum_sha256 == "b" * 64
+    assert ref_rows[1].selection_context_json["formula_inputs"] == {"waste_factor": "0.10"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("invalid_ref_mode", ["stale", "superseded"])
+@requires_database
+async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate_refs_before_insert(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+    invalid_ref_mode: str,
+) -> None:
+    seed = await _seed_quantity_lineage()
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    request_body["pricing"]["effective_date"] = "2026-05-20"
+    publish_calls: list[UUID] = []
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    rate = _build_rate_catalog_entry(
+        scope_type="project",
+        project_id=seed.project_id,
+        rate_key="labour:install",
+        checksum_sha256="a" * 64,
+        effective_from=date(2026, 1, 1),
+        effective_to=(date(2026, 4, 1) if invalid_ref_mode == "stale" else date(2026, 5, 20)),
+    )
+    formula = _build_formula_definition(
+        scope_type="project",
+        project_id=seed.project_id,
+        formula_id="formula:waste",
+        checksum_sha256="b" * 64,
+    )
+
+    async with session_factory() as db:
+        db.add(rate)
+        db.add(formula)
+        await db.commit()
+
+        if invalid_ref_mode == "superseded":
+            successor_rate = _build_rate_catalog_entry(
+                scope_type="project",
+                project_id=seed.project_id,
+                rate_key="labour:install",
+                checksum_sha256="c" * 64,
+                effective_from=date(2026, 5, 21),
+            )
+            db.add(successor_rate)
+            await db.commit()
+            db.add(
+                EstimationRateSupersession(
+                    predecessor_rate_id=rate.id,
+                    successor_rate_id=successor_rate.id,
+                )
+            )
+            await db.commit()
+
+    request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
+    request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert publish_calls == []
+
+    async with session_factory() as db:
+        estimate_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        (Job.project_id == seed.project_id)
+                        & (Job.job_type == JobType.ESTIMATE.value)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_inputs = (
+            (
+                await db.execute(
+                    select(EstimateJobInput).where(EstimateJobInput.project_id == seed.project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_refs = (
+            (
+                await db.execute(
+                    select(EstimateJobInputCatalogRef).where(
+                        EstimateJobInputCatalogRef.estimate_job_id.in_(
+                            [job.id for job in estimate_jobs]
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert estimate_jobs == []
+    assert estimate_inputs == []
+    assert estimate_refs == []
+
+
+@pytest.mark.anyio
+@requires_database
+async def test_create_revision_estimate_version_rejects_cross_project_project_refs_before_insert(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+) -> None:
+    seed = await _seed_quantity_lineage()
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    request_body["pricing"]["effective_date"] = "2026-05-20"
+    publish_calls: list[UUID] = []
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    other_project_id = uuid4()
+    rate = _build_rate_catalog_entry(
+        scope_type="project",
+        project_id=other_project_id,
+        rate_key="labour:install",
+        checksum_sha256="a" * 64,
+        effective_from=date(2026, 1, 1),
+    )
+    formula = _build_formula_definition(
+        scope_type="project",
+        project_id=seed.project_id,
+        formula_id="formula:waste",
+        checksum_sha256="b" * 64,
+    )
+
+    async with session_factory() as db:
+        db.add(Project(id=other_project_id, name="Other project"))
+        await db.commit()
+        db.add(rate)
+        db.add(formula)
+        await db.commit()
+
+    request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
+    request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert publish_calls == []
+
+    async with session_factory() as db:
+        estimate_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        (Job.project_id == seed.project_id)
+                        & (Job.job_type == JobType.ESTIMATE.value)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_inputs = (
+            (
+                await db.execute(
+                    select(EstimateJobInput).where(EstimateJobInput.project_id == seed.project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert estimate_jobs == []
+    assert estimate_inputs == []
+
+
+@pytest.mark.anyio
+@requires_database
+async def test_create_revision_estimate_version_rejects_non_executable_quantity_items_before_insert(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+) -> None:
+    seed = await _seed_quantity_lineage()
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    request_body["pricing"]["effective_date"] = "2026-05-20"
+    publish_calls: list[UUID] = []
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    rate = _build_rate_catalog_entry(
+        scope_type="project",
+        project_id=seed.project_id,
+        rate_key="labour:install",
+        checksum_sha256="a" * 64,
+        effective_from=date(2026, 1, 1),
+    )
+    formula = _build_formula_definition(
+        scope_type="project",
+        project_id=seed.project_id,
+        formula_id="formula:waste",
+        checksum_sha256="b" * 64,
+    )
+
+    async with session_factory() as db:
+        db.add(rate)
+        db.add(formula)
+        await db.commit()
+
+        revision = await db.get(DrawingRevision, seed.revision_id)
+        assert revision is not None
+
+        revision_entity = RevisionEntity(
+            project_id=seed.project_id,
+            source_file_id=seed.file_id,
+            extraction_profile_id=revision.extraction_profile_id,
+            source_job_id=revision.source_job_id,
+            drawing_revision_id=seed.revision_id,
+            adapter_run_output_id=revision.adapter_run_output_id,
+            canonical_entity_schema_version=revision.canonical_entity_schema_version,
+            sequence_index=0,
+            entity_id="entity-1",
+            entity_type="polygon",
+            entity_schema_version="1.0.0",
+            confidence_score=1.0,
+            confidence_json={},
+            geometry_json={},
+            properties_json={},
+            provenance_json={},
+            canonical_entity_json=None,
+            source_identity="entity-1",
+            source_hash="1" * 64,
+        )
+        db.add(revision_entity)
+        await db.commit()
+
+        quantity_item = QuantityItem(
+            quantity_takeoff_id=seed.takeoff_id,
+            project_id=seed.project_id,
+            drawing_revision_id=seed.revision_id,
+            item_kind=QuantityItemKind.EXCLUSION.value,
+            quantity_type="area",
+            value=None,
+            unit="sq_ft",
+            review_state="approved",
+            validation_status="valid",
+            quantity_gate=QuantityGate.ALLOWED.value,
+            source_entity_id="entity-1",
+            excluded_source_entity_ids_json=[],
+        )
+        db.add(quantity_item)
+        await db.commit()
+
+    request_body["catalog_refs"][0]["quantity_item_id"] = str(quantity_item.id)
+    request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
+    request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert publish_calls == []
+
+    async with session_factory() as db:
+        estimate_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        (Job.project_id == seed.project_id)
+                        & (Job.job_type == JobType.ESTIMATE.value)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_inputs = (
+            (
+                await db.execute(
+                    select(EstimateJobInput).where(EstimateJobInput.project_id == seed.project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert estimate_jobs == []
+    assert estimate_inputs == []
+
+
 def test_list_and_get_revision_quantity_takeoffs(monkeypatch: Any) -> None:
     revision = _build_revision()
     created_at = datetime(2026, 5, 16, tzinfo=UTC)
@@ -512,9 +1775,7 @@ def test_list_and_get_revision_quantity_takeoffs(monkeypatch: Any) -> None:
     assert [item["id"] for item in list_body["items"]] == [str(first_takeoff.id)]
     assert list_body["next_cursor"] is not None
 
-    read_response = client.get(
-        f"/v1/revisions/{revision.id}/quantity-takeoffs/{first_takeoff.id}"
-    )
+    read_response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs/{first_takeoff.id}")
 
     assert read_response.status_code == 200
     assert read_response.json()["id"] == str(first_takeoff.id)
@@ -839,7 +2100,7 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
     response = client.post(f"/v1/revisions/{revision.id}/quantity-takeoffs")
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -899,7 +2160,7 @@ def test_list_revision_quantity_takeoffs_rejects_invalid_cursor(monkeypatch: Any
     response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs?cursor=not-base64")
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+    assert _response_error_code(response) == "INVALID_CURSOR"
 
 
 def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
@@ -927,4 +2188,4 @@ def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+    assert _response_error_code(response) == "INVALID_CURSOR"
