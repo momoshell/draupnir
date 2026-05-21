@@ -230,6 +230,83 @@ def _quantity_takeoff_semantic_payload(
     }
 
 
+def _estimate_persisted_semantic_payload(
+    estimate_version: EstimateVersion,
+    snapshot_entries: list[EstimateSnapshotEntry],
+    line_items: list[EstimateItem],
+) -> dict[str, Any]:
+    """Return rerun-comparable persisted estimate semantics without row identity fields."""
+    snapshot_payloads = [
+        {
+            "entry_type": entry.entry_type,
+            "entry_key": entry.entry_key,
+            "entry_label": entry.entry_label,
+            "sort_order": entry.sort_order,
+            "currency": entry.currency,
+            "quantity_value": entry.quantity_value,
+            "unit": entry.unit,
+            "effective_date": entry.effective_date,
+            "unit_amount": entry.unit_amount,
+            "source_payload_json": deepcopy(entry.source_payload_json),
+            "rounding_json": deepcopy(entry.rounding_json),
+            "source_rate_id": entry.source_rate_id,
+            "source_material_id": entry.source_material_id,
+            "source_formula_id": entry.source_formula_id,
+            "source_quantity_takeoff_id": entry.source_quantity_takeoff_id,
+            "source_quantity_item_id": entry.source_quantity_item_id,
+            "source_checksum_sha256": entry.source_checksum_sha256,
+        }
+        for entry in snapshot_entries
+    ]
+
+    line_item_payloads = [
+        {
+            "line_type": item.line_type,
+            "line_number": item.line_number,
+            "line_key": item.line_key,
+            "description": item.description,
+            "currency": item.currency,
+            "quantity_value": item.quantity_value,
+            "quantity_unit": item.quantity_unit,
+            "unit_rate_amount": item.unit_rate_amount,
+            "effective_date": item.effective_date,
+            "subtotal_amount": item.subtotal_amount,
+            "tax_amount": item.tax_amount,
+            "total_amount": item.total_amount,
+            "rounding_json": deepcopy(item.rounding_json),
+            "quantity_snapshot_entry_id": item.quantity_snapshot_entry_id,
+            "rate_snapshot_entry_id": item.rate_snapshot_entry_id,
+            "material_snapshot_entry_id": item.material_snapshot_entry_id,
+            "formula_snapshot_entry_id": item.formula_snapshot_entry_id,
+            "assumption_snapshot_entry_id": item.assumption_snapshot_entry_id,
+        }
+        for item in line_items
+    ]
+
+    return {
+        "version": {
+            "source_job_id": estimate_version.source_job_id,
+            "quantity_takeoff_id": estimate_version.quantity_takeoff_id,
+            "source_file_id": estimate_version.source_file_id,
+            "drawing_revision_id": estimate_version.drawing_revision_id,
+            "quantity_gate": estimate_version.quantity_gate,
+            "trusted_totals": estimate_version.trusted_totals,
+            "currency": estimate_version.currency,
+            "subtotal_amount": estimate_version.subtotal_amount,
+            "tax_amount": estimate_version.tax_amount,
+            "total_amount": estimate_version.total_amount,
+        },
+        "snapshot_entries": sorted(
+            snapshot_payloads,
+            key=lambda entry: (entry["sort_order"], entry["entry_key"]),
+        ),
+        "line_items": sorted(
+            line_item_payloads,
+            key=lambda item: (item["line_number"], item["line_key"]),
+        ),
+    }
+
+
 def _estimate_catalog_ref_stub(
     *,
     ref_type: str,
@@ -7404,7 +7481,6 @@ class TestJobs:
 
             with pytest.raises(IntegrityError):
                 await session.commit()
-
             await session.rollback()
 
     @pytest.mark.parametrize("job_type", ["ingest", "reprocess"])
@@ -7438,3 +7514,183 @@ class TestJobs:
                 await session.commit()
 
             await session.rollback()
+
+    async def test_estimate_worker_persists_replayable_historical_output_after_catalog_evolution(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Estimate outputs should stay replayable after append-only catalog evolution."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            quantity_takeoff,
+            quantity_items,
+            estimate_job,
+        ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
+        quantity_item = _select_eligible_aggregate_quantity_item(quantity_items)
+        assert quantity_item.value is not None
+        assert quantity_item.value > 0
+
+        rate_key = "historical-paint-labor"
+        original_rate_id = uuid.UUID("00000000-0000-0000-0000-000000000291")
+        evolved_rate_id = uuid.UUID("00000000-0000-0000-0000-000000000292")
+        original_checksum = "1" * 64
+        evolved_checksum = "2" * 64
+
+        await _persist_estimate_job_input(
+            estimate_job=estimate_job,
+            quantity_takeoff=quantity_takeoff,
+            assumptions_json={"tax_rate": "0.20"},
+            catalog_refs=[
+                {
+                    "ref_type": "rate",
+                    "selection_key": rate_key,
+                    "ref_order": 20,
+                    "rate_catalog_entry_id": original_rate_id,
+                    "catalog_checksum_sha256": original_checksum,
+                    "selection_context_json": {
+                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "line_key": "historical-rate-line",
+                        "line_type": "rate",
+                        "description": "Historical paint labor",
+                        "quantity_item_id": str(quantity_item.id),
+                    },
+                }
+            ],
+        )
+
+        async def _resolve_latest_rate(*args: Any, **kwargs: Any) -> Any:
+            _ = (args, kwargs)
+            session_maker = session_module.AsyncSessionLocal
+            assert session_maker is not None
+
+            async with session_maker() as session:
+                rate_row = (
+                    (
+                        await session.execute(
+                            select(EstimationRate)
+                            .where(
+                                EstimationRate.project_id == estimate_job.project_id,
+                                EstimationRate.rate_key == rate_key,
+                            )
+                            .order_by(
+                                EstimationRate.effective_from.desc(),
+                                EstimationRate.created_at.desc(),
+                                EstimationRate.id.desc(),
+                            )
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .one()
+                )
+
+            return types.SimpleNamespace(
+                id=rate_row.id,
+                rate_key=rate_row.rate_key,
+                item_type=rate_row.item_type,
+                unit=quantity_item.unit,
+                currency=rate_row.currency,
+                value=rate_row.amount,
+                effective_start=rate_row.effective_from,
+                checksum_sha256=rate_row.checksum_sha256,
+                metadata=deepcopy(rate_row.metadata_json),
+            )
+
+        monkeypatch.setattr(worker_module, "resolve_rate", _resolve_latest_rate)
+
+        await worker_module.process_estimate_job(estimate_job.id)
+
+        updated_job = await _get_job(estimate_job.id)
+        estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
+        assert updated_job.status == "succeeded"
+        assert len(estimate_versions) == 1
+        estimate_version = estimate_versions[0]
+        snapshot_entries = await _get_estimate_snapshot_entries_for_version(estimate_version.id)
+        line_items = await _get_estimate_items_for_version(estimate_version.id)
+        assert snapshot_entries != []
+        assert line_items != []
+
+        original_payload = _estimate_persisted_semantic_payload(
+            estimate_version,
+            snapshot_entries,
+            line_items,
+        )
+        original_rate_snapshot = next(
+            entry for entry in original_payload["snapshot_entries"] if entry["entry_type"] == "rate"
+        )
+        assert original_rate_snapshot["source_checksum_sha256"] == original_checksum
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                EstimationRate(
+                    id=evolved_rate_id,
+                    scope_type=CatalogScopeType.PROJECT,
+                    project_id=estimate_job.project_id,
+                    rate_key=rate_key,
+                    source="tests.test_jobs",
+                    metadata_json={"catalog_generation": "evolved"},
+                    name=rate_key,
+                    item_type="labor",
+                    per_unit="square_meter",
+                    currency="GBP",
+                    amount=Decimal("99.00"),
+                    effective_from=date(2026, 1, 3),
+                    effective_to=None,
+                    checksum_sha256=evolved_checksum,
+                )
+            )
+            replay_attempt_token = uuid.uuid4()
+            persisted_job = await session.get(Job, estimate_job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.finished_at = None
+            persisted_job.attempt_token = replay_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) + timedelta(minutes=5)
+            await session.commit()
+
+        replay_input = await worker_module._build_estimate_engine_input(
+            estimate_job.id,
+            attempt_token=replay_attempt_token,
+        )
+        replay_output = real_compose_estimate(replay_input)
+        replay_version_kwargs = replay_output.estimate_version_model_kwargs()
+        replay_snapshot_kwargs = replay_output.snapshot_entry_model_kwargs()
+        replay_rate_snapshot = next(
+            entry for entry in replay_snapshot_kwargs if entry["entry_type"] == "rate"
+        )
+        assert replay_rate_snapshot["source_checksum_sha256"] == evolved_checksum
+        assert replay_rate_snapshot["unit_amount"] != original_rate_snapshot["unit_amount"]
+        assert replay_version_kwargs["total_amount"] != original_payload["version"]["total_amount"]
+
+        finalized_again = await worker_module._finalize_estimate_job(
+            estimate_job.id,
+            attempt_token=replay_attempt_token,
+            output=replay_output,
+        )
+        assert finalized_again is False
+
+        estimate_versions_after = await _get_estimate_versions_for_job(estimate_job.id)
+        assert len(estimate_versions_after) == 1
+        snapshot_entries_after = await _get_estimate_snapshot_entries_for_version(
+            estimate_versions_after[0].id
+        )
+        line_items_after = await _get_estimate_items_for_version(estimate_versions_after[0].id)
+        evolved_payload = _estimate_persisted_semantic_payload(
+            estimate_versions_after[0],
+            snapshot_entries_after,
+            line_items_after,
+        )
+        assert evolved_payload == original_payload
