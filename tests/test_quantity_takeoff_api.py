@@ -42,6 +42,7 @@ from app.models.quantity_takeoff import (
     QuantityItemKind,
     QuantityTakeoff,
 )
+from app.models.revision_materialization import RevisionEntity
 from tests.conftest import requires_database
 
 
@@ -84,6 +85,19 @@ class _AsyncSessionStub:
 
     async def commit(self) -> None:
         self.commits += 1
+
+
+def _response_error_code(response: Any) -> str:
+    body = response.json()
+    error = body.get("error")
+    if error is None:
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            error = detail.get("error")
+    assert isinstance(error, dict)
+    code = error.get("code")
+    assert isinstance(code, str)
+    return code
 
 
 @dataclass(slots=True)
@@ -991,7 +1005,7 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
     )
 
     assert conflict_response.status_code == 409
-    assert conflict_response.json()["detail"]["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert _response_error_code(conflict_response) == "IDEMPOTENCY_CONFLICT"
     assert len(session.added) == 4
     assert session.commits == 1
     assert enqueued_job_ids == [UUID(first_body["id"])]
@@ -1051,7 +1065,7 @@ def test_create_revision_estimate_version_rejects_non_gbp(monkeypatch: Any) -> N
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -1118,7 +1132,7 @@ def test_create_revision_estimate_version_rejects_non_allowed_quantity_gate_befo
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -1179,7 +1193,7 @@ def test_create_revision_estimate_version_rejects_untrusted_takeoff(monkeypatch:
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -1261,7 +1275,7 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -1390,7 +1404,7 @@ async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate
         rate_key="labour:install",
         checksum_sha256="a" * 64,
         effective_from=date(2026, 1, 1),
-        effective_to=date(2026, 4, 1) if invalid_ref_mode == "stale" else None,
+        effective_to=(date(2026, 4, 1) if invalid_ref_mode == "stale" else date(2026, 5, 20)),
     )
     formula = _build_formula_definition(
         scope_type="project",
@@ -1410,7 +1424,7 @@ async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate
                 project_id=seed.project_id,
                 rate_key="labour:install",
                 checksum_sha256="c" * 64,
-                effective_from=date(2026, 5, 1),
+                effective_from=date(2026, 5, 21),
             )
             db.add(successor_rate)
             await db.commit()
@@ -1446,7 +1460,7 @@ async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert publish_calls == []
 
     async with session_factory() as db:
@@ -1549,7 +1563,7 @@ async def test_create_revision_estimate_version_rejects_cross_project_project_re
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert publish_calls == []
 
     async with session_factory() as db:
@@ -1611,13 +1625,51 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
         db.add(formula)
         await db.commit()
 
-        quantity_item = await db.get(QuantityItem, seed.quantity_item_id)
-        assert quantity_item is not None
-        quantity_item.item_kind = QuantityItemKind.EXCLUSION.value
-        quantity_item.value = None
-        quantity_item.source_entity_id = "entity-1"
+        revision = await db.get(DrawingRevision, seed.revision_id)
+        assert revision is not None
+
+        revision_entity = RevisionEntity(
+            project_id=seed.project_id,
+            source_file_id=seed.file_id,
+            extraction_profile_id=revision.extraction_profile_id,
+            source_job_id=revision.source_job_id,
+            drawing_revision_id=seed.revision_id,
+            adapter_run_output_id=revision.adapter_run_output_id,
+            canonical_entity_schema_version=revision.canonical_entity_schema_version,
+            sequence_index=0,
+            entity_id="entity-1",
+            entity_type="polygon",
+            entity_schema_version="1.0.0",
+            confidence_score=1.0,
+            confidence_json={},
+            geometry_json={},
+            properties_json={},
+            provenance_json={},
+            canonical_entity_json=None,
+            source_identity="entity-1",
+            source_hash="1" * 64,
+        )
+        db.add(revision_entity)
         await db.commit()
 
+        quantity_item = QuantityItem(
+            quantity_takeoff_id=seed.takeoff_id,
+            project_id=seed.project_id,
+            drawing_revision_id=seed.revision_id,
+            item_kind=QuantityItemKind.EXCLUSION.value,
+            quantity_type="area",
+            value=None,
+            unit="sq_ft",
+            review_state="approved",
+            validation_status="valid",
+            quantity_gate=QuantityGate.ALLOWED.value,
+            source_entity_id="entity-1",
+            excluded_source_entity_ids_json=[],
+        )
+        db.add(quantity_item)
+        await db.commit()
+
+    request_body["catalog_refs"][0]["quantity_item_id"] = str(quantity_item.id)
     request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
     request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
 
@@ -1642,7 +1694,7 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert publish_calls == []
 
     async with session_factory() as db:
@@ -2048,7 +2100,7 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
     response = client.post(f"/v1/revisions/{revision.id}/quantity-takeoffs")
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INPUT_INVALID"
+    assert _response_error_code(response) == "INPUT_INVALID"
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
@@ -2108,7 +2160,7 @@ def test_list_revision_quantity_takeoffs_rejects_invalid_cursor(monkeypatch: Any
     response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs?cursor=not-base64")
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+    assert _response_error_code(response) == "INVALID_CURSOR"
 
 
 def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
@@ -2136,4 +2188,4 @@ def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["error"]["code"] == "INVALID_CURSOR"
+    assert _response_error_code(response) == "INVALID_CURSOR"
