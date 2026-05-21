@@ -404,7 +404,7 @@ def _build_formula_definition(
         output_contract_json={"type": "number"},
         declared_inputs_json=[{"key": "waste_factor", "type": "number"}],
         expression_json={"kind": "literal", "value": "1.10"},
-        rounding_json=None,
+        rounding_json={},
         checksum_sha256=checksum_sha256,
     )
 
