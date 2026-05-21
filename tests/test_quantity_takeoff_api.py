@@ -27,6 +27,7 @@ from app.db.session import get_db
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
+from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
 from app.models.estimation_catalog import (
     EstimationFormula,
     EstimationRate,
@@ -186,7 +187,11 @@ def _build_estimate_request_body(
     }
 
 
-async def _seed_quantity_lineage() -> _QuantityLineageSeed:
+async def _seed_quantity_lineage(
+    *,
+    quantity_gate: str = QuantityGate.ALLOWED.value,
+    trusted_totals: bool = True,
+) -> _QuantityLineageSeed:
     session_factory = session_module.AsyncSessionLocal
     assert session_factory is not None
 
@@ -306,8 +311,8 @@ async def _seed_quantity_lineage() -> _QuantityLineageSeed:
             source_job_type=JobType.QUANTITY_TAKEOFF.value,
             review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
+            quantity_gate=quantity_gate,
+            trusted_totals=trusted_totals,
         )
         item = QuantityItem(
             quantity_takeoff_id=takeoff_id,
@@ -319,7 +324,7 @@ async def _seed_quantity_lineage() -> _QuantityLineageSeed:
             unit="sq_ft",
             review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
+            quantity_gate=quantity_gate,
             source_entity_id=None,
             excluded_source_entity_ids_json=[],
         )
@@ -356,6 +361,96 @@ async def _seed_quantity_lineage() -> _QuantityLineageSeed:
         takeoff_id=takeoff_id,
         quantity_item_id=item.id,
     )
+
+
+async def _assert_no_estimate_persistence_for_project(seed: _QuantityLineageSeed) -> None:
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    async with session_factory() as db:
+        estimate_jobs = (
+            (
+                await db.execute(
+                    select(Job).where(
+                        (Job.project_id == seed.project_id)
+                        & (Job.job_type == JobType.ESTIMATE.value)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_inputs = (
+            (
+                await db.execute(
+                    select(EstimateJobInput).where(EstimateJobInput.project_id == seed.project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_refs = (
+            (
+                await db.execute(
+                    select(EstimateJobInputCatalogRef).where(
+                        EstimateJobInputCatalogRef.estimate_job_id.in_(
+                            select(Job.id).where(
+                                (Job.project_id == seed.project_id)
+                                & (Job.job_type == JobType.ESTIMATE.value)
+                            )
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_versions = (
+            (
+                await db.execute(
+                    select(EstimateVersion).where(EstimateVersion.project_id == seed.project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        snapshot_entries = (
+            (
+                await db.execute(
+                    select(EstimateSnapshotEntry).where(
+                        EstimateSnapshotEntry.estimate_version_id.in_(
+                            select(EstimateVersion.id).where(
+                                EstimateVersion.project_id == seed.project_id
+                            )
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        estimate_items = (
+            (
+                await db.execute(
+                    select(EstimateItem).where(
+                        EstimateItem.estimate_version_id.in_(
+                            select(EstimateVersion.id).where(
+                                EstimateVersion.project_id == seed.project_id
+                            )
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert estimate_jobs == []
+    assert estimate_inputs == []
+    assert estimate_refs == []
+    assert estimate_versions == []
+    assert snapshot_entries == []
+    assert estimate_items == []
 
 
 async def _soft_delete_lineage(seed: _QuantityLineageSeed, *, target: str) -> None:
@@ -1279,6 +1374,80 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
     assert session.added == []
     assert session.commits == 0
     assert publish_calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("quantity_gate", "trusted_totals"),
+    [
+        pytest.param(
+            QuantityGate.REVIEW_GATED.value,
+            False,
+            id="review_gated",
+        ),
+        pytest.param(QuantityGate.ALLOWED.value, False, id="untrusted"),
+    ],
+)
+@requires_database
+async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_before_insert(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+    quantity_gate: str,
+    trusted_totals: bool,
+) -> None:
+    seed = await _seed_quantity_lineage(quantity_gate=quantity_gate, trusted_totals=trusted_totals)
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    publish_calls: list[UUID] = []
+    enqueue_calls: list[UUID] = []
+    catalog_resolver_called = False
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    def fake_enqueue_estimate_job(job_id: UUID) -> None:
+        enqueue_calls.append(job_id)
+
+    async def fake_resolve_estimate_catalog_refs(
+        revision_value: Any,
+        takeoff_value: Any,
+        request_refs: Any,
+        pricing_effective_date: date,
+        db: AsyncSession,
+    ) -> list[Any]:
+        _ = (revision_value, takeoff_value, request_refs, pricing_effective_date, db)
+        nonlocal catalog_resolver_called
+        catalog_resolver_called = True
+        return []
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_catalog_refs",
+        fake_resolve_estimate_catalog_refs,
+    )
+
+    response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 400
+    assert _response_error_code(response) == "INPUT_INVALID"
+    assert catalog_resolver_called is False
+    assert publish_calls == []
+    assert enqueue_calls == []
+    await _assert_no_estimate_persistence_for_project(seed)
 
 
 @pytest.mark.anyio
