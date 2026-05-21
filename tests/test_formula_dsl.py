@@ -13,6 +13,7 @@ from app.estimating.formulas import (
     ValueContract,
     evaluate_formula,
 )
+from app.estimating.formulas import evaluator as evaluator_module
 
 SCALAR = ValueContract(kind="scalar")
 MONEY_GBP = ValueContract(kind="money", currency="GBP")
@@ -299,6 +300,73 @@ def test_evaluate_formula_raises_input_invalid_for_invalid_decimal_literal() -> 
     assert exc_info.value.code == "INPUT_INVALID"
 
 
+@pytest.mark.parametrize(
+    "literal",
+    ["1E-999999", "1e2", "+1", "01", "1.0", "1.", ".1", "-0"],
+)
+def test_evaluate_formula_rejects_non_canonical_decimal_literals(literal: str) -> None:
+    definition = FormulaDefinition(
+        formula_id="formula.non_canonical_decimal_literal",
+        name="Non canonical decimal literal",
+        version=23,
+        checksum="sha256:non-canonical-decimal-literal",
+        output_key="result",
+        output_contract=SCALAR,
+        declared_inputs=(),
+        expression=FormulaNode(kind="literal", value=literal),
+    )
+
+    with pytest.raises(FormulaEvaluationError) as exc_info:
+        evaluate_formula(definition, {})
+
+    assert exc_info.value.code == "INPUT_INVALID"
+    assert exc_info.value.reason == "literal_not_canonical"
+
+
+def test_evaluate_formula_rejects_exponent_literals_before_canonical_formatting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    definition = FormulaDefinition(
+        formula_id="formula.exponent_literal_precheck",
+        name="Exponent literal precheck",
+        version=24,
+        checksum="sha256:exponent-literal-precheck",
+        output_key="result",
+        output_contract=SCALAR,
+        declared_inputs=(),
+        expression=FormulaNode(kind="literal", value="1E-999999"),
+    )
+
+    def fail_if_called(_: Decimal) -> str:
+        raise AssertionError("_canonical_decimal_string must not run")
+
+    monkeypatch.setattr(evaluator_module, "_canonical_decimal_string", fail_if_called)
+
+    with pytest.raises(FormulaEvaluationError) as exc_info:
+        evaluate_formula(definition, {})
+
+    assert exc_info.value.code == "INPUT_INVALID"
+    assert exc_info.value.reason == "literal_not_canonical"
+
+
+@pytest.mark.parametrize("literal", ["0", "-1", "0.001", "12.34"])
+def test_evaluate_formula_accepts_canonical_decimal_literals(literal: str) -> None:
+    definition = FormulaDefinition(
+        formula_id="formula.valid_decimal_literal",
+        name="Valid decimal literal",
+        version=25,
+        checksum="sha256:valid-decimal-literal",
+        output_key="result",
+        output_contract=SCALAR,
+        declared_inputs=(),
+        expression=FormulaNode(kind="literal", value=literal),
+    )
+
+    result = evaluate_formula(definition, {})
+
+    assert result.value == FormulaValue(amount=Decimal(literal), contract=SCALAR)
+
+
 def test_formula_node_rejects_unknown_extra_ast_keys() -> None:
     payload: Any = {"kind": "literal", "value": "1", "extra_key": "unexpected"}
 
@@ -582,9 +650,7 @@ def test_evaluate_formula_raises_input_invalid_for_excessive_node_count() -> Non
             if index + 1 == len(nodes):
                 next_level.append(nodes[index])
                 continue
-            next_level.append(
-                FormulaNode(kind="add", args=(nodes[index], nodes[index + 1]))
-            )
+            next_level.append(FormulaNode(kind="add", args=(nodes[index], nodes[index + 1])))
         nodes = next_level
 
     definition = FormulaDefinition(

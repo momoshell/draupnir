@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import (
@@ -32,6 +33,10 @@ _MAX_NODE_COUNT: Final = 512
 _MAX_NODE_ARGS: Final = 64
 _MAX_LITERAL_LENGTH: Final = 256
 _MAX_ROUNDING_SCALE: Final = 28
+_CANONICAL_DECIMAL_PATTERN: Final = re.compile(
+    r"(?:0|-?(?:[1-9][0-9]*|0\.[0-9]*[1-9]|[1-9][0-9]*\.[0-9]*[1-9]))\Z",
+    re.ASCII,
+)
 _EVALUATION_CONTEXT: Final = Context(
     prec=16_384,
     rounding=ROUND_HALF_EVEN,
@@ -570,6 +575,11 @@ def _parse_canonical_decimal(value: str) -> Decimal:
         _raise_input_invalid(
             "literal_invalid",
             f"Decimal literals cannot exceed {_MAX_LITERAL_LENGTH} characters.",
+        )
+    if _CANONICAL_DECIMAL_PATTERN.fullmatch(value) is None:
+        _raise_input_invalid(
+            "literal_not_canonical",
+            f"Decimal literal '{value}' is not canonical.",
         )
     try:
         decimal_value = Decimal(value)
