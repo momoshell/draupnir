@@ -83,15 +83,16 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
         validation_report = validation_reports[0]
 
-        response = await async_client.get(
-            f"/v1/revisions/{drawing_revision.id}/validation-report"
-        )
+        response = await async_client.get(f"/v1/revisions/{drawing_revision.id}/validation-report")
 
         assert response.status_code == 200
 
@@ -127,15 +128,10 @@ class TestValidationReportApi:
         assert body["summary"]["validation_status"] == validation_report.validation_status
         assert body["summary"]["review_state"] == validation_report.review_state
         assert body["summary"]["quantity_gate"] == validation_report.quantity_gate
-        assert (
-            body["summary"]["effective_confidence"]
-            == validation_report.effective_confidence
-        )
+        assert body["summary"]["effective_confidence"] == validation_report.effective_confidence
         assert body["checks"]
         assert body["findings"] == validation_report.report_json["findings"]
-        assert (
-            body["adapter_warnings"] == validation_report.report_json["adapter_warnings"]
-        )
+        assert body["adapter_warnings"] == validation_report.report_json["adapter_warnings"]
         assert body["provenance"] == validation_report.report_json["provenance"]
 
     async def test_get_validation_report_rewrites_nested_confidence_from_db_columns(
@@ -193,14 +189,15 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
-        response = await async_client.get(
-            f"/v1/revisions/{drawing_revision.id}/validation-report"
-        )
+        response = await async_client.get(f"/v1/revisions/{drawing_revision.id}/validation-report")
 
         assert response.status_code == 200
         body = response.json()
@@ -237,9 +234,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, _drawing_revisions, validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            _drawing_revisions,
+            validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         assert len(validation_reports) == 1
 
         revision_id = uuid.uuid4()
@@ -279,9 +279,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        adapter_outputs, drawing_revisions, validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
         adapter_output = adapter_outputs[0]
         validation_report = validation_reports[0]
@@ -326,17 +329,13 @@ class TestValidationReportApi:
             session.add(next_revision)
             await session.commit()
 
-        response = await async_client.get(
-            f"/v1/revisions/{next_revision.id}/validation-report"
-        )
+        response = await async_client.get(f"/v1/revisions/{next_revision.id}/validation-report")
 
         assert response.status_code == 404
         assert response.json() == {
             "error": {
                 "code": ErrorCode.NOT_FOUND.value,
-                "message": (
-                    f"Validation report with identifier '{next_revision.id}' not found"
-                ),
+                "message": (f"Validation report with identifier '{next_revision.id}' not found"),
                 "details": None,
             }
         }
@@ -366,17 +365,18 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         delete_response = await async_client.delete(f"/v1/projects/{project['id']}")
         assert delete_response.status_code == 204
 
-        response = await async_client.get(
-            f"/v1/revisions/{drawing_revision.id}/validation-report"
-        )
+        response = await async_client.get(f"/v1/revisions/{drawing_revision.id}/validation-report")
 
         assert response.status_code == 404
         assert response.json() == {
@@ -404,9 +404,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         response = await async_client.get(f"/v1/files/{uploaded['id']}/revisions")
@@ -450,9 +453,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         adapter_output = adapter_outputs[0]
         drawing_revision = drawing_revisions[0]
 
@@ -521,11 +527,11 @@ class TestValidationReportApi:
             params={"cursor": "not-a-valid-cursor"},
         )
 
-        assert invalid_cursor_response.status_code == 422
+        assert invalid_cursor_response.status_code == 400
         assert invalid_cursor_response.json() == {
             "error": {
-                "code": ErrorCode.VALIDATION_ERROR.value,
-                "message": "Invalid cursor",
+                "code": ErrorCode.INVALID_CURSOR.value,
+                "message": "Invalid cursor format",
                 "details": None,
             }
         }
@@ -547,9 +553,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         adapter_output = adapter_outputs[0]
         drawing_revision = drawing_revisions[0]
 
@@ -567,9 +576,8 @@ class TestValidationReportApi:
         assert by_revision_body["id"] == str(adapter_output.id)
         assert by_revision_body["project_id"] == str(adapter_output.project_id)
         assert by_revision_body["source_file_id"] == str(adapter_output.source_file_id)
-        assert (
-            by_revision_body["extraction_profile_id"]
-            == str(adapter_output.extraction_profile_id)
+        assert by_revision_body["extraction_profile_id"] == str(
+            adapter_output.extraction_profile_id
         )
         assert by_revision_body["source_job_id"] == str(adapter_output.source_job_id)
         assert by_revision_body["adapter_key"] == adapter_output.adapter_key
@@ -580,10 +588,7 @@ class TestValidationReportApi:
             == adapter_output.canonical_entity_schema_version
         )
         assert by_revision_body["confidence_score"] == adapter_output.confidence_score
-        assert (
-            by_revision_body["result_checksum_sha256"]
-            == adapter_output.result_checksum_sha256
-        )
+        assert by_revision_body["result_checksum_sha256"] == adapter_output.result_checksum_sha256
         assert _parse_timestamp(by_revision_body["created_at"]) == (
             adapter_output.created_at.astimezone(UTC)
         )
@@ -610,9 +615,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         file_response = await async_client.get(f"/v1/files/{uploaded['id']}/generated-artifacts")
@@ -645,10 +653,7 @@ class TestValidationReportApi:
         assert first_item["source_file_id"] == str(first_artifact.source_file_id)
         assert first_item["job_id"] == str(first_artifact.job_id)
         assert first_item["drawing_revision_id"] == str(first_artifact.drawing_revision_id)
-        assert (
-            first_item["adapter_run_output_id"]
-            == str(first_artifact.adapter_run_output_id)
-        )
+        assert first_item["adapter_run_output_id"] == str(first_artifact.adapter_run_output_id)
         assert first_item["artifact_kind"] == first_artifact.artifact_kind
         assert first_item["name"] == first_artifact.name
         assert first_item["format"] == first_artifact.format
@@ -710,9 +715,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         session_maker = session_module.AsyncSessionLocal
@@ -777,6 +785,19 @@ class TestValidationReportApi:
         revision_second_page = revision_second_page_response.json()
         assert _artifact_ids(revision_second_page["items"]) == [str(revision_artifacts[1].id)]
 
+        invalid_revision_cursor_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/generated-artifacts",
+            params={"cursor": "not-a-valid-cursor"},
+        )
+        assert invalid_revision_cursor_response.status_code == 400
+        assert invalid_revision_cursor_response.json() == {
+            "error": {
+                "code": ErrorCode.INVALID_CURSOR.value,
+                "message": "Invalid cursor format",
+                "details": None,
+            }
+        }
+
     async def test_discoverability_endpoints_hide_soft_deleted_project_data(
         self,
         async_client: httpx.AsyncClient,
@@ -794,9 +815,12 @@ class TestValidationReportApi:
 
         await process_ingest_job(job.id)
 
-        adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
         adapter_output = adapter_outputs[0]
 
@@ -804,9 +828,7 @@ class TestValidationReportApi:
         assert delete_response.status_code == 204
 
         revisions_response = await async_client.get(f"/v1/files/{uploaded['id']}/revisions")
-        adapter_output_response = await async_client.get(
-            f"/v1/adapter-outputs/{adapter_output.id}"
-        )
+        adapter_output_response = await async_client.get(f"/v1/adapter-outputs/{adapter_output.id}")
 
         assert revisions_response.status_code == 404
         assert revisions_response.json() == {
