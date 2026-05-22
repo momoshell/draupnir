@@ -147,7 +147,7 @@ def _decode_revision_cursor(cursor: str) -> _DrawingRevisionCursor:
         decoded = base64.urlsafe_b64decode(f"{cursor}{'=' * (-len(cursor) % 4)}")
         return _DrawingRevisionCursor.model_validate_json(decoded)
     except (ValueError, ValidationError, binascii.Error) as exc:
-        raise HTTPException(status_code=422, detail="Invalid cursor") from exc
+        raise_invalid_cursor(exc)
 
 
 def _decode_artifact_cursor(cursor: str) -> _GeneratedArtifactCursor:
@@ -157,7 +157,7 @@ def _decode_artifact_cursor(cursor: str) -> _GeneratedArtifactCursor:
         decoded = base64.urlsafe_b64decode(f"{cursor}{'=' * (-len(cursor) % 4)}")
         return _GeneratedArtifactCursor.model_validate_json(decoded)
     except (ValueError, ValidationError, binascii.Error) as exc:
-        raise HTTPException(status_code=422, detail="Invalid cursor") from exc
+        raise_invalid_cursor(exc)
 
 
 def _encode_materialization_cursor(sequence_index: int, row_id: UUID) -> str:
