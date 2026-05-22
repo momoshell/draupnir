@@ -64,10 +64,17 @@ class _ScalarResultStub:
 
 
 class _AsyncSessionStub:
-    def __init__(self, *, execute_results: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        execute_results: list[Any] | None = None,
+        refresh_created_at: datetime | None = None,
+    ) -> None:
         self._execute_results: deque[Any] = deque(execute_results or [])
+        self._refresh_created_at = refresh_created_at
         self.added: list[Any] = []
         self.commits = 0
+        self.refresh_calls = 0
 
     async def execute(self, _statement: Any) -> _ScalarResultStub:
         if not self._execute_results:
@@ -81,8 +88,9 @@ class _AsyncSessionStub:
         return None
 
     async def refresh(self, value: Any) -> None:
+        self.refresh_calls += 1
         if getattr(value, "created_at", None) is None:
-            value.created_at = datetime.now(UTC)
+            value.created_at = self._refresh_created_at or datetime.now(UTC)
 
     async def commit(self) -> None:
         self.commits += 1
@@ -684,11 +692,13 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     takeoff = _build_takeoff(revision)
     quantity_item_id = uuid4()
     request_body = _build_estimate_request_body(quantity_item_id=quantity_item_id)
-    session = _AsyncSessionStub()
+    job_created_at = datetime(2026, 5, 21, 1, 0, tzinfo=UTC)
+    session = _AsyncSessionStub(refresh_created_at=datetime(2026, 5, 20, 9, 30, tzinfo=UTC))
     app = _build_app(session)
     client = TestClient(app)
     idempotency_state: dict[str, dict[str, Any]] = {}
     enqueued_job_ids: list[UUID] = []
+    pricing_effective_dates: list[date] = []
 
     class _EstimateJobInputRecord:
         pass
@@ -722,7 +732,8 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         pricing_effective_date: date,
         db: AsyncSession,
     ) -> list[Any]:
-        _ = (revision_value, takeoff_value, pricing_effective_date, db)
+        _ = (revision_value, takeoff_value, db)
+        pricing_effective_dates.append(pricing_effective_date)
         return [
             revisions_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[0].ref_type,
@@ -807,6 +818,14 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
+    class _AppClock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> _AppClock:
+            app_now = job_created_at
+            if tz is None:
+                return cls.fromtimestamp(app_now.timestamp(), UTC)
+            return cls.fromtimestamp(app_now.astimezone(tz).timestamp(), tz)
+
     monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
         revisions_module,
@@ -836,6 +855,7 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         fake_publish_job_enqueue_intent,
     )
     monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(revisions_module, "datetime", _AppClock)
     monkeypatch.setattr(
         revisions_module,
         "_resolve_estimate_job_model_classes",
@@ -858,8 +878,10 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     assert first_body["job_type"] == "estimate"
     assert first_body["base_revision_id"] == str(revision.id)
     assert first_body["parent_job_id"] == str(takeoff.source_job_id)
+    assert pricing_effective_dates == [job_created_at.date()]
     assert len(session.added) == 4
     estimate_job = session.added[0]
+    assert estimate_job.created_at == job_created_at
     estimate_input = session.added[1]
     assert estimate_input.estimate_job_id == estimate_job.id
     assert estimate_input.source_job_type == JobType.ESTIMATE.value
@@ -1294,7 +1316,7 @@ def test_create_revision_estimate_version_rejects_untrusted_takeoff(monkeypatch:
     assert publish_calls == []
 
 
-def test_create_revision_estimate_version_rejects_catalog_validation_before_enqueue(
+def test_create_revision_estimate_version_rejects_catalog_validation_before_idempotency_claim(
     monkeypatch: Any,
 ) -> None:
     revision = _build_revision()
@@ -1303,6 +1325,8 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
     session = _AsyncSessionStub()
     app = _build_app(session)
     client = TestClient(app)
+    idempotency_claimed = False
+    idempotency_completed = False
     publish_calls: list[UUID] = []
 
     async def fake_get_active_revision(
@@ -1338,6 +1362,39 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
         )
         raise AssertionError("unreachable")
 
+    async def fake_claim_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation:
+        _ = (db, key, fingerprint, method, path)
+        nonlocal idempotency_claimed
+        idempotency_claimed = True
+        return IdempotencyReservation(record_id=uuid4())
+
+    async def fake_replay_idempotency(
+        db: AsyncSession,
+        *,
+        key: str,
+        fingerprint: str,
+    ) -> IdempotencyReplay | None:
+        _ = (db, key, fingerprint)
+        return None
+
+    async def fake_mark_idempotency_completed(
+        db: AsyncSession,
+        reservation: IdempotencyReservation,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> None:
+        _ = (db, reservation, status_code, response_body)
+        nonlocal idempotency_completed
+        idempotency_completed = True
+
     async def fake_publish_job_enqueue_intent(
         job_id: UUID,
         *,
@@ -1358,6 +1415,13 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
+    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
+    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
+    monkeypatch.setattr(
+        revisions_module,
+        "mark_idempotency_completed",
+        fake_mark_idempotency_completed,
+    )
     monkeypatch.setattr(
         revisions_module,
         "publish_job_enqueue_intent",
@@ -1366,13 +1430,17 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_enqu
 
     response = client.post(
         f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
         json=_build_estimate_request_body(quantity_item_id=quantity_item_id),
     )
 
     assert response.status_code == 400
     assert _response_error_code(response) == "INPUT_INVALID"
+    assert idempotency_claimed is False
+    assert session.refresh_calls == 0
     assert session.added == []
     assert session.commits == 0
+    assert idempotency_completed is False
     assert publish_calls == []
 
 
@@ -1671,6 +1739,89 @@ async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate
     assert estimate_jobs == []
     assert estimate_inputs == []
     assert estimate_refs == []
+
+
+@pytest.mark.anyio
+@requires_database
+async def test_create_revision_estimate_version_invalid_catalog_retry_reuses_idempotency_key(
+    async_client: AsyncClient,
+    monkeypatch: Any,
+) -> None:
+    seed = await _seed_quantity_lineage()
+    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
+    request_body["pricing"]["effective_date"] = "2026-05-20"
+    publish_calls: list[UUID] = []
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    stale_rate = _build_rate_catalog_entry(
+        scope_type="project",
+        project_id=seed.project_id,
+        rate_key="labour:install",
+        checksum_sha256="a" * 64,
+        effective_from=date(2026, 1, 1),
+        effective_to=date(2026, 4, 1),
+    )
+    valid_rate = _build_rate_catalog_entry(
+        scope_type="project",
+        project_id=seed.project_id,
+        rate_key="labour:install",
+        checksum_sha256="c" * 64,
+        effective_from=date(2026, 4, 1),
+    )
+    formula = _build_formula_definition(
+        scope_type="project",
+        project_id=seed.project_id,
+        formula_id="formula:waste",
+        checksum_sha256="b" * 64,
+    )
+
+    async with session_factory() as db:
+        db.add(stale_rate)
+        db.add(valid_rate)
+        db.add(formula)
+        await db.commit()
+
+    request_body["catalog_refs"][0]["selection_id"] = str(stale_rate.id)
+    request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = (publisher, suppress_exceptions)
+        publish_calls.append(job_id)
+
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+
+    first_response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=request_body,
+    )
+
+    assert first_response.status_code == 400
+    assert _response_error_code(first_response) == "INPUT_INVALID"
+    assert publish_calls == []
+    await _assert_no_estimate_persistence_for_project(seed)
+
+    request_body["catalog_refs"][0]["selection_id"] = str(valid_rate.id)
+    request_body["catalog_refs"][0]["selection_checksum_sha256"] = valid_rate.checksum_sha256
+
+    second_response = await async_client.post(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
+        headers={"Idempotency-Key": "estimate-1"},
+        json=request_body,
+    )
+
+    assert second_response.status_code == 202
+    assert publish_calls == [UUID(second_response.json()["id"])]
 
 
 @pytest.mark.anyio
