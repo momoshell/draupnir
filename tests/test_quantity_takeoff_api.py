@@ -1767,7 +1767,7 @@ async def test_create_revision_estimate_version_invalid_catalog_retry_reuses_ide
         project_id=seed.project_id,
         rate_key="labour:install",
         checksum_sha256="c" * 64,
-        effective_from=date(2026, 1, 1),
+        effective_from=date(2026, 4, 1),
     )
     formula = _build_formula_definition(
         scope_type="project",
