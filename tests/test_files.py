@@ -152,9 +152,7 @@ class RecordingStorage:
             key=key,
             storage_uri=f"memory://{key}",
             size_bytes=len(body),
-            checksum_sha256=(
-                self.returned_checksum_sha256 or hashlib.sha256(body).hexdigest()
-            ),
+            checksum_sha256=(self.returned_checksum_sha256 or hashlib.sha256(body).hexdigest()),
         )
 
     async def get(
@@ -220,6 +218,24 @@ class LocalChecksumMismatchStorage(LocalFilesystemStorage):
             size_bytes=meta.size_bytes,
             checksum_sha256="0" * 64,
         )
+
+
+class CountingLocalChecksumMismatchStorage(LocalChecksumMismatchStorage):
+    """Checksum-mismatch storage that tracks put calls for replay assertions."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.put_call_count = 0
+
+    async def put(
+        self,
+        key: str,
+        data: bytes | Path,
+        *,
+        immutable: bool = False,
+    ) -> StoredObjectMeta:
+        self.put_call_count += 1
+        return await super().put(key, data, immutable=immutable)
 
 
 @requires_database
@@ -367,9 +383,7 @@ class TestProjectFiles:
         finally:
             app.dependency_overrides.pop(get_storage, None)
 
-        expected_key = (
-            f"originals/{uploaded['id']}/{hashlib.sha256(payload).hexdigest()}"
-        )
+        expected_key = f"originals/{uploaded['id']}/{hashlib.sha256(payload).hexdigest()}"
         assert len(storage.put_calls) == 1
         put_key, put_path, put_body, put_immutable = storage.put_calls[0]
         assert put_key == expected_key
@@ -417,6 +431,68 @@ class TestProjectFiles:
                 "details": None,
             }
         }
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+        originals_root = upload_root / "originals"
+        assert not originals_root.exists() or not any(
+            path.is_file() for path in originals_root.rglob("*")
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            file_result = await session.execute(
+                select(FileModel).where(
+                    FileModel.project_id == uuid.UUID(str(created_project["id"]))
+                )
+            )
+            job_result = await session.execute(
+                select(Job).where(Job.project_id == uuid.UUID(str(created_project["id"])))
+            )
+
+        assert file_result.scalars().all() == []
+        assert job_result.scalars().all() == []
+
+    async def test_upload_file_replays_storage_failure_for_same_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+    ) -> None:
+        """POST should replay finalized storage failures without re-persisting staged bytes."""
+        _ = self
+        payload = b"%PDF-1.7\nidempotent-checksum-mismatch"
+        upload_root = Path(settings.upload_storage_root).resolve()
+        storage = CountingLocalChecksumMismatchStorage(upload_root)
+        app.dependency_overrides[get_storage] = lambda: storage
+        headers = {"Idempotency-Key": "upload-storage-failure-replay-key"}
+        try:
+            first_response = await async_client.post(
+                f"/v1/projects/{created_project['id']}/files",
+                files={"file": ("mismatch.pdf", payload, "application/pdf")},
+                headers=headers,
+            )
+            second_response = await async_client.post(
+                f"/v1/projects/{created_project['id']}/files",
+                files={"file": ("mismatch.pdf", payload, "application/pdf")},
+                headers=headers,
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage, None)
+
+        expected_body = {
+            "error": {
+                "code": "STORAGE_FAILED",
+                "message": "Stored file checksum mismatch detected.",
+                "details": None,
+            }
+        }
+        assert first_response.status_code == 500
+        assert second_response.status_code == 500
+        assert first_response.json() == expected_body
+        assert second_response.json() == expected_body
+        assert storage.put_call_count == 1
+
         staging_root = upload_root / ".staging"
         assert not staging_root.exists() or not any(staging_root.iterdir())
         originals_root = upload_root / "originals"
@@ -1338,8 +1414,8 @@ class TestProjectFiles:
         _ = self
         payload = b"%PDF-1.7\npayload"
 
-        app.dependency_overrides[session_module.get_db] = (
-            _make_get_db_override_with_commit_error(RuntimeError("forced commit failure"))
+        app.dependency_overrides[session_module.get_db] = _make_get_db_override_with_commit_error(
+            RuntimeError("forced commit failure")
         )
         try:
             with pytest.raises(RuntimeError, match="forced commit failure"):
@@ -1369,8 +1445,8 @@ class TestProjectFiles:
         _ = self
         payload = b"%PDF-1.7\npayload"
 
-        app.dependency_overrides[session_module.get_db] = (
-            _make_get_db_override_with_commit_error(asyncio.CancelledError())
+        app.dependency_overrides[session_module.get_db] = _make_get_db_override_with_commit_error(
+            asyncio.CancelledError()
         )
         try:
             caught: BaseException | None = None

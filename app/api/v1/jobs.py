@@ -5,18 +5,17 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
-    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
-    claim_idempotency,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
-    mark_idempotency_completed,
-    replay_idempotency,
+    replay_idempotency_response,
 )
 from app.api.pagination import (
     decode_cursor_payload,
@@ -60,9 +59,7 @@ async def _get_job_lock_metadata_or_404(
     job_id: UUID,
 ) -> tuple[UUID, UUID]:
     """Return project/file identifiers needed for ordered job locking."""
-    result = await db.execute(
-        select(Job.project_id, Job.file_id).where(Job.id == job_id)
-    )
+    result = await db.execute(select(Job.project_id, Job.file_id).where(Job.id == job_id))
     row = result.one_or_none()
     if row is None:
         raise_not_found("Job", str(job_id))
@@ -80,9 +77,7 @@ async def _get_project_for_job_update_or_404(
 ) -> Project:
     """Lock a job's project row before any job/file row locks."""
     result = await db.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(of=Project)
+        select(Project).where(Project.id == project_id).with_for_update(of=Project)
     )
     project = result.scalar_one_or_none()
     if project is None:
@@ -100,11 +95,7 @@ async def _get_job_for_update_or_404(
     expected_file_id: UUID | None = None,
 ) -> Job:
     """Return a persisted job with a row lock or raise not found."""
-    result = await db.execute(
-        select(Job)
-        .where(Job.id == job_id)
-        .with_for_update(of=Job)
-    )
+    result = await db.execute(select(Job).where(Job.id == job_id).with_for_update(of=Job))
     job = result.scalar_one_or_none()
     if job is None:
         raise_not_found("Job", str(job_id))
@@ -293,27 +284,27 @@ async def cancel_job(
             f"jobs.cancel:{job_id}",
             {"job_id": str(job_id)},
         )
-        replay = await replay_idempotency(
+        replay = await replay_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
         )
         if replay is not None:
-            return replay.response
+            return replay
 
     project_id, file_id = await _get_job_lock_metadata_or_404(db, job_id)
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path=f"/jobs/{job_id}/cancel",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
         reservation = claim
 
     await _get_project_for_job_update_or_404(
@@ -329,30 +320,28 @@ async def cancel_job(
     )
     if job.status in _TERMINAL_JOB_STATUSES:
         if reservation is not None:
-            body = JobRead.model_validate(job).model_dump(mode="json")
-            await mark_idempotency_completed(
+            response = await complete_idempotency_response(
                 db,
                 reservation,
                 status_code=status.HTTP_202_ACCEPTED,
-                response_body=body,
+                response_body=JobRead.model_validate(job).model_dump(mode="json"),
             )
             await db.commit()
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+            return response
         return job
 
     job.cancel_requested = True
     if reservation is not None:
         await db.flush()
         await db.refresh(job)
-        body = JobRead.model_validate(job).model_dump(mode="json")
-        await mark_idempotency_completed(
+        response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_202_ACCEPTED,
-            response_body=body,
+            response_body=JobRead.model_validate(job).model_dump(mode="json"),
         )
         await db.commit()
-        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+        return response
 
     await db.commit()
     await db.refresh(job)
@@ -377,27 +366,27 @@ async def retry_job(
             f"jobs.retry:{job_id}",
             {"job_id": str(job_id)},
         )
-        replay = await replay_idempotency(
+        replay = await replay_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
         )
         if replay is not None:
-            return replay.response
+            return replay
 
     project_id, file_id = await _get_job_lock_metadata_or_404(db, job_id)
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path=f"/jobs/{job_id}/retry",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
         reservation = claim
 
     job = await _lock_retry_source_or_404(
@@ -408,41 +397,38 @@ async def retry_job(
     )
     if job.status != "failed" or job.attempts >= job.max_attempts:
         if reservation is not None:
-            body = JobRead.model_validate(job).model_dump(mode="json")
-            await mark_idempotency_completed(
+            response = await complete_idempotency_response(
                 db,
                 reservation,
                 status_code=status.HTTP_202_ACCEPTED,
-                response_body=body,
+                response_body=JobRead.model_validate(job).model_dump(mode="json"),
             )
             await db.commit()
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+            return response
         return job
 
     if job.error_code == ErrorCode.REVISION_CONFLICT.value:
         if reservation is not None:
-            body = JobRead.model_validate(job).model_dump(mode="json")
-            await mark_idempotency_completed(
+            response = await complete_idempotency_response(
                 db,
                 reservation,
                 status_code=status.HTTP_202_ACCEPTED,
-                response_body=body,
+                response_body=JobRead.model_validate(job).model_dump(mode="json"),
             )
             await db.commit()
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+            return response
         return job
 
     if not is_recoverable_enqueue_job_type(job.job_type):
         if reservation is not None:
-            body = JobRead.model_validate(job).model_dump(mode="json")
-            await mark_idempotency_completed(
+            response = await complete_idempotency_response(
                 db,
                 reservation,
                 status_code=status.HTTP_202_ACCEPTED,
-                response_body=body,
+                response_body=JobRead.model_validate(job).model_dump(mode="json"),
             )
             await db.commit()
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body)
+            return response
         return job
 
     job.status = "pending"
@@ -455,21 +441,20 @@ async def retry_job(
     await db.flush()
     await db.refresh(job)
 
-    success_body: dict[str, object] | None = None
+    retry_response: Response | None = None
     if reservation is not None:
-        success_body = JobRead.model_validate(job).model_dump(mode="json")
-        await mark_idempotency_completed(
+        retry_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_202_ACCEPTED,
-            response_body=success_body,
+            response_body=JobRead.model_validate(job).model_dump(mode="json"),
         )
 
     await db.commit()
     await publish_job_enqueue_intent(job.id, suppress_exceptions=True)
 
     if reservation is not None:
-        assert success_body is not None
-        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
+        assert retry_response is not None
+        return retry_response
 
     return job

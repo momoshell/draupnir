@@ -167,6 +167,22 @@ async def replay_idempotency(
     )
 
 
+async def replay_idempotency_response(
+    db: AsyncSession,
+    *,
+    key: str | None,
+    fingerprint: str,
+) -> Response | None:
+    """Return an optional replay response for routes with an Idempotency-Key."""
+
+    if key is None:
+        return None
+    replay = await replay_idempotency(db, key=key, fingerprint=fingerprint)
+    if replay is None:
+        return None
+    return replay.response
+
+
 async def claim_idempotency(
     db: AsyncSession,
     *,
@@ -209,6 +225,30 @@ async def claim_idempotency(
     )
 
 
+async def claim_idempotency_response(
+    db: AsyncSession,
+    *,
+    key: str | None,
+    fingerprint: str,
+    method: str,
+    path: str,
+) -> IdempotencyReservation | Response | None:
+    """Claim an optional idempotency reservation or return an immediate response."""
+
+    if key is None:
+        return None
+    claim = await claim_idempotency(
+        db,
+        key=key,
+        fingerprint=fingerprint,
+        method=method,
+        path=path,
+    )
+    if isinstance(claim, IdempotencyReplay):
+        return claim.response
+    return claim
+
+
 async def mark_idempotency_completed(
     db: AsyncSession,
     reservation: IdempotencyReservation,
@@ -231,3 +271,24 @@ async def mark_idempotency_completed(
     record.response_status_code = status_code
     record.response_body_json = response_body
     record.completed_at = datetime.now(UTC)
+
+
+async def complete_idempotency_response(
+    db: AsyncSession,
+    reservation: IdempotencyReservation | None,
+    *,
+    status_code: int,
+    response_body: dict[str, Any] | None,
+) -> Response:
+    """Snapshot an optional reservation and build a replay-safe HTTP response."""
+
+    if reservation is not None:
+        await mark_idempotency_completed(
+            db,
+            reservation,
+            status_code=status_code,
+            response_body=response_body,
+        )
+    if status_code == status.HTTP_204_NO_CONTENT:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return JSONResponse(status_code=status_code, content=response_body)

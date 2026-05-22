@@ -11,18 +11,17 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
 from fastapi import File as FilePart
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
-    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
-    claim_idempotency,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
-    mark_idempotency_completed,
-    replay_idempotency,
+    replay_idempotency_response,
 )
 from app.api.pagination import (
     decode_cursor_payload,
@@ -89,9 +88,7 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     """Decode cursor to typed created_at and id values."""
     try:
         cursor_data = decode_cursor_payload(cursor)
-        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
-            str(cursor_data["id"])
-        )
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(str(cursor_data["id"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise_invalid_cursor(exc)
 
@@ -250,9 +247,7 @@ async def _get_active_project_or_404(
     for_update: bool = False,
 ) -> Project:
     """Return an active project row or raise not found."""
-    query = select(Project).where(
-        (Project.id == project_id) & (Project.deleted_at.is_(None))
-    )
+    query = select(Project).where((Project.id == project_id) & (Project.deleted_at.is_(None)))
     if for_update:
         query = query.with_for_update()
     project = (await db.execute(query)).scalar_one_or_none()
@@ -310,8 +305,7 @@ async def _get_latest_finalized_revision(
     query = (
         select(DrawingRevision)
         .where(
-            (DrawingRevision.project_id == project_id)
-            & (DrawingRevision.source_file_id == file_id)
+            (DrawingRevision.project_id == project_id) & (DrawingRevision.source_file_id == file_id)
         )
         .order_by(DrawingRevision.revision_sequence.desc())
         .limit(1)
@@ -347,7 +341,7 @@ async def _raise_upload_storage_failure(
         details=None,
     )
     if reservation is not None:
-        await mark_idempotency_completed(
+        await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -490,23 +484,24 @@ async def upload_project_file(
                     "checksum_sha256": checksum,
                 },
             )
-            replay = await replay_idempotency(
+            replay = await replay_idempotency_response(
                 db,
                 key=idempotency_key,
                 fingerprint=fingerprint,
             )
             if replay is not None:
-                return replay.response
+                return replay
             await _get_active_project_or_404(db, project_id)
-            claim = await claim_idempotency(
+            claim = await claim_idempotency_response(
                 db,
                 key=idempotency_key,
                 fingerprint=fingerprint,
                 method="POST",
                 path=f"/projects/{project_id}/files",
             )
-            if isinstance(claim, IdempotencyReplay):
-                return claim.response
+            if isinstance(claim, Response):
+                return claim
+            assert claim is not None
             reservation = claim
 
         try:
@@ -590,11 +585,12 @@ async def upload_project_file(
     await db.refresh(ingest_job)
 
     success_body: dict[str, Any] | None = None
+    idempotent_response: Response | None = None
     if reservation is not None:
         success_body = FileRead.model_validate(
             _attach_initial_upload_metadata(file_row)
         ).model_dump(mode="json")
-        await mark_idempotency_completed(
+        idempotent_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_201_CREATED,
@@ -608,9 +604,8 @@ async def upload_project_file(
         suppress_exceptions=True,
     )
 
-    if reservation is not None:
-        assert success_body is not None
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=success_body)
+    if idempotent_response is not None:
+        return idempotent_response
 
     return _attach_initial_upload_metadata(file_row)
 
@@ -635,13 +630,13 @@ async def reprocess_project_file(
             f"files.reprocess:{project_id}:{file_id}",
             request.model_dump(mode="json"),
         )
-        replay = await replay_idempotency(
+        replay = await replay_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
         )
         if replay is not None:
-            return replay.response
+            return replay
 
     await _get_active_project_or_404(db, project_id)
     await _get_project_file_or_404(db, project_id, file_id)
@@ -661,15 +656,16 @@ async def reprocess_project_file(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path=f"/projects/{project_id}/files/{file_id}/reprocess",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
     await _get_active_project_or_404(db, project_id, for_update=True)
     await _get_project_file_or_404(db, project_id, file_id, for_update=True)
@@ -698,9 +694,10 @@ async def reprocess_project_file(
     await db.refresh(ingest_job)
 
     success_body: dict[str, Any] | None = None
+    idempotent_response: Response | None = None
     if reservation is not None:
         success_body = JobRead.model_validate(ingest_job).model_dump(mode="json")
-        await mark_idempotency_completed(
+        idempotent_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_202_ACCEPTED,
@@ -714,9 +711,8 @@ async def reprocess_project_file(
         suppress_exceptions=True,
     )
 
-    if reservation is not None:
-        assert success_body is not None
-        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
+    if idempotent_response is not None:
+        return idempotent_response
 
     return ingest_job
 
@@ -736,9 +732,7 @@ async def list_project_files(
 
     query = (
         select(FileModel)
-        .where(
-            (FileModel.project_id == project_id) & (FileModel.deleted_at.is_(None))
-        )
+        .where((FileModel.project_id == project_id) & (FileModel.deleted_at.is_(None)))
         .order_by(FileModel.created_at.desc(), FileModel.id.desc())
     )
 

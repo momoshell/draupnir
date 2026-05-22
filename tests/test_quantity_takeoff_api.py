@@ -19,7 +19,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.idempotency import IdempotencyReplay, IdempotencyReservation
+from app.api.idempotency import IdempotencyReservation
 from app.api.v1 import revisions as revisions_module
 from app.api.v1.revisions import revisions_router
 from app.db import session as session_module
@@ -560,24 +560,22 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
             raise AssertionError("Unexpected revision lookup")
         return _build_validation_report()
 
-    async def fake_replay_idempotency(
+    async def fake_replay_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
         fingerprint: str,
-    ) -> IdempotencyReplay | None:
+    ) -> JSONResponse | None:
         _ = db
         record = idempotency_state.get(key)
         if record is None or record["fingerprint"] != fingerprint or not record["completed"]:
             return None
-        return IdempotencyReplay(
-            response=JSONResponse(
-                status_code=record["status_code"],
-                content=record["response_body"],
-            )
+        return JSONResponse(
+            status_code=record["status_code"],
+            content=record["response_body"],
         )
 
-    async def fake_claim_idempotency(
+    async def fake_claim_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
@@ -595,19 +593,21 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
             idempotency_state[key] = record
         return IdempotencyReservation(record_id=uuid4())
 
-    async def fake_mark_idempotency_completed(
+    async def fake_complete_idempotency_response(
         db: AsyncSession,
-        reservation: IdempotencyReservation,
+        reservation: IdempotencyReservation | None,
         *,
         status_code: int,
         response_body: dict[str, Any] | None,
-    ) -> None:
+    ) -> JSONResponse | None:
         _ = (db, reservation)
+        assert reservation is not None
         idempotency_state["quantity-1"].update(
             completed=True,
             status_code=status_code,
             response_body=response_body,
         )
+        return JSONResponse(status_code=status_code, content=response_body)
 
     def fake_prepare_job_enqueue_intent(job: Any) -> None:
         _ = job
@@ -635,12 +635,20 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
         "_get_active_validation_report_or_404",
         fake_get_validation_report,
     )
-    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
-    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
     monkeypatch.setattr(
         revisions_module,
-        "mark_idempotency_completed",
-        fake_mark_idempotency_completed,
+        "replay_idempotency_response",
+        fake_replay_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "claim_idempotency_response",
+        fake_claim_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
         revisions_module,
@@ -685,6 +693,109 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
     assert replay_response.status_code == 202
     assert replay_response.json() == first_body
     assert len(session.added) == 1
+
+
+def test_create_revision_quantity_takeoff_returns_job_without_idempotency_key(
+    monkeypatch: Any,
+) -> None:
+    revision = _build_revision()
+    session = _AsyncSessionStub()
+    app = _build_app(session)
+    client = TestClient(app)
+    manifest = SimpleNamespace(id=uuid4())
+    enqueued_job_ids: list[UUID] = []
+    complete_calls = 0
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_manifest(
+        revision_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace | None:
+        _ = db
+        return manifest if revision_id == revision.id else None
+
+    async def fake_get_validation_report(
+        revision_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id:
+            raise AssertionError("Unexpected revision lookup")
+        return _build_validation_report()
+
+    async def fake_complete_idempotency_response(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> JSONResponse | None:
+        _ = (db, reservation, response_body)
+        nonlocal complete_calls
+        complete_calls += 1
+        return JSONResponse(status_code=status_code, content=None)
+
+    def fake_prepare_job_enqueue_intent(job: Any) -> None:
+        _ = job
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = suppress_exceptions
+        assert publisher is revisions_module.enqueue_quantity_takeoff_job
+        publisher(job_id)
+
+    def fake_enqueue_quantity_takeoff_job(job_id: UUID) -> None:
+        enqueued_job_ids.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(revisions_module, "_get_revision_manifest", fake_get_revision_manifest)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_active_validation_report_or_404",
+        fake_get_validation_report,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "prepare_job_enqueue_intent",
+        fake_prepare_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "enqueue_quantity_takeoff_job",
+        fake_enqueue_quantity_takeoff_job,
+    )
+
+    response = client.post(f"/v1/revisions/{revision.id}/quantity-takeoffs")
+
+    assert response.status_code == 202
+    assert response.json()["job_type"] == "quantity_takeoff"
+    assert response.json()["base_revision_id"] == str(revision.id)
+    assert len(session.added) == 1
+    assert session.commits == 1
+    assert enqueued_job_ids == [UUID(response.json()["id"])]
+    assert complete_calls == 0
 
 
 def test_create_revision_estimate_version_replays_idempotent_response(monkeypatch: Any) -> None:
@@ -757,24 +868,22 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
             ),
         ]
 
-    async def fake_replay_idempotency(
+    async def fake_replay_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
         fingerprint: str,
-    ) -> IdempotencyReplay | None:
+    ) -> JSONResponse | None:
         _ = db
         record = idempotency_state.get(key)
         if record is None or record["fingerprint"] != fingerprint or not record["completed"]:
             return None
-        return IdempotencyReplay(
-            response=JSONResponse(
-                status_code=record["status_code"],
-                content=record["response_body"],
-            )
+        return JSONResponse(
+            status_code=record["status_code"],
+            content=record["response_body"],
         )
 
-    async def fake_claim_idempotency(
+    async def fake_claim_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
@@ -788,19 +897,21 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
             idempotency_state[key] = {"fingerprint": fingerprint, "completed": False}
         return IdempotencyReservation(record_id=uuid4())
 
-    async def fake_mark_idempotency_completed(
+    async def fake_complete_idempotency_response(
         db: AsyncSession,
-        reservation: IdempotencyReservation,
+        reservation: IdempotencyReservation | None,
         *,
         status_code: int,
         response_body: dict[str, Any] | None,
-    ) -> None:
+    ) -> JSONResponse | None:
         _ = (db, reservation)
+        assert reservation is not None
         idempotency_state["estimate-1"].update(
             completed=True,
             status_code=status_code,
             response_body=response_body,
         )
+        return JSONResponse(status_code=status_code, content=response_body)
 
     def fake_prepare_job_enqueue_intent(job: Any) -> None:
         _ = job
@@ -837,12 +948,20 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
-    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
-    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
     monkeypatch.setattr(
         revisions_module,
-        "mark_idempotency_completed",
-        fake_mark_idempotency_completed,
+        "replay_idempotency_response",
+        fake_replay_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "claim_idempotency_response",
+        fake_claim_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
         revisions_module,
@@ -912,6 +1031,156 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     assert replay_response.status_code == 202
     assert replay_response.json() == first_body
     assert len(session.added) == 4
+
+
+def test_create_revision_estimate_version_returns_job_without_idempotency_key(
+    monkeypatch: Any,
+) -> None:
+    revision = _build_revision()
+    takeoff = _build_takeoff(revision)
+    quantity_item_id = uuid4()
+    request_body = _build_estimate_request_body(quantity_item_id=quantity_item_id)
+    session = _AsyncSessionStub(refresh_created_at=datetime(2026, 5, 20, 9, 30, tzinfo=UTC))
+    app = _build_app(session)
+    client = TestClient(app)
+    enqueued_job_ids: list[UUID] = []
+    complete_calls = 0
+
+    class _EstimateJobInputRecord:
+        pass
+
+    class _EstimateJobInputCatalogRefRecord:
+        pass
+
+    async def fake_get_active_revision(
+        revision_id: UUID,
+        db: AsyncSession,
+        *,
+        for_update: bool = False,
+    ) -> SimpleNamespace | None:
+        _ = (db, for_update)
+        return revision if revision_id == revision.id else None
+
+    async def fake_get_revision_quantity_takeoff_or_404(
+        revision_id: UUID,
+        takeoff_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        _ = db
+        if revision_id != revision.id or takeoff_id != takeoff.id:
+            raise AssertionError("Unexpected takeoff lookup")
+        return takeoff
+
+    async def fake_resolve_estimate_catalog_refs(
+        revision_value: Any,
+        takeoff_value: Any,
+        request_refs: Any,
+        pricing_effective_date: date,
+        db: AsyncSession,
+    ) -> list[Any]:
+        _ = (revision_value, takeoff_value, pricing_effective_date, db)
+        return [
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[0].ref_type,
+                selection_id=request_refs[0].selection_id,
+                selection_key=request_refs[0].selection_key,
+                selection_checksum_sha256=request_refs[0].selection_checksum_sha256,
+                description=request_refs[0].description,
+                line_key=request_refs[0].line_key,
+                quantity_item_id=request_refs[0].quantity_item_id,
+                formula_inputs=request_refs[0].formula_inputs,
+            ),
+            revisions_module._NormalizedEstimateCatalogRef(
+                ref_type=request_refs[1].ref_type,
+                selection_id=request_refs[1].selection_id,
+                selection_key=request_refs[1].selection_key,
+                selection_checksum_sha256=request_refs[1].selection_checksum_sha256,
+                description=request_refs[1].description,
+                line_key=request_refs[1].line_key,
+                quantity_item_id=request_refs[1].quantity_item_id,
+                formula_inputs=request_refs[1].formula_inputs,
+            ),
+        ]
+
+    async def fake_complete_idempotency_response(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> JSONResponse | None:
+        _ = (db, reservation, response_body)
+        nonlocal complete_calls
+        complete_calls += 1
+        return JSONResponse(status_code=status_code, content=None)
+
+    def fake_prepare_job_enqueue_intent(job: Any) -> None:
+        _ = job
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: Any = None,
+        suppress_exceptions: bool = False,
+    ) -> None:
+        _ = suppress_exceptions
+        assert publisher is revisions_module.enqueue_estimate_job
+        publisher(job_id)
+
+    def fake_enqueue_estimate_job(job_id: UUID) -> None:
+        enqueued_job_ids.append(job_id)
+
+    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        revisions_module,
+        "_get_revision_quantity_takeoff_or_404",
+        fake_get_revision_quantity_takeoff_or_404,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_catalog_refs",
+        fake_resolve_estimate_catalog_refs,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "prepare_job_enqueue_intent",
+        fake_prepare_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(
+        revisions_module,
+        "_resolve_estimate_job_model_classes",
+        lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "_build_mapped_instance",
+        lambda _model_class, values: type("StubRecord", (), values.copy())(),
+    )
+
+    response = client.post(
+        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
+        json=request_body,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["job_type"] == "estimate"
+    assert response.json()["base_revision_id"] == str(revision.id)
+    assert response.json()["parent_job_id"] == str(takeoff.source_job_id)
+    assert len(session.added) == 4
+    assert session.commits == 1
+    assert enqueued_job_ids == [UUID(response.json()["id"])]
+    assert complete_calls == 0
 
 
 def test_create_revision_estimate_version_rejects_idempotency_reuse_with_different_payload(
@@ -985,41 +1254,37 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
             ),
         ]
 
-    async def fake_replay_idempotency(
+    async def fake_replay_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
         fingerprint: str,
-    ) -> IdempotencyReplay | None:
+    ) -> JSONResponse | None:
         _ = db
         record = idempotency_state.get(key)
         if record is None:
             return None
         if record["fingerprint"] != fingerprint:
-            return IdempotencyReplay(
-                response=JSONResponse(
-                    status_code=409,
-                    content={
-                        "detail": {
-                            "error": {
-                                "code": "IDEMPOTENCY_CONFLICT",
-                                "message": "Idempotency-Key already used with different payload.",
-                                "details": None,
-                            }
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": {
+                        "error": {
+                            "code": "IDEMPOTENCY_CONFLICT",
+                            "message": "Idempotency-Key already used with different payload.",
+                            "details": None,
                         }
-                    },
-                )
+                    }
+                },
             )
         if not record["completed"]:
             return None
-        return IdempotencyReplay(
-            response=JSONResponse(
-                status_code=record["status_code"],
-                content=record["response_body"],
-            )
+        return JSONResponse(
+            status_code=record["status_code"],
+            content=record["response_body"],
         )
 
-    async def fake_claim_idempotency(
+    async def fake_claim_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
@@ -1033,19 +1298,21 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
             idempotency_state[key] = {"fingerprint": fingerprint, "completed": False}
         return IdempotencyReservation(record_id=uuid4())
 
-    async def fake_mark_idempotency_completed(
+    async def fake_complete_idempotency_response(
         db: AsyncSession,
-        reservation: IdempotencyReservation,
+        reservation: IdempotencyReservation | None,
         *,
         status_code: int,
         response_body: dict[str, Any] | None,
-    ) -> None:
+    ) -> JSONResponse | None:
         _ = (db, reservation)
+        assert reservation is not None
         idempotency_state["estimate-1"].update(
             completed=True,
             status_code=status_code,
             response_body=response_body,
         )
+        return JSONResponse(status_code=status_code, content=response_body)
 
     def fake_prepare_job_enqueue_intent(job: Any) -> None:
         _ = job
@@ -1074,12 +1341,20 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
-    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
-    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
     monkeypatch.setattr(
         revisions_module,
-        "mark_idempotency_completed",
-        fake_mark_idempotency_completed,
+        "replay_idempotency_response",
+        fake_replay_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "claim_idempotency_response",
+        fake_claim_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
         revisions_module,
@@ -1362,7 +1637,7 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
         )
         raise AssertionError("unreachable")
 
-    async def fake_claim_idempotency(
+    async def fake_claim_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
@@ -1375,25 +1650,26 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
         idempotency_claimed = True
         return IdempotencyReservation(record_id=uuid4())
 
-    async def fake_replay_idempotency(
+    async def fake_replay_idempotency_response(
         db: AsyncSession,
         *,
         key: str,
         fingerprint: str,
-    ) -> IdempotencyReplay | None:
+    ) -> JSONResponse | None:
         _ = (db, key, fingerprint)
         return None
 
-    async def fake_mark_idempotency_completed(
+    async def fake_complete_idempotency_response(
         db: AsyncSession,
-        reservation: IdempotencyReservation,
+        reservation: IdempotencyReservation | None,
         *,
         status_code: int,
         response_body: dict[str, Any] | None,
-    ) -> None:
+    ) -> JSONResponse | None:
         _ = (db, reservation, status_code, response_body)
         nonlocal idempotency_completed
         idempotency_completed = True
+        return JSONResponse(status_code=status_code, content=response_body)
 
     async def fake_publish_job_enqueue_intent(
         job_id: UUID,
@@ -1415,12 +1691,20 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
-    monkeypatch.setattr(revisions_module, "replay_idempotency", fake_replay_idempotency)
-    monkeypatch.setattr(revisions_module, "claim_idempotency", fake_claim_idempotency)
     monkeypatch.setattr(
         revisions_module,
-        "mark_idempotency_completed",
-        fake_mark_idempotency_completed,
+        "replay_idempotency_response",
+        fake_replay_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "claim_idempotency_response",
+        fake_claim_idempotency_response,
+    )
+    monkeypatch.setattr(
+        revisions_module,
+        "complete_idempotency_response",
+        fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
         revisions_module,
