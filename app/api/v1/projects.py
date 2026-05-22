@@ -5,18 +5,17 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
-    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
-    claim_idempotency,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
-    mark_idempotency_completed,
-    replay_idempotency,
+    replay_idempotency_response,
 )
 from app.api.pagination import (
     decode_cursor_payload,
@@ -47,9 +46,7 @@ async def _get_active_project_or_404(
     for_update: bool = False,
 ) -> Project:
     """Return an active project row or raise not found."""
-    query = select(Project).where(
-        (Project.id == project_id) & (Project.deleted_at.is_(None))
-    )
+    query = select(Project).where((Project.id == project_id) & (Project.deleted_at.is_(None)))
     if for_update:
         query = query.with_for_update()
     project = (await db.execute(query)).scalar_one_or_none()
@@ -74,9 +71,7 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     """Decode cursor to typed created_at and id values."""
     try:
         cursor_data = decode_cursor_payload(cursor)
-        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(
-            str(cursor_data["id"])
-        )
+        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(str(cursor_data["id"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise_invalid_cursor(exc)
 
@@ -92,21 +87,19 @@ async def create_project(
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> Project | Response:
     """Create a new project."""
-    reservation: IdempotencyReservation | None = None
-    if idempotency_key is not None:
-        claim = await claim_idempotency(
-            db,
-            key=idempotency_key,
-            fingerprint=build_idempotency_fingerprint(
-                "projects.create",
-                project_in.model_dump(mode="json", exclude_unset=True),
-            ),
-            method="POST",
-            path="/projects",
-        )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
-        reservation = claim
+    claim = await claim_idempotency_response(
+        db,
+        key=idempotency_key,
+        fingerprint=build_idempotency_fingerprint(
+            "projects.create",
+            project_in.model_dump(mode="json", exclude_unset=True),
+        ),
+        method="POST",
+        path="/projects",
+    )
+    if isinstance(claim, Response):
+        return claim
+    reservation = claim
 
     project = Project(
         name=project_in.name,
@@ -118,15 +111,14 @@ async def create_project(
     if reservation is not None:
         await db.flush()
         await db.refresh(project)
-        body = ProjectRead.model_validate(project).model_dump(mode="json")
-        await mark_idempotency_completed(
+        response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_201_CREATED,
-            response_body=body,
+            response_body=ProjectRead.model_validate(project).model_dump(mode="json"),
         )
         await db.commit()
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=body)
+        return response
 
     await db.commit()
     await db.refresh(project)
@@ -160,10 +152,7 @@ async def list_projects(
         # Filter for items after the cursor position
         query = query.filter(
             (Project.created_at < created_at)
-            | (
-                (Project.created_at == created_at)
-                & (Project.id < project_id)
-            )
+            | ((Project.created_at == created_at) & (Project.id < project_id))
         )
 
     # Fetch limit + 1 to determine if there's a next page
@@ -215,26 +204,26 @@ async def update_project(
             f"projects.update:{project_id}",
             project_in.model_dump(mode="json", exclude_unset=True),
         )
-        replay = await replay_idempotency(
+        replay = await replay_idempotency_response(
             db,
-            key=idempotency_key,
             fingerprint=fingerprint,
+            key=idempotency_key,
         )
         if replay is not None:
-            return replay.response
+            return replay
 
     project = await _get_active_project_or_404(db, project_id)
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="PATCH",
             path=f"/projects/{project_id}",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
         reservation = claim
         project = await _get_active_project_or_404(db, project_id)
 
@@ -246,15 +235,14 @@ async def update_project(
     if reservation is not None:
         await db.flush()
         await db.refresh(project)
-        body = ProjectRead.model_validate(project).model_dump(mode="json")
-        await mark_idempotency_completed(
+        response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_200_OK,
-            response_body=body,
+            response_body=ProjectRead.model_validate(project).model_dump(mode="json"),
         )
         await db.commit()
-        return JSONResponse(status_code=status.HTTP_200_OK, content=body)
+        return response
 
     await db.commit()
     await db.refresh(project)
@@ -278,41 +266,42 @@ async def delete_project(
             f"projects.delete:{project_id}",
             {"project_id": str(project_id)},
         )
-        replay = await replay_idempotency(
+        replay = await replay_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
         )
         if replay is not None:
-            return replay.response
+            return replay
 
     await _get_active_project_or_404(db, project_id)
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="DELETE",
             path=f"/projects/{project_id}",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
         reservation = claim
 
     project = await _get_active_project_or_404(db, project_id, for_update=True)
     locked_jobs = (
-        await db.execute(
-            select(Job)
-            .where(
-                (Job.project_id == project_id)
-                & (Job.status.in_(("pending", "running")))
+        (
+            await db.execute(
+                select(Job)
+                .where((Job.project_id == project_id) & (Job.status.in_(("pending", "running"))))
+                .order_by(Job.created_at.asc(), Job.id.asc())
+                .with_for_update(of=Job)
             )
-            .order_by(Job.created_at.asc(), Job.id.asc())
-            .with_for_update(of=Job)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     deleted_at = datetime.now(UTC)
     project.deleted_at = deleted_at
     for job in locked_jobs:
@@ -331,17 +320,18 @@ async def delete_project(
     await db.execute(
         update(GeneratedArtifact)
         .where(
-            (GeneratedArtifact.project_id == project_id)
-            & (GeneratedArtifact.deleted_at.is_(None))
+            (GeneratedArtifact.project_id == project_id) & (GeneratedArtifact.deleted_at.is_(None))
         )
         .values(deleted_at=deleted_at)
     )
     if reservation is not None:
-        await mark_idempotency_completed(
+        response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_204_NO_CONTENT,
             response_body=None,
         )
+        await db.commit()
+        return response
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

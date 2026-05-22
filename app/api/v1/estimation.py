@@ -7,7 +7,7 @@ from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -15,13 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.api.idempotency import (
-    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
-    claim_idempotency,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
-    mark_idempotency_completed,
-    replay_idempotency,
+    replay_idempotency_response,
 )
 from app.api.pagination import decode_cursor_payload, encode_cursor_payload, raise_invalid_cursor
 from app.core.errors import ErrorCode
@@ -119,7 +118,7 @@ async def _raise_catalog_conflict(
 ) -> None:
     error_body = _catalog_conflict_body(kind)
     if reservation is not None:
-        await mark_idempotency_completed(
+        await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_409_CONFLICT,
@@ -422,9 +421,13 @@ async def create_rate(
             "estimation.rates.create",
             rate_in.model_dump(mode="json"),
         )
-        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
+        replay = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
         if replay is not None:
-            return replay.response
+            return replay
 
     if rate_in.project_id is not None:
         await _get_active_project_or_404(db, rate_in.project_id)
@@ -441,15 +444,16 @@ async def create_rate(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path="/estimation/catalog/rates",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
 
     rate = EstimationRate(
@@ -503,8 +507,9 @@ async def create_rate(
         supersedes_rate_id=rate_in.supersedes_rate_id,
     )
     response_body = body.model_dump(mode="json")
+    idempotent_response: Response | None = None
     if reservation is not None:
-        await mark_idempotency_completed(
+        idempotent_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_201_CREATED,
@@ -512,8 +517,8 @@ async def create_rate(
         )
     await db.commit()
 
-    if reservation is not None:
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_body)
+    if idempotent_response is not None:
+        return idempotent_response
     return body
 
 
@@ -627,9 +632,13 @@ async def create_material(
             "estimation.materials.create",
             material_in.model_dump(mode="json"),
         )
-        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
+        replay = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
         if replay is not None:
-            return replay.response
+            return replay
 
     if material_in.project_id is not None:
         await _get_active_project_or_404(db, material_in.project_id)
@@ -646,15 +655,16 @@ async def create_material(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path="/estimation/catalog/materials",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
 
     material = EstimationMaterial(
@@ -706,8 +716,9 @@ async def create_material(
         supersedes_material_id=material_in.supersedes_material_id,
     )
     response_body = body.model_dump(mode="json")
+    idempotent_response: Response | None = None
     if reservation is not None:
-        await mark_idempotency_completed(
+        idempotent_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_201_CREATED,
@@ -715,8 +726,8 @@ async def create_material(
         )
     await db.commit()
 
-    if reservation is not None:
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_body)
+    if idempotent_response is not None:
+        return idempotent_response
     return body
 
 
@@ -834,9 +845,13 @@ async def create_formula(
             "estimation.formulas.create",
             formula_in.model_dump(mode="json"),
         )
-        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
+        replay = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
         if replay is not None:
-            return replay.response
+            return replay
 
     if formula_in.project_id is not None:
         await _get_active_project_or_404(db, formula_in.project_id)
@@ -848,15 +863,16 @@ async def create_formula(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path="/estimation/formulas",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
 
     formula = EstimationFormula(
@@ -908,8 +924,9 @@ async def create_formula(
         supersedes_formula_id=formula_in.supersedes_formula_id,
     )
     response_body = body.model_dump(mode="json")
+    idempotent_response: Response | None = None
     if reservation is not None:
-        await mark_idempotency_completed(
+        idempotent_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_201_CREATED,
@@ -917,8 +934,8 @@ async def create_formula(
         )
     await db.commit()
 
-    if reservation is not None:
-        return JSONResponse(status_code=status.HTTP_201_CREATED, content=response_body)
+    if idempotent_response is not None:
+        return idempotent_response
     return body
 
 

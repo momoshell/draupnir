@@ -10,19 +10,25 @@ from typing import Any, cast
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 
+import app.api.idempotency as idempotency_api
 import app.api.v1.files as files_api
 import app.api.v1.jobs as jobs_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.api.idempotency import (
+    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
     hash_idempotency_key,
     mark_idempotency_completed,
     replay_idempotency,
+    replay_idempotency_response,
 )
 from app.core.config import settings
 from app.core.errors import ErrorCode
@@ -115,6 +121,181 @@ async def test_get_idempotency_key_rejects_invalid_rfc9110_token() -> None:
         await get_idempotency_key("contains space")
 
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_replay_idempotency_response_returns_none_without_key() -> None:
+    """Optional replay helper should no-op when no key is supplied."""
+
+    result = await replay_idempotency_response(
+        cast(Any, object()),
+        key=None,
+        fingerprint="fingerprint-1",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_replay_idempotency_response_unwraps_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Optional replay helper should unwrap short-circuit replay responses."""
+
+    replay_response = Response(status_code=204)
+
+    async def _fake_replay_idempotency(_: Any, *, key: str, fingerprint: str) -> IdempotencyReplay:
+        assert key == "replay-key-1"
+        assert fingerprint == "fingerprint-2"
+        return IdempotencyReplay(response=replay_response)
+
+    monkeypatch.setattr(idempotency_api, "replay_idempotency", _fake_replay_idempotency)
+
+    result = await replay_idempotency_response(
+        cast(Any, object()),
+        key="replay-key-1",
+        fingerprint="fingerprint-2",
+    )
+
+    assert result is replay_response
+
+
+@pytest.mark.asyncio
+async def test_claim_idempotency_response_returns_none_without_key() -> None:
+    """Optional claim helper should no-op when no key is supplied."""
+
+    result = await claim_idempotency_response(
+        cast(Any, object()),
+        key=None,
+        fingerprint="fingerprint-3",
+        method="POST",
+        path="/v1/projects",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_claim_idempotency_response_unwraps_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Optional claim helper should unwrap replay conflicts into a response."""
+
+    replay_response = JSONResponse(status_code=409, content={"error": {"code": "conflict"}})
+
+    async def _fake_claim_idempotency(
+        _: Any,
+        *,
+        key: str,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReplay:
+        assert (key, fingerprint, method, path) == (
+            "claim-key-1",
+            "fingerprint-4",
+            "PATCH",
+            "/v1/projects/project-1",
+        )
+        return IdempotencyReplay(response=replay_response)
+
+    monkeypatch.setattr(idempotency_api, "claim_idempotency", _fake_claim_idempotency)
+
+    result = await claim_idempotency_response(
+        cast(Any, object()),
+        key="claim-key-1",
+        fingerprint="fingerprint-4",
+        method="PATCH",
+        path="/v1/projects/project-1",
+    )
+
+    assert result is replay_response
+
+
+class _FakeScalarResult:
+    """Minimal async execute result wrapper for idempotency unit tests."""
+
+    def __init__(self, record: IdempotencyKey) -> None:
+        self._record = record
+
+    def scalar_one(self) -> IdempotencyKey:
+        return self._record
+
+
+class _FakeIdempotencySession:
+    """Small session double to verify helper commit behavior."""
+
+    def __init__(self, record: IdempotencyKey) -> None:
+        self._record = record
+        self.commit_calls = 0
+
+    async def execute(self, _: Any) -> _FakeScalarResult:
+        return _FakeScalarResult(self._record)
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_complete_idempotency_response_marks_snapshot_and_returns_json() -> None:
+    """Completion helper should snapshot success bodies without committing the session."""
+
+    record = IdempotencyKey(
+        id=uuid.uuid4(),
+        key_hash=hash_idempotency_key("complete-json-1"),
+        request_fingerprint="fingerprint-5",
+        request_method="POST",
+        request_path="/v1/projects",
+        status=IdempotencyStatus.IN_PROGRESS.value,
+    )
+    session = _FakeIdempotencySession(record)
+    reservation = IdempotencyReservation(record_id=record.id)
+    response_body = {"id": "project-1", "name": "Replay Project"}
+
+    response = await complete_idempotency_response(
+        cast(Any, session),
+        reservation,
+        status_code=201,
+        response_body=response_body,
+    )
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 201
+    assert json.loads(bytes(response.body)) == response_body
+    assert record.status == IdempotencyStatus.COMPLETED.value
+    assert record.response_status_code == 201
+    assert record.response_body_json == response_body
+    assert record.completed_at is not None
+    assert session.commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_idempotency_response_returns_204_without_commit() -> None:
+    """Completion helper should build empty replay responses without committing."""
+
+    record = IdempotencyKey(
+        id=uuid.uuid4(),
+        key_hash=hash_idempotency_key("complete-empty-1"),
+        request_fingerprint="fingerprint-6",
+        request_method="DELETE",
+        request_path="/v1/projects/project-1",
+        status=IdempotencyStatus.IN_PROGRESS.value,
+    )
+    session = _FakeIdempotencySession(record)
+    reservation = IdempotencyReservation(record_id=record.id)
+
+    response = await complete_idempotency_response(
+        cast(Any, session),
+        reservation,
+        status_code=204,
+        response_body=None,
+    )
+
+    assert isinstance(response, Response)
+    assert not isinstance(response, JSONResponse)
+    assert response.status_code == 204
+    assert response.body == b""
+    assert record.status == IdempotencyStatus.COMPLETED.value
+    assert record.response_status_code == 204
+    assert record.response_body_json is None
+    assert record.completed_at is not None
+    assert session.commit_calls == 0
 
 
 @pytest.fixture(autouse=True)
@@ -550,9 +731,7 @@ class TestEndpointIdempotency:
         assert second.json() == {
             "error": {
                 "code": "IDEMPOTENCY_CONFLICT",
-                "message": (
-                    "This Idempotency-Key is already associated with a different request."
-                ),
+                "message": ("This Idempotency-Key is already associated with a different request."),
                 "details": {"reason": "request_mismatch"},
             }
         }

@@ -621,6 +621,39 @@ class TestEstimationCatalogApiRateIdempotency:
         assert isinstance(body["error"].get("code"), str)
         assert body["error"]["code"]
 
+    async def test_create_rate_replays_db_conflict_for_same_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Idempotency Conflict Replay Project")
+        payload = _valid_rate_payload(project_id=project_id)
+        headers = {"Idempotency-Key": "rate-create-db-conflict-replay-key"}
+
+        initial_response = await async_client.post(
+            "/v1/estimation/catalog/rates",
+            json=payload,
+        )
+        first_conflict_response = await async_client.post(
+            "/v1/estimation/catalog/rates",
+            json=payload,
+            headers=headers,
+        )
+        second_conflict_response = await async_client.post(
+            "/v1/estimation/catalog/rates",
+            json=payload,
+            headers=headers,
+        )
+
+        assert initial_response.status_code == 201
+        assert first_conflict_response.status_code == 409
+        assert second_conflict_response.status_code == 409
+        assert first_conflict_response.json() == second_conflict_response.json()
+        assert first_conflict_response.json()["error"]["code"] == "DB_CONFLICT"
+
 
 @requires_database
 class TestEstimationCatalogApiSupersessionAndAsOf:

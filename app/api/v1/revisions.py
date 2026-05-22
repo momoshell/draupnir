@@ -11,19 +11,18 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
-    IdempotencyReplay,
     IdempotencyReservation,
     build_idempotency_fingerprint,
-    claim_idempotency,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
-    mark_idempotency_completed,
-    replay_idempotency,
+    replay_idempotency_response,
 )
 from app.api.pagination import (
     decode_cursor_payload,
@@ -1650,9 +1649,13 @@ async def create_revision_estimate_version(
                 "body": normalized_body,
             },
         )
-        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
-        if replay is not None:
-            return replay.response
+        replay_response = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay_response is not None:
+            return replay_response
 
     revision = await _get_active_revision(revision_id, db)
     if revision is None:
@@ -1687,15 +1690,16 @@ async def create_revision_estimate_version(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path=f"/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/estimate-versions",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
 
     estimate_job = Job(
@@ -1742,14 +1746,13 @@ async def create_revision_estimate_version(
     for ref_payload in ref_payloads:
         db.add(_build_mapped_instance(estimate_job_input_ref_model, ref_payload))
 
-    success_body: dict[str, object] | None = None
+    success_response: Response | None = None
     if reservation is not None:
-        success_body = JobRead.model_validate(estimate_job).model_dump(mode="json")
-        await mark_idempotency_completed(
+        success_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_202_ACCEPTED,
-            response_body=success_body,
+            response_body=JobRead.model_validate(estimate_job).model_dump(mode="json"),
         )
 
     await db.commit()
@@ -1759,9 +1762,8 @@ async def create_revision_estimate_version(
         suppress_exceptions=True,
     )
 
-    if reservation is not None:
-        assert success_body is not None
-        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
+    if success_response is not None:
+        return success_response
 
     return estimate_job
 
@@ -1937,9 +1939,13 @@ async def create_revision_quantity_takeoff(
             f"revisions.quantity_takeoffs:{revision_id}",
             {"revision_id": str(revision_id)},
         )
-        replay = await replay_idempotency(db, key=idempotency_key, fingerprint=fingerprint)
-        if replay is not None:
-            return replay.response
+        replay_response = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay_response is not None:
+            return replay_response
 
     revision = await _get_active_revision(revision_id, db)
     if revision is None:
@@ -1961,15 +1967,16 @@ async def create_revision_quantity_takeoff(
 
     if idempotency_key is not None:
         assert fingerprint is not None
-        claim = await claim_idempotency(
+        claim = await claim_idempotency_response(
             db,
             key=idempotency_key,
             fingerprint=fingerprint,
             method="POST",
             path=f"/revisions/{revision_id}/quantity-takeoffs",
         )
-        if isinstance(claim, IdempotencyReplay):
-            return claim.response
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
         reservation = claim
 
     quantity_job = Job(
@@ -1996,14 +2003,13 @@ async def create_revision_quantity_takeoff(
     await db.flush()
     await db.refresh(quantity_job)
 
-    success_body: dict[str, object] | None = None
+    success_response: Response | None = None
     if reservation is not None:
-        success_body = JobRead.model_validate(quantity_job).model_dump(mode="json")
-        await mark_idempotency_completed(
+        success_response = await complete_idempotency_response(
             db,
             reservation,
             status_code=status.HTTP_202_ACCEPTED,
-            response_body=success_body,
+            response_body=JobRead.model_validate(quantity_job).model_dump(mode="json"),
         )
 
     await db.commit()
@@ -2013,9 +2019,8 @@ async def create_revision_quantity_takeoff(
         suppress_exceptions=True,
     )
 
-    if reservation is not None:
-        assert success_body is not None
-        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=success_body)
+    if success_response is not None:
+        return success_response
 
     return quantity_job
 
