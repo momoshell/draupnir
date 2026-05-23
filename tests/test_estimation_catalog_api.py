@@ -656,6 +656,114 @@ class TestEstimationCatalogApiRateIdempotency:
 
 
 @requires_database
+class TestEstimationCatalogApiMaterialIdempotency:
+    async def test_create_material_replays_same_response_for_same_idempotency_key_and_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Material Idempotency Replay Project")
+        payload = _valid_material_payload(project_id=project_id)
+        headers = {"Idempotency-Key": "material-create-replay-key"}
+
+        first_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+            headers=headers,
+        )
+        second_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+            headers=headers,
+        )
+
+        assert first_response.status_code == 201
+        assert second_response.status_code == 201
+        first_body = first_response.json()
+        second_body = second_response.json()
+        assert first_body["id"] == second_body["id"]
+        assert first_body["checksum_sha256"] == second_body["checksum_sha256"]
+        assert first_body == second_body
+
+    async def test_create_material_returns_conflict_for_same_idempotency_key_and_different_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(
+            async_client,
+            name="Material Idempotency Conflict Project",
+        )
+        payload = _valid_material_payload(project_id=project_id)
+        conflicting_payload = _valid_material_payload(project_id=project_id)
+        conflicting_payload["name"] = "PVC conduit 20mm changed"
+        headers = {"Idempotency-Key": "material-create-conflict-key"}
+
+        first_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+            headers=headers,
+        )
+        conflict_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=conflicting_payload,
+            headers=headers,
+        )
+
+        assert first_response.status_code == 201
+        assert conflict_response.status_code == 409
+        conflict_body = conflict_response.json()
+        assert conflict_body["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+        assert (
+            conflict_body["error"]["message"]
+            == "This Idempotency-Key is already associated with a different request."
+        )
+        assert set(conflict_body["error"]) == {"code", "message", "details"}
+
+    async def test_create_material_replays_db_conflict_for_same_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(
+            async_client,
+            name="Material Idempotency Conflict Replay Project",
+        )
+        payload = _valid_material_payload(project_id=project_id)
+        headers = {"Idempotency-Key": "material-create-db-conflict-replay-key"}
+
+        initial_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+        )
+        first_conflict_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+            headers=headers,
+        )
+        second_conflict_response = await async_client.post(
+            "/v1/estimation/catalog/materials",
+            json=payload,
+            headers=headers,
+        )
+
+        assert initial_response.status_code == 201
+        assert first_conflict_response.status_code == 409
+        assert second_conflict_response.status_code == 409
+        assert first_conflict_response.json() == second_conflict_response.json()
+        assert first_conflict_response.json()["error"]["code"] == "DB_CONFLICT"
+
+
+@requires_database
 class TestEstimationCatalogApiSupersessionAndAsOf:
     async def test_rate_superseded_entry_hidden_by_default_and_included_when_requested(
         self,
@@ -711,6 +819,72 @@ class TestEstimationCatalogApiSupersessionAndAsOf:
         }
         assert predecessor_id in include_superseded_ids
         assert successor_id in include_superseded_ids
+
+    async def test_formula_supersession_visibility_and_missing_link_fields(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Formula Supersession Project")
+
+        predecessor_payload = _valid_formula_payload(project_id=project_id)
+        predecessor_response = await async_client.post(
+            "/v1/estimation/formulas",
+            json=predecessor_payload,
+        )
+        assert predecessor_response.status_code == 201
+        predecessor = predecessor_response.json()
+        predecessor_id = predecessor["id"]
+
+        successor_payload = _valid_formula_payload(project_id=project_id)
+        successor_payload["version"] = 2
+        successor_payload["name"] = "Line total v2"
+        successor_payload["supersedes_formula_id"] = predecessor_id
+        successor_response = await async_client.post(
+            "/v1/estimation/formulas",
+            json=successor_payload,
+        )
+        assert successor_response.status_code == 201
+        successor = successor_response.json()
+        successor_id = successor["id"]
+
+        default_list_response = await async_client.get(
+            "/v1/estimation/formulas",
+            params={
+                "project_id": project_id,
+                "formula_id": predecessor_payload["formula_id"],
+            },
+        )
+        assert default_list_response.status_code == 200
+        default_ids = [item["id"] for item in default_list_response.json()["items"]]
+        assert successor_id in default_ids
+        assert predecessor_id not in default_ids
+
+        include_superseded_response = await async_client.get(
+            "/v1/estimation/formulas",
+            params={
+                "project_id": project_id,
+                "formula_id": predecessor_payload["formula_id"],
+                "include_superseded": "true",
+            },
+        )
+        assert include_superseded_response.status_code == 200
+        include_items = include_superseded_response.json()["items"]
+        include_by_id = {item["id"]: item for item in include_items}
+        assert predecessor_id in include_by_id
+        assert successor_id in include_by_id
+        assert set(default_ids) == {successor_id}
+        assert {item["id"] for item in include_items} == {predecessor_id, successor_id}
+
+        predecessor_item = include_by_id[predecessor_id]
+        successor_item = include_by_id[successor_id]
+        assert predecessor_item["supersedes_formula_id"] is None
+        assert predecessor_item["superseded_by_id"] == successor_id
+        assert successor_item["supersedes_formula_id"] == predecessor_id
+        assert successor_item["superseded_by_id"] is None
 
     async def test_rate_list_as_of_filters_by_effective_window(
         self,
@@ -816,6 +990,103 @@ class TestEstimationCatalogApiConflicts:
         assert first_response.status_code == 201
         assert conflict_response.status_code == 409
         assert conflict_response.json()["error"]["code"] == "DB_CONFLICT"
+
+
+@requires_database
+class TestEstimationCatalogApiPagination:
+    async def test_rate_list_cursor_pagination_enforces_strict_cursor_boundaries(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Rate Pagination Project")
+
+        created_ids: list[str] = []
+        for index in range(3):
+            payload = _valid_rate_payload(project_id=project_id)
+            payload["rate_key"] = f"labour:cursor:{index}"
+            payload["name"] = f"Cursor rate {index}"
+            create_response = await async_client.post(
+                "/v1/estimation/catalog/rates",
+                json=payload,
+            )
+            assert create_response.status_code == 201
+            created_ids.append(create_response.json()["id"])
+
+        full_list_response = await async_client.get(
+            "/v1/estimation/catalog/rates",
+            params={"project_id": project_id},
+        )
+        assert full_list_response.status_code == 200
+        full_items = full_list_response.json()["items"]
+        full_ids = [item["id"] for item in full_items]
+        assert set(created_ids).issubset(set(full_ids))
+
+        first_page_response = await async_client.get(
+            "/v1/estimation/catalog/rates",
+            params={"project_id": project_id, "limit": 1},
+        )
+        assert first_page_response.status_code == 200
+        first_page = first_page_response.json()
+        first_page_ids = [item["id"] for item in first_page["items"]]
+        assert len(first_page_ids) == 1
+        first_page_next_cursor = first_page["next_cursor"]
+        assert isinstance(first_page_next_cursor, str)
+        assert first_page_next_cursor
+
+        second_page_response = await async_client.get(
+            "/v1/estimation/catalog/rates",
+            params={
+                "project_id": project_id,
+                "limit": 1,
+                "cursor": first_page_next_cursor,
+            },
+        )
+        assert second_page_response.status_code == 200
+        second_page = second_page_response.json()
+        second_page_ids = [item["id"] for item in second_page["items"]]
+        assert len(second_page_ids) == 1
+        second_page_next_cursor = second_page["next_cursor"]
+        assert isinstance(second_page_next_cursor, str)
+        assert second_page_next_cursor
+
+        third_page_response = await async_client.get(
+            "/v1/estimation/catalog/rates",
+            params={
+                "project_id": project_id,
+                "limit": 1,
+                "cursor": second_page_next_cursor,
+            },
+        )
+        assert third_page_response.status_code == 200
+        third_page = third_page_response.json()
+        third_page_ids = [item["id"] for item in third_page["items"]]
+        assert len(third_page_ids) == 1
+        assert third_page["next_cursor"] is None
+
+        fourth_page_response = await async_client.get(
+            "/v1/estimation/catalog/rates",
+            params={
+                "project_id": project_id,
+                "limit": 1,
+                "cursor": second_page_next_cursor,
+            },
+        )
+        assert fourth_page_response.status_code == 200
+        fourth_page = fourth_page_response.json()
+        fourth_page_ids = [item["id"] for item in fourth_page["items"]]
+        assert fourth_page_ids == third_page_ids
+        assert fourth_page["next_cursor"] is None
+
+        combined_ids = first_page_ids + second_page_ids + third_page_ids
+        assert len(combined_ids) == len(set(combined_ids))
+        assert combined_ids == full_ids[:3]
+        assert first_page_ids[0] == full_ids[0]
+        assert second_page_ids[0] == full_ids[1]
+        assert third_page_ids[0] == full_ids[2]
 
     async def test_create_rate_duplicate_payload_returns_db_conflict(
         self,

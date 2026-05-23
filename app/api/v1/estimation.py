@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from typing import Annotated, Any, cast
 from uuid import UUID
@@ -139,6 +140,194 @@ def _raise_input_invalid(message: str) -> None:
     )
 
 
+def _catalog_query(
+    *,
+    model: Any,
+    supersession_model: Any,
+    predecessor_attr: str,
+    successor_attr: str,
+) -> tuple[Any, Any]:
+    superseded_link = aliased(supersession_model)
+    supersedes_link = aliased(supersession_model)
+    superseded_predecessor_column = getattr(superseded_link, predecessor_attr)
+    superseded_successor_column = getattr(superseded_link, successor_attr)
+    supersedes_predecessor_column = getattr(supersedes_link, predecessor_attr)
+    supersedes_successor_column = getattr(supersedes_link, successor_attr)
+    statement = (
+        select(model, superseded_successor_column, supersedes_predecessor_column)
+        .outerjoin(superseded_link, superseded_predecessor_column == model.id)
+        .outerjoin(supersedes_link, supersedes_successor_column == model.id)
+        .where(_active_project_visibility(model.project_id))
+    )
+    return statement, superseded_successor_column
+
+
+async def _get_catalog_predecessor_or_404(
+    *,
+    db: AsyncSession,
+    model: Any,
+    entry_id: UUID,
+    resource_name: str,
+) -> Any:
+    entry = (
+        await db.execute(
+            select(model)
+            .where((model.id == entry_id) & _active_project_visibility(model.project_id))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if entry is None:
+        raise_not_found(resource_name, str(entry_id))
+    return entry
+
+
+async def _create_catalog_entry[
+    CatalogCreateT: BaseModel,
+    CatalogEntryT,
+    CatalogPredecessorT,
+    CatalogReadT: BaseModel,
+](
+    *,
+    payload: CatalogCreateT,
+    db: AsyncSession,
+    idempotency_key: str | None,
+    fingerprint_namespace: str,
+    path: str,
+    conflict_kind: str,
+    project_id: UUID | None,
+    supersedes_id: UUID | None,
+    get_predecessor: Callable[[AsyncSession, UUID], Awaitable[CatalogPredecessorT]],
+    validate_predecessor: Callable[[CatalogCreateT, CatalogPredecessorT], None],
+    validate_effective_window: Callable[[CatalogCreateT, CatalogPredecessorT], None] | None,
+    build_entry: Callable[[CatalogCreateT], CatalogEntryT],
+    build_supersession: Callable[[CatalogPredecessorT, CatalogEntryT], Any] | None,
+    serialize_created: Callable[[CatalogEntryT, UUID | None], CatalogReadT],
+) -> CatalogReadT | Response:
+    reservation: IdempotencyReservation | None = None
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = build_idempotency_fingerprint(
+            fingerprint_namespace,
+            payload.model_dump(mode="json"),
+        )
+        replay = await replay_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+        )
+        if replay is not None:
+            return replay
+
+    if project_id is not None:
+        await _get_active_project_or_404(db, project_id)
+
+    predecessor: CatalogPredecessorT | None = None
+    if supersedes_id is not None:
+        predecessor = await get_predecessor(db, supersedes_id)
+        validate_predecessor(payload, predecessor)
+        if validate_effective_window is not None:
+            validate_effective_window(payload, predecessor)
+
+    if idempotency_key is not None:
+        assert fingerprint is not None
+        claim = await claim_idempotency_response(
+            db,
+            key=idempotency_key,
+            fingerprint=fingerprint,
+            method="POST",
+            path=path,
+        )
+        if isinstance(claim, Response):
+            return claim
+        assert claim is not None
+        reservation = claim
+
+    entry = build_entry(payload)
+    db.add(entry)
+
+    try:
+        await db.flush()
+        if predecessor is not None and build_supersession is not None:
+            db.add(build_supersession(predecessor, entry))
+            await db.flush()
+        await db.refresh(entry)
+    except IntegrityError:
+        await db.rollback()
+        await _raise_catalog_conflict(db, reservation, kind=conflict_kind)
+
+    body = serialize_created(entry, supersedes_id)
+    response_body = body.model_dump(mode="json")
+    idempotent_response: Response | None = None
+    if reservation is not None:
+        idempotent_response = await complete_idempotency_response(
+            db,
+            reservation,
+            status_code=status.HTTP_201_CREATED,
+            response_body=response_body,
+        )
+    await db.commit()
+
+    if idempotent_response is not None:
+        return idempotent_response
+    return body
+
+
+async def _get_catalog_entry_or_404[CatalogReadT: BaseModel](
+    *,
+    db: AsyncSession,
+    statement: Any,
+    model: Any,
+    entry_id: UUID,
+    resource_name: str,
+    serialize_row: Callable[[Any], CatalogReadT],
+) -> CatalogReadT:
+    row = (await db.execute(statement.where(model.id == entry_id))).one_or_none()
+    if row is None:
+        raise_not_found(resource_name, str(entry_id))
+    return serialize_row(row)
+
+
+def _apply_catalog_list_page(
+    *,
+    statement: Any,
+    model: Any,
+    superseded_by_column: Any,
+    include_superseded: bool,
+    cursor: str | None,
+) -> Any:
+    if not include_superseded:
+        statement = statement.where(superseded_by_column.is_(None))
+    if cursor is not None:
+        created_at, row_id = _decode_timestamp_cursor(cursor)
+        statement = statement.where(
+            (model.created_at < created_at)
+            | ((model.created_at == created_at) & (model.id < row_id))
+        )
+    return statement
+
+
+async def _list_catalog_entries[CatalogReadT: BaseModel, CatalogListT: BaseModel](
+    *,
+    db: AsyncSession,
+    statement: Any,
+    model: Any,
+    limit: int,
+    serialize_row: Callable[[Any], CatalogReadT],
+    build_response: Callable[[list[CatalogReadT], str | None], CatalogListT],
+) -> CatalogListT:
+    rows = (
+        await db.execute(
+            statement.order_by(model.created_at.desc(), model.id.desc()).limit(limit + 1)
+        )
+    ).all()
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit:
+        last_row = page[-1]
+        next_cursor = _encode_timestamp_cursor(last_row[0].created_at, last_row[0].id)
+    return build_response([serialize_row(row) for row in page], next_cursor)
+
+
 def _serialize_rate(
     rate: EstimationRate,
     *,
@@ -219,126 +408,72 @@ def _serialize_formula(
 
 
 def _rate_query() -> tuple[Any, Any]:
-    superseded_link = aliased(EstimationRateSupersession)
-    supersedes_link = aliased(EstimationRateSupersession)
-    statement = (
-        select(
-            EstimationRate,
-            superseded_link.successor_rate_id,
-            supersedes_link.predecessor_rate_id,
-        )
-        .outerjoin(
-            superseded_link,
-            superseded_link.predecessor_rate_id == EstimationRate.id,
-        )
-        .outerjoin(
-            supersedes_link,
-            supersedes_link.successor_rate_id == EstimationRate.id,
-        )
-        .where(_active_project_visibility(EstimationRate.project_id))
+    return _catalog_query(
+        model=EstimationRate,
+        supersession_model=EstimationRateSupersession,
+        predecessor_attr="predecessor_rate_id",
+        successor_attr="successor_rate_id",
     )
-    return statement, superseded_link.successor_rate_id
 
 
 def _material_query() -> tuple[Any, Any]:
-    superseded_link = aliased(EstimationMaterialSupersession)
-    supersedes_link = aliased(EstimationMaterialSupersession)
-    statement = (
-        select(
-            EstimationMaterial,
-            superseded_link.successor_material_id,
-            supersedes_link.predecessor_material_id,
-        )
-        .outerjoin(
-            superseded_link,
-            superseded_link.predecessor_material_id == EstimationMaterial.id,
-        )
-        .outerjoin(
-            supersedes_link,
-            supersedes_link.successor_material_id == EstimationMaterial.id,
-        )
-        .where(_active_project_visibility(EstimationMaterial.project_id))
+    return _catalog_query(
+        model=EstimationMaterial,
+        supersession_model=EstimationMaterialSupersession,
+        predecessor_attr="predecessor_material_id",
+        successor_attr="successor_material_id",
     )
-    return statement, superseded_link.successor_material_id
 
 
 def _formula_query() -> tuple[Any, Any]:
-    superseded_link = aliased(EstimationFormulaSupersession)
-    supersedes_link = aliased(EstimationFormulaSupersession)
-    statement = (
-        select(
-            EstimationFormula,
-            superseded_link.successor_formula_id,
-            supersedes_link.predecessor_formula_id,
-        )
-        .outerjoin(
-            superseded_link,
-            superseded_link.predecessor_formula_id == EstimationFormula.id,
-        )
-        .outerjoin(
-            supersedes_link,
-            supersedes_link.successor_formula_id == EstimationFormula.id,
-        )
-        .where(_active_project_visibility(EstimationFormula.project_id))
+    return _catalog_query(
+        model=EstimationFormula,
+        supersession_model=EstimationFormulaSupersession,
+        predecessor_attr="predecessor_formula_id",
+        successor_attr="successor_formula_id",
     )
-    return statement, superseded_link.successor_formula_id
 
 
 async def _get_rate_predecessor_or_404(db: AsyncSession, rate_id: UUID) -> EstimationRate:
-    rate = (
-        await db.execute(
-            select(EstimationRate)
-            .where(
-                (EstimationRate.id == rate_id)
-                & _active_project_visibility(EstimationRate.project_id)
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if rate is None:
-        raise_not_found("Rate catalog entry", str(rate_id))
-    assert rate is not None
-    return rate
+    return cast(
+        EstimationRate,
+        await _get_catalog_predecessor_or_404(
+            db=db,
+            model=EstimationRate,
+            entry_id=rate_id,
+            resource_name="Rate catalog entry",
+        ),
+    )
 
 
 async def _get_material_predecessor_or_404(
     db: AsyncSession,
     material_id: UUID,
 ) -> EstimationMaterial:
-    material = (
-        await db.execute(
-            select(EstimationMaterial)
-            .where(
-                (EstimationMaterial.id == material_id)
-                & _active_project_visibility(EstimationMaterial.project_id)
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if material is None:
-        raise_not_found("Material catalog entry", str(material_id))
-    assert material is not None
-    return material
+    return cast(
+        EstimationMaterial,
+        await _get_catalog_predecessor_or_404(
+            db=db,
+            model=EstimationMaterial,
+            entry_id=material_id,
+            resource_name="Material catalog entry",
+        ),
+    )
 
 
 async def _get_formula_predecessor_or_404(
     db: AsyncSession,
     formula_id: UUID,
 ) -> EstimationFormula:
-    formula = (
-        await db.execute(
-            select(EstimationFormula)
-            .where(
-                (EstimationFormula.id == formula_id)
-                & _active_project_visibility(EstimationFormula.project_id)
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if formula is None:
-        raise_not_found("Formula definition", str(formula_id))
-    assert formula is not None
-    return formula
+    return cast(
+        EstimationFormula,
+        await _get_catalog_predecessor_or_404(
+            db=db,
+            model=EstimationFormula,
+            entry_id=formula_id,
+            resource_name="Formula definition",
+        ),
+    )
 
 
 def _validate_rate_supersession(
@@ -404,59 +539,30 @@ def _validate_successor_effective_window(
         )
 
 
-@estimation_router.post(
-    "/estimation/catalog/rates",
-    response_model=EstimationRateRead,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_rate(
-    rate_in: EstimationRateCreate,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
-) -> EstimationRateRead | Response:
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            "estimation.rates.create",
-            rate_in.model_dump(mode="json"),
-        )
-        replay = await replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay is not None:
-            return replay
+def _validate_rate_successor_effective_window(
+    payload: EstimationRateCreate,
+    predecessor: EstimationRate,
+) -> None:
+    _validate_successor_effective_window(
+        predecessor.effective_to,
+        payload.effective_from,
+        resource_name="rate",
+    )
 
-    if rate_in.project_id is not None:
-        await _get_active_project_or_404(db, rate_in.project_id)
 
-    predecessor: EstimationRate | None = None
-    if rate_in.supersedes_rate_id is not None:
-        predecessor = await _get_rate_predecessor_or_404(db, rate_in.supersedes_rate_id)
-        _validate_rate_supersession(rate_in, predecessor)
-        _validate_successor_effective_window(
-            predecessor.effective_to,
-            rate_in.effective_from,
-            resource_name="rate",
-        )
+def _validate_material_successor_effective_window(
+    payload: EstimationMaterialCreate,
+    predecessor: EstimationMaterial,
+) -> None:
+    _validate_successor_effective_window(
+        predecessor.effective_to,
+        payload.effective_from,
+        resource_name="material",
+    )
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path="/estimation/catalog/rates",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
 
-    rate = EstimationRate(
+def _build_rate(rate_in: EstimationRateCreate) -> EstimationRate:
+    return EstimationRate(
         scope_type=rate_in.scope_type,
         project_id=rate_in.project_id,
         rate_key=rate_in.rate_key,
@@ -484,42 +590,126 @@ async def create_rate(
             effective_to=rate_in.effective_to,
         ),
     )
-    db.add(rate)
 
-    try:
-        await db.flush()
-        if predecessor is not None:
-            db.add(
-                EstimationRateSupersession(
-                    predecessor_rate_id=predecessor.id,
-                    successor_rate_id=rate.id,
-                )
-            )
-            await db.flush()
-        await db.refresh(rate)
-    except IntegrityError:
-        await db.rollback()
-        await _raise_catalog_conflict(db, reservation, kind="Rate catalog entry")
 
-    body = _serialize_rate(
-        rate,
-        superseded_by_id=None,
-        supersedes_rate_id=rate_in.supersedes_rate_id,
+def _build_material(material_in: EstimationMaterialCreate) -> EstimationMaterial:
+    return EstimationMaterial(
+        scope_type=material_in.scope_type,
+        project_id=material_in.project_id,
+        material_key=material_in.material_key,
+        source=material_in.source,
+        metadata_json=material_in.metadata_json,
+        name=material_in.name,
+        unit=material_in.unit,
+        currency=material_in.currency,
+        unit_cost=material_in.unit_cost,
+        effective_from=material_in.effective_from,
+        effective_to=material_in.effective_to,
+        checksum_sha256=material_checksum_sha256(
+            scope_type=material_in.scope_type,
+            project_id=material_in.project_id,
+            material_key=material_in.material_key,
+            source=material_in.source,
+            metadata_json=material_in.metadata_json,
+            name=material_in.name,
+            unit=material_in.unit,
+            currency=material_in.currency,
+            unit_cost=material_in.unit_cost,
+            effective_from=material_in.effective_from,
+            effective_to=material_in.effective_to,
+        ),
     )
-    response_body = body.model_dump(mode="json")
-    idempotent_response: Response | None = None
-    if reservation is not None:
-        idempotent_response = await complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_201_CREATED,
-            response_body=response_body,
-        )
-    await db.commit()
 
-    if idempotent_response is not None:
-        return idempotent_response
-    return body
+
+def _build_formula(formula_in: EstimationFormulaCreate) -> EstimationFormula:
+    return EstimationFormula(
+        scope_type=formula_in.scope_type,
+        project_id=formula_in.project_id,
+        formula_id=formula_in.formula_id,
+        version=formula_in.version,
+        name=formula_in.name,
+        dsl_version=formula_in.dsl_version,
+        output_key=formula_in.output_key,
+        output_contract_json=formula_in.output_contract_json,
+        declared_inputs_json=formula_in.declared_inputs_json,
+        expression_json=formula_in.expression_json,
+        rounding_json=formula_in.rounding_json,
+        checksum_sha256=formula_checksum_sha256(
+            scope_type=formula_in.scope_type,
+            project_id=formula_in.project_id,
+            formula_id=formula_in.formula_id,
+            version=formula_in.version,
+            name=formula_in.name,
+            dsl_version=formula_in.dsl_version,
+            output_key=formula_in.output_key,
+            output_contract_json=formula_in.output_contract_json,
+            declared_inputs_json=formula_in.declared_inputs_json,
+            expression_json=formula_in.expression_json,
+            rounding_json=formula_in.rounding_json,
+        ),
+    )
+
+
+def _build_rate_supersession(
+    predecessor: EstimationRate,
+    successor: EstimationRate,
+) -> EstimationRateSupersession:
+    return EstimationRateSupersession(
+        predecessor_rate_id=predecessor.id,
+        successor_rate_id=successor.id,
+    )
+
+
+def _build_material_supersession(
+    predecessor: EstimationMaterial,
+    successor: EstimationMaterial,
+) -> EstimationMaterialSupersession:
+    return EstimationMaterialSupersession(
+        predecessor_material_id=predecessor.id,
+        successor_material_id=successor.id,
+    )
+
+
+def _build_formula_supersession(
+    predecessor: EstimationFormula,
+    successor: EstimationFormula,
+) -> EstimationFormulaSupersession:
+    return EstimationFormulaSupersession(
+        predecessor_formula_id=predecessor.id,
+        successor_formula_id=successor.id,
+    )
+
+
+@estimation_router.post(
+    "/estimation/catalog/rates",
+    response_model=EstimationRateRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rate(
+    rate_in: EstimationRateCreate,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> EstimationRateRead | Response:
+    return await _create_catalog_entry(
+        payload=rate_in,
+        db=db,
+        idempotency_key=idempotency_key,
+        fingerprint_namespace="estimation.rates.create",
+        path="/estimation/catalog/rates",
+        conflict_kind="Rate catalog entry",
+        project_id=rate_in.project_id,
+        supersedes_id=rate_in.supersedes_rate_id,
+        get_predecessor=_get_rate_predecessor_or_404,
+        validate_predecessor=_validate_rate_supersession,
+        validate_effective_window=_validate_rate_successor_effective_window,
+        build_entry=_build_rate,
+        build_supersession=_build_rate_supersession,
+        serialize_created=lambda rate, supersedes_rate_id: _serialize_rate(
+            rate,
+            superseded_by_id=None,
+            supersedes_rate_id=supersedes_rate_id,
+        ),
+    )
 
 
 @estimation_router.get(
@@ -531,11 +721,18 @@ async def get_rate(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> EstimationRateRead:
     statement, _ = _rate_query()
-    row = (await db.execute(statement.where(EstimationRate.id == rate_id))).one_or_none()
-    if row is None:
-        raise_not_found("Rate catalog entry", str(rate_id))
-    assert row is not None
-    return _serialize_rate(row[0], superseded_by_id=row[1], supersedes_rate_id=row[2])
+    return await _get_catalog_entry_or_404(
+        db=db,
+        statement=statement,
+        model=EstimationRate,
+        entry_id=rate_id,
+        resource_name="Rate catalog entry",
+        serialize_row=lambda row: _serialize_rate(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_rate_id=row[2],
+        ),
+    )
 
 
 @estimation_router.get(
@@ -585,33 +782,27 @@ async def list_rates(
             (EstimationRate.effective_from <= as_of)
             & (EstimationRate.effective_to.is_(None) | (EstimationRate.effective_to > as_of))
         )
-    if not include_superseded:
-        statement = statement.where(superseded_by_column.is_(None))
-    if cursor is not None:
-        created_at, row_id = _decode_timestamp_cursor(cursor)
-        statement = statement.where(
-            (EstimationRate.created_at < created_at)
-            | ((EstimationRate.created_at == created_at) & (EstimationRate.id < row_id))
-        )
-
-    rows = (
-        await db.execute(
-            statement.order_by(EstimationRate.created_at.desc(), EstimationRate.id.desc()).limit(
-                limit + 1
-            )
-        )
-    ).all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row[0].created_at, last_row[0].id)
-    return EstimationRateListResponse(
-        items=[
-            _serialize_rate(row[0], superseded_by_id=row[1], supersedes_rate_id=row[2])
-            for row in page
-        ],
-        next_cursor=next_cursor,
+    statement = _apply_catalog_list_page(
+        statement=statement,
+        model=EstimationRate,
+        superseded_by_column=superseded_by_column,
+        include_superseded=include_superseded,
+        cursor=cursor,
+    )
+    return await _list_catalog_entries(
+        db=db,
+        statement=statement,
+        model=EstimationRate,
+        limit=limit,
+        serialize_row=lambda row: _serialize_rate(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_rate_id=row[2],
+        ),
+        build_response=lambda items, next_cursor: EstimationRateListResponse(
+            items=items,
+            next_cursor=next_cursor,
+        ),
     )
 
 
@@ -625,110 +816,26 @@ async def create_material(
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> EstimationMaterialRead | Response:
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            "estimation.materials.create",
-            material_in.model_dump(mode="json"),
-        )
-        replay = await replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay is not None:
-            return replay
-
-    if material_in.project_id is not None:
-        await _get_active_project_or_404(db, material_in.project_id)
-
-    predecessor: EstimationMaterial | None = None
-    if material_in.supersedes_material_id is not None:
-        predecessor = await _get_material_predecessor_or_404(db, material_in.supersedes_material_id)
-        _validate_material_supersession(material_in, predecessor)
-        _validate_successor_effective_window(
-            predecessor.effective_to,
-            material_in.effective_from,
-            resource_name="material",
-        )
-
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path="/estimation/catalog/materials",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
-
-    material = EstimationMaterial(
-        scope_type=material_in.scope_type,
+    return await _create_catalog_entry(
+        payload=material_in,
+        db=db,
+        idempotency_key=idempotency_key,
+        fingerprint_namespace="estimation.materials.create",
+        path="/estimation/catalog/materials",
+        conflict_kind="Material catalog entry",
         project_id=material_in.project_id,
-        material_key=material_in.material_key,
-        source=material_in.source,
-        metadata_json=material_in.metadata_json,
-        name=material_in.name,
-        unit=material_in.unit,
-        currency=material_in.currency,
-        unit_cost=material_in.unit_cost,
-        effective_from=material_in.effective_from,
-        effective_to=material_in.effective_to,
-        checksum_sha256=material_checksum_sha256(
-            scope_type=material_in.scope_type,
-            project_id=material_in.project_id,
-            material_key=material_in.material_key,
-            source=material_in.source,
-            metadata_json=material_in.metadata_json,
-            name=material_in.name,
-            unit=material_in.unit,
-            currency=material_in.currency,
-            unit_cost=material_in.unit_cost,
-            effective_from=material_in.effective_from,
-            effective_to=material_in.effective_to,
+        supersedes_id=material_in.supersedes_material_id,
+        get_predecessor=_get_material_predecessor_or_404,
+        validate_predecessor=_validate_material_supersession,
+        validate_effective_window=_validate_material_successor_effective_window,
+        build_entry=_build_material,
+        build_supersession=_build_material_supersession,
+        serialize_created=lambda material, supersedes_material_id: _serialize_material(
+            material,
+            superseded_by_id=None,
+            supersedes_material_id=supersedes_material_id,
         ),
     )
-    db.add(material)
-
-    try:
-        await db.flush()
-        if predecessor is not None:
-            db.add(
-                EstimationMaterialSupersession(
-                    predecessor_material_id=predecessor.id,
-                    successor_material_id=material.id,
-                )
-            )
-            await db.flush()
-        await db.refresh(material)
-    except IntegrityError:
-        await db.rollback()
-        await _raise_catalog_conflict(db, reservation, kind="Material catalog entry")
-
-    body = _serialize_material(
-        material,
-        superseded_by_id=None,
-        supersedes_material_id=material_in.supersedes_material_id,
-    )
-    response_body = body.model_dump(mode="json")
-    idempotent_response: Response | None = None
-    if reservation is not None:
-        idempotent_response = await complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_201_CREATED,
-            response_body=response_body,
-        )
-    await db.commit()
-
-    if idempotent_response is not None:
-        return idempotent_response
-    return body
 
 
 @estimation_router.get(
@@ -740,11 +847,18 @@ async def get_material(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> EstimationMaterialRead:
     statement, _ = _material_query()
-    row = (await db.execute(statement.where(EstimationMaterial.id == material_id))).one_or_none()
-    if row is None:
-        raise_not_found("Material catalog entry", str(material_id))
-    assert row is not None
-    return _serialize_material(row[0], superseded_by_id=row[1], supersedes_material_id=row[2])
+    return await _get_catalog_entry_or_404(
+        db=db,
+        statement=statement,
+        model=EstimationMaterial,
+        entry_id=material_id,
+        resource_name="Material catalog entry",
+        serialize_row=lambda row: _serialize_material(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_material_id=row[2],
+        ),
+    )
 
 
 @estimation_router.get(
@@ -794,37 +908,27 @@ async def list_materials(
                 | (EstimationMaterial.effective_to > as_of)
             )
         )
-    if not include_superseded:
-        statement = statement.where(superseded_by_column.is_(None))
-    if cursor is not None:
-        created_at, row_id = _decode_timestamp_cursor(cursor)
-        statement = statement.where(
-            (EstimationMaterial.created_at < created_at)
-            | ((EstimationMaterial.created_at == created_at) & (EstimationMaterial.id < row_id))
-        )
-
-    rows = (
-        await db.execute(
-            statement.order_by(
-                EstimationMaterial.created_at.desc(), EstimationMaterial.id.desc()
-            ).limit(limit + 1)
-        )
-    ).all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row[0].created_at, last_row[0].id)
-    return EstimationMaterialListResponse(
-        items=[
-            _serialize_material(
-                row[0],
-                superseded_by_id=row[1],
-                supersedes_material_id=row[2],
-            )
-            for row in page
-        ],
-        next_cursor=next_cursor,
+    statement = _apply_catalog_list_page(
+        statement=statement,
+        model=EstimationMaterial,
+        superseded_by_column=superseded_by_column,
+        include_superseded=include_superseded,
+        cursor=cursor,
+    )
+    return await _list_catalog_entries(
+        db=db,
+        statement=statement,
+        model=EstimationMaterial,
+        limit=limit,
+        serialize_row=lambda row: _serialize_material(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_material_id=row[2],
+        ),
+        build_response=lambda items, next_cursor: EstimationMaterialListResponse(
+            items=items,
+            next_cursor=next_cursor,
+        ),
     )
 
 
@@ -838,105 +942,26 @@ async def create_formula(
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> EstimationFormulaRead | Response:
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            "estimation.formulas.create",
-            formula_in.model_dump(mode="json"),
-        )
-        replay = await replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay is not None:
-            return replay
-
-    if formula_in.project_id is not None:
-        await _get_active_project_or_404(db, formula_in.project_id)
-
-    predecessor: EstimationFormula | None = None
-    if formula_in.supersedes_formula_id is not None:
-        predecessor = await _get_formula_predecessor_or_404(db, formula_in.supersedes_formula_id)
-        _validate_formula_supersession(formula_in, predecessor)
-
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path="/estimation/formulas",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
-
-    formula = EstimationFormula(
-        scope_type=formula_in.scope_type,
+    return await _create_catalog_entry(
+        payload=formula_in,
+        db=db,
+        idempotency_key=idempotency_key,
+        fingerprint_namespace="estimation.formulas.create",
+        path="/estimation/formulas",
+        conflict_kind="Formula definition",
         project_id=formula_in.project_id,
-        formula_id=formula_in.formula_id,
-        version=formula_in.version,
-        name=formula_in.name,
-        dsl_version=formula_in.dsl_version,
-        output_key=formula_in.output_key,
-        output_contract_json=formula_in.output_contract_json,
-        declared_inputs_json=formula_in.declared_inputs_json,
-        expression_json=formula_in.expression_json,
-        rounding_json=formula_in.rounding_json,
-        checksum_sha256=formula_checksum_sha256(
-            scope_type=formula_in.scope_type,
-            project_id=formula_in.project_id,
-            formula_id=formula_in.formula_id,
-            version=formula_in.version,
-            name=formula_in.name,
-            dsl_version=formula_in.dsl_version,
-            output_key=formula_in.output_key,
-            output_contract_json=formula_in.output_contract_json,
-            declared_inputs_json=formula_in.declared_inputs_json,
-            expression_json=formula_in.expression_json,
-            rounding_json=formula_in.rounding_json,
+        supersedes_id=formula_in.supersedes_formula_id,
+        get_predecessor=_get_formula_predecessor_or_404,
+        validate_predecessor=_validate_formula_supersession,
+        validate_effective_window=None,
+        build_entry=_build_formula,
+        build_supersession=_build_formula_supersession,
+        serialize_created=lambda formula, supersedes_formula_id: _serialize_formula(
+            formula,
+            superseded_by_id=None,
+            supersedes_formula_id=supersedes_formula_id,
         ),
     )
-    db.add(formula)
-
-    try:
-        await db.flush()
-        if predecessor is not None:
-            db.add(
-                EstimationFormulaSupersession(
-                    predecessor_formula_id=predecessor.id,
-                    successor_formula_id=formula.id,
-                )
-            )
-            await db.flush()
-        await db.refresh(formula)
-    except IntegrityError:
-        await db.rollback()
-        await _raise_catalog_conflict(db, reservation, kind="Formula definition")
-
-    body = _serialize_formula(
-        formula,
-        superseded_by_id=None,
-        supersedes_formula_id=formula_in.supersedes_formula_id,
-    )
-    response_body = body.model_dump(mode="json")
-    idempotent_response: Response | None = None
-    if reservation is not None:
-        idempotent_response = await complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_201_CREATED,
-            response_body=response_body,
-        )
-    await db.commit()
-
-    if idempotent_response is not None:
-        return idempotent_response
-    return body
 
 
 @estimation_router.get(
@@ -948,13 +973,18 @@ async def get_formula(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> EstimationFormulaRead:
     statement, _ = _formula_query()
-    row = (
-        await db.execute(statement.where(EstimationFormula.id == formula_definition_id))
-    ).one_or_none()
-    if row is None:
-        raise_not_found("Formula definition", str(formula_definition_id))
-    assert row is not None
-    return _serialize_formula(row[0], superseded_by_id=row[1], supersedes_formula_id=row[2])
+    return await _get_catalog_entry_or_404(
+        db=db,
+        statement=statement,
+        model=EstimationFormula,
+        entry_id=formula_definition_id,
+        resource_name="Formula definition",
+        serialize_row=lambda row: _serialize_formula(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_formula_id=row[2],
+        ),
+    )
 
 
 @estimation_router.get(
@@ -992,31 +1022,25 @@ async def list_formulas(
         statement = statement.where(EstimationFormula.dsl_version == dsl_version)
     if output_key is not None:
         statement = statement.where(EstimationFormula.output_key == output_key)
-    if not include_superseded:
-        statement = statement.where(superseded_by_column.is_(None))
-    if cursor is not None:
-        created_at, row_id = _decode_timestamp_cursor(cursor)
-        statement = statement.where(
-            (EstimationFormula.created_at < created_at)
-            | ((EstimationFormula.created_at == created_at) & (EstimationFormula.id < row_id))
-        )
-
-    rows = (
-        await db.execute(
-            statement.order_by(
-                EstimationFormula.created_at.desc(), EstimationFormula.id.desc()
-            ).limit(limit + 1)
-        )
-    ).all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row[0].created_at, last_row[0].id)
-    return EstimationFormulaListResponse(
-        items=[
-            _serialize_formula(row[0], superseded_by_id=row[1], supersedes_formula_id=row[2])
-            for row in page
-        ],
-        next_cursor=next_cursor,
+    statement = _apply_catalog_list_page(
+        statement=statement,
+        model=EstimationFormula,
+        superseded_by_column=superseded_by_column,
+        include_superseded=include_superseded,
+        cursor=cursor,
+    )
+    return await _list_catalog_entries(
+        db=db,
+        statement=statement,
+        model=EstimationFormula,
+        limit=limit,
+        serialize_row=lambda row: _serialize_formula(
+            row[0],
+            superseded_by_id=row[1],
+            supersedes_formula_id=row[2],
+        ),
+        build_response=lambda items, next_cursor: EstimationFormulaListResponse(
+            items=items,
+            next_cursor=next_cursor,
+        ),
     )
