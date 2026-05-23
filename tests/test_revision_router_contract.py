@@ -1,0 +1,470 @@
+"""Regression contract for the revision API route table."""
+
+from annotated_types import Ge, Le
+from fastapi.routing import APIRoute
+from pydantic_core import PydanticUndefined
+
+from app.api.v1.revisions import revisions_router
+
+type RouteParameterContract = tuple[
+    str,
+    str | None,
+    bool | None,
+    object | None,
+    object | None,
+    object | None,
+    str | None,
+]
+
+
+def _parameter_contract(route: APIRoute) -> tuple[RouteParameterContract, ...]:
+    """Return path/query/dependency metadata for a route."""
+
+    parameter_contract: list[RouteParameterContract] = []
+
+    for parameter in route.dependant.path_params:
+        ge: object | None = None
+        le: object | None = None
+        for metadata in parameter.field_info.metadata:
+            if isinstance(metadata, Ge):
+                ge = metadata.ge
+            elif isinstance(metadata, Le):
+                le = metadata.le
+
+        required = parameter.default is PydanticUndefined
+        default = None if required else parameter.default
+        parameter_contract.append(("path", parameter.name, required, default, ge, le, None))
+
+    for parameter in route.dependant.query_params:
+        ge = None
+        le = None
+        for metadata in parameter.field_info.metadata:
+            if isinstance(metadata, Ge):
+                ge = metadata.ge
+            elif isinstance(metadata, Le):
+                le = metadata.le
+
+        required = parameter.default is PydanticUndefined
+        default = None if required else parameter.default
+        parameter_contract.append(("query", parameter.name, required, default, ge, le, None))
+
+    for dependency in route.dependant.dependencies:
+        dependency_name = dependency.call.__name__ if dependency.call else None
+        parameter_contract.append(
+            (
+                "dependency",
+                dependency.name,
+                None,
+                None,
+                None,
+                None,
+                dependency_name,
+            )
+        )
+
+    return tuple(parameter_contract)
+
+
+def _route_contract() -> list[
+    tuple[
+        str,
+        str,
+        str,
+        str,
+        str | None,
+        int | None,
+        tuple[RouteParameterContract, ...],
+    ]
+]:
+    """Return ordered revision route contract tuples."""
+
+    contract: list[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            int | None,
+            tuple[RouteParameterContract, ...],
+        ]
+    ] = []
+    for route in revisions_router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+
+        method = next(iter(route.methods))
+        response_model_name = (
+            route.response_model.__name__ if route.response_model is not None else None
+        )
+        contract.append(
+            (
+                method,
+                route.path,
+                route.name,
+                route.endpoint.__name__,
+                response_model_name,
+                route.status_code,
+                _parameter_contract(route),
+            )
+        )
+
+    return contract
+
+
+def test_revision_router_routes_match_baseline_contract() -> None:
+    # Arrange
+    expected_contract = [
+        (
+            "GET",
+            "/files/{file_id}/revisions",
+            "list_file_revisions",
+            "list_file_revisions",
+            "DrawingRevisionListResponse",
+            None,
+            (
+                ("path", "file_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/adapter-output",
+            "get_revision_adapter_output",
+            "get_revision_adapter_output",
+            "AdapterRunOutputRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/adapter-outputs/{adapter_output_id}",
+            "get_adapter_output",
+            "get_adapter_output",
+            "AdapterRunOutputRead",
+            None,
+            (
+                ("path", "adapter_output_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/files/{file_id}/generated-artifacts",
+            "list_file_generated_artifacts",
+            "list_file_generated_artifacts",
+            "GeneratedArtifactListResponse",
+            None,
+            (
+                ("path", "file_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/generated-artifacts",
+            "list_revision_generated_artifacts",
+            "list_revision_generated_artifacts",
+            "GeneratedArtifactListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/layouts",
+            "list_revision_layouts",
+            "list_revision_layouts",
+            "RevisionLayoutListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/layers",
+            "list_revision_layers",
+            "list_revision_layers",
+            "RevisionLayerListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/blocks",
+            "list_revision_blocks",
+            "list_revision_blocks",
+            "RevisionBlockListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/entities",
+            "list_revision_entities",
+            "list_revision_entities",
+            "RevisionEntityListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("query", "entity_id", False, None, None, None, None),
+                ("query", "entity_type", False, None, None, None, None),
+                ("query", "layout_ref", False, None, None, None, None),
+                ("query", "layer_ref", False, None, None, None, None),
+                ("query", "block_ref", False, None, None, None, None),
+                ("query", "parent_entity_ref", False, None, None, None, None),
+                ("query", "source_identity", False, None, None, None, None),
+                ("query", "source_hash", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/entities/{entity_id:path}",
+            "get_revision_entity",
+            "get_revision_entity",
+            "RevisionEntityRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "entity_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/quantity-takeoffs",
+            "list_revision_quantity_takeoffs",
+            "list_revision_quantity_takeoffs",
+            "QuantityTakeoffListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}",
+            "get_revision_quantity_takeoff",
+            "get_revision_quantity_takeoff",
+            "QuantityTakeoffRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "takeoff_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/items",
+            "list_revision_quantity_takeoff_items",
+            "list_revision_quantity_takeoff_items",
+            "QuantityItemListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "takeoff_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/estimates",
+            "list_revision_estimates",
+            "list_revision_estimates",
+            "EstimateVersionListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "POST",
+            "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/estimate-versions",
+            "create_revision_estimate_version",
+            "create_revision_estimate_version",
+            "JobRead",
+            202,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "takeoff_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+                (
+                    "dependency",
+                    "idempotency_key",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "get_idempotency_key",
+                ),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/estimates/{estimate_version_id}",
+            "get_revision_estimate",
+            "get_revision_estimate",
+            "EstimateVersionRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "estimate_version_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/estimates/{estimate_version_id}/items",
+            "list_revision_estimate_items",
+            "list_revision_estimate_items",
+            "EstimateItemListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "estimate_version_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/estimates/{estimate_version_id}/snapshot-entries",
+            "list_revision_estimate_snapshot_entries",
+            "list_revision_estimate_snapshot_entries",
+            "EstimateSnapshotEntryListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "estimate_version_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "POST",
+            "/revisions/{revision_id}/quantity-takeoffs",
+            "create_revision_quantity_takeoff",
+            "create_revision_quantity_takeoff",
+            "JobRead",
+            202,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+                (
+                    "dependency",
+                    "idempotency_key",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "get_idempotency_key",
+                ),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/validation-report",
+            "get_validation_report",
+            "get_validation_report",
+            "ValidationReportResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+    ]
+
+    # Act
+    actual_contract = _route_contract()
+
+    # Assert
+    assert actual_contract == expected_contract
+
+
+def test_revision_router_excludes_legacy_entity_and_estimate_post_routes() -> None:
+    # Arrange
+    forbidden_contract_entries = {
+        (
+            "GET",
+            "/revisions/{revision_id}/entities/{entity_id}",
+            "get_revision_entity",
+            "get_revision_entity",
+            "RevisionEntityRead",
+            None,
+            (),
+        ),
+        (
+            "POST",
+            "/revisions/{revision_id}/estimate-versions",
+            "create_revision_estimate_version",
+            "create_revision_estimate_version",
+            "JobRead",
+            202,
+            (),
+        ),
+    }
+
+    # Act
+    actual_contract = {
+        (
+            method,
+            path,
+            name,
+            endpoint_name,
+            response_model_name,
+            status_code,
+            (),
+        )
+        for (
+            method,
+            path,
+            name,
+            endpoint_name,
+            response_model_name,
+            status_code,
+            _,
+        ) in _route_contract()
+    }
+
+    # Assert
+    assert actual_contract.isdisjoint(forbidden_contract_entries)
