@@ -91,6 +91,9 @@ from app.api.v1.revision_lineage import (
 from app.api.v1.revision_lineage import (
     _get_revision_quantity_takeoff_or_404 as _lineage_get_revision_quantity_takeoff_or_404,
 )
+from app.api.v1.revision_lineage import (
+    _manifest_counts as _lineage_manifest_counts,
+)
 from app.api.v1.revision_routes.adapter_outputs import (
     adapter_outputs_router,
 )
@@ -146,6 +149,7 @@ _MAX_PAGE_SIZE = 200
 
 _get_active_file = _lineage_get_active_file
 _get_active_revision = _lineage_get_active_revision
+_manifest_counts = _lineage_manifest_counts
 _get_revision_quantity_takeoff_or_404 = _lineage_get_revision_quantity_takeoff_or_404
 _get_revision_estimate_version_or_404 = _lineage_get_revision_estimate_version_or_404
 _NormalizedEstimateCatalogRef = _estimate_inputs_NormalizedEstimateCatalogRef
