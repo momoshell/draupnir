@@ -161,6 +161,53 @@ def _manifest_line_geometry(length: float) -> dict[str, Any]:
     }
 
 
+def test_worker_loop_reuses_same_running_loop_for_sequential_sync_entrypoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sync worker entrypoints should reuse one running loop across sequential calls."""
+    observed_calls: list[tuple[str, uuid.UUID, int]] = []
+    recovered_loop_ids: list[int] = []
+    ingest_job_id = uuid.uuid4()
+    quantity_job_id = uuid.uuid4()
+    estimate_job_id = uuid.uuid4()
+
+    async def _fake_recover() -> list[uuid.UUID]:
+        recovered_loop_ids.append(id(asyncio.get_running_loop()))
+        return []
+
+    async def _fake_process_ingest(job_id: uuid.UUID) -> None:
+        observed_calls.append(("ingest", job_id, id(asyncio.get_running_loop())))
+
+    async def _fake_process_quantity(job_id: uuid.UUID) -> None:
+        observed_calls.append(("quantity", job_id, id(asyncio.get_running_loop())))
+
+    async def _fake_process_estimate(job_id: uuid.UUID) -> None:
+        observed_calls.append(("estimate", job_id, id(asyncio.get_running_loop())))
+
+    worker_module._close_worker_loop_runner()
+    monkeypatch.setattr(worker_module, "recover_incomplete_ingest_jobs", _fake_recover)
+    monkeypatch.setattr(worker_module, "process_ingest_job", _fake_process_ingest)
+    monkeypatch.setattr(worker_module, "process_quantity_takeoff_job", _fake_process_quantity)
+    monkeypatch.setattr(worker_module, "process_estimate_job", _fake_process_estimate)
+
+    try:
+        worker_module.recover_incomplete_ingest_jobs_on_worker_start()
+        worker_module.run_ingest_job(str(ingest_job_id))
+        worker_module.run_quantity_takeoff_job(str(quantity_job_id))
+        worker_module.run_estimate_job(str(estimate_job_id))
+    finally:
+        worker_module._close_worker_loop_runner()
+
+    assert [call[:2] for call in observed_calls] == [
+        ("ingest", ingest_job_id),
+        ("quantity", quantity_job_id),
+        ("estimate", estimate_job_id),
+    ]
+    assert len(recovered_loop_ids) == 1
+    loop_ids = recovered_loop_ids + [loop_id for _, _, loop_id in observed_calls]
+    assert len(set(loop_ids)) == 1
+
+
 def _quantity_item_values_by_type(items: list[QuantityItem], *, item_kind: str) -> dict[str, float]:
     """Return persisted quantity item values keyed by quantity type."""
     values: dict[str, float] = {}

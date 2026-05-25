@@ -3,13 +3,15 @@
 # ruff: noqa: SLF001
 
 import asyncio
+import atexit
 import hashlib
 import heapq
 import inspect
 import json
 import math
+import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -142,6 +144,9 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "detected_format",
     "media_type",
 )
+
+_WORKER_LOOP_RUNNER: asyncio.Runner | None = None
+_WORKER_LOOP_RUNNER_LOCK = threading.Lock()
 
 
 def is_ingest_worker_job_type(job_type: JobType | str) -> bool:
@@ -386,6 +391,36 @@ celery_app.autodiscover_tasks(["app.jobs"], force=True)
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(UTC)
+
+
+def _get_worker_loop_runner() -> asyncio.Runner:
+    """Return the reusable asyncio runner for sync Celery entrypoints."""
+    global _WORKER_LOOP_RUNNER
+    if _WORKER_LOOP_RUNNER is None:
+        _WORKER_LOOP_RUNNER = asyncio.Runner()
+    return _WORKER_LOOP_RUNNER
+
+
+def _close_worker_loop_runner() -> None:
+    """Close and clear the reusable asyncio runner."""
+    global _WORKER_LOOP_RUNNER
+    with _WORKER_LOOP_RUNNER_LOCK:
+        runner = _WORKER_LOOP_RUNNER
+        if runner is None:
+            return
+        runner.close()
+        _WORKER_LOOP_RUNNER = None
+
+
+def _run_worker_loop[WorkerLoopResultT](
+    coro_factory: Callable[[], Coroutine[Any, Any, WorkerLoopResultT]],
+) -> WorkerLoopResultT:
+    """Run a worker coroutine on the process-local reusable event loop."""
+    with _WORKER_LOOP_RUNNER_LOCK:
+        return _get_worker_loop_runner().run(coro_factory())
+
+
+atexit.register(_close_worker_loop_runner)
 
 
 def _clear_job_attempt_lease(job: Job) -> None:
@@ -4136,7 +4171,7 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
     """Requeue incomplete ingest/reprocess/quantity/estimate jobs when a worker starts."""
     try:
-        recovered_job_ids = asyncio.run(recover_incomplete_ingest_jobs())
+        recovered_job_ids = _run_worker_loop(recover_incomplete_ingest_jobs)
     except Exception as exc:
         logger.error("ingest_job_recovery_failed", error=str(exc), exc_info=True)
         return
@@ -4159,7 +4194,7 @@ worker_ready.connect(recover_incomplete_ingest_jobs_on_worker_start)
 )
 def run_ingest_job(job_id: str) -> None:
     """Celery task wrapper for the persisted ingest job processor."""
-    asyncio.run(process_ingest_job(UUID(job_id)))
+    _run_worker_loop(lambda: process_ingest_job(UUID(job_id)))
 
 
 def enqueue_ingest_job(job_id: UUID) -> None:
@@ -4307,7 +4342,7 @@ async def process_quantity_takeoff_job(job_id: UUID) -> None:
 )
 def run_quantity_takeoff_job(job_id: str) -> None:
     """Celery task wrapper for persisted quantity takeoff jobs."""
-    asyncio.run(process_quantity_takeoff_job(UUID(job_id)))
+    _run_worker_loop(lambda: process_quantity_takeoff_job(UUID(job_id)))
 
 
 def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
@@ -4437,7 +4472,7 @@ async def process_estimate_job(job_id: UUID) -> None:
 )
 def run_estimate_job(job_id: str) -> None:
     """Celery task wrapper for persisted estimate jobs."""
-    asyncio.run(process_estimate_job(UUID(job_id)))
+    _run_worker_loop(lambda: process_estimate_job(UUID(job_id)))
 
 
 def enqueue_estimate_job(job_id: UUID) -> None:
