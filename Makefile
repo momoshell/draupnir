@@ -8,7 +8,10 @@
 #
 # NOTE: app/ and tests/ directories are scaffolded in a later step (#20/#21).
 # Lint and typecheck targets will report "no files found" until then.
-#   make test        — Run pytest
+#   make test        — Run full pytest suite
+#   make smoke       — Run fast smoke pytest lane
+#   make integration — Run DB-backed integration pytest lane
+#   make compose-smoke — Run opt-in Docker Compose smoke pytest lane
 #   make format      — Run ruff formatter on app/ and tests/
 #   make check       — Run lint + typecheck + test
 #   make hooks       — Install pre-commit + adaptive pre-push hooks
@@ -21,11 +24,15 @@
 #   make migrate     — Run Alembic migrations
 # =============================================================================
 
-UV_SYNC_ARGS = --extra db --extra jobs --extra dev --extra test
+UV_SYNC_ARGS = --extra db --extra jobs --extra ingestion --extra dev --extra test
 PRE_PUSH_HOOK = .git/hooks/pre-push
 PRE_PUSH_HOOK_VERSION = v1
+PYTEST_SMOKE_EXPRESSION = smoke and not integration and not compose_smoke
+PYTEST_INTEGRATION_EXPRESSION = integration and not compose_smoke
+PYTEST_COMPOSE_SMOKE_EXPRESSION = compose_smoke
+SMOKE_BASE_URL ?= http://localhost:8000
 
-.PHONY: sync lint typecheck test format check hooks up down logs ps shell-api shell-worker migrate
+.PHONY: sync lint typecheck test smoke integration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
 
 sync:
 	uv sync $(UV_SYNC_ARGS)
@@ -38,6 +45,16 @@ typecheck:
 
 test:
 	uv run pytest
+
+smoke:
+	uv run pytest -m "$(PYTEST_SMOKE_EXPRESSION)"
+
+integration:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_INTEGRATION_EXPRESSION)"
+
+compose-smoke:
+	COMPOSE_SMOKE=1 SMOKE_BASE_URL="$(SMOKE_BASE_URL)" uv run pytest -m "$(PYTEST_COMPOSE_SMOKE_EXPRESSION)"
 
 format:
 	uv run ruff format app tests

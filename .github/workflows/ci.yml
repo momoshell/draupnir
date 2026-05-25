@@ -90,12 +90,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
+      - name: Run pytest smoke lane
+        run: uv run pytest -m "smoke and not integration and not compose_smoke"
+
       - name: Run Alembic migrations
         run: uv run alembic upgrade head
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
 
-      - name: Run pytest
-        run: uv run pytest
+      - name: Run pytest non-integration lane
+        run: uv run pytest -m "not integration and not compose_smoke and not smoke"
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
+
+      - name: Run pytest integration lane
+        run: uv run pytest -m "integration and not compose_smoke"
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test

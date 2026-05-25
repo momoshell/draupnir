@@ -61,11 +61,21 @@ _LEGACY_APPEND_ONLY_TRIGGER_NAMES: tuple[str, ...] = (
 )
 _TEST_ONLY_CLEANUP_TABLES: tuple[str, ...] = ("idempotency_keys",)
 
-# Marker for tests that require a running database
-requires_database = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
-    reason="DATABASE_URL not set - skipping database tests",
-)
+_DATABASE_REQUIRED_REASON = "DATABASE_URL not set - skipping database tests"
+
+# Marker for tests that require a running database.
+requires_database = pytest.mark.integration
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Skip integration tests when DATABASE_URL is not configured."""
+    if os.environ.get("DATABASE_URL"):
+        return
+
+    skip_database = pytest.mark.skip(reason=_DATABASE_REQUIRED_REASON)
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_database)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -179,9 +189,7 @@ async def _set_append_only_triggers_enabled(
 
     action = "ENABLE" if enabled else "DISABLE"
     for table_name, trigger_name in triggers:
-        await session.execute(
-            text(f'ALTER TABLE "{table_name}" {action} TRIGGER {trigger_name}')
-        )
+        await session.execute(text(f'ALTER TABLE "{table_name}" {action} TRIGGER {trigger_name}'))
 
 
 async def _assert_append_only_triggers_enabled(

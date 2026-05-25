@@ -33,6 +33,7 @@ from app.schemas.system import (
 from tests.conftest import requires_database
 
 
+@pytest.mark.smoke
 def test_version() -> None:
     """Test that version is a non-empty string."""
     assert isinstance(__version__, str)
@@ -71,6 +72,8 @@ def _fake_ingest_payload(*, generated_at: datetime) -> IngestFinalizationPayload
         generated_at=generated_at,
     )
 
+
+@pytest.mark.smoke
 class TestHealthEndpoint:
     """Smoke tests for the health check endpoint."""
 
@@ -125,8 +128,7 @@ class TestHealthEndpoint:
 
         # Assert request ID matches the expected pattern
         assert REQUEST_ID_PATTERN.match(request_id) is not None, (
-            f"Request ID '{request_id}' does not match pattern "
-            f"{REQUEST_ID_PATTERN.pattern}"
+            f"Request ID '{request_id}' does not match pattern {REQUEST_ID_PATTERN.pattern}"
         )
 
         # Assert request ID length is within bounds (max 64 chars)
@@ -197,6 +199,7 @@ class TestHealthEndpoint:
         )
 
 
+@pytest.mark.smoke
 class TestSystemHealthSmoke:
     """Smoke tests for degraded system health behavior."""
 
@@ -267,9 +270,7 @@ class TestIngestWorkflowSmoke:
         payload = _fake_ingest_payload(generated_at=generated_at)
         enqueued_job_ids: list[UUID] = []
 
-        async def _fake_run_ingestion(
-            *args: object, **kwargs: object
-        ) -> IngestFinalizationPayload:
+        async def _fake_run_ingestion(*args: object, **kwargs: object) -> IngestFinalizationPayload:
             del args, kwargs
             return payload
 
@@ -433,9 +434,9 @@ def _read_original_from_worker_storage(
 
     payload: object = json.loads(stdout_lines[-1])
     assert isinstance(payload, dict), "worker storage probe returned non-object JSON"
-    assert all(
-        isinstance(key, str) for key in payload
-    ), "worker storage probe returned non-string keys"
+    assert all(isinstance(key, str) for key in payload), (
+        "worker storage probe returned non-string keys"
+    )
 
     return cast(dict[str, object], payload)
 
@@ -444,6 +445,7 @@ def _read_original_from_worker_storage(
     not (COMPOSE_SMOKE and SMOKE_BASE_URL),
     reason="COMPOSE_SMOKE=1 and SMOKE_BASE_URL must be set for compose smoke",
 )
+@pytest.mark.compose_smoke
 class TestHealthEndpointRealServer:
     """Smoke tests against a real running server (compose stack)."""
 
