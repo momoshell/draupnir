@@ -1,5 +1,7 @@
 """Celery worker application and persisted job handlers."""
 
+# ruff: noqa: SLF001
+
 import asyncio
 import hashlib
 import heapq
@@ -50,6 +52,7 @@ from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
+from app.jobs import lifecycle as job_lifecycle
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
@@ -57,8 +60,6 @@ from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, Est
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
-from app.models.job_event import JobEvent
-from app.models.project import Project
 from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
 from app.models.revision_materialization import (
     RevisionBlock,
@@ -170,12 +171,8 @@ def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None]
     return registry.get(normalized_job_type)
 
 
-class _InactiveSourceError(Exception):
-    """Raised when a job source project or file is no longer active."""
-
-
-class _StaleJobAttemptError(Exception):
-    """Raised when a worker attempt no longer owns the job lease."""
+_InactiveSourceError = job_lifecycle._InactiveSourceError
+_StaleJobAttemptError = job_lifecycle._StaleJobAttemptError
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +230,7 @@ class _EstimateJobInputError(Exception):
         return self.message
 
 
-@dataclass(frozen=True, slots=True)
-class _JobAttemptLease:
-    """Persisted ownership token for a claimed job attempt."""
-
-    token: UUID
-    lease_expires_at: datetime
+_JobAttemptLease = job_lifecycle._JobAttemptLease
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,21 +297,8 @@ class _EstimateWorkerAssemblyInput:
     quantity_entries: list[_EstimateWorkerQuantityEntry]
 
 
-@dataclass(frozen=True, slots=True)
-class _JobLockBootstrap:
-    """Non-locking job metadata needed to acquire ordered row locks."""
-
-    project_id: UUID
-    file_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class _LockedJobSource:
-    """Project/job/file rows locked in the approved terminal-mutation order."""
-
-    project: Project
-    job: Job
-    source_file: File | None
+_JobLockBootstrap = job_lifecycle._JobLockBootstrap
+_LockedJobSource = job_lifecycle._LockedJobSource
 
 
 class _PersistedJobCancellationHandle:
@@ -435,28 +414,18 @@ def _claim_job_attempt_lease(
     *,
     now: datetime,
     increment_attempt: bool,
+    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
 ) -> _JobAttemptLease:
     """Mint and persist a fresh job-attempt ownership lease."""
-    attempt_token = uuid.uuid4()
-    lease_expires_at = now + _RUNNING_JOB_STALE_AFTER
-
-    if increment_attempt:
-        job.attempts += 1
-
-    job.status = "running"
-    job.started_at = now
-    job.finished_at = None
-    job.error_code = None
-    job.error_message = None
-    job.attempt_token = attempt_token
-    job.attempt_lease_expires_at = lease_expires_at
-
-    return _JobAttemptLease(token=attempt_token, lease_expires_at=lease_expires_at)
+    return job_lifecycle._claim_job_attempt_lease(
+        job,
+        now=now,
+        increment_attempt=increment_attempt,
+        stale_after=stale_after,
+    )
 
 
-def _job_attempt_is_current(job: Job, *, attempt_token: UUID) -> bool:
-    """Return whether a worker still owns the persisted job attempt lease."""
-    return job.status == "running" and job.attempt_token == attempt_token
+_job_attempt_is_current = job_lifecycle._job_attempt_is_current
 
 
 def _job_is_safe_recovery_failure_target(job: Job) -> bool:
@@ -471,22 +440,18 @@ def _job_is_safe_recovery_failure_target(job: Job) -> bool:
     )
 
 
-def _is_stale_running_job(job: Job, *, now: datetime) -> bool:
+def _is_stale_running_job(
+    job: Job,
+    *,
+    now: datetime,
+    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
+) -> bool:
     """Return whether a running job is old enough to treat as orphaned."""
-    lease_expires_at = job.attempt_lease_expires_at
-    if lease_expires_at is not None:
-        if lease_expires_at.tzinfo is None:
-            lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
-        return lease_expires_at <= now
-
-    if job.started_at is None:
-        return True
-
-    started_at = job.started_at
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=UTC)
-
-    return started_at <= now - _RUNNING_JOB_STALE_AFTER
+    return job_lifecycle._is_stale_running_job(
+        job,
+        now=now,
+        stale_after=stale_after,
+    )
 
 
 def _is_stale_enqueue_intent(job: Job, *, now: datetime) -> bool:
@@ -511,74 +476,11 @@ def _claim_enqueue_intent_lease(job: Job, *, now: datetime) -> _EnqueueIntentLea
     return _EnqueueIntentLease(token=token, lease_expires_at=lease_expires_at)
 
 
-async def _get_job_for_update(session: AsyncSession, job_id: UUID) -> Job | None:
-    """Load and lock a persisted job row."""
-    return await _get_job_for_update_with_metadata(session, job_id)
-
-
-async def _get_job_lock_bootstrap(
-    session: AsyncSession,
-    job_id: UUID,
-) -> _JobLockBootstrap | None:
-    """Load job metadata without taking locks."""
-    result = await session.execute(select(Job.project_id, Job.file_id).where(Job.id == job_id))
-    row = result.one_or_none()
-    if row is None:
-        return None
-
-    project_id, file_id = row
-    return _JobLockBootstrap(project_id=project_id, file_id=file_id)
-
-
-async def _get_project(
-    session: AsyncSession,
-    project_id: UUID,
-    *,
-    for_update: bool = False,
-) -> Project | None:
-    """Load a persisted project row, optionally under a row lock."""
-    statement = select(Project).where(Project.id == project_id)
-    if for_update:
-        statement = statement.with_for_update(of=Project)
-
-    result = await session.execute(statement)
-    return result.scalar_one_or_none()
-
-
-async def _get_job_for_update_with_metadata(
-    session: AsyncSession,
-    job_id: UUID,
-    *,
-    expected_project_id: UUID | None = None,
-    expected_file_id: UUID | None = None,
-) -> Job | None:
-    """Load and lock a persisted job row, revalidating stable metadata."""
-    result = await session.execute(select(Job).where(Job.id == job_id).with_for_update(of=Job))
-    job = result.scalar_one_or_none()
-    if job is None:
-        return None
-    if expected_project_id is not None and job.project_id != expected_project_id:
-        return None
-    if expected_file_id is not None and job.file_id != expected_file_id:
-        return None
-
-    return job
-
-
-async def _get_source_file(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    file_id: UUID,
-    for_update: bool = False,
-) -> File | None:
-    """Load a source file row, optionally under a row lock."""
-    statement = select(File).where((File.project_id == project_id) & (File.id == file_id))
-    if for_update:
-        statement = statement.with_for_update(of=File)
-
-    result = await session.execute(statement)
-    return result.scalar_one_or_none()
+_get_job_for_update = job_lifecycle._get_job_for_update
+_get_job_lock_bootstrap = job_lifecycle._get_job_lock_bootstrap
+_get_project = job_lifecycle._get_project
+_get_job_for_update_with_metadata = job_lifecycle._get_job_for_update_with_metadata
+_get_source_file = job_lifecycle._get_source_file
 
 
 async def _lock_job_source_for_terminal_mutation(
@@ -586,32 +488,14 @@ async def _lock_job_source_for_terminal_mutation(
     job_id: UUID,
 ) -> _LockedJobSource:
     """Lock project/job/file rows in the approved order for terminal writes."""
-    bootstrap = await _get_job_lock_bootstrap(session, job_id)
-    if bootstrap is None:
-        raise LookupError(f"Job with identifier '{job_id}' not found")
-
-    project = await _get_project(session, bootstrap.project_id, for_update=True)
-    if project is None:
-        raise LookupError(
-            f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
-        )
-
-    job = await _get_job_for_update_with_metadata(
+    return await job_lifecycle._lock_job_source_for_terminal_mutation(
         session,
         job_id,
-        expected_project_id=bootstrap.project_id,
-        expected_file_id=bootstrap.file_id,
+        get_job_lock_bootstrap_func=_get_job_lock_bootstrap,
+        get_project_func=_get_project,
+        get_job_for_update_with_metadata_func=_get_job_for_update_with_metadata,
+        get_source_file_func=_get_source_file,
     )
-    if job is None:
-        raise LookupError(f"Job with identifier '{job_id}' not found")
-
-    source_file = await _get_source_file(
-        session,
-        project_id=bootstrap.project_id,
-        file_id=bootstrap.file_id,
-        for_update=True,
-    )
-    return _LockedJobSource(project=project, job=job, source_file=source_file)
 
 
 async def _get_existing_adapter_run_output(
@@ -3509,37 +3393,17 @@ async def emit_job_event(
     session: AsyncSession | None = None,
 ) -> bool:
     """Persist a job lifecycle event."""
-    event = JobEvent(
-        job_id=job_id,
+    return await job_lifecycle.emit_job_event(
+        job_id,
         level=level,
         message=message,
         data_json=data_json,
+        attempt_token=attempt_token,
+        session=session,
+        get_job_for_update_func=_get_job_for_update,
+        job_attempt_is_current_func=_job_attempt_is_current,
+        session_maker_factory=get_session_maker,
     )
-    if session is not None:
-        if attempt_token is not None:
-            job = await _get_job_for_update(session, job_id)
-            if job is None:
-                raise LookupError(f"Job with identifier '{job_id}' not found")
-            if not _job_attempt_is_current(job, attempt_token=attempt_token):
-                return False
-        session.add(event)
-        return True
-
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as managed_session:
-        if attempt_token is not None:
-            job = await _get_job_for_update(managed_session, job_id)
-            if job is None:
-                raise LookupError(f"Job with identifier '{job_id}' not found")
-            if not _job_attempt_is_current(job, attempt_token=attempt_token):
-                return False
-        managed_session.add(event)
-        await managed_session.commit()
-
-    return True
 
 
 def _progress_event_data(update: ProgressUpdate) -> dict[str, Any]:
@@ -3666,22 +3530,15 @@ async def _persist_job_failed(
     error_details: dict[str, Any] | None = None,
 ) -> None:
     """Persist a failed job state and matching event within an active session."""
-    job.status = "failed"
-    job.error_code = error_code.value
-    job.error_message = error_message
-    job.finished_at = _utcnow()
-    _clear_job_attempt_lease(job)
-    await emit_job_event(
-        job.id,
-        level="error",
-        message="Job failed",
-        data_json={
-            "status": "failed",
-            "error_code": error_code.value,
-            "error_message": error_message,
-            **({"details": error_details} if error_details is not None else {}),
-        },
-        session=session,
+    await job_lifecycle._persist_job_failed(
+        session,
+        job,
+        error_message=error_message,
+        error_code=error_code,
+        error_details=error_details,
+        utcnow_func=_utcnow,
+        clear_job_attempt_lease_func=_clear_job_attempt_lease,
+        emit_job_event_func=emit_job_event,
     )
 
 
@@ -3694,120 +3551,107 @@ async def _mark_job_failed(
     error_details: dict[str, Any] | None = None,
 ) -> bool:
     """Persist a failed job state with the supplied message."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
-        job = locked_source.job
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "ingest_job_failure_mark_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-        if attempt_token is not None and not _job_attempt_is_current(
-            job,
-            attempt_token=attempt_token,
-        ):
-            logger.info(
-                "ingest_job_failure_mark_skipped_stale_attempt",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        if (
-            locked_source.project.deleted_at is not None
-            or locked_source.source_file is None
-            or locked_source.source_file.deleted_at is not None
-        ):
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-                attempt_token=attempt_token,
-            )
-            logger.info(
-                "ingest_job_failure_mark_skipped_inactive_source",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        if attempt_token is not None and job.cancel_requested:
-            _finalize_job_cancelled(job)
-            await emit_job_event(
-                job.id,
-                level="warning",
-                message="Job cancelled",
-                data_json={"status": "cancelled"},
-                session=session,
-            )
-            await session.commit()
-            logger.info(
-                "ingest_job_failure_mark_preferred_cancelled",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        await _persist_job_failed(
-            session,
-            job,
-            error_message=error_message,
-            error_code=error_code,
-            error_details=error_details,
-        )
-        await session.commit()
-
-    return True
+    return await job_lifecycle._mark_job_failed(
+        job_id,
+        error_message=error_message,
+        error_code=error_code,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        attempt_token=attempt_token,
+        error_details=error_details,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        job_attempt_is_current_func=_job_attempt_is_current,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        persist_job_failed_func=_persist_job_failed,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
 
 
 async def _mark_job_cancelled(job_id: UUID, *, attempt_token: UUID | None = None) -> bool:
     """Persist a cancelled job state."""
-    session_maker = get_session_maker()
-    if session_maker is None:
+    return await job_lifecycle._mark_job_cancelled(
+        job_id,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        attempt_token=attempt_token,
+        session_maker_factory=get_session_maker,
+        get_job_for_update_func=_get_job_for_update,
+        job_attempt_is_current_func=_job_attempt_is_current,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
+
+
+def _ensure_worker_database_configured() -> None:
+    """Raise when persisted worker processing is invoked without DB access."""
+    if get_session_maker() is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "ingest_job_cancel_mark_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
+async def _mark_job_cancelled_with_log(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    log_event: str,
+    log_fields: dict[str, Any] | None = None,
+) -> None:
+    """Persist a cancelled terminal state and emit the matching worker log."""
+    await _mark_job_cancelled(job_id, attempt_token=attempt_token)
+    logger.info(log_event, job_id=str(job_id), **(log_fields or {}))
 
-        if attempt_token is not None and not _job_attempt_is_current(
-            job,
-            attempt_token=attempt_token,
-        ):
-            logger.info(
-                "ingest_job_cancel_mark_skipped_stale_attempt",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
 
-        _finalize_job_cancelled(job)
-        await emit_job_event(
-            job_id,
-            level="warning",
-            message="Job cancelled",
-            data_json={"status": "cancelled"},
-            session=session,
-        )
-        await session.commit()
+async def _mark_job_failed_for_revision_conflict(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    log_event: str,
+    exc: _RevisionConflictError,
+) -> None:
+    """Persist and log the shared revision-conflict failure contract."""
+    await _mark_job_failed(
+        job_id,
+        error_message=exc.message,
+        error_code=ErrorCode.REVISION_CONFLICT,
+        attempt_token=attempt_token,
+        error_details=exc.details,
+    )
+    logger.warning(
+        log_event,
+        job_id=str(job_id),
+        error_code=ErrorCode.REVISION_CONFLICT.value,
+        **exc.details,
+    )
 
-    return True
+
+async def _mark_job_failed_with_internal_error_log(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    error_message: str,
+    log_event: str,
+    log_fields: dict[str, Any] | None = None,
+) -> None:
+    """Persist and log unexpected internal worker failures."""
+    await _mark_job_failed(
+        job_id,
+        error_message=error_message,
+        attempt_token=attempt_token,
+    )
+    logger.error(
+        log_event,
+        job_id=str(job_id),
+        **(
+            log_fields
+            if log_fields is not None
+            else {
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "error_message": error_message,
+            }
+        ),
+        exc_info=True,
+    )
 
 
 async def _mark_job_failed_if_recovery_safe(
@@ -4011,11 +3855,12 @@ async def _mark_recovery_enqueue_failed(job_id: UUID) -> bool:
 
 def _finalize_job_cancelled(job: Job) -> None:
     """Apply the persisted cancelled terminal state to a job."""
-    job.status = "cancelled"
-    job.error_code = _JOB_CANCELLED_ERROR_CODE
-    job.error_message = None
-    job.finished_at = _utcnow()
-    _clear_job_attempt_lease(job)
+    job_lifecycle._finalize_job_cancelled(
+        job,
+        cancelled_error_code=_JOB_CANCELLED_ERROR_CODE,
+        utcnow_func=_utcnow,
+        clear_job_attempt_lease_func=_clear_job_attempt_lease,
+    )
 
 
 async def _cancel_job_for_inactive_source(
@@ -4026,438 +3871,116 @@ async def _cancel_job_for_inactive_source(
     attempt_token: UUID | None = None,
 ) -> bool:
     """Persist cancellation when a job source project/file is no longer active."""
-    if job.status in _TERMINAL_JOB_STATUSES:
-        return False
-
-    if attempt_token is not None and not _job_attempt_is_current(job, attempt_token=attempt_token):
-        return False
-
-    job.cancel_requested = True
-    _finalize_job_cancelled(job)
-    await emit_job_event(
-        job.id,
-        level="warning",
-        message="Job cancelled",
-        data_json={"status": "cancelled", "reason": reason},
-        session=session,
+    return await job_lifecycle._cancel_job_for_inactive_source(
+        session,
+        job,
+        reason=reason,
+        attempt_token=attempt_token,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        job_attempt_is_current_func=_job_attempt_is_current,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
     )
-    await session.commit()
-
-    return True
 
 
 async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted ingest job under a row lock."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    now = _utcnow()
-
-    async with session_maker() as session:
-        bootstrap = await _get_job_lock_bootstrap(session, job_id)
-        if bootstrap is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        project = await _get_project(session, bootstrap.project_id, for_update=True)
-        if project is None:
-            raise LookupError(
-                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
-            )
-
-        job = await _get_job_for_update_with_metadata(
-            session,
-            job_id,
-            expected_project_id=bootstrap.project_id,
-            expected_file_id=bootstrap.file_id,
-        )
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if not is_ingest_worker_job_type(job.job_type):
-            logger.info(
-                "ingest_job_unsupported_type_skipped",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return None
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "ingest_job_cancel_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return None
-
-        if project.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        source_file = await _get_source_file(
-            session,
-            project_id=job.project_id,
-            file_id=job.file_id,
-            for_update=True,
-        )
-        if source_file is None or source_file.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        if not job.cancel_requested:
-            if job.status == "running":
-                if _is_stale_running_job(job, now=now):
-                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-                    await emit_job_event(
-                        job.id,
-                        level="info",
-                        message="Job started",
-                        data_json={
-                            "status": "running",
-                            "attempts": job.attempts,
-                            "reclaimed": True,
-                        },
-                        session=session,
-                    )
-                    await session.commit()
-                    logger.warning(
-                        "ingest_job_reclaimed_stale_running_status",
-                        job_id=str(job_id),
-                        status=job.status,
-                    )
-                    return lease
-
-                logger.info(
-                    "ingest_job_duplicate_delivery_skipped_running_attempt",
-                    job_id=str(job_id),
-                    status=job.status,
-                )
-                return None
-
-            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-            await emit_job_event(
-                job.id,
-                level="info",
-                message="Job started",
-                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
-                session=session,
-            )
-            await session.commit()
-            return lease
-
-        _finalize_job_cancelled(job)
-        await emit_job_event(
-            job.id,
-            level="warning",
-            message="Job cancelled",
-            data_json={"status": "cancelled"},
-            session=session,
-        )
-        await session.commit()
-
-    logger.info("ingest_job_cancelled", job_id=str(job_id))
-    return None
+    return await job_lifecycle._begin_or_resume_ingest_job(
+        job_id,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        stale_after=_RUNNING_JOB_STALE_AFTER,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        claim_job_attempt_lease_func=_claim_job_attempt_lease,
+        is_stale_running_job_func=_is_stale_running_job,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
 
 
 async def _begin_or_resume_quantity_takeoff_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted quantity takeoff job under a row lock."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    now = _utcnow()
-
-    async with session_maker() as session:
-        bootstrap = await _get_job_lock_bootstrap(session, job_id)
-        if bootstrap is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        project = await _get_project(session, bootstrap.project_id, for_update=True)
-        if project is None:
-            raise LookupError(
-                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
-            )
-
-        job = await _get_job_for_update_with_metadata(
-            session,
-            job_id,
-            expected_project_id=bootstrap.project_id,
-            expected_file_id=bootstrap.file_id,
-        )
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if job.job_type != JobType.QUANTITY_TAKEOFF.value:
-            logger.info(
-                "quantity_takeoff_job_unsupported_type_skipped",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return None
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "quantity_takeoff_job_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return None
-
-        if project.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("quantity_takeoff_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        source_file = await _get_source_file(
-            session,
-            project_id=job.project_id,
-            file_id=job.file_id,
-            for_update=True,
-        )
-        if source_file is None or source_file.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("quantity_takeoff_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        if not job.cancel_requested:
-            if job.status == "running":
-                if _is_stale_running_job(job, now=now):
-                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-                    await emit_job_event(
-                        job.id,
-                        level="info",
-                        message="Job started",
-                        data_json={
-                            "status": "running",
-                            "attempts": job.attempts,
-                            "reclaimed": True,
-                        },
-                        session=session,
-                    )
-                    await session.commit()
-                    logger.warning(
-                        "quantity_takeoff_job_reclaimed_stale_running_status",
-                        job_id=str(job_id),
-                        status=job.status,
-                    )
-                    return lease
-
-                logger.info(
-                    "quantity_takeoff_job_duplicate_delivery_skipped_running_attempt",
-                    job_id=str(job_id),
-                    status=job.status,
-                )
-                return None
-
-            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-            await emit_job_event(
-                job.id,
-                level="info",
-                message="Job started",
-                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
-                session=session,
-            )
-            await session.commit()
-            return lease
-
-        _finalize_job_cancelled(job)
-        await emit_job_event(
-            job.id,
-            level="warning",
-            message="Job cancelled",
-            data_json={"status": "cancelled"},
-            session=session,
-        )
-        await session.commit()
-
-    logger.info("quantity_takeoff_job_cancelled", job_id=str(job_id))
-    return None
+    return await job_lifecycle._begin_or_resume_quantity_takeoff_job(
+        job_id,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        stale_after=_RUNNING_JOB_STALE_AFTER,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        claim_job_attempt_lease_func=_claim_job_attempt_lease,
+        is_stale_running_job_func=_is_stale_running_job,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
 
 
 async def _begin_or_resume_estimate_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted estimate job under a row lock."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    return await job_lifecycle._begin_or_resume_estimate_job(
+        job_id,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        stale_after=_RUNNING_JOB_STALE_AFTER,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        claim_job_attempt_lease_func=_claim_job_attempt_lease,
+        is_stale_running_job_func=_is_stale_running_job,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
 
-    now = _utcnow()
 
-    async with session_maker() as session:
-        bootstrap = await _get_job_lock_bootstrap(session, job_id)
-        if bootstrap is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        project = await _get_project(session, bootstrap.project_id, for_update=True)
-        if project is None:
-            raise LookupError(
-                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
-            )
-
-        job = await _get_job_for_update_with_metadata(
-            session,
+async def _execute_ingest_job_attempt(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> IngestFinalizationPayload:
+    """Build inputs, run ingestion, and drain progress/cancellation monitors."""
+    request = await _build_ingestion_run_request(job_id, attempt_token=attempt_token)
+    progress_bridge = _JobProgressEventBridge(job_id, attempt_token=attempt_token)
+    cancellation = _PersistedJobCancellationHandle()
+    stop_event = asyncio.Event()
+    run_task = asyncio.create_task(
+        _invoke_ingestion_runner(
+            request,
+            timeout=AdapterTimeout(seconds=_DEFAULT_ADAPTER_TIMEOUT.total_seconds()),
+            cancellation=cancellation,
+            on_progress=progress_bridge.callback,
+        )
+    )
+    cancellation_task = asyncio.create_task(
+        _poll_job_cancellation(
             job_id,
-            expected_project_id=bootstrap.project_id,
-            expected_file_id=bootstrap.file_id,
+            attempt_token=attempt_token,
+            cancellation=cancellation,
+            run_task=run_task,
+            stop_event=stop_event,
         )
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if job.job_type != JobType.ESTIMATE.value:
-            logger.info(
-                "estimate_job_unsupported_type_skipped",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return None
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "estimate_job_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return None
-
-        if project.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        source_file = await _get_source_file(
-            session,
-            project_id=job.project_id,
-            file_id=job.file_id,
-            for_update=True,
+    )
+    try:
+        return await run_task
+    finally:
+        await _stop_job_execution_monitor(
+            progress_bridge=progress_bridge,
+            stop_event=stop_event,
+            cancellation_task=cancellation_task,
         )
-        if source_file is None or source_file.deleted_at is not None:
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
-            return None
-
-        if not job.cancel_requested:
-            if job.status == "running":
-                if _is_stale_running_job(job, now=now):
-                    lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-                    await emit_job_event(
-                        job.id,
-                        level="info",
-                        message="Job started",
-                        data_json={
-                            "status": "running",
-                            "attempts": job.attempts,
-                            "reclaimed": True,
-                        },
-                        session=session,
-                    )
-                    await session.commit()
-                    logger.warning(
-                        "estimate_job_reclaimed_stale_running_status",
-                        job_id=str(job_id),
-                        status=job.status,
-                    )
-                    return lease
-
-                logger.info(
-                    "estimate_job_duplicate_delivery_skipped_running_attempt",
-                    job_id=str(job_id),
-                    status=job.status,
-                )
-                return None
-
-            lease = _claim_job_attempt_lease(job, now=now, increment_attempt=True)
-            await emit_job_event(
-                job.id,
-                level="info",
-                message="Job started",
-                data_json={"status": "running", "attempts": job.attempts, "reclaimed": False},
-                session=session,
-            )
-            await session.commit()
-            return lease
-
-        _finalize_job_cancelled(job)
-        await emit_job_event(
-            job.id,
-            level="warning",
-            message="Job cancelled",
-            data_json={"status": "cancelled"},
-            session=session,
-        )
-        await session.commit()
-
-    logger.info("estimate_job_cancelled", job_id=str(job_id))
-    return None
 
 
 async def process_ingest_job(job_id: UUID) -> None:
     """Load a persisted ingest job, run ingestion, and persist state transitions."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    _ensure_worker_database_configured()
 
     lease = await _begin_or_resume_ingest_job(job_id)
     if lease is None:
         return
 
     try:
-        request = await _build_ingestion_run_request(job_id, attempt_token=lease.token)
-        progress_bridge = _JobProgressEventBridge(job_id, attempt_token=lease.token)
-        cancellation = _PersistedJobCancellationHandle()
-        stop_event = asyncio.Event()
-        run_task = asyncio.create_task(
-            _invoke_ingestion_runner(
-                request,
-                timeout=AdapterTimeout(seconds=_DEFAULT_ADAPTER_TIMEOUT.total_seconds()),
-                cancellation=cancellation,
-                on_progress=progress_bridge.callback,
-            )
-        )
-        cancellation_task = asyncio.create_task(
-            _poll_job_cancellation(
-                job_id,
-                attempt_token=lease.token,
-                cancellation=cancellation,
-                run_task=run_task,
-                stop_event=stop_event,
-            )
-        )
-        try:
-            payload = await run_task
-        finally:
-            await _stop_job_execution_monitor(
-                progress_bridge=progress_bridge,
-                stop_event=stop_event,
-                cancellation_task=cancellation_task,
-            )
+        payload = await _execute_ingest_job_attempt(job_id, attempt_token=lease.token)
     except _InactiveSourceError:
         logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
         return
@@ -4465,27 +3988,20 @@ async def process_ingest_job(job_id: UUID) -> None:
         logger.info("ingest_job_stale_attempt_skipped", job_id=str(job_id))
         return
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "ingest_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="ingest_job_revision_conflict",
+            exc=exc,
         )
         raise
     except IngestionRunnerError as exc:
         if exc.error_code is ErrorCode.JOB_CANCELLED:
-            await _mark_job_cancelled(job_id, attempt_token=lease.token)
-            logger.info(
-                "ingest_job_cancelled_during_execution",
-                job_id=str(job_id),
-                error_code=exc.error_code.value,
+            await _mark_job_cancelled_with_log(
+                job_id,
+                attempt_token=lease.token,
+                log_event="ingest_job_cancelled_during_execution",
+                log_fields={"error_code": exc.error_code.value},
             )
         else:
             await _mark_job_failed(
@@ -4497,21 +4013,18 @@ async def process_ingest_job(job_id: UUID) -> None:
             logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
         raise
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("ingest_job_cancelled_during_execution", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="ingest_job_cancelled_during_execution",
+        )
         raise
     except Exception:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "ingest_job_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
-            exc_info=True,
+            log_event="ingest_job_failed",
         )
         raise
 
@@ -4522,35 +4035,27 @@ async def process_ingest_job(job_id: UUID) -> None:
             payload=payload,
         )
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("ingest_job_cancelled_during_finalization", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="ingest_job_cancelled_during_finalization",
+        )
         raise
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "ingest_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="ingest_job_revision_conflict",
+            exc=exc,
         )
         raise
     except Exception as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "ingest_job_finalization_failed",
-            job_id=str(job_id),
-            error=str(exc),
-            exc_info=True,
+            error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE,
+            log_event="ingest_job_finalization_failed",
+            log_fields={"error": str(exc)},
         )
         raise
 
@@ -4664,9 +4169,7 @@ def enqueue_ingest_job(job_id: UUID) -> None:
 
 async def process_quantity_takeoff_job(job_id: UUID) -> None:
     """Load a persisted quantity takeoff job and atomically persist its result."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    _ensure_worker_database_configured()
 
     lease = await _begin_or_resume_quantity_takeoff_job(job_id)
     if lease is None:
@@ -4722,18 +4225,11 @@ async def process_quantity_takeoff_job(job_id: UUID) -> None:
         logger.info("quantity_takeoff_job_stale_attempt_skipped", job_id=str(job_id))
         return
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "quantity_takeoff_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="quantity_takeoff_job_revision_conflict",
+            exc=exc,
         )
         return
     except _QuantityTakeoffJobError as exc:
@@ -4753,21 +4249,18 @@ async def process_quantity_takeoff_job(job_id: UUID) -> None:
         )
         return
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("quantity_takeoff_job_cancelled_during_execution", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="quantity_takeoff_job_cancelled_during_execution",
+        )
         raise
     except Exception:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "quantity_takeoff_job_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
-            exc_info=True,
+            log_event="quantity_takeoff_job_failed",
         )
         raise
 
@@ -4779,36 +4272,26 @@ async def process_quantity_takeoff_job(job_id: UUID) -> None:
             result=result,
         )
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("quantity_takeoff_job_cancelled_during_finalization", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="quantity_takeoff_job_cancelled_during_finalization",
+        )
         raise
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "quantity_takeoff_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="quantity_takeoff_job_revision_conflict",
+            exc=exc,
         )
         return
     except Exception:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "quantity_takeoff_job_finalization_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
-            exc_info=True,
+            log_event="quantity_takeoff_job_finalization_failed",
         )
         raise
 
@@ -4834,9 +4317,7 @@ def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
 
 async def process_estimate_job(job_id: UUID) -> None:
     """Load a persisted estimate job and assemble deterministic engine inputs."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    _ensure_worker_database_configured()
 
     lease = await _begin_or_resume_estimate_job(job_id)
     if lease is None:
@@ -4849,18 +4330,11 @@ async def process_estimate_job(job_id: UUID) -> None:
         logger.info("estimate_job_stale_attempt_skipped", job_id=str(job_id))
         return
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "estimate_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="estimate_job_revision_conflict",
+            exc=exc,
         )
         return
     except _EstimateJobInputError as exc:
@@ -4896,21 +4370,18 @@ async def process_estimate_job(job_id: UUID) -> None:
         )
         return
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("estimate_job_cancelled_during_execution", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="estimate_job_cancelled_during_execution",
+        )
         raise
     except Exception:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "estimate_job_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
-            exc_info=True,
+            log_event="estimate_job_failed",
         )
         raise
 
@@ -4931,36 +4402,26 @@ async def process_estimate_job(job_id: UUID) -> None:
             output=estimate_output,
         )
     except asyncio.CancelledError:
-        await _mark_job_cancelled(job_id, attempt_token=lease.token)
-        logger.info("estimate_job_cancelled_during_finalization", job_id=str(job_id))
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="estimate_job_cancelled_during_finalization",
+        )
         raise
     except _RevisionConflictError as exc:
-        await _mark_job_failed(
+        await _mark_job_failed_for_revision_conflict(
             job_id,
-            error_message=exc.message,
-            error_code=ErrorCode.REVISION_CONFLICT,
             attempt_token=lease.token,
-            error_details=exc.details,
-        )
-        logger.warning(
-            "estimate_job_revision_conflict",
-            job_id=str(job_id),
-            error_code=ErrorCode.REVISION_CONFLICT.value,
-            **exc.details,
+            log_event="estimate_job_revision_conflict",
+            exc=exc,
         )
         return
     except Exception:
-        await _mark_job_failed(
+        await _mark_job_failed_with_internal_error_log(
             job_id,
-            error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
             attempt_token=lease.token,
-        )
-        logger.error(
-            "estimate_job_finalization_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INTERNAL_ERROR.value,
             error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
-            exc_info=True,
+            log_event="estimate_job_finalization_failed",
         )
         raise
 

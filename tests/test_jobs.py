@@ -1343,6 +1343,97 @@ async def test_mark_recovery_enqueue_failed_logs_only_safe_fields(
     ]
 
 
+def test_claim_job_attempt_lease_adapter_forwards_stale_after_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker adapter should accept and forward lifecycle stale-after overrides."""
+    job = cast(Job, object())
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    stale_after = timedelta(seconds=17)
+    sentinel_lease = cast(Any, object())
+    captured: dict[str, Any] = {}
+
+    def _fake_claim_job_attempt_lease(
+        forwarded_job: Job,
+        *,
+        now: datetime,
+        increment_attempt: bool,
+        stale_after: timedelta,
+    ) -> Any:
+        captured.update(
+            {
+                "job": forwarded_job,
+                "now": now,
+                "increment_attempt": increment_attempt,
+                "stale_after": stale_after,
+            }
+        )
+        return sentinel_lease
+
+    monkeypatch.setattr(
+        "app.jobs.worker.job_lifecycle._claim_job_attempt_lease",
+        _fake_claim_job_attempt_lease,
+    )
+
+    lease = worker_module._claim_job_attempt_lease(
+        job,
+        now=now,
+        increment_attempt=True,
+        stale_after=stale_after,
+    )
+
+    assert lease is sentinel_lease
+    assert captured == {
+        "job": job,
+        "now": now,
+        "increment_attempt": True,
+        "stale_after": stale_after,
+    }
+
+
+def test_is_stale_running_job_adapter_forwards_stale_after_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker adapter should accept and forward lifecycle stale-after overrides."""
+    job = cast(Job, object())
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    stale_after = timedelta(seconds=29)
+    captured: dict[str, Any] = {}
+
+    def _fake_is_stale_running_job(
+        forwarded_job: Job,
+        *,
+        now: datetime,
+        stale_after: timedelta,
+    ) -> bool:
+        captured.update(
+            {
+                "job": forwarded_job,
+                "now": now,
+                "stale_after": stale_after,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(
+        "app.jobs.worker.job_lifecycle._is_stale_running_job",
+        _fake_is_stale_running_job,
+    )
+
+    is_stale = worker_module._is_stale_running_job(
+        job,
+        now=now,
+        stale_after=stale_after,
+    )
+
+    assert is_stale is True
+    assert captured == {
+        "job": job,
+        "now": now,
+        "stale_after": stale_after,
+    }
+
+
 @requires_database
 class TestJobs:
     """Tests for job status retrieval and worker state transitions."""
@@ -3995,6 +4086,207 @@ class TestJobs:
         assert recovered.extraction_profile_id is None
         assert recovered.base_revision_id == original.base_revision_id
         assert recovered.parent_job_id == original.parent_job_id
+
+    async def test_begin_or_resume_quantity_takeoff_job_skips_duplicate_running_attempt(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity duplicate delivery should leave a fresh running attempt unchanged."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        attempt_token = uuid.uuid4()
+        lease_expires_at = datetime.now(UTC) + worker_module._RUNNING_JOB_STALE_AFTER
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, quantity_job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = datetime.now(UTC)
+            persisted_job.attempt_token = attempt_token
+            persisted_job.attempt_lease_expires_at = lease_expires_at
+            await session.commit()
+
+        lease = await worker_module._begin_or_resume_quantity_takeoff_job(quantity_job.id)
+
+        assert lease is None
+        unchanged = await _get_job(quantity_job.id)
+        assert unchanged.status == "running"
+        assert unchanged.attempts == 1
+        assert unchanged.started_at is not None
+        assert unchanged.finished_at is None
+        assert unchanged.attempt_token == attempt_token
+        assert unchanged.attempt_lease_expires_at == lease_expires_at
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        assert response.json()["items"] == []
+
+    async def test_resume_quantity_takeoff_job_reclaims_stale_attempt_with_new_token(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity stale running attempts should be reclaimed with a fresh ownership token."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        old_attempt_token = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, quantity_job.id)
+            assert persisted_job is not None
+            persisted_job.status = "running"
+            persisted_job.attempts = 1
+            persisted_job.started_at = (
+                datetime.now(UTC) - worker_module._RUNNING_JOB_STALE_AFTER - timedelta(seconds=1)
+            )
+            persisted_job.attempt_token = old_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        lease = await worker_module._begin_or_resume_quantity_takeoff_job(quantity_job.id)
+
+        assert lease is not None
+        assert lease.token != old_attempt_token
+        reclaimed_job = await _get_job(quantity_job.id)
+        assert reclaimed_job.status == "running"
+        assert reclaimed_job.attempts == 2
+        assert reclaimed_job.attempt_token == lease.token
+        assert reclaimed_job.attempt_lease_expires_at == lease.lease_expires_at
+        assert reclaimed_job.attempt_lease_expires_at is not None
+        assert reclaimed_job.attempt_lease_expires_at > datetime.now(UTC)
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [event["message"] for event in items] == ["Job started"]
+        assert items[0]["data_json"] == {"status": "running", "attempts": 2, "reclaimed": True}
+
+    async def test_begin_or_resume_quantity_takeoff_job_cancels_inactive_source(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity begin/resume should cancel when the source project or file is inactive."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        (
+            project,
+            uploaded,
+            _,
+            _,
+            quantity_job,
+        ) = await _create_ready_quantity_takeoff_job(async_client)
+        await _mark_source_deleted(
+            uuid.UUID(project["id"]),
+            uuid.UUID(uploaded["id"]),
+            delete_project=False,
+            delete_file=True,
+        )
+
+        lease = await worker_module._begin_or_resume_quantity_takeoff_job(quantity_job.id)
+
+        assert lease is None
+        cancelled = await _get_job(quantity_job.id)
+        assert cancelled.status == "cancelled"
+        assert cancelled.attempts == 0
+        assert cancelled.cancel_requested is True
+        assert cancelled.attempt_token is None
+        assert cancelled.attempt_lease_expires_at is None
+        assert cancelled.error_code == ErrorCode.JOB_CANCELLED.value
+        assert cancelled.finished_at is not None
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [event["message"] for event in items] == ["Job cancelled"]
+        assert items[0]["data_json"] == {"status": "cancelled", "reason": "source_deleted"}
+
+    async def test_begin_or_resume_quantity_takeoff_job_finalizes_cancel_requested_job_as_cancelled(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity begin/resume should finalize cancel-requested jobs to cancelled."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        await _update_job(quantity_job.id, status="pending", cancel_requested=True)
+
+        lease = await worker_module._begin_or_resume_quantity_takeoff_job(quantity_job.id)
+
+        assert lease is None
+        updated = await _get_job(quantity_job.id)
+        assert updated.status == "cancelled"
+        assert updated.attempts == 0
+        assert updated.cancel_requested is True
+        assert updated.attempt_token is None
+        assert updated.attempt_lease_expires_at is None
+        assert updated.error_code == ErrorCode.JOB_CANCELLED.value
+        assert updated.finished_at is not None
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [event["message"] for event in items] == ["Job cancelled"]
+        assert items[0]["data_json"] == {"status": "cancelled"}
+
+    async def test_begin_or_resume_quantity_takeoff_job_skips_terminal_status(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Quantity begin/resume should ignore already terminal jobs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
+        await _update_job(
+            quantity_job.id,
+            status="failed",
+            attempts=1,
+            error_code=ErrorCode.INTERNAL_ERROR.value,
+            error_message="done",
+        )
+        before = await _get_job(quantity_job.id)
+        before_finished_at = before.finished_at
+
+        lease = await worker_module._begin_or_resume_quantity_takeoff_job(quantity_job.id)
+
+        assert lease is None
+        unchanged = await _get_job(quantity_job.id)
+        assert unchanged.status == "failed"
+        assert unchanged.attempts == 1
+        assert unchanged.attempt_token is None
+        assert unchanged.attempt_lease_expires_at is None
+        assert unchanged.error_code == ErrorCode.INTERNAL_ERROR.value
+        assert unchanged.error_message == "done"
+        assert unchanged.finished_at == before_finished_at
+
+        response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
+        assert response.status_code == 200
+        assert response.json()["items"] == []
 
     async def test_begin_or_resume_estimate_job_skips_duplicate_running_attempt(
         self,
