@@ -1,5 +1,6 @@
 """Smoke tests for Draupnir."""
 
+import asyncio
 import io
 import json
 import logging
@@ -9,7 +10,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -354,6 +355,8 @@ class TestIngestWorkflowSmoke:
 COMPOSE_SMOKE = os.environ.get("COMPOSE_SMOKE") == "1"
 SMOKE_BASE_URL = os.environ.get("SMOKE_BASE_URL", "")
 REPO_ROOT = Path(__file__).resolve().parents[1]
+COMPOSE_DXF_FIXTURE_PATH = REPO_ROOT / "tests/fixtures/dxf/simple-line.dxf"
+COMPOSE_DXF_MEDIA_TYPE = "image/vnd.dxf"
 WORKER_STORAGE_READ_SCRIPT = """
 import asyncio
 import hashlib
@@ -441,6 +444,71 @@ def _read_original_from_worker_storage(
     return cast(dict[str, object], payload)
 
 
+async def _job_events_diagnostics(
+    *,
+    real_async_client: httpx.AsyncClient,
+    job_id: UUID,
+) -> str:
+    response = await real_async_client.get(f"/v1/jobs/{job_id}/events?limit=20")
+    if response.status_code != 200:
+        return f"events_status={response.status_code} events_body={response.text[:500]}"
+
+    data = response.json()
+    return json.dumps(data)[-1000:]
+
+
+async def _wait_for_job_success(
+    *,
+    real_async_client: httpx.AsyncClient,
+    job_id: UUID,
+    timeout_seconds: float = 90.0,
+    poll_interval_seconds: float = 0.5,
+) -> dict[str, object]:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    last_status: object = None
+    last_error_code: object = None
+    last_error_message: object = None
+
+    while asyncio.get_running_loop().time() < deadline:
+        job_response = await real_async_client.get(f"/v1/jobs/{job_id}")
+        assert job_response.status_code == 200, job_response.text
+        job_data = cast(dict[str, object], job_response.json())
+
+        last_status = job_data.get("status")
+        last_error_code = job_data.get("error_code")
+        last_error_message = job_data.get("error_message")
+
+        if last_status == "succeeded":
+            return job_data
+
+        if last_status in {"failed", "cancelled"}:
+            events_diagnostics = await _job_events_diagnostics(
+                real_async_client=real_async_client,
+                job_id=job_id,
+            )
+            raise AssertionError(
+                "ingest job did not succeed: "
+                f"status={last_status} "
+                f"error_code={last_error_code} "
+                f"error_message={last_error_message} "
+                f"events={events_diagnostics}"
+            )
+
+        await asyncio.sleep(poll_interval_seconds)
+
+    events_diagnostics = await _job_events_diagnostics(
+        real_async_client=real_async_client,
+        job_id=job_id,
+    )
+    raise AssertionError(
+        "ingest job timed out before success: "
+        f"status={last_status} "
+        f"error_code={last_error_code} "
+        f"error_message={last_error_message} "
+        f"events={events_diagnostics}"
+    )
+
+
 @pytest.mark.skipif(
     not (COMPOSE_SMOKE and SMOKE_BASE_URL),
     reason="COMPOSE_SMOKE=1 and SMOKE_BASE_URL must be set for compose smoke",
@@ -492,7 +560,7 @@ class TestHealthEndpointRealServer:
         real_async_client: httpx.AsyncClient,
     ) -> None:
         """Compose stack shares immutable upload storage between API and worker."""
-        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n"
+        dxf_bytes = COMPOSE_DXF_FIXTURE_PATH.read_bytes()
 
         project_response = await real_async_client.post(
             "/v1/projects",
@@ -503,7 +571,13 @@ class TestHealthEndpointRealServer:
 
         upload_response = await real_async_client.post(
             f"/v1/projects/{project_id}/files",
-            files={"file": ("compose-smoke.pdf", pdf_bytes, "application/pdf")},
+            files={
+                "file": (
+                    COMPOSE_DXF_FIXTURE_PATH.name,
+                    dxf_bytes,
+                    COMPOSE_DXF_MEDIA_TYPE,
+                )
+            },
         )
         assert upload_response.status_code == 201
 
@@ -521,5 +595,68 @@ class TestHealthEndpointRealServer:
         assert worker_data == {
             "path": storage_key,
             "sha256": checksum_sha256,
-            "size": len(pdf_bytes),
+            "size": len(dxf_bytes),
         }
+
+    async def test_upload_ingest_job_persists_revision_and_validation_via_public_apis(
+        self,
+        real_async_client: httpx.AsyncClient,
+    ) -> None:
+        """Compose smoke validates upload->worker->revision/validation API visibility."""
+        project_response = await real_async_client.post(
+            "/v1/projects",
+            json={"name": f"compose-smoke-ingest-{uuid4()}"},
+        )
+        assert project_response.status_code == 201
+        project_id = project_response.json()["id"]
+        UUID(project_id)
+
+        dxf_bytes = COMPOSE_DXF_FIXTURE_PATH.read_bytes()
+
+        upload_response = await real_async_client.post(
+            f"/v1/projects/{project_id}/files",
+            files={
+                "file": (
+                    COMPOSE_DXF_FIXTURE_PATH.name,
+                    dxf_bytes,
+                    COMPOSE_DXF_MEDIA_TYPE,
+                )
+            },
+        )
+        assert upload_response.status_code == 201, upload_response.text
+
+        upload_data = upload_response.json()
+        file_id = UUID(upload_data["id"])
+        job_id = UUID(upload_data["initial_job_id"])
+        extraction_profile_id = UUID(upload_data["initial_extraction_profile_id"])
+        assert str(file_id) == upload_data["id"]
+        assert str(job_id) == upload_data["initial_job_id"]
+        assert str(extraction_profile_id) == upload_data["initial_extraction_profile_id"]
+
+        _ = await _wait_for_job_success(
+            real_async_client=real_async_client,
+            job_id=job_id,
+        )
+
+        revisions_response = await real_async_client.get(f"/v1/files/{file_id}/revisions")
+        assert revisions_response.status_code == 200, revisions_response.text
+        revisions_data = revisions_response.json()
+        assert revisions_data["items"]
+
+        first_revision = revisions_data["items"][0]
+        revision_id = UUID(first_revision["id"])
+        assert first_revision["source_file_id"] == str(file_id)
+        assert first_revision["source_job_id"] == str(job_id)
+        assert first_revision["extraction_profile_id"] == str(extraction_profile_id)
+        assert first_revision["revision_sequence"] == 1
+
+        validation_response = await real_async_client.get(
+            f"/v1/revisions/{revision_id}/validation-report"
+        )
+        assert validation_response.status_code == 200, validation_response.text
+        validation_data = validation_response.json()
+        assert validation_data["drawing_revision_id"] == str(revision_id)
+        assert validation_data["source_job_id"] == str(job_id)
+        assert validation_data["validation_status"] == "valid"
+        assert validation_data["review_state"] == "approved"
+        assert validation_data["quantity_gate"] == "allowed"

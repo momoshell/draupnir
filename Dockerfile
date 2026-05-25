@@ -19,13 +19,13 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 
 # Sync runtime dependencies before project source is available
-RUN uv sync --locked --no-install-project --no-dev --extra db --extra jobs
+RUN uv sync --locked --no-install-project --no-dev --extra db --extra jobs --extra dxf
 
 # Copy application source
 COPY app/ ./app/
 
 # Install project and runtime extras into the project environment
-RUN uv sync --locked --no-dev --extra db --extra jobs
+RUN uv sync --locked --no-dev --extra db --extra jobs --extra dxf
 
 # Create non-root user and shared upload root
 RUN useradd -m -u 1000 appuser \
