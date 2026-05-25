@@ -197,3 +197,8 @@ strict_optional = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "smoke: fast in-memory smoke lane",
+    "integration: tests that require database or integration resources",
+    "compose_smoke: compose-backed real-server smoke lane",
+]

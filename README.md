@@ -29,7 +29,7 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
 > [!WARNING]
 > Docker Compose now runs PostgreSQL 18. Existing local Docker volumes created
 > for PostgreSQL 17 will not boot as-is under PostgreSQL 18.
-> 
+>
 > - If the data matters, dump it from PostgreSQL 17 first and restore it into a
 >   fresh PostgreSQL 18 volume.
 > - If the data does not matter, reset the local stack destructively with:
@@ -102,6 +102,68 @@ make migrate        # Run database migrations
 make down -v        # Stop and remove volumes (destructive)
 ```
 
+### Pytest Lanes
+
+The repository keeps three explicit pytest lanes with non-overlapping marker expressions:
+
+- `make smoke` runs the fast smoke lane: `smoke and not integration and not compose_smoke`
+- `make integration` runs the database-backed integration lane: `integration and not compose_smoke`
+- `make compose-smoke` runs the opt-in Docker Compose lane: `compose_smoke`
+
+#### Smoke
+
+Purpose: fast host-side verification without Docker Compose.
+
+Prerequisites:
+
+- `uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test`
+
+Command:
+
+```bash
+make smoke
+# or: uv run pytest -m "smoke and not integration and not compose_smoke"
+```
+
+#### Integration
+
+Purpose: host-side tests that require PostgreSQL and a migrated schema.
+
+Prerequisites:
+
+- PostgreSQL 18 reachable via `DATABASE_URL`
+- Alembic migrations applied to that database
+
+Command:
+
+```bash
+export DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
+make integration
+# or: uv run alembic upgrade head && uv run pytest -m "integration and not compose_smoke"
+```
+
+CI keeps this lane separate from smoke and preserves the PostgreSQL service plus Alembic migration step before pytest.
+
+#### Compose smoke
+
+Purpose: opt-in/manual checks against a running Docker Compose stack.
+
+Prerequisites:
+
+- `make up` (or equivalent `docker compose up -d`) already running
+- `COMPOSE_SMOKE=1` enabled (the `make compose-smoke` target sets this for you)
+- `SMOKE_BASE_URL` set to the API base URL under test (defaults to `http://localhost:8000` in `make compose-smoke`)
+
+Command:
+
+```bash
+make compose-smoke
+# override base URL: make compose-smoke SMOKE_BASE_URL=http://localhost:8001
+# or: COMPOSE_SMOKE=1 SMOKE_BASE_URL=http://localhost:8000 uv run pytest -m "compose_smoke"
+```
+
+This lane stays manual and is not started automatically in CI.
+
 ### Local Development (without Docker)
 
 Prerequisite: use PostgreSQL 18 for host-side database development, or point
@@ -119,7 +181,7 @@ The reported version should be PostgreSQL 18.x.
 
 1. **Install dependencies**:
    ```bash
-   uv sync --locked --extra db --extra jobs --extra dev --extra test
+   uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
    ```
 
 2. **Set up environment**:
