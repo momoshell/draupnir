@@ -1031,7 +1031,7 @@ Phase 8 export contract narrows this further:
 
 Downstream export issue boundaries for this phase are:
 
-- #249 PDF ADR only; generator choice remains open until that ADR lands
+- #249 PDF ADR only; selects ReportLab as the first estimate PDF generator
 - #250 export job type/input persistence
 - #251 pure revision JSON service
 - #252 pure quantity/estimate CSV services
@@ -1646,7 +1646,6 @@ Probe rules:
 
 ## Open Technical Questions
 
-- Whether PDF generation uses WeasyPrint or ReportLab.
 - Whether geometry validation starts with FreeCAD or direct OCCT bindings.
 - Webhook/SSE event delivery vs polling-only for MVP.
 - Whether materials live in a shared catalog or per-project.
