@@ -10,9 +10,9 @@
 - [ADR-0006](./decisions/0006-dwg-adapter.md) — LibreDWG as first DWG adapter
 - [ADR-0007](./decisions/0007-vector-pdf-adapter.md) — PyMuPDF as first vector PDF adapter
 - [ADR-0008](./decisions/0008-raster-pdf-strategy.md) — Raster PDF candidate CAD pipeline with VTracer, centerline extraction, and Tesseract
+- [ADR-0009](./decisions/0009-pdf-report-generator.md) — ReportLab as first estimate PDF report generator
 
 ## Open
-- Final PDF report generator (WeasyPrint vs ReportLab)
 - Geometry validation engine (FreeCAD vs OCCT)
 - Webhook/SSE vs polling-only for MVP events
 - Generated artifact quantity foreign key remains deferred even though docs now
@@ -22,7 +22,7 @@
 
 ## Phase 8 Export Issue Boundaries
 
-- #249 — PDF ADR only; do not use it for JSON/CSV ownership
+- #249 — PDF ADR only; generator choice resolved by ADR-0009
 - #250 — Export job type/input persistence
 - #251 — Pure revision JSON service
 - #252 — Pure quantity/estimate CSV services
