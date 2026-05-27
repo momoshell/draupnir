@@ -56,6 +56,20 @@ The MVP should support:
 - PDF estimate/report
 - DXF revised drawing/export
 
+Phase 8 contract notes:
+
+- The shared export job currently defines MVP-ready contract work for Revision
+  JSON, Quantity CSV, Estimate CSV, Estimate/report PDF, and Debug overlay.
+- Downstream ownership is split by shared responsibilities rather than one issue
+  per export kind: #249 PDF ADR only, #250 job type/input persistence, #251
+  revision JSON pure service, #252 quantity/estimate CSV pure services, #253
+  create endpoints/schemas/idempotency, #254 JSON/CSV worker finalization,
+  #255 PDF pure generation, #256 PDF worker finalization, #257 E2E smoke.
+- DXF revised drawing/export remains in MVP scope at the product level, but its
+  implementation contract is deferred from the current Phase 8 issue split.
+- Later outputs still include DWG/IFC/STEP/IGES and general SVG/PNG preview
+  exports; do not expand the current export contract to those formats yet.
+
 Planned later outputs:
 
 - DWG revised drawing/export through a licensed adapter

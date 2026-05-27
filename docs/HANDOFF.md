@@ -17,6 +17,20 @@
 - Webhook/SSE vs polling-only for MVP events
 - Generated artifact quantity foreign key remains deferred even though docs now
   describe append-only quantity takeoff persistence lineage.
+- DXF revised drawing export remains deferred from the Phase 8 export issue
+  split; there is currently no owner issue for that implementation.
+
+## Phase 8 Export Issue Boundaries
+
+- #249 — PDF ADR only; do not use it for JSON/CSV ownership
+- #250 — Export job type/input persistence
+- #251 — Pure revision JSON service
+- #252 — Pure quantity/estimate CSV services
+- #253 — Export create endpoints, schemas, and idempotency
+- #254 — JSON/CSV worker finalization
+- #255 — Pure PDF generation after #249
+- #256 — PDF worker finalization
+- #257 — End-to-end export smoke
 
 ## Resolved For Phase 7 Estimation Contracts
 

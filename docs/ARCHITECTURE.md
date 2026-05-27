@@ -398,8 +398,12 @@ origin and lock anchor for the chain:
 ingest(file)
   -> [optional] quantity_takeoff(drawing_revision)
        -> [optional] estimate(quantity_takeoff, rate_catalog)
-            -> [optional] export(...)
+             -> [optional] export(...)
 ```
+
+`export(...)` is one shared downstream job type, not a separate worker contract
+per format. It consumes one pinned lineage context and commits one immutable
+artifact at most.
 
 `ingest(file)` produces a `drawing_revision` that becomes the pinned input for
 later revision-scoped work. `quantity_takeoff(drawing_revision)` worker
@@ -446,6 +450,24 @@ Operationally, this distinguishes retry from regeneration or re-export:
   new ids and storage keys per the artifact lifecycle rules below.
 - `job_events` are the durable trace for queueing, execution, cancellation,
   retry scheduling, and terminal outcome transitions across attempts.
+
+For export jobs specifically:
+
+- Pure export services are responsible for deterministic rendering/serialization
+  from already-pinned lineage inputs, but they do not commit database rows,
+  publish storage objects, or mark terminal success on their own.
+- Worker finalization exclusively owns committed artifact publication,
+  append-only artifact row creation, and the terminal `succeeded` transition.
+- One export job maps to one committed artifact. If a format later needs
+  multiple files, that must be modeled as a container artifact or a new
+  contract, not as multiple committed artifacts from one job under this MVP
+  rule.
+- Retry of a failed export job may rebuild attempt-local staged bytes, but must
+  never yield more than one committed artifact for that job.
+- Duplicate queue delivery, lease reclaim, or overlapping retry completions must
+  be fenced so only one finalization path commits an artifact.
+- Cancellation observed before finalization commits no artifact. Cancellation
+  after finalization does not retract or mutate the committed artifact.
 
 ## Deployment Topology
 
@@ -498,6 +520,29 @@ Rules:
   artifacts currently own a required quantity-takeoff foreign key.
 - Original uploads and generated artifacts remain separate immutable classes of
   stored objects.
+
+Phase 8 export kinds and boundaries:
+
+| Export kind | Format | Lineage anchor | Trust gate | Pure-service owner | Worker-finalization owner | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Revision JSON | JSON | revision | finalized revision; preserve upstream review/provisional metadata | #251 | #254 | planned |
+| Quantity CSV | CSV | quantity takeoff | trusted allowed takeoff only | #252 | #254 | planned |
+| Estimate CSV | CSV | estimate version | finalized estimate from trusted allowed takeoff | #252 | #254 | planned |
+| Estimate/report PDF | PDF | estimate version | finalized estimate from trusted allowed takeoff | #255 (after #249) | #256 | planned |
+| Debug overlay | SVG/PNG/PDF | source file, drawing revision, job, generator options, optional entity/takeoff/predecessor refs | debug/review use only; existing behavior with no new Phase 8 endpoint owner | none | none | existing |
+| DXF revised drawing | DXF | revision changeset/export context | validated edit/export flow required | none | none | deferred |
+
+Shared export semantics across all kinds:
+
+- Export output must be reproducible from the pinned lineage inputs plus
+  generator name, version, and options snapshot.
+- Export is append-only at the artifact layer even when the bytes are
+  byte-identical to an earlier export.
+- #249 owns only the PDF ADR decision, #250 owns export job type/input
+  persistence, and #253 owns create-endpoint/schema/idempotency work shared
+  across the MVP export kinds above.
+- Phase 8 does not assign an implementation owner for DXF revised drawing
+  export; that contract remains deferred.
 
 Append-only versus mutable record rules:
 
