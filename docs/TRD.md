@@ -998,6 +998,52 @@ Generated artifacts are immutable, append-only outputs. The system must never
 overwrite an existing generated artifact row/object in place, even when
 regenerating the same logical export.
 
+Phase 8 export contract narrows this further:
+
+- MVP export kinds are fixed to: `revision_json`, `quantity_csv`,
+  `estimate_csv`, `estimate_pdf`, `debug_overlay`, and a later
+  `revised_dxf` contract that stays deferred for now.
+- Export remains one job type, `export`, across all artifact kinds.
+- One export job commits at most one visible artifact row/object. Bundles or
+  multi-file payloads are post-MVP.
+- Export services may build deterministic payload bytes in memory or in
+  attempt-local staging, but only worker finalization may publish the committed
+  artifact row/object and terminal job success.
+- Retries are for the same failed job and must still yield at most one
+  committed artifact. Re-export/regeneration is a new job and therefore a new
+  artifact id/storage key.
+- Duplicate delivery or overlapping retry completion must collapse to one
+  winning finalization path. Losers must not publish a second artifact.
+- Cancellation before final commit publishes no artifact. Cancellation after a
+  committed artifact leaves the artifact immutable and only changes workflow
+  history.
+
+### Export Kind Matrix
+
+| Export kind | MVP format | Required lineage refs | Trust gate | Pure-service owner | Worker-finalization owner | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `revision_json` | JSON | `source_file_id`, `drawing_revision_id`, `job_id` | finalized revision required; may reflect provisional/review metadata but not hide it | #251 | #254 | planned |
+| `quantity_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `job_id` | trusted takeoff only (`quantity_gate = allowed`) | #252 | #254 | planned |
+| `estimate_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #252 | #254 | planned |
+| `estimate_pdf` | PDF | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #255 (after #249) | #256 | planned |
+| `debug_overlay` | SVG, PNG, or PDF | `source_file_id`, `drawing_revision_id`, `job_id`, generator options, optional entity/takeoff/predecessor refs | review/debug artifact; not a trusted-estimation substitute; existing behavior with no new Phase 8 endpoint owner | none | none | existing |
+| `revised_dxf` | DXF | would require `source_file_id`, `drawing_revision_id`, `changeset_id`, `job_id` | requires validated revision-edit/export path | none | none | deferred |
+
+Downstream export issue boundaries for this phase are:
+
+- #249 PDF ADR only; generator choice remains open until that ADR lands
+- #250 export job type/input persistence
+- #251 pure revision JSON service
+- #252 pure quantity/estimate CSV services
+- #253 export create endpoints, request/response schemas, and idempotency
+- #254 JSON/CSV worker finalization
+- #255 pure PDF generation after #249
+- #256 PDF worker finalization
+- #257 end-to-end export smoke coverage
+
+DXF revised drawing export is explicitly deferred in this phase and currently
+has no owning issue in the Phase 8 implementation split.
+
 Minimum artifact lineage fields:
 
 - `source_file_id`
@@ -1025,6 +1071,12 @@ Rules:
   key requirement.
 - Original uploads and generated artifacts follow the same immutability rule but
   remain distinct storage classes and records.
+- Export artifacts are constrained by kind-specific lineage and trust gates, but
+  they still use the same append-only artifact lifecycle.
+- Export payload generation should be deterministic for the same pinned lineage
+  inputs, generator identity, and options snapshot. If a generator version or
+  options change, that is a different export lineage and must produce a new
+  artifact.
 
 Database ownership and append-only policy:
 
