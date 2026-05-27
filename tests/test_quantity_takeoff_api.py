@@ -2328,124 +2328,109 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
     assert estimate_inputs == []
 
 
-def test_list_and_get_revision_quantity_takeoffs(monkeypatch: Any) -> None:
-    revision = _build_revision()
-    created_at = datetime(2026, 5, 16, tzinfo=UTC)
-    first_takeoff = SimpleNamespace(
-        id=uuid4(),
-        project_id=revision.project_id,
-        source_file_id=revision.source_file_id,
-        drawing_revision_id=revision.id,
-        source_job_id=uuid4(),
-        source_job_type="quantity_takeoff",
-        review_state="approved",
-        validation_status="valid",
-        quantity_gate="allowed",
-        trusted_totals=True,
-        created_at=created_at,
+@pytest.mark.anyio
+@requires_database
+async def test_list_and_get_revision_quantity_takeoffs(async_client: AsyncClient) -> None:
+    seed = await _seed_quantity_lineage()
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
+
+    second_takeoff_id = uuid4()
+    second_quantity_job_id = uuid4()
+
+    async with session_factory() as db:
+        second_quantity_job = Job(
+            id=second_quantity_job_id,
+            project_id=seed.project_id,
+            file_id=seed.file_id,
+            extraction_profile_id=None,
+            base_revision_id=seed.revision_id,
+            parent_job_id=None,
+            job_type=JobType.QUANTITY_TAKEOFF.value,
+            status="succeeded",
+            attempts=1,
+            max_attempts=3,
+            enqueue_status="published",
+            enqueue_attempts=1,
+            cancel_requested=False,
+            error_code=None,
+            error_message=None,
+            started_at=None,
+            finished_at=None,
+        )
+        second_takeoff = QuantityTakeoff(
+            id=second_takeoff_id,
+            project_id=seed.project_id,
+            source_file_id=seed.file_id,
+            drawing_revision_id=seed.revision_id,
+            source_job_id=second_quantity_job_id,
+            source_job_type=JobType.QUANTITY_TAKEOFF.value,
+            review_state="provisional",
+            validation_status="valid_with_warnings",
+            quantity_gate="allowed_provisional",
+            trusted_totals=False,
+            created_at=datetime(2100, 1, 1, tzinfo=UTC),
+        )
+        db.add(second_quantity_job)
+        await db.commit()
+        db.add(second_takeoff)
+        await db.commit()
+
+    list_response = await async_client.get(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs?limit=1"
     )
-    second_takeoff = SimpleNamespace(
-        id=uuid4(),
-        project_id=revision.project_id,
-        source_file_id=revision.source_file_id,
-        drawing_revision_id=revision.id,
-        source_job_id=uuid4(),
-        source_job_type="quantity_takeoff",
-        review_state="provisional",
-        validation_status="valid_with_warnings",
-        quantity_gate="allowed_provisional",
-        trusted_totals=False,
-        created_at=created_at.replace(second=1),
-    )
-    session = _AsyncSessionStub(execute_results=[[first_takeoff, second_takeoff], first_takeoff])
-    app = _build_app(session)
-    client = TestClient(app)
-
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
-
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-
-    list_response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs?limit=1")
 
     assert list_response.status_code == 200
     list_body = list_response.json()
-    assert [item["id"] for item in list_body["items"]] == [str(first_takeoff.id)]
+    assert [item["id"] for item in list_body["items"]] == [str(seed.takeoff_id)]
     assert list_body["next_cursor"] is not None
 
-    read_response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs/{first_takeoff.id}")
+    read_response = await async_client.get(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}"
+    )
 
     assert read_response.status_code == 200
-    assert read_response.json()["id"] == str(first_takeoff.id)
+    assert read_response.json()["id"] == str(seed.takeoff_id)
 
 
-def test_list_revision_quantity_takeoff_items(monkeypatch: Any) -> None:
-    revision = _build_revision()
-    takeoff = SimpleNamespace(id=uuid4())
-    created_at = datetime(2026, 5, 16, tzinfo=UTC)
-    first_item = SimpleNamespace(
-        id=uuid4(),
-        quantity_takeoff_id=takeoff.id,
-        project_id=revision.project_id,
-        drawing_revision_id=revision.id,
-        item_kind="aggregate",
-        quantity_type="area",
-        value=120.5,
-        unit="sq_ft",
-        review_state="approved",
-        validation_status="valid",
-        quantity_gate="allowed",
-        source_entity_id=None,
-        excluded_source_entity_ids_json=[],
-        created_at=created_at,
-    )
-    second_item = SimpleNamespace(
-        id=uuid4(),
-        quantity_takeoff_id=takeoff.id,
-        project_id=revision.project_id,
-        drawing_revision_id=revision.id,
-        item_kind="contributor",
-        quantity_type="area",
-        value=20.0,
-        unit="sq_ft",
-        review_state="approved",
-        validation_status="valid",
-        quantity_gate="allowed",
-        source_entity_id="entity-1",
-        excluded_source_entity_ids_json=["entity-2"],
-        created_at=created_at.replace(second=1),
-    )
-    session = _AsyncSessionStub(execute_results=[takeoff, [first_item, second_item]])
-    app = _build_app(session)
-    client = TestClient(app)
+@pytest.mark.anyio
+@requires_database
+async def test_list_revision_quantity_takeoff_items(async_client: AsyncClient) -> None:
+    seed = await _seed_quantity_lineage()
+    session_factory = session_module.AsyncSessionLocal
+    assert session_factory is not None
 
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
+    second_item_id = uuid4()
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    async with session_factory() as db:
+        second_item = QuantityItem(
+            id=second_item_id,
+            quantity_takeoff_id=seed.takeoff_id,
+            project_id=seed.project_id,
+            drawing_revision_id=seed.revision_id,
+            item_kind=QuantityItemKind.AGGREGATE.value,
+            quantity_type="area",
+            value=20.0,
+            unit="sq_ft",
+            review_state="approved",
+            validation_status="valid",
+            quantity_gate=QuantityGate.ALLOWED.value,
+            source_entity_id=None,
+            excluded_source_entity_ids_json=[],
+            created_at=datetime(2100, 1, 1, tzinfo=UTC),
+        )
+        db.add(second_item)
+        await db.commit()
 
-    response = client.get(
-        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/items?limit=1"
+    response = await async_client.get(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/items?limit=1"
     )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["items"][0]["id"] == str(first_item.id)
+    assert body["items"][0]["id"] == str(seed.quantity_item_id)
     assert body["items"][0]["excluded_source_entity_ids"] == []
     assert body["next_cursor"] is not None
-    assert session.commits == 0
 
 
 @pytest.mark.anyio
@@ -2744,51 +2729,30 @@ def test_revision_quantity_takeoff_routes_return_404_for_unknown_revision(
         assert response.status_code == 404
 
 
-def test_list_revision_quantity_takeoffs_rejects_invalid_cursor(monkeypatch: Any) -> None:
-    revision = _build_revision()
-    session = _AsyncSessionStub()
-    app = _build_app(session)
-    client = TestClient(app)
+@pytest.mark.anyio
+@requires_database
+async def test_list_revision_quantity_takeoffs_rejects_invalid_cursor(
+    async_client: AsyncClient,
+) -> None:
+    seed = await _seed_quantity_lineage()
 
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
-
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-
-    response = client.get(f"/v1/revisions/{revision.id}/quantity-takeoffs?cursor=not-base64")
+    response = await async_client.get(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs?cursor=not-base64"
+    )
 
     assert response.status_code == 400
     assert _response_error_code(response) == "INVALID_CURSOR"
 
 
-def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
-    monkeypatch: Any,
+@pytest.mark.anyio
+@requires_database
+async def test_list_revision_quantity_takeoff_items_rejects_invalid_cursor(
+    async_client: AsyncClient,
 ) -> None:
-    revision = _build_revision()
-    takeoff = SimpleNamespace(id=uuid4())
-    session = _AsyncSessionStub(execute_results=[takeoff])
-    app = _build_app(session)
-    client = TestClient(app)
+    seed = await _seed_quantity_lineage()
 
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
-
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-
-    response = client.get(
-        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/items?cursor=not-base64"
+    response = await async_client.get(
+        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/items?cursor=not-base64"
     )
 
     assert response.status_code == 400

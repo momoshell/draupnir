@@ -16,16 +16,12 @@ from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.generated_artifact import GeneratedArtifact
 from tests.conftest import requires_database
+from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import (
     _assert_validation_report_json_matches_columns,
     _load_project_outputs,
 )
-from tests.test_jobs import (
-    _build_fake_ingest_payload,
-    _create_project,
-    _get_job_for_file,
-    _upload_file,
-)
+from tests.test_jobs import _build_fake_ingest_payload
 
 
 @pytest.fixture(autouse=True)
