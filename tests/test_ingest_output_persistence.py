@@ -34,6 +34,13 @@ from app.models.revision_materialization import (
 from app.models.validation_report import ValidationReport
 from app.storage.keys import build_generated_artifact_storage_key
 from tests.conftest import requires_database
+from tests.jobs_test_helpers import (
+    _create_project,
+    _get_job,
+    _get_job_for_file,
+    _update_job,
+    _upload_file,
+)
 from tests.test_jobs import (
     _FAKE_RUNNER_ADAPTER_KEY,
     _FAKE_RUNNER_ADAPTER_VERSION,
@@ -44,11 +51,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
     _FAKE_RUNNER_VALIDATION_STATUS,
     _build_fake_ingest_payload,
-    _create_project,
-    _get_job,
-    _get_job_for_file,
-    _update_job,
-    _upload_file,
 )
 
 
@@ -1651,11 +1653,7 @@ class TestIngestOutputPersistence:
 
         assert sum(result is None for result in results) == 1
         assert (
-            sum(
-                isinstance(result, worker_module._RevisionConflictError)
-                for result in results
-            )
-            == 1
+            sum(isinstance(result, worker_module._RevisionConflictError) for result in results) == 1
         )
 
         second_job = await _get_job(second_job.id)
@@ -2049,9 +2047,7 @@ class TestIngestOutputPersistence:
         assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
         assert updated_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
         assert len(storage.put_calls) == 1
-        assert storage.delete_calls == [
-            (storage.put_calls[0], f"memory://{storage.put_calls[0]}")
-        ]
+        assert storage.delete_calls == [(storage.put_calls[0], f"memory://{storage.put_calls[0]}")]
 
         (
             adapter_outputs,
@@ -2142,9 +2138,7 @@ class TestIngestOutputPersistence:
         assert updated_job.error_code == ErrorCode.JOB_CANCELLED.value
         assert updated_job.error_message is None
         assert len(storage.put_calls) == 1
-        assert storage.delete_calls == [
-            (storage.put_calls[0], f"memory://{storage.put_calls[0]}")
-        ]
+        assert storage.delete_calls == [(storage.put_calls[0], f"memory://{storage.put_calls[0]}")]
 
         (
             adapter_outputs,

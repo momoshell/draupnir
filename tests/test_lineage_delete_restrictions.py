@@ -26,17 +26,13 @@ from app.models.job import Job
 from app.models.project import Project
 from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
+from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import (
     _as_uuid,
     _load_project_outputs,
     _replace_fake_canonical_payload,
 )
-from tests.test_jobs import (
-    _build_fake_ingest_payload,
-    _create_project,
-    _get_job_for_file,
-    _upload_file,
-)
+from tests.test_jobs import _build_fake_ingest_payload
 
 
 @dataclass
@@ -522,8 +518,9 @@ def _inspect_materialization_schema(
     }
 
 
-async def _load_installed_lineage_foreign_keys(
-) -> dict[tuple[str, tuple[str, ...], str, tuple[str, ...]], str]:
+async def _load_installed_lineage_foreign_keys() -> dict[
+    tuple[str, tuple[str, ...], str, tuple[str, ...]], str
+]:
     """Inspect the migrated database instead of ORM metadata."""
 
     session_maker = session_module.AsyncSessionLocal
@@ -570,9 +567,12 @@ async def _load_lineage_snapshot(
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
 
-    adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-        await _load_project_outputs(project_id)
-    )
+    (
+        adapter_outputs,
+        drawing_revisions,
+        validation_reports,
+        generated_artifacts,
+    ) = await _load_project_outputs(project_id)
     assert len(adapter_outputs) == 1
     assert len(drawing_revisions) == 1
     assert len(validation_reports) == 1

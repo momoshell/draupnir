@@ -21,18 +21,14 @@ from app.jobs.worker import process_ingest_job
 from app.models.job import Job, JobStatus, JobType
 from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
 from tests.conftest import requires_database
+from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import (
     _build_contract_entity,
     _load_project_materialization,
     _load_project_outputs,
     _replace_fake_canonical_payload,
 )
-from tests.test_jobs import (
-    _build_fake_ingest_payload,
-    _create_project,
-    _get_job_for_file,
-    _upload_file,
-)
+from tests.test_jobs import _build_fake_ingest_payload
 
 _SEED_SOURCE_ENTITY_ID = "__seed_source_entity_id__"
 
@@ -599,61 +595,77 @@ class TestQuantityTakeoffPersistence:
         for expected_gate in ("review_gated", "blocked"):
             assert expected_gate in conflict_gate_sql
 
-        assert foreign_keys["quantity_takeoffs"][
-            (("project_id",), "projects", ("id",))
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_takeoffs"][
-            (("source_file_id", "project_id"), "files", ("id", "project_id"))
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_takeoffs"][
-            (
-                ("drawing_revision_id", "project_id", "source_file_id"),
-                "drawing_revisions",
-                ("id", "project_id", "source_file_id"),
-            )
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_takeoffs"][
-            (
+        assert (
+            foreign_keys["quantity_takeoffs"][(("project_id",), "projects", ("id",))] == "RESTRICT"
+        )
+        assert (
+            foreign_keys["quantity_takeoffs"][
+                (("source_file_id", "project_id"), "files", ("id", "project_id"))
+            ]
+            == "RESTRICT"
+        )
+        assert (
+            foreign_keys["quantity_takeoffs"][
                 (
-                    "source_job_id",
-                    "project_id",
-                    "source_file_id",
-                    "drawing_revision_id",
-                    "source_job_type",
-                ),
-                "jobs",
-                ("id", "project_id", "file_id", "base_revision_id", "job_type"),
-            )
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_items"][
-            (("project_id",), "projects", ("id",))
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_items"][
-            (
-                ("quantity_takeoff_id", "project_id", "drawing_revision_id"),
-                "quantity_takeoffs",
-                ("id", "project_id", "drawing_revision_id"),
-            )
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_items"][
-            (
+                    ("drawing_revision_id", "project_id", "source_file_id"),
+                    "drawing_revisions",
+                    ("id", "project_id", "source_file_id"),
+                )
+            ]
+            == "RESTRICT"
+        )
+        assert (
+            foreign_keys["quantity_takeoffs"][
                 (
-                    "quantity_takeoff_id",
-                    "project_id",
-                    "drawing_revision_id",
-                    "quantity_gate",
-                ),
-                "quantity_takeoffs",
-                ("id", "project_id", "drawing_revision_id", "quantity_gate"),
-            )
-        ] == "RESTRICT"
-        assert foreign_keys["quantity_items"][
-            (
-                ("drawing_revision_id", "source_entity_id"),
-                "revision_entities",
-                ("drawing_revision_id", "entity_id"),
-            )
-        ] == "RESTRICT"
+                    (
+                        "source_job_id",
+                        "project_id",
+                        "source_file_id",
+                        "drawing_revision_id",
+                        "source_job_type",
+                    ),
+                    "jobs",
+                    ("id", "project_id", "file_id", "base_revision_id", "job_type"),
+                )
+            ]
+            == "RESTRICT"
+        )
+        assert foreign_keys["quantity_items"][(("project_id",), "projects", ("id",))] == "RESTRICT"
+        assert (
+            foreign_keys["quantity_items"][
+                (
+                    ("quantity_takeoff_id", "project_id", "drawing_revision_id"),
+                    "quantity_takeoffs",
+                    ("id", "project_id", "drawing_revision_id"),
+                )
+            ]
+            == "RESTRICT"
+        )
+        assert (
+            foreign_keys["quantity_items"][
+                (
+                    (
+                        "quantity_takeoff_id",
+                        "project_id",
+                        "drawing_revision_id",
+                        "quantity_gate",
+                    ),
+                    "quantity_takeoffs",
+                    ("id", "project_id", "drawing_revision_id", "quantity_gate"),
+                )
+            ]
+            == "RESTRICT"
+        )
+        assert (
+            foreign_keys["quantity_items"][
+                (
+                    ("drawing_revision_id", "source_entity_id"),
+                    "revision_entities",
+                    ("drawing_revision_id", "entity_id"),
+                )
+            ]
+            == "RESTRICT"
+        )
 
     async def test_quantity_takeoff_constraints_reject_invalid_gate(
         self,

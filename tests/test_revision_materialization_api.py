@@ -17,6 +17,7 @@ from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from tests.conftest import requires_database
+from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import (
     _build_contract_entity,
     _load_project_materialization,
@@ -30,9 +31,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_CONFIDENCE_SCORE,
     _FAKE_RUNNER_REVIEW_STATE,
     _build_fake_ingest_payload,
-    _create_project,
-    _get_job_for_file,
-    _upload_file,
 )
 
 
@@ -130,9 +128,12 @@ class TestRevisionMaterializationApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         manifests, layouts, layers, blocks, entities = await _load_project_materialization(
             project["id"]
         )
@@ -304,9 +305,12 @@ class TestRevisionMaterializationApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         filter_cases = [
@@ -421,9 +425,12 @@ class TestRevisionMaterializationApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         entity_response = await async_client.get(
@@ -469,9 +476,12 @@ class TestRevisionMaterializationApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         missing_revision_id = uuid.uuid4()
@@ -647,9 +657,12 @@ class TestRevisionMaterializationApi:
 
         await process_ingest_job(job.id)
 
-        _adapter_outputs, drawing_revisions, _validation_reports, _generated_artifacts = (
-            await _load_project_outputs(project["id"])
-        )
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
         drawing_revision = drawing_revisions[0]
 
         expected_counts = {"layouts": 0, "layers": 0, "blocks": 0, "entities": 0}
