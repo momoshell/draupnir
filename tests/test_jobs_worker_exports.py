@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -29,6 +30,7 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
 from app.models.job_event import JobEvent
 from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
+from app.schemas.export import ExportKind
 from app.storage import get_storage
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import (
@@ -678,3 +680,99 @@ async def test_publish_export_job_recovery_failure_marks_export_specific_message
     assert job.status == "failed"
     assert job.error_code == ErrorCode.INTERNAL_ERROR.value
     assert job.error_message == worker_module._ENQUEUE_EXPORT_JOB_ERROR_MESSAGE
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportE2ECase:
+    name: str
+    export_kind: ExportKind
+    path: str
+    body: dict[str, object]
+
+
+def _export_e2e_cases(lineage: _ExportTestLineage) -> list[_ExportE2ECase]:
+    return [
+        _ExportE2ECase(
+            name="revision_json",
+            export_kind=ExportKind.REVISION_JSON,
+            path=f"/v1/revisions/{lineage.drawing_revision_id}/exports/revision-json",
+            body={"options": {"include_manifest": True}},
+        ),
+        _ExportE2ECase(
+            name="quantity_csv",
+            export_kind=ExportKind.QUANTITY_CSV,
+            path=(
+                f"/v1/revisions/{lineage.drawing_revision_id}"
+                f"/quantity-takeoffs/{lineage.quantity_takeoff_id}/exports/quantity-csv"
+            ),
+            body={"options": {"dialect": "excel", "include_units": True}},
+        ),
+        _ExportE2ECase(
+            name="estimate_pdf",
+            export_kind=ExportKind.ESTIMATE_PDF,
+            path=(
+                f"/v1/revisions/{lineage.drawing_revision_id}"
+                f"/quantity-takeoffs/{lineage.quantity_takeoff_id}"
+                f"/estimates/{lineage.estimate_version_id}/exports"
+            ),
+            body={"export_kind": ExportKind.ESTIMATE_PDF.value, "options": {}},
+        ),
+    ]
+
+
+def _assert_export_payload_bytes(case: _ExportE2ECase, payload_bytes: bytes) -> None:
+    if case.export_kind == ExportKind.REVISION_JSON:
+        body = json.loads(payload_bytes.decode("utf-8"))
+        assert body["schema_version"] == "revision-json-export-v1"
+        return
+
+    if case.export_kind == ExportKind.QUANTITY_CSV:
+        csv_text = payload_bytes.decode("utf-8")
+        assert "quantity_item_id" in csv_text
+        assert "quantity_takeoff_id" in csv_text
+        return
+
+    assert case.export_kind == ExportKind.ESTIMATE_PDF
+    assert payload_bytes.startswith(b"%PDF")
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["revision_json", "quantity_csv", "estimate_pdf"],
+)
+async def test_export_create_to_worker_to_artifact_list_storage_readback(
+    async_client: httpx.AsyncClient,
+    case_name: str,
+) -> None:
+    lineage = await _create_export_test_lineage(async_client)
+    case = next(case for case in _export_e2e_cases(lineage) if case.name == case_name)
+
+    create_response = await async_client.post(case.path, json=case.body)
+
+    assert create_response.status_code == 202
+    export_job_id = uuid.UUID(create_response.json()["id"])
+
+    await worker_module.process_export_job(export_job_id)
+
+    export_job = await _get_job(export_job_id)
+    assert export_job.status == "succeeded"
+
+    artifacts_for_job = await _get_generated_artifacts_for_job(export_job_id)
+    assert len(artifacts_for_job) == 1
+    artifact = artifacts_for_job[0]
+
+    list_response = await async_client.get(
+        f"/v1/revisions/{lineage.drawing_revision_id}/generated-artifacts"
+    )
+
+    assert list_response.status_code == 200
+    payload = list_response.json()
+    listed_artifacts = payload["items"]
+    assert len(listed_artifacts) >= 1
+    listed_ids = {item["id"] for item in listed_artifacts}
+    assert str(artifact.id) in listed_ids
+
+    storage_path = Path(artifact.storage_uri.removeprefix("file://"))
+    assert storage_path.exists()
+    artifact_bytes = storage_path.read_bytes()
+    _assert_export_payload_bytes(case, artifact_bytes)
