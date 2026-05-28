@@ -61,6 +61,9 @@ dependencies = [
 
     # Structured JSON logging (TRD observability requirement)
     "structlog>=24.1",
+
+    # Deterministic PDF exports
+    "reportlab>=4.2",
 ]
 
 # ---------------------------------------------------------------------------
