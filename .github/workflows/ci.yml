@@ -22,8 +22,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        run: python -m pip install uv==0.11.8
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.8"
+          enable-cache: true
 
       - name: Install dependencies
         run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
@@ -43,8 +46,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        run: python -m pip install uv==0.11.8
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.8"
+          enable-cache: true
 
       - name: Install dependencies
         run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
@@ -52,8 +58,56 @@ jobs:
       - name: Run mypy
         run: uv run mypy app tests
 
-  test:
-    name: Test
+  test-smoke:
+    name: Test smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.8"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+
+      - name: Run pytest smoke lane
+        run: uv run pytest -m "smoke and not integration and not compose_smoke"
+
+  test-non-integration:
+    name: Test non-integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.8"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+
+      - name: Run pytest non-integration lane
+        run: uv run pytest -m "not integration and not compose_smoke and not smoke"
+
+  test-integration:
+    name: Test integration
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -78,22 +132,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install uv
-        run: python -m pip install uv==0.11.8
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.8"
+          enable-cache: true
 
       - name: Install dependencies
         run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
-      - name: Run pytest smoke lane
-        run: uv run pytest -m "smoke and not integration and not compose_smoke"
-
       - name: Run Alembic migrations
         run: uv run alembic upgrade head
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
-
-      - name: Run pytest non-integration lane
-        run: uv run pytest -m "not integration and not compose_smoke and not smoke"
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
 
