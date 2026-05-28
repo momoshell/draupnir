@@ -20,6 +20,7 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.exports.csv import CsvExportResult, render_estimate_csv_export, render_quantity_csv_export
+from app.exports.estimate_pdf import EstimatePdfExportResult, render_estimate_pdf_export
 from app.exports.revision_json import RevisionJsonExportResult, render_revision_json_export
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -342,7 +343,7 @@ async def _expected_export_bytes(
     session_maker = _get_session_maker()
 
     async with session_maker() as session:
-        result: RevisionJsonExportResult | CsvExportResult
+        result: RevisionJsonExportResult | CsvExportResult | EstimatePdfExportResult
         if export_kind == "revision_json":
             result = await render_revision_json_export(
                 session,
@@ -353,6 +354,12 @@ async def _expected_export_bytes(
             result = await render_quantity_csv_export(session, lineage.quantity_takeoff_id)
         elif export_kind == "estimate_csv":
             result = await render_estimate_csv_export(session, lineage.estimate_version_id)
+        elif export_kind == "estimate_pdf":
+            result = await render_estimate_pdf_export(
+                session,
+                lineage.estimate_version_id,
+                options=options_json,
+            )
         else:
             raise AssertionError(f"Unexpected export kind {export_kind}")
 
@@ -365,6 +372,7 @@ async def _expected_export_bytes(
         ("revision_json", "json", "application/json", {"include_manifest": True}),
         ("quantity_csv", "csv", "text/csv", {}),
         ("estimate_csv", "csv", "text/csv", {}),
+        ("estimate_pdf", "pdf", "application/pdf", {}),
     ],
 )
 async def test_process_export_job_supported_kinds_persist_artifact(
@@ -382,13 +390,19 @@ async def test_process_export_job_supported_kinds_persist_artifact(
         media_type=media_type,
         options_json=options_json,
         quantity_takeoff_id=(
-            lineage.quantity_takeoff_id if export_kind in {"quantity_csv", "estimate_csv"} else None
+            lineage.quantity_takeoff_id
+            if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"}
+            else None
         ),
         estimate_version_id=(
-            lineage.estimate_version_id if export_kind == "estimate_csv" else None
+            lineage.estimate_version_id if export_kind in {"estimate_csv", "estimate_pdf"} else None
         ),
-        quantity_gate=("allowed" if export_kind in {"quantity_csv", "estimate_csv"} else None),
-        trusted_totals=(True if export_kind in {"quantity_csv", "estimate_csv"} else None),
+        quantity_gate=(
+            "allowed" if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"} else None
+        ),
+        trusted_totals=(
+            True if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"} else None
+        ),
     )
 
     await worker_module.process_export_job(export_job_id)
@@ -461,31 +475,6 @@ async def test_process_export_job_duplicate_terminal_redelivery_is_noop(
         event for event in await _get_job_events(export_job_id) if event.message == "Job succeeded"
     ]
     assert len(success_events) == 1
-
-
-async def test_process_export_job_estimate_pdf_fails_without_artifact(
-    async_client: httpx.AsyncClient,
-) -> None:
-    lineage = await _create_export_test_lineage(async_client)
-    export_job_id = await _create_export_job(
-        lineage=lineage,
-        export_kind="estimate_pdf",
-        export_format="pdf",
-        media_type="application/pdf",
-        options_json={},
-        quantity_takeoff_id=lineage.quantity_takeoff_id,
-        estimate_version_id=lineage.estimate_version_id,
-        quantity_gate="allowed",
-        trusted_totals=True,
-    )
-
-    await worker_module.process_export_job(export_job_id)
-
-    job = await _get_job(export_job_id)
-    assert job.status == "failed"
-    assert job.error_code == "INPUT_INVALID"
-    assert job.error_message == "Estimate PDF exports are not implemented."
-    assert await _get_generated_artifacts_for_job(export_job_id) == []
 
 
 async def test_process_export_job_honors_cancel_before_finalization(
