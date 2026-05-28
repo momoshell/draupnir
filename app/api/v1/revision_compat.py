@@ -101,6 +101,10 @@ def enqueue_estimate_job(*args: Any, **kwargs: Any) -> Any:
     return _resolve_callable("enqueue_estimate_job")(*args, **kwargs)
 
 
+def enqueue_export_job(*args: Any, **kwargs: Any) -> Any:
+    return _resolve_callable("enqueue_export_job")(*args, **kwargs)
+
+
 async def replay_idempotency_response(*args: Any, **kwargs: Any) -> Any:
     return await _resolve_callable("replay_idempotency_response")(*args, **kwargs)
 
@@ -150,6 +154,7 @@ __all__ = [
     "claim_idempotency_response",
     "complete_idempotency_response",
     "enqueue_estimate_job",
+    "enqueue_export_job",
     "enqueue_quantity_takeoff_job",
     "prepare_job_enqueue_intent",
     "publish_job_enqueue_intent",
