@@ -100,6 +100,9 @@ from app.api.v1.revision_routes.adapter_outputs import (
 from app.api.v1.revision_routes.estimates import (
     estimates_router,
 )
+from app.api.v1.revision_routes.exports import (
+    exports_router,
+)
 from app.api.v1.revision_routes.file_revisions import (
     file_revisions_router,
 )
@@ -400,6 +403,7 @@ revisions_router.include_router(generated_artifacts_router)
 revisions_router.include_router(materialization_router)
 revisions_router.include_router(quantity_takeoffs_router)
 revisions_router.include_router(estimates_router)
+revisions_router.include_router(exports_router)
 revisions_router.include_router(quantity_takeoff_create_router)
 
 
