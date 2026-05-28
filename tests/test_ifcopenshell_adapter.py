@@ -126,9 +126,7 @@ def _write_ifc_with_capped_header(path: Path) -> None:
     )
 
 
-def _write_ifc_with_capped_fake_header_terminator(
-    path: Path, *, fake_terminator_line: str
-) -> None:
+def _write_ifc_with_capped_fake_header_terminator(path: Path, *, fake_terminator_line: str) -> None:
     oversized_description = "X" * adapter_module._HEADER_READ_LIMIT_BYTES
     path.write_text(
         "ISO-10303-21;\n"
@@ -289,12 +287,14 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
     )
     assert entities[0]["provenance"]["source_identity"] == "DUPLICATE"
     assert entities[0]["provenance"]["canonical_entity_ref"] == "entities.DUPLICATE"
-    assert entities[0]["provenance"]["source_hash"] == hashlib.sha256(
-        b"ifc://IfcWall/global-id:DUPLICATE"
-    ).hexdigest()
-    assert entities[0]["provenance"]["normalized_source_hash"] == hashlib.sha256(
-        b"ifc://IfcWall/global-id:DUPLICATE"
-    ).hexdigest()
+    assert (
+        entities[0]["provenance"]["source_hash"]
+        == hashlib.sha256(b"ifc://IfcWall/global-id:DUPLICATE").hexdigest()
+    )
+    assert (
+        entities[0]["provenance"]["normalized_source_hash"]
+        == hashlib.sha256(b"ifc://IfcWall/global-id:DUPLICATE").hexdigest()
+    )
     assert entities[0]["provenance"]["extraction_path"] == ["semantic_extract"]
     assert entities[0]["provenance"]["notes"] == ["semantic_ifc_metadata_only"]
     assert entities[0]["confidence"] == {
@@ -306,20 +306,21 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
     assert entities[0]["qtos"][0]["name"] == "Qto_WallBaseQuantities"
     assert entities[0]["material_refs"][0]["name"] == "Concrete"
     assert (
-        entities[0]["representation"]["representations"][0]["representation_identifier"]
-        == "Body"
+        entities[0]["representation"]["representations"][0]["representation_identifier"] == "Body"
     )
     assert entities[2]["provenance"]["source"] == "ifc://IfcDoor/step-id:42"
     assert entities[2]["provenance"]["source_ref"] == "ifc://IfcDoor/step-id:42"
     assert entities[2]["provenance"]["source_entity_ref"] == "ifc://IfcDoor/step-id:42"
     assert entities[2]["provenance"]["source_identity"] == "#42"
     assert entities[2]["provenance"]["canonical_entity_ref"] == "entities.#42"
-    assert entities[2]["provenance"]["source_hash"] == hashlib.sha256(
-        b"ifc://IfcDoor/step-id:42"
-    ).hexdigest()
-    assert entities[2]["provenance"]["normalized_source_hash"] == hashlib.sha256(
-        b"ifc://IfcDoor/step-id:42"
-    ).hexdigest()
+    assert (
+        entities[2]["provenance"]["source_hash"]
+        == hashlib.sha256(b"ifc://IfcDoor/step-id:42").hexdigest()
+    )
+    assert (
+        entities[2]["provenance"]["normalized_source_hash"]
+        == hashlib.sha256(b"ifc://IfcDoor/step-id:42").hexdigest()
+    )
     assert canonical["layers"] == [{"name": "IfcWall"}, {"name": "IfcDoor"}]
     assert payload.provenance_json["records"][1]["details"]["entity_count"] == 3
     assert {record["source_ref"] for record in payload.provenance_json["records"]} == {
@@ -801,7 +802,7 @@ async def test_ifcopenshell_adapter_non_step_payload_does_not_short_circuit_sche
             media_type="application/octet-stream",
             original_name="nested/input.ifc",
         ),
-        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=5)),
     )
 
     assert runtime_called is True

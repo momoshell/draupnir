@@ -28,6 +28,7 @@ class JobType(StrEnum):
     REPROCESS = "reprocess"
     QUANTITY_TAKEOFF = "quantity_takeoff"
     ESTIMATE = "estimate"
+    EXPORT = "export"
 
 
 class JobStatus(StrEnum):
@@ -49,10 +50,12 @@ _BASE_REQUIRED_JOB_TYPE_VALUES = (
     JobType.REPROCESS.value,
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
+    JobType.EXPORT.value,
 )
 _EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
+    JobType.EXPORT.value,
 )
 
 
@@ -104,8 +107,7 @@ class Job(Base):
             name="ck_jobs_status_valid",
         ),
         CheckConstraint(
-            "error_code IS NULL "
-            f"OR error_code IN ({_sql_in_list(_JOB_ERROR_CODE_VALUES)})",
+            f"error_code IS NULL OR error_code IN ({_sql_in_list(_JOB_ERROR_CODE_VALUES)})",
             name="ck_jobs_error_code_valid",
         ),
         CheckConstraint(
@@ -194,15 +196,12 @@ class Job(Base):
     parent_job_id: Mapped[uuid.UUID | None] = mapped_column(
         nullable=True,
         index=True,
-        comment=(
-            "Optional parent job identifier for same-project, same-file job "
-            "lineage."
-        ),
+        comment=("Optional parent job identifier for same-project, same-file job lineage."),
     )
     job_type: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="Job type (e.g. ingest, reprocess, quantity_takeoff, estimate)",
+        comment=("Job type (e.g. ingest, reprocess, quantity_takeoff, estimate, export)"),
     )
     status: Mapped[str] = mapped_column(
         String(32),
