@@ -57,6 +57,11 @@ from app.exports.csv import (
     render_estimate_csv_export,
     render_quantity_csv_export,
 )
+from app.exports.estimate_pdf import (
+    EstimatePdfExportError,
+    EstimatePdfExportResult,
+    render_estimate_pdf_export,
+)
 from app.exports.revision_json import (
     RevisionJsonExportError,
     RevisionJsonExportResult,
@@ -126,7 +131,6 @@ _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
 _DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
 _DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
 _DEBUG_OVERLAY_GENERATOR_VERSION = "1"
-_ESTIMATE_PDF_EXPORT_UNSUPPORTED_ERROR_MESSAGE = "Estimate PDF exports are not implemented."
 _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE = 500
 _QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE = (
     "Quantity takeoff is blocked by the revision validation gate."
@@ -3214,7 +3218,7 @@ async def _render_export_artifact(
 ) -> _RenderedExportArtifact:
     """Render bytes for a supported export job."""
     try:
-        result: RevisionJsonExportResult | CsvExportResult
+        result: RevisionJsonExportResult | CsvExportResult | EstimatePdfExportResult
         if execution.export_kind == "revision_json":
             result = await render_revision_json_export(
                 session,
@@ -3227,6 +3231,13 @@ async def _render_export_artifact(
         elif execution.export_kind == "estimate_csv":
             assert execution.estimate_version_id is not None
             result = await render_estimate_csv_export(session, execution.estimate_version_id)
+        elif execution.export_kind == "estimate_pdf":
+            assert execution.estimate_version_id is not None
+            result = await render_estimate_pdf_export(
+                session,
+                execution.estimate_version_id,
+                options=execution.options_json,
+            )
         else:
             raise _build_export_job_input_error(
                 "Export job kind is not supported by the worker.",
@@ -3248,6 +3259,15 @@ async def _render_export_artifact(
             },
         ) from exc
     except EstimateCsvExportError as exc:
+        raise _build_export_job_input_error(
+            str(exc),
+            error_code=ErrorCode.NOT_FOUND,
+            details={
+                "drawing_revision_id": str(execution.drawing_revision_id),
+                "estimate_version_id": str(execution.estimate_version_id),
+            },
+        ) from exc
+    except EstimatePdfExportError as exc:
         raise _build_export_job_input_error(
             str(exc),
             error_code=ErrorCode.NOT_FOUND,
@@ -3342,16 +3362,11 @@ async def _build_export_execution_input(
         ):
             raise ValueError("Export job base revision does not belong to the source file")
 
-        if export_input.export_kind == "estimate_pdf":
-            raise _build_export_job_input_error(
-                _ESTIMATE_PDF_EXPORT_UNSUPPORTED_ERROR_MESSAGE,
-                details={"export_kind": export_input.export_kind},
-            )
-
         supported_exports: dict[str, tuple[str, str]] = {
             "revision_json": ("json", "application/json"),
             "quantity_csv": ("csv", "text/csv"),
             "estimate_csv": ("csv", "text/csv"),
+            "estimate_pdf": ("pdf", "application/pdf"),
         }
         expected_export_metadata = supported_exports.get(export_input.export_kind)
         if expected_export_metadata is None:
@@ -3467,7 +3482,7 @@ async def _build_export_execution_input(
         estimate_version_id = export_input.estimate_version_id
         if estimate_version_id is None:
             raise _build_export_job_input_error(
-                "Estimate CSV export input is missing its estimate version linkage.",
+                "Estimate export input is missing its estimate version linkage.",
                 details={"quantity_takeoff_id": str(quantity_takeoff.id)},
             )
 
