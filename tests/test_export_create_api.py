@@ -290,7 +290,13 @@ async def _count_export_side_effects(lineage: ExportLineage) -> tuple[int, int, 
             )
         )
         generated_artifact_count = await session.scalar(
-            select(func.count()).select_from(GeneratedArtifact)
+            select(func.count())
+            .select_from(GeneratedArtifact)
+            .where(
+                GeneratedArtifact.project_id == lineage.project_id,
+                GeneratedArtifact.source_file_id == lineage.file_id,
+                GeneratedArtifact.drawing_revision_id == lineage.revision_id,
+            )
         )
 
     assert export_job_count is not None
@@ -533,7 +539,13 @@ async def test_create_export_persists_pending_job_and_input(
             assert export_input.estimate_version_id == lineage.estimate_version_id
 
         generated_artifact_count = await session.scalar(
-            select(func.count()).select_from(GeneratedArtifact)
+            select(func.count())
+            .select_from(GeneratedArtifact)
+            .where(
+                GeneratedArtifact.project_id == lineage.project_id,
+                GeneratedArtifact.source_file_id == lineage.file_id,
+                GeneratedArtifact.drawing_revision_id == lineage.revision_id,
+            )
         )
         assert generated_artifact_count == 0
 

@@ -50,6 +50,18 @@ from app.estimating.quantities.contracts import (
     RevisionGateMetadata,
 )
 from app.estimating.quantities.engine import compute_quantities
+from app.exports.csv import (
+    CsvExportResult,
+    EstimateCsvExportError,
+    QuantityCsvExportError,
+    render_estimate_csv_export,
+    render_quantity_csv_export,
+)
+from app.exports.revision_json import (
+    RevisionJsonExportError,
+    RevisionJsonExportResult,
+    render_revision_json_export,
+)
 from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
@@ -59,6 +71,7 @@ from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
+from app.models.export_job_input import ExportJobInput
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
@@ -82,6 +95,7 @@ _RECOVERABLE_ENQUEUE_JOB_TYPES = (
     JobType.REPROCESS.value,
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
+    JobType.EXPORT.value,
 )
 _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER: frozenset[str] = frozenset()
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
@@ -94,18 +108,25 @@ _ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
 _ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
+_ENQUEUE_REPROCESS_JOB_ERROR_MESSAGE = "Failed to enqueue reprocess job"
+_ENQUEUE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to enqueue quantity takeoff job"
+_ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to enqueue estimate job"
+_ENQUEUE_EXPORT_JOB_ERROR_MESSAGE = "Failed to enqueue export job"
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
 _FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to finalize estimate job"
+_FINALIZE_EXPORT_JOB_ERROR_MESSAGE = "Failed to finalize export job"
 _PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexpectedly."
 _PROCESS_ESTIMATE_JOB_ERROR_MESSAGE = "Estimate job failed unexpectedly."
+_PROCESS_EXPORT_JOB_ERROR_MESSAGE = "Export job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
 _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
 _DEBUG_OVERLAY_ARTIFACT_FORMAT = "svg"
 _DEBUG_OVERLAY_GENERATOR_NAME = "app.ingestion.debug_overlay"
 _DEBUG_OVERLAY_GENERATOR_VERSION = "1"
+_ESTIMATE_PDF_EXPORT_UNSUPPORTED_ERROR_MESSAGE = "Estimate PDF exports are not implemented."
 _NORMALIZED_ENTITY_INSERT_CHUNK_SIZE = 500
 _QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE = (
     "Quantity takeoff is blocked by the revision validation gate."
@@ -172,6 +193,7 @@ def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None]
         JobType.REPROCESS.value: enqueue_ingest_job,
         JobType.QUANTITY_TAKEOFF.value: enqueue_quantity_takeoff_job,
         JobType.ESTIMATE.value: enqueue_estimate_job,
+        JobType.EXPORT.value: enqueue_export_job,
     }
     return registry.get(normalized_job_type)
 
@@ -233,6 +255,44 @@ class _EstimateJobInputError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportJobInputError(Exception):
+    """Raised for deterministic export job input failures."""
+
+    error_code: ErrorCode
+    message: str
+    details: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportExecutionInput:
+    """Resolved persisted inputs for a supported export job."""
+
+    drawing_revision_id: UUID
+    export_kind: str
+    export_format: str
+    media_type: str
+    artifact_name: str
+    options_json: dict[str, Any]
+    quantity_takeoff_id: UUID | None = None
+    estimate_version_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedExportArtifact:
+    """Deterministic rendered artifact bytes and metadata."""
+
+    content_bytes: bytes
+    checksum_sha256: str
+    size_bytes: int
+    media_type: str
+    generator_name: str
+    generator_version: str
 
 
 _JobAttemptLease = job_lifecycle._JobAttemptLease
@@ -565,6 +625,23 @@ async def _get_existing_estimate_version(
     """Load an existing committed estimate version for a job."""
     result = await session.execute(
         select(EstimateVersion).where(EstimateVersion.source_job_id == source_job_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_existing_generated_artifact(
+    session: AsyncSession,
+    *,
+    source_job_id: UUID,
+) -> GeneratedArtifact | None:
+    """Load an existing committed generated artifact for a job."""
+    result = await session.execute(
+        select(GeneratedArtifact)
+        .where(
+            (GeneratedArtifact.job_id == source_job_id) & (GeneratedArtifact.deleted_at.is_(None))
+        )
+        .order_by(GeneratedArtifact.created_at.asc(), GeneratedArtifact.id.asc())
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -2414,6 +2491,17 @@ async def _cleanup_failed_storage_writes(
             )
 
 
+def _get_enqueue_job_error_message(job_type: str) -> str:
+    """Return the persisted enqueue failure message for a worker job type."""
+    return {
+        JobType.INGEST.value: _ENQUEUE_INGEST_JOB_ERROR_MESSAGE,
+        JobType.REPROCESS.value: _ENQUEUE_REPROCESS_JOB_ERROR_MESSAGE,
+        JobType.QUANTITY_TAKEOFF.value: _ENQUEUE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+        JobType.ESTIMATE.value: _ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE,
+        JobType.EXPORT.value: _ENQUEUE_EXPORT_JOB_ERROR_MESSAGE,
+    }.get(job_type, "Failed to enqueue job")
+
+
 async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> IngestionRunRequest:
     """Load persisted job and file metadata for the ingestion runner."""
     session_maker = get_session_maker()
@@ -3046,6 +3134,562 @@ def _build_quantity_items(
         )
 
     return items
+
+
+def _build_export_artifact_name(
+    *,
+    export_kind: str,
+    export_format: str,
+    drawing_revision_id: UUID,
+    quantity_takeoff_id: UUID | None = None,
+    estimate_version_id: UUID | None = None,
+) -> str:
+    """Build a deterministic filename for a generated export artifact."""
+    if export_kind == "revision_json":
+        return f"revision-{drawing_revision_id}.{export_format}"
+    if export_kind == "quantity_csv":
+        assert quantity_takeoff_id is not None
+        return f"quantity-takeoff-{quantity_takeoff_id}.{export_format}"
+    if export_kind in {"estimate_csv", "estimate_pdf"}:
+        assert estimate_version_id is not None
+        return f"estimate-{estimate_version_id}.{export_format}"
+    return f"export-{drawing_revision_id}.{export_format}"
+
+
+def _build_export_job_input_error(
+    message: str,
+    *,
+    error_code: ErrorCode = ErrorCode.INPUT_INVALID,
+    details: dict[str, Any] | None = None,
+) -> _ExportJobInputError:
+    """Build a deterministic export job input failure."""
+    return _ExportJobInputError(error_code=error_code, message=message, details=details)
+
+
+def _build_export_artifact_lineage_json(
+    *,
+    source_file: File,
+    job: Job,
+    execution: _ExportExecutionInput,
+) -> dict[str, Any]:
+    """Build lineage metadata for a persisted export artifact."""
+    return {
+        "source_file": {
+            "id": str(source_file.id),
+            "original_filename": source_file.original_filename,
+            "detected_format": source_file.detected_format,
+            "media_type": source_file.media_type,
+            "checksum_sha256": source_file.checksum_sha256,
+        },
+        "job": {
+            "id": str(job.id),
+            "attempts": job.attempts,
+            "base_revision_id": (
+                str(job.base_revision_id) if job.base_revision_id is not None else None
+            ),
+        },
+        "drawing_revision": {"id": str(execution.drawing_revision_id)},
+        "export": {
+            "kind": execution.export_kind,
+            "format": execution.export_format,
+            "media_type": execution.media_type,
+            "quantity_takeoff_id": (
+                str(execution.quantity_takeoff_id)
+                if execution.quantity_takeoff_id is not None
+                else None
+            ),
+            "estimate_version_id": (
+                str(execution.estimate_version_id)
+                if execution.estimate_version_id is not None
+                else None
+            ),
+            "options": deepcopy(execution.options_json),
+        },
+    }
+
+
+async def _render_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> _RenderedExportArtifact:
+    """Render bytes for a supported export job."""
+    try:
+        result: RevisionJsonExportResult | CsvExportResult
+        if execution.export_kind == "revision_json":
+            result = await render_revision_json_export(
+                session,
+                execution.drawing_revision_id,
+                options=execution.options_json,
+            )
+        elif execution.export_kind == "quantity_csv":
+            assert execution.quantity_takeoff_id is not None
+            result = await render_quantity_csv_export(session, execution.quantity_takeoff_id)
+        elif execution.export_kind == "estimate_csv":
+            assert execution.estimate_version_id is not None
+            result = await render_estimate_csv_export(session, execution.estimate_version_id)
+        else:
+            raise _build_export_job_input_error(
+                "Export job kind is not supported by the worker.",
+                details={"export_kind": execution.export_kind},
+            )
+    except RevisionJsonExportError as exc:
+        raise _build_export_job_input_error(
+            str(exc),
+            error_code=ErrorCode.NOT_FOUND,
+            details={"drawing_revision_id": str(execution.drawing_revision_id)},
+        ) from exc
+    except QuantityCsvExportError as exc:
+        raise _build_export_job_input_error(
+            str(exc),
+            error_code=ErrorCode.NOT_FOUND,
+            details={
+                "drawing_revision_id": str(execution.drawing_revision_id),
+                "quantity_takeoff_id": str(execution.quantity_takeoff_id),
+            },
+        ) from exc
+    except EstimateCsvExportError as exc:
+        raise _build_export_job_input_error(
+            str(exc),
+            error_code=ErrorCode.NOT_FOUND,
+            details={
+                "drawing_revision_id": str(execution.drawing_revision_id),
+                "estimate_version_id": str(execution.estimate_version_id),
+            },
+        ) from exc
+
+    if result.media_type != execution.media_type:
+        raise ValueError("Rendered export media type does not match the persisted export job input")
+
+    computed_checksum = hashlib.sha256(result.content_bytes).hexdigest()
+    if computed_checksum != result.checksum_sha256:
+        raise ValueError("Rendered export checksum does not match the generated bytes")
+
+    if len(result.content_bytes) != result.size_bytes:
+        raise ValueError("Rendered export size does not match the generated bytes")
+
+    return _RenderedExportArtifact(
+        content_bytes=result.content_bytes,
+        checksum_sha256=result.checksum_sha256,
+        size_bytes=result.size_bytes,
+        media_type=result.media_type,
+        generator_name=result.generator_name,
+        generator_version=result.generator_version,
+    )
+
+
+async def _build_export_execution_input(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _ExportExecutionInput:
+    """Load deterministic persisted inputs for a claimed export job."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await session.get(Job, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+        if job.job_type != JobType.EXPORT.value:
+            raise ValueError(f"Unsupported export job type '{job.job_type}'")
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Export job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "current_revision_id": None,
+                },
+            )
+
+        export_input = await session.get(ExportJobInput, job.id)
+        if export_input is None:
+            raise _build_export_job_input_error(
+                "Export job input is missing.",
+                error_code=ErrorCode.NOT_FOUND,
+                details={"job_id": str(job.id)},
+            )
+        if (
+            export_input.project_id != job.project_id
+            or export_input.source_file_id != job.file_id
+            or export_input.drawing_revision_id != job.base_revision_id
+            or export_input.source_job_id != job.id
+            or export_input.source_job_type != JobType.EXPORT.value
+        ):
+            raise _build_export_job_input_error(
+                "Export job input lineage does not match the persisted job.",
+                details={
+                    "drawing_revision_id": str(export_input.drawing_revision_id),
+                    "base_revision_id": str(job.base_revision_id),
+                    "source_job_type": export_input.source_job_type,
+                },
+            )
+
+        drawing_revision = await _get_drawing_revision(session, revision_id=job.base_revision_id)
+        if drawing_revision is None:
+            raise _RevisionConflictError(
+                message="Export job base revision no longer exists.",
+                details={
+                    "base_revision_id": str(job.base_revision_id),
+                    "current_revision_id": None,
+                },
+            )
+        if (
+            drawing_revision.project_id != job.project_id
+            or drawing_revision.source_file_id != job.file_id
+        ):
+            raise ValueError("Export job base revision does not belong to the source file")
+
+        if export_input.export_kind == "estimate_pdf":
+            raise _build_export_job_input_error(
+                _ESTIMATE_PDF_EXPORT_UNSUPPORTED_ERROR_MESSAGE,
+                details={"export_kind": export_input.export_kind},
+            )
+
+        supported_exports: dict[str, tuple[str, str]] = {
+            "revision_json": ("json", "application/json"),
+            "quantity_csv": ("csv", "text/csv"),
+            "estimate_csv": ("csv", "text/csv"),
+        }
+        expected_export_metadata = supported_exports.get(export_input.export_kind)
+        if expected_export_metadata is None:
+            raise _build_export_job_input_error(
+                "Export job kind is not supported by the worker.",
+                details={"export_kind": export_input.export_kind},
+            )
+
+        expected_format, expected_media_type = expected_export_metadata
+        if (
+            export_input.export_format != expected_format
+            or export_input.media_type != expected_media_type
+        ):
+            raise _build_export_job_input_error(
+                "Export job metadata does not match the supported export kind.",
+                details={
+                    "export_kind": export_input.export_kind,
+                    "export_format": export_input.export_format,
+                    "media_type": export_input.media_type,
+                },
+            )
+
+        options_json = deepcopy(export_input.options_json)
+        if export_input.export_kind == "revision_json":
+            if (
+                export_input.quantity_takeoff_id is not None
+                or export_input.estimate_version_id is not None
+                or export_input.quantity_gate is not None
+                or export_input.trusted_totals is not None
+            ):
+                raise _build_export_job_input_error(
+                    "Revision JSON export input contains unexpected quantity or estimate lineage.",
+                    details={"export_kind": export_input.export_kind},
+                )
+            return _ExportExecutionInput(
+                drawing_revision_id=drawing_revision.id,
+                export_kind=export_input.export_kind,
+                export_format=export_input.export_format,
+                media_type=export_input.media_type,
+                artifact_name=_build_export_artifact_name(
+                    export_kind=export_input.export_kind,
+                    export_format=export_input.export_format,
+                    drawing_revision_id=drawing_revision.id,
+                ),
+                options_json=options_json,
+            )
+
+        quantity_takeoff_id = export_input.quantity_takeoff_id
+        if quantity_takeoff_id is None:
+            raise _build_export_job_input_error(
+                "Export job input is missing its quantity takeoff linkage.",
+                details={"export_kind": export_input.export_kind},
+            )
+        if export_input.quantity_gate != "allowed" or export_input.trusted_totals is not True:
+            raise _build_export_job_input_error(
+                "Export job input requires a trusted quantity takeoff with allowed gate.",
+                details={
+                    "quantity_takeoff_id": str(quantity_takeoff_id),
+                    "quantity_gate": export_input.quantity_gate,
+                    "trusted_totals": export_input.trusted_totals,
+                },
+            )
+
+        quantity_takeoff = await session.get(QuantityTakeoff, quantity_takeoff_id)
+        if quantity_takeoff is None:
+            raise _build_export_job_input_error(
+                "Export job quantity takeoff was not found.",
+                error_code=ErrorCode.NOT_FOUND,
+                details={"quantity_takeoff_id": str(quantity_takeoff_id)},
+            )
+        if (
+            quantity_takeoff.project_id != job.project_id
+            or quantity_takeoff.source_file_id != job.file_id
+            or quantity_takeoff.drawing_revision_id != drawing_revision.id
+            or quantity_takeoff.quantity_gate != export_input.quantity_gate
+            or quantity_takeoff.trusted_totals is not export_input.trusted_totals
+            or quantity_takeoff.source_job_type != JobType.QUANTITY_TAKEOFF.value
+        ):
+            raise _build_export_job_input_error(
+                "Export job quantity takeoff lineage does not match the persisted job input.",
+                details={
+                    "quantity_takeoff_id": str(quantity_takeoff.id),
+                    "drawing_revision_id": str(quantity_takeoff.drawing_revision_id),
+                    "quantity_gate": quantity_takeoff.quantity_gate,
+                    "trusted_totals": quantity_takeoff.trusted_totals,
+                },
+            )
+
+        if export_input.export_kind == "quantity_csv":
+            if export_input.estimate_version_id is not None:
+                raise _build_export_job_input_error(
+                    "Quantity CSV export input contains unexpected estimate linkage.",
+                    details={
+                        "quantity_takeoff_id": str(quantity_takeoff.id),
+                        "estimate_version_id": str(export_input.estimate_version_id),
+                    },
+                )
+            return _ExportExecutionInput(
+                drawing_revision_id=drawing_revision.id,
+                export_kind=export_input.export_kind,
+                export_format=export_input.export_format,
+                media_type=export_input.media_type,
+                artifact_name=_build_export_artifact_name(
+                    export_kind=export_input.export_kind,
+                    export_format=export_input.export_format,
+                    drawing_revision_id=drawing_revision.id,
+                    quantity_takeoff_id=quantity_takeoff.id,
+                ),
+                options_json=options_json,
+                quantity_takeoff_id=quantity_takeoff.id,
+            )
+
+        estimate_version_id = export_input.estimate_version_id
+        if estimate_version_id is None:
+            raise _build_export_job_input_error(
+                "Estimate CSV export input is missing its estimate version linkage.",
+                details={"quantity_takeoff_id": str(quantity_takeoff.id)},
+            )
+
+        estimate_version = await session.get(EstimateVersion, estimate_version_id)
+        if estimate_version is None:
+            raise _build_export_job_input_error(
+                "Export job estimate version was not found.",
+                error_code=ErrorCode.NOT_FOUND,
+                details={"estimate_version_id": str(estimate_version_id)},
+            )
+        if (
+            estimate_version.project_id != job.project_id
+            or estimate_version.source_file_id != job.file_id
+            or estimate_version.drawing_revision_id != drawing_revision.id
+            or estimate_version.quantity_takeoff_id != quantity_takeoff.id
+            or estimate_version.quantity_gate != export_input.quantity_gate
+            or estimate_version.trusted_totals is not export_input.trusted_totals
+        ):
+            raise _build_export_job_input_error(
+                "Export job estimate lineage does not match the persisted job input.",
+                details={
+                    "estimate_version_id": str(estimate_version.id),
+                    "drawing_revision_id": str(estimate_version.drawing_revision_id),
+                    "quantity_takeoff_id": str(estimate_version.quantity_takeoff_id),
+                    "quantity_gate": estimate_version.quantity_gate,
+                    "trusted_totals": estimate_version.trusted_totals,
+                },
+            )
+
+        return _ExportExecutionInput(
+            drawing_revision_id=drawing_revision.id,
+            export_kind=export_input.export_kind,
+            export_format=export_input.export_format,
+            media_type=export_input.media_type,
+            artifact_name=_build_export_artifact_name(
+                export_kind=export_input.export_kind,
+                export_format=export_input.export_format,
+                drawing_revision_id=drawing_revision.id,
+                quantity_takeoff_id=quantity_takeoff.id,
+                estimate_version_id=estimate_version.id,
+            ),
+            options_json=options_json,
+            quantity_takeoff_id=quantity_takeoff.id,
+            estimate_version_id=estimate_version.id,
+        )
+
+
+async def _finalize_export_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    execution: _ExportExecutionInput,
+    rendered: _RenderedExportArtifact,
+) -> bool:
+    """Atomically publish one export artifact and terminal job success."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+        source_file = locked_source.source_file
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "export_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "export_job_completion_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info("export_job_cancelled", job_id=str(job_id))
+            return False
+
+        if job.status != "running":
+            logger.info(
+                "export_job_completion_skipped_non_running_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or source_file is None
+            or source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("export_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
+        if job.base_revision_id != execution.drawing_revision_id:
+            raise _RevisionConflictError(
+                message="Export base revision changed before finalization.",
+                details={
+                    "base_revision_id": (
+                        str(job.base_revision_id) if job.base_revision_id is not None else None
+                    ),
+                    "drawing_revision_id": str(execution.drawing_revision_id),
+                },
+            )
+
+        existing_artifact = await _get_existing_generated_artifact(session, source_job_id=job.id)
+        if existing_artifact is not None:
+            logger.info(
+                "export_job_completion_skipped_existing_artifact",
+                job_id=str(job_id),
+                generated_artifact_id=str(existing_artifact.id),
+            )
+            return False
+
+        generated_artifact_id = uuid.uuid4()
+        storage_key = build_generated_artifact_storage_key(
+            generated_artifact_id,
+            execution.artifact_name,
+        )
+        lineage_json = _build_export_artifact_lineage_json(
+            source_file=source_file,
+            job=job,
+            execution=execution,
+        )
+        storage = get_storage()
+        written_storage_objects: list[tuple[str, str]] = []
+        commit_started = False
+
+        try:
+            stored_object = await storage.put(storage_key, rendered.content_bytes, immutable=True)
+            written_storage_objects.append((stored_object.key, stored_object.storage_uri))
+
+            if stored_object.checksum_sha256 != rendered.checksum_sha256:
+                raise ValueError(
+                    "Stored export artifact checksum does not match the rendered bytes"
+                )
+            if stored_object.size_bytes != rendered.size_bytes:
+                raise ValueError("Stored export artifact size does not match the rendered bytes")
+
+            session.add(
+                GeneratedArtifact(
+                    id=generated_artifact_id,
+                    project_id=job.project_id,
+                    source_file_id=source_file.id,
+                    job_id=job.id,
+                    drawing_revision_id=execution.drawing_revision_id,
+                    artifact_kind=execution.export_kind,
+                    name=execution.artifact_name,
+                    format=execution.export_format,
+                    media_type=rendered.media_type,
+                    size_bytes=stored_object.size_bytes,
+                    checksum_sha256=stored_object.checksum_sha256,
+                    generator_name=rendered.generator_name,
+                    generator_version=rendered.generator_version,
+                    generator_config_json=deepcopy(execution.options_json),
+                    storage_key=stored_object.key,
+                    storage_uri=stored_object.storage_uri,
+                    lineage_json=lineage_json,
+                )
+            )
+
+            job.status = "succeeded"
+            job.finished_at = _utcnow()
+            job.error_code = None
+            job.error_message = None
+            _clear_job_attempt_lease(job)
+            await emit_job_event(
+                job.id,
+                level="info",
+                message="Job succeeded",
+                data_json={
+                    "status": "succeeded",
+                    "attempts": job.attempts,
+                    "generated_artifact_id": str(generated_artifact_id),
+                    "export_kind": execution.export_kind,
+                },
+                session=session,
+            )
+            await session.flush()
+            commit_started = True
+            await session.commit()
+        except asyncio.CancelledError:
+            if not commit_started:
+                await session.rollback()
+                await _cleanup_failed_storage_writes(
+                    storage,
+                    written_storage_objects,
+                    job_id=job_id,
+                )
+            raise
+        except Exception:
+            if not commit_started:
+                await session.rollback()
+                await _cleanup_failed_storage_writes(
+                    storage,
+                    written_storage_objects,
+                    job_id=job_id,
+                )
+            raise
+
+    return True
 
 
 async def _build_quantity_takeoff_execution_input(
@@ -3716,16 +4360,18 @@ async def _mark_job_failed_if_recovery_safe(
                 reason="source_deleted",
             )
             logger.info(
-                "ingest_job_recovery_enqueue_failure_mark_skipped_inactive_source",
+                "job_recovery_enqueue_failure_mark_skipped_inactive_source",
                 job_id=str(job_id),
+                job_type=job.job_type,
                 status=job.status,
             )
             return False
 
         if not _job_is_safe_recovery_failure_target(job):
             logger.info(
-                "ingest_job_recovery_enqueue_failure_mark_skipped_changed_state",
+                "job_recovery_enqueue_failure_mark_skipped_changed_state",
                 job_id=str(job_id),
+                job_type=job.job_type,
                 status=job.status,
             )
             return False
@@ -3833,6 +4479,7 @@ async def publish_job_enqueue_intent(
     suppress_exceptions: bool = False,
 ) -> bool:
     """Best-effort publish for a durable enqueue intent recorded in Postgres."""
+    claimed_intent: _ClaimedJobEnqueueIntent | None = None
     try:
         claimed_intent = await _claim_job_enqueue_intent(job_id)
         if claimed_intent is None:
@@ -3847,11 +4494,12 @@ async def publish_job_enqueue_intent(
         except Exception:
             await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
             if recovery:
-                await _mark_recovery_enqueue_failed(job_id)
+                await _mark_recovery_enqueue_failed(job_id, job_type=claimed_intent.job_type)
             else:
                 logger.warning(
-                    "ingest_job_enqueue_deferred",
+                    "job_enqueue_deferred",
                     job_id=str(job_id),
+                    job_type=claimed_intent.job_type,
                     recovery_action="worker_start_recovery",
                 )
             return False
@@ -3863,25 +4511,27 @@ async def publish_job_enqueue_intent(
             raise
 
         logger.warning(
-            "ingest_job_enqueue_deferred",
+            "job_enqueue_deferred",
             job_id=str(job_id),
+            job_type=claimed_intent.job_type if claimed_intent is not None else None,
             recovery_action="worker_start_recovery",
         )
         return False
 
 
-async def _mark_recovery_enqueue_failed(job_id: UUID) -> bool:
+async def _mark_recovery_enqueue_failed(job_id: UUID, *, job_type: str) -> bool:
     """Persist and log a sanitized worker-recovery enqueue failure."""
     marked_failed = await _mark_job_failed_if_recovery_safe(
         job_id,
-        error_message=_ENQUEUE_INGEST_JOB_ERROR_MESSAGE,
+        error_message=_get_enqueue_job_error_message(job_type),
     )
     if not marked_failed:
         return False
 
     logger.error(
-        "ingest_job_recovery_enqueue_failed",
+        "job_recovery_enqueue_failed",
         job_id=str(job_id),
+        job_type=job_type,
         error_code=ErrorCode.INTERNAL_ERROR.value,
         recovery_action="mark_failed",
     )
@@ -3955,6 +4605,23 @@ async def _begin_or_resume_quantity_takeoff_job(job_id: UUID) -> _JobAttemptLeas
 async def _begin_or_resume_estimate_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted estimate job under a row lock."""
     return await job_lifecycle._begin_or_resume_estimate_job(
+        job_id,
+        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
+        stale_after=_RUNNING_JOB_STALE_AFTER,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        claim_job_attempt_lease_func=_claim_job_attempt_lease,
+        is_stale_running_job_func=_is_stale_running_job,
+        finalize_job_cancelled_func=_finalize_job_cancelled,
+        emit_job_event_func=emit_job_event,
+        logger_instance=logger,
+    )
+
+
+async def _begin_or_resume_export_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted export job under a row lock."""
+    return await job_lifecycle._begin_or_resume_export_job(
         job_id,
         terminal_job_statuses=_TERMINAL_JOB_STATUSES,
         stale_after=_RUNNING_JOB_STALE_AFTER,
@@ -4478,3 +5145,113 @@ def run_estimate_job(job_id: str) -> None:
 def enqueue_estimate_job(job_id: UUID) -> None:
     """Publish a persisted estimate job to Celery."""
     run_estimate_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+
+
+async def process_export_job(job_id: UUID) -> None:
+    """Load a persisted export job and atomically persist its generated artifact."""
+    _ensure_worker_database_configured()
+
+    lease = await _begin_or_resume_export_job(job_id)
+    if lease is None:
+        return
+
+    try:
+        execution = await _build_export_execution_input(job_id, attempt_token=lease.token)
+        session_maker = get_session_maker()
+        if session_maker is None:
+            raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+        async with session_maker() as session:
+            rendered = await _render_export_artifact(session, execution)
+    except _StaleJobAttemptError:
+        logger.info("export_job_stale_attempt_skipped", job_id=str(job_id))
+        return
+    except _RevisionConflictError as exc:
+        await _mark_job_failed_for_revision_conflict(
+            job_id,
+            attempt_token=lease.token,
+            log_event="export_job_revision_conflict",
+            exc=exc,
+        )
+        return
+    except _ExportJobInputError as exc:
+        failure_details = exc.details
+        await _mark_job_failed(
+            job_id,
+            error_message=exc.message,
+            error_code=exc.error_code,
+            attempt_token=lease.token,
+            error_details=failure_details,
+        )
+        logger.warning(
+            "export_job_input_failed",
+            job_id=str(job_id),
+            error_code=exc.error_code.value,
+            **(failure_details or {}),
+        )
+        return
+    except asyncio.CancelledError:
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="export_job_cancelled_during_execution",
+        )
+        raise
+    except Exception:
+        await _mark_job_failed_with_internal_error_log(
+            job_id,
+            attempt_token=lease.token,
+            error_message=_PROCESS_EXPORT_JOB_ERROR_MESSAGE,
+            log_event="export_job_failed",
+        )
+        raise
+
+    try:
+        finalized = await _finalize_export_job(
+            job_id,
+            attempt_token=lease.token,
+            execution=execution,
+            rendered=rendered,
+        )
+    except asyncio.CancelledError:
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event="export_job_cancelled_during_finalization",
+        )
+        raise
+    except _RevisionConflictError as exc:
+        await _mark_job_failed_for_revision_conflict(
+            job_id,
+            attempt_token=lease.token,
+            log_event="export_job_revision_conflict",
+            exc=exc,
+        )
+        return
+    except Exception:
+        await _mark_job_failed_with_internal_error_log(
+            job_id,
+            attempt_token=lease.token,
+            error_message=_FINALIZE_EXPORT_JOB_ERROR_MESSAGE,
+            log_event="export_job_finalization_failed",
+        )
+        raise
+
+    if finalized:
+        logger.info("export_job_succeeded", job_id=str(job_id))
+
+
+@celery_app.task(
+    name="app.jobs.worker.run_export_job",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def run_export_job(job_id: str) -> None:
+    """Celery task wrapper for persisted export jobs."""
+    _run_worker_loop(lambda: process_export_job(UUID(job_id)))
+
+
+def enqueue_export_job(job_id: UUID) -> None:
+    """Publish a persisted export job to Celery."""
+
+    run_export_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)

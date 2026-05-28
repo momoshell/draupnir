@@ -838,3 +838,44 @@ async def _begin_or_resume_estimate_job(
         emit_job_event_func=emit_job_event_func,
         logger_instance=logger_instance,
     )
+
+
+async def _begin_or_resume_export_job(
+    job_id: UUID,
+    *,
+    terminal_job_statuses: Collection[str],
+    stale_after: timedelta,
+    session_maker_factory: Callable[[], Any] | None = None,
+    lock_job_source_for_terminal_mutation_func: (
+        Callable[..., Awaitable[_LockedJobSource]] | None
+    ) = None,
+    cancel_job_for_inactive_source_func: Callable[..., Awaitable[bool]] | None = None,
+    claim_job_attempt_lease_func: Callable[..., _JobAttemptLease] | None = None,
+    is_stale_running_job_func: Callable[..., bool] | None = None,
+    finalize_job_cancelled_func: Callable[[Job], None] | None = None,
+    emit_job_event_func: Callable[..., Awaitable[bool]] | None = None,
+    logger_instance: Any | None = None,
+) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted export job under a row lock."""
+    return await _begin_or_resume_job(
+        job_id,
+        supported_job_types={JobType.EXPORT.value},
+        terminal_job_statuses=terminal_job_statuses,
+        stale_after=stale_after,
+        log_keys=_BeginOrResumeLogKeys(
+            unsupported_type="export_job_unsupported_type_skipped",
+            terminal_status="export_job_skipped_terminal_status",
+            inactive_source="export_job_cancelled_inactive_source",
+            reclaimed_stale_running="export_job_reclaimed_stale_running_status",
+            duplicate_delivery="export_job_duplicate_delivery_skipped_running_attempt",
+            cancelled="export_job_cancelled",
+        ),
+        session_maker_factory=session_maker_factory,
+        lock_job_source_for_terminal_mutation_func=lock_job_source_for_terminal_mutation_func,
+        cancel_job_for_inactive_source_func=cancel_job_for_inactive_source_func,
+        claim_job_attempt_lease_func=claim_job_attempt_lease_func,
+        is_stale_running_job_func=is_stale_running_job_func,
+        finalize_job_cancelled_func=finalize_job_cancelled_func,
+        emit_job_event_func=emit_job_event_func,
+        logger_instance=logger_instance,
+    )

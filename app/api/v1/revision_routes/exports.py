@@ -30,7 +30,9 @@ from app.api.v1.revision_lineage import (
 )
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
+from app.jobs.worker import enqueue_export_job as _enqueue_export_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
+from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
@@ -54,6 +56,8 @@ type _ActiveRevisionGetter = Callable[..., Awaitable[DrawingRevision | None]]
 type _RevisionTakeoffGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[QuantityTakeoff]]
 type _EstimateVersionGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[EstimateVersion]]
 type _FingerprintBuilder = Callable[..., str]
+type _JobEnqueuePublisher = Callable[[UUID], None]
+type _PublishJobEnqueueIntent = Callable[..., Awaitable[bool]]
 type _ReplayIdempotencyResponse = Callable[..., Awaitable[Response | None]]
 type _CompleteIdempotencyResponse = Callable[..., Awaitable[Response]]
 
@@ -191,6 +195,32 @@ def _prepare_job_enqueue_intent(job: Job) -> None:
         default=_prepare_job_enqueue_intent_direct,
     )
     helper(job)
+
+
+async def _publish_job_enqueue_intent(*args: Any, **kwargs: Any) -> bool:
+    """Compatibility wrapper for durable enqueue publication."""
+
+    helper = cast(
+        _PublishJobEnqueueIntent,
+        _compat_attr(
+            "publish_job_enqueue_intent",
+            default=_publish_job_enqueue_intent_direct,
+        ),
+    )
+    return await helper(*args, **kwargs)
+
+
+def _enqueue_export_job(job_id: UUID) -> None:
+    """Compatibility wrapper for export job queue publication."""
+
+    helper = cast(
+        _JobEnqueuePublisher,
+        _compat_attr(
+            "enqueue_export_job",
+            default=_enqueue_export_job_direct,
+        ),
+    )
+    helper(job_id)
 
 
 def _raise_estimate_takeoff_gate_invalid(takeoff: QuantityTakeoff) -> None:
@@ -449,6 +479,11 @@ async def create_revision_json_export(
         )
 
     await db.commit()
+    await _publish_job_enqueue_intent(
+        export_job.id,
+        publisher=_enqueue_export_job,
+        suppress_exceptions=True,
+    )
 
     if success_response is not None:
         return success_response
@@ -541,6 +576,11 @@ async def create_revision_quantity_csv_export(
         )
 
     await db.commit()
+    await _publish_job_enqueue_intent(
+        export_job.id,
+        publisher=_enqueue_export_job,
+        suppress_exceptions=True,
+    )
 
     if success_response is not None:
         return success_response
@@ -649,6 +689,11 @@ async def create_revision_estimate_export(
         )
 
     await db.commit()
+    await _publish_job_enqueue_intent(
+        export_job.id,
+        publisher=_enqueue_export_job,
+        suppress_exceptions=True,
+    )
 
     if success_response is not None:
         return success_response

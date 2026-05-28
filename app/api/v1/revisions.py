@@ -177,6 +177,13 @@ def enqueue_estimate_job(job_id: UUID) -> None:
     publisher(job_id)
 
 
+def enqueue_export_job(job_id: UUID) -> None:
+    """Compatibility wrapper kept for test fixture patching."""
+
+    publisher = jobs_worker_module.enqueue_export_job
+    publisher(job_id)
+
+
 async def _get_active_validation_report_or_404(
     revision_id: UUID,
     db: AsyncSession,
