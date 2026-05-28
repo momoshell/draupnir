@@ -19,7 +19,7 @@ from app.core.errors import ErrorCode
 from app.ingestion.contracts import CancellationHandle
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
-from app.models.job import Job
+from app.models.job import Job, JobType
 from app.models.project import Project
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import (
@@ -1013,9 +1013,10 @@ class TestJobsWorkerLifecycle:
 
         assert logger_error_calls == [
             (
-                "ingest_job_recovery_enqueue_failed",
+                "job_recovery_enqueue_failed",
                 {
                     "job_id": str(job.id),
+                    "job_type": JobType.INGEST.value,
                     "error_code": ErrorCode.INTERNAL_ERROR.value,
                     "recovery_action": "mark_failed",
                 },
@@ -1054,7 +1055,10 @@ class TestJobsWorkerLifecycle:
             persisted_job.attempt_lease_expires_at = lease_expires_at
             await session.commit()
 
-        marked_failed = await worker_module._mark_recovery_enqueue_failed(job.id)
+        marked_failed = await worker_module._mark_recovery_enqueue_failed(
+            job.id,
+            job_type=JobType.INGEST.value,
+        )
 
         assert marked_failed is False
         updated_job = await _get_job(job.id)
@@ -1089,7 +1093,10 @@ class TestJobsWorkerLifecycle:
             persisted_job.finished_at = datetime.now(UTC)
             await session.commit()
 
-        marked_failed = await worker_module._mark_recovery_enqueue_failed(job.id)
+        marked_failed = await worker_module._mark_recovery_enqueue_failed(
+            job.id,
+            job_type=JobType.INGEST.value,
+        )
 
         assert marked_failed is False
         updated_job = await _get_job(job.id)

@@ -1141,15 +1141,19 @@ async def test_mark_recovery_enqueue_failed_logs_only_safe_fields(
     )
     monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
 
-    marked_failed = await worker_module._mark_recovery_enqueue_failed(job_id)
+    marked_failed = await worker_module._mark_recovery_enqueue_failed(
+        job_id,
+        job_type=JobType.INGEST.value,
+    )
 
     assert marked_failed is True
     assert marked_failed_job_ids == [job_id]
     assert logger_error_calls == [
         (
-            "ingest_job_recovery_enqueue_failed",
+            "job_recovery_enqueue_failed",
             {
                 "job_id": str(job_id),
+                "job_type": JobType.INGEST.value,
                 "error_code": ErrorCode.INTERNAL_ERROR.value,
                 "recovery_action": "mark_failed",
             },
