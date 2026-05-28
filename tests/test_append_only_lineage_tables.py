@@ -27,6 +27,7 @@ from app.ingestion.runner import IngestionRunRequest
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from app.models.estimation_catalog import EstimationRate
+from app.models.export_job_input import ExportJobInput
 from app.models.job import Job, JobStatus, JobType
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
@@ -71,6 +72,7 @@ class _ProtectedRowIds:
     generated_artifact_id: uuid.UUID
     job_event_id: uuid.UUID
     estimate_version_id: uuid.UUID
+    export_job_input_source_job_id: uuid.UUID
     estimate_job_input_id: uuid.UUID
     estimate_job_input_catalog_ref_key: tuple[uuid.UUID, str, str]
     estimate_snapshot_entry_id: uuid.UUID
@@ -213,6 +215,11 @@ def _row_filter_for_table(
             "estimate_job_id = :estimate_job_id",
             {"estimate_job_id": row_ids.estimate_job_input_id},
         )
+    if table_name == "export_job_inputs":
+        return (
+            "source_job_id = :source_job_id",
+            {"source_job_id": row_ids.export_job_input_source_job_id},
+        )
 
     return "id = :row_id", {"row_id": _row_id_for_table(row_ids, table_name)}
 
@@ -222,9 +229,12 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
 
     quantity_seed = await _seed_quantity_lineage(async_client)
 
-    adapter_outputs, drawing_revisions, validation_reports, generated_artifacts = (
-        await _load_project_outputs(str(quantity_seed.project_id))
-    )
+    (
+        adapter_outputs,
+        drawing_revisions,
+        validation_reports,
+        generated_artifacts,
+    ) = await _load_project_outputs(str(quantity_seed.project_id))
     manifests, layouts, layers, blocks, entities = await _load_project_materialization(
         str(quantity_seed.project_id)
     )
@@ -270,6 +280,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         assumption_snapshot_entry_type="assumption",
     )
     estimate_job_id = uuid.uuid4()
+    export_job_id = uuid.uuid4()
     rate_id = uuid.uuid4()
     rate_checksum = "d" * 64
     estimate_job_input = EstimateJobInput(
@@ -294,6 +305,21 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         rate_catalog_entry_id=rate_id,
         catalog_checksum_sha256=rate_checksum,
         selection_context_json={"source": "append-only"},
+    )
+    export_job_input = ExportJobInput(
+        source_job_id=export_job_id,
+        project_id=quantity_seed.project_id,
+        source_file_id=quantity_seed.file_id,
+        drawing_revision_id=quantity_seed.drawing_revision_id,
+        source_job_type=JobType.EXPORT.value,
+        export_kind="revision_json",
+        export_format="json",
+        media_type="application/json",
+        options_json={"source": "append-only"},
+        quantity_takeoff_id=None,
+        quantity_gate=None,
+        trusted_totals=None,
+        estimate_version_id=None,
     )
 
     session_maker = session_module.AsyncSessionLocal
@@ -332,7 +358,25 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
             )
         )
         await session.flush()
+        session.add(
+            Job(
+                id=export_job_id,
+                project_id=quantity_seed.project_id,
+                file_id=quantity_seed.file_id,
+                extraction_profile_id=None,
+                base_revision_id=quantity_seed.drawing_revision_id,
+                parent_job_id=quantity_seed.quantity_job_id,
+                job_type=JobType.EXPORT.value,
+                status=JobStatus.PENDING.value,
+                enqueue_status="pending",
+                enqueue_attempts=0,
+                cancel_requested=False,
+            )
+        )
+        await session.flush()
         session.add(estimate_job_input)
+        await session.flush()
+        session.add(export_job_input)
         await session.flush()
         session.add(estimate_job_input_ref)
         await session.flush()
@@ -365,6 +409,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         generated_artifact_id=generated_artifacts[0].id,
         job_event_id=job_events[0].id,
         estimate_version_id=estimate_version.id,
+        export_job_input_source_job_id=export_job_input.source_job_id,
         estimate_job_input_id=estimate_job_input.estimate_job_id,
         estimate_job_input_catalog_ref_key=(
             estimate_job_input_ref.estimate_job_id,
@@ -1484,6 +1529,7 @@ class TestAppendOnlyLineageTables:
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
             ("job_events", "message", "mutated job event"),
             ("estimate_versions", "total_amount", "121.00"),
+            ("export_job_inputs", "export_kind", "quantity_csv"),
             ("estimate_job_inputs", "currency", "USD"),
             (
                 "estimate_job_input_catalog_refs",
@@ -1558,9 +1604,7 @@ class TestAppendOnlyLineageTables:
                             "coordinates": [[0.0, 0.0], [1.0, 1.0]],
                         },
                         "properties_json": {"layer": "A-WALL"},
-                        "provenance_json": {
-                            "source_id": "entity-source-append-only-001"
-                        },
+                        "provenance_json": {"source_id": "entity-source-append-only-001"},
                     }
                 ],
                 "entity_counts": {
@@ -1576,8 +1620,8 @@ class TestAppendOnlyLineageTables:
         await _run_sql_and_expect_append_only_failure(
             (
                 'UPDATE "adapter_run_outputs" '
-                'SET canonical_json = CAST(:replacement_value AS json) '
-                'WHERE id = :row_id'
+                "SET canonical_json = CAST(:replacement_value AS json) "
+                "WHERE id = :row_id"
             ),
             {
                 "replacement_value": equivalent_canonical_json,
@@ -1613,8 +1657,8 @@ class TestAppendOnlyLineageTables:
         await _run_sql_and_expect_append_only_failure(
             (
                 'UPDATE "revision_entities" '
-                'SET canonical_entity_json = CAST(:replacement_value AS json) '
-                'WHERE id = :row_id'
+                "SET canonical_entity_json = CAST(:replacement_value AS json) "
+                "WHERE id = :row_id"
             ),
             {
                 "replacement_value": equivalent_entity_payload_json,
@@ -1782,9 +1826,9 @@ class TestAppendOnlyLineageTables:
                 _DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
-            assert (
-                downgrade_result.returncode == 0
-            ), downgrade_result.stdout + downgrade_result.stderr
+            assert downgrade_result.returncode == 0, (
+                downgrade_result.stdout + downgrade_result.stderr
+            )
         finally:
             await _drop_temp_database(database_name)
 
