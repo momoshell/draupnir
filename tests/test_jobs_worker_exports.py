@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
+from app.exports._base import ExportArtifact
 from app.exports.csv import CsvExportResult, render_estimate_csv_export, render_quantity_csv_export
 from app.exports.estimate_pdf import EstimatePdfExportResult, render_estimate_pdf_export
 from app.exports.revision_json import RevisionJsonExportResult, render_revision_json_export
@@ -368,6 +369,40 @@ async def _expected_export_bytes(
     return result.content_bytes, result.generator_name, result.generator_version
 
 
+def _build_export_execution_input(
+    *,
+    lineage: _ExportTestLineage,
+    export_kind: str,
+    export_format: str,
+    media_type: str,
+    options_json: dict[str, object],
+) -> worker_module._ExportExecutionInput:
+    quantity_takeoff_id = (
+        lineage.quantity_takeoff_id
+        if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"}
+        else None
+    )
+    estimate_version_id = (
+        lineage.estimate_version_id if export_kind in {"estimate_csv", "estimate_pdf"} else None
+    )
+    return worker_module._ExportExecutionInput(
+        drawing_revision_id=lineage.drawing_revision_id,
+        export_kind=export_kind,
+        export_format=export_format,
+        media_type=media_type,
+        artifact_name=worker_module._build_export_artifact_name(
+            export_kind=export_kind,
+            export_format=export_format,
+            drawing_revision_id=lineage.drawing_revision_id,
+            quantity_takeoff_id=quantity_takeoff_id,
+            estimate_version_id=estimate_version_id,
+        ),
+        options_json=options_json,
+        quantity_takeoff_id=quantity_takeoff_id,
+        estimate_version_id=estimate_version_id,
+    )
+
+
 @pytest.mark.parametrize(
     ("export_kind", "export_format", "media_type", "options_json"),
     [
@@ -455,6 +490,39 @@ async def test_process_export_job_supported_kinds_persist_artifact(
     }
 
 
+@pytest.mark.parametrize(
+    ("export_kind", "export_format", "media_type", "options_json"),
+    [
+        ("revision_json", "json", "application/json", {"include_manifest": True}),
+        ("quantity_csv", "csv", "text/csv", {}),
+        ("estimate_csv", "csv", "text/csv", {}),
+        ("estimate_pdf", "pdf", "application/pdf", {}),
+    ],
+)
+async def test_render_export_artifact_supported_kinds_return_shared_export_artifact(
+    async_client: httpx.AsyncClient,
+    export_kind: str,
+    export_format: str,
+    media_type: str,
+    options_json: dict[str, object],
+) -> None:
+    lineage = await _create_export_test_lineage(async_client)
+    execution = _build_export_execution_input(
+        lineage=lineage,
+        export_kind=export_kind,
+        export_format=export_format,
+        media_type=media_type,
+        options_json=options_json,
+    )
+    session_maker = _get_session_maker()
+
+    async with session_maker() as session:
+        rendered = await worker_module._render_export_artifact(session, execution)
+
+    assert isinstance(rendered, ExportArtifact)
+    assert rendered.media_type == media_type
+
+
 async def test_process_export_job_duplicate_terminal_redelivery_is_noop(
     async_client: httpx.AsyncClient,
 ) -> None:
@@ -477,6 +545,60 @@ async def test_process_export_job_duplicate_terminal_redelivery_is_noop(
         event for event in await _get_job_events(export_job_id) if event.message == "Job succeeded"
     ]
     assert len(success_events) == 1
+
+
+async def test_process_export_job_metadata_mismatch_fails_without_artifact(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _create_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revision_json",
+        export_format="json",
+        media_type="application/json",
+        options_json={"include_manifest": True},
+    )
+    monkeypatch.setitem(
+        worker_module._EXPORT_KIND_SPECS,
+        "revision_json",
+        replace(
+            worker_module._EXPORT_KIND_SPECS["revision_json"],
+            format="csv",
+            media_type="text/csv",
+        ),
+    )
+
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "failed"
+    assert job.error_code == ErrorCode.INPUT_INVALID.value
+    assert job.error_message == "Export job metadata does not match the supported export kind."
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
+
+
+async def test_process_export_job_unsupported_kind_fails_without_artifact(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _create_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revision_json",
+        export_format="json",
+        media_type="application/json",
+        options_json={"include_manifest": True},
+    )
+    monkeypatch.delitem(worker_module._EXPORT_KIND_SPECS, "revision_json")
+
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "failed"
+    assert job.error_code == ErrorCode.INPUT_INVALID.value
+    assert job.error_message == "Export job kind is not supported by the worker."
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
 
 
 async def test_process_export_job_honors_cancel_before_finalization(
@@ -539,10 +661,10 @@ async def test_process_export_job_revision_drift_fails_without_artifact(
     async def _render_without_revision_lookup(
         session: AsyncSession,
         execution: worker_module._ExportExecutionInput,
-    ) -> worker_module._RenderedExportArtifact:
+    ) -> ExportArtifact:
         _ = (session, execution)
         content_bytes = b"stale-rendered-export"
-        return worker_module._RenderedExportArtifact(
+        return ExportArtifact(
             content_bytes=content_bytes,
             checksum_sha256=hashlib.sha256(content_bytes).hexdigest(),
             size_bytes=len(content_bytes),

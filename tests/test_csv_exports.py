@@ -54,6 +54,10 @@ from tests.conftest import requires_database
 
 pytestmark = [pytest.mark.asyncio, requires_database]
 
+_FIXTURE_UUID_NAMESPACE = uuid.UUID("4b7a71cb-4eb0-4738-b6c6-8b3af08e4e3c")
+_EXPECTED_QUANTITY_CSV_CHECKSUM = "9d06cec6bd7b523c069a1d3f0d1b894a77342bb1ba0534838586db7e50a64f4e"
+_EXPECTED_ESTIMATE_CSV_CHECKSUM = "f054d06bf73f77cf1faa90e5b78efdcf606b7f15fee806641b34cda980e9f48a"
+
 
 @dataclass(frozen=True, slots=True)
 class SeededExportFixture:
@@ -88,6 +92,7 @@ async def test_render_quantity_csv_export_is_deterministic_and_stable(
     assert first.generator_name == QUANTITY_CSV_EXPORT_GENERATOR_NAME
     assert first.generator_version == QUANTITY_CSV_EXPORT_GENERATOR_VERSION
     assert first.checksum_sha256 == hashlib.sha256(first.content_bytes).hexdigest()
+    assert first.checksum_sha256 == _EXPECTED_QUANTITY_CSV_CHECKSUM
 
     rows = _read_csv_rows(first)
     assert rows[0] == list(QUANTITY_CSV_EXPORT_HEADERS)
@@ -123,6 +128,7 @@ async def test_render_estimate_csv_export_is_deterministic_and_stable(
     assert first.generator_name == ESTIMATE_CSV_EXPORT_GENERATOR_NAME
     assert first.generator_version == ESTIMATE_CSV_EXPORT_GENERATOR_VERSION
     assert first.checksum_sha256 == hashlib.sha256(first.content_bytes).hexdigest()
+    assert first.checksum_sha256 == _EXPECTED_ESTIMATE_CSV_CHECKSUM
 
     rows = _read_csv_rows(first)
     assert rows[0] == list(ESTIMATE_CSV_EXPORT_HEADERS)
@@ -232,12 +238,12 @@ def _read_csv_rows(result: CsvExportResult) -> list[list[str]]:
 
 async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     project = Project(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("project"),
         name="CSV Export Project",
         description="Fixture project",
     )
     source_file = File(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("source_file"),
         project_id=project.id,
         original_filename="fixture.dxf",
         media_type="application/dxf",
@@ -249,7 +255,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 17, 0, tzinfo=UTC),
     )
     extraction_profile = ExtractionProfile(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("extraction_profile"),
         project_id=project.id,
         profile_version="1.0",
         layout_mode="all",
@@ -261,7 +267,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 17, 1, tzinfo=UTC),
     )
     ingest_job = Job(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("ingest_job"),
         project_id=project.id,
         file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -278,7 +284,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         finished_at=datetime(2026, 5, 27, 17, 3, tzinfo=UTC),
     )
     adapter_output = AdapterRunOutput(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("adapter_output"),
         project_id=project.id,
         source_file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -297,7 +303,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 17, 4, tzinfo=UTC),
     )
     revision = DrawingRevision(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("revision"),
         project_id=project.id,
         source_file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -312,7 +318,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 17, 5, tzinfo=UTC),
     )
     quantity_job = Job(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("quantity_job"),
         project_id=project.id,
         file_id=source_file.id,
         extraction_profile_id=None,
@@ -329,7 +335,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         finished_at=datetime(2026, 5, 27, 17, 7, tzinfo=UTC),
     )
     quantity_takeoff = QuantityTakeoff(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("quantity_takeoff"),
         project_id=project.id,
         source_file_id=source_file.id,
         drawing_revision_id=revision.id,
@@ -359,7 +365,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     await db_session.flush()
 
     quantity_item_first = QuantityItem(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("quantity_item_first"),
         quantity_takeoff_id=quantity_takeoff.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -375,7 +381,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 18, 0, tzinfo=UTC),
     )
     quantity_item_second = QuantityItem(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("quantity_item_second"),
         quantity_takeoff_id=quantity_takeoff.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -395,7 +401,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     await db_session.flush()
 
     estimate_job = Job(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("estimate_job"),
         project_id=project.id,
         file_id=source_file.id,
         extraction_profile_id=None,
@@ -415,7 +421,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     await db_session.flush()
 
     estimate_version = EstimateVersion(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("estimate_version"),
         project_id=project.id,
         source_file_id=source_file.id,
         drawing_revision_id=revision.id,
@@ -433,7 +439,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     await db_session.flush()
 
     assumption_snapshot_entry_first = EstimateSnapshotEntry(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("assumption_snapshot_entry_first"),
         estimate_version_id=estimate_version.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -457,7 +463,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 18, 8, tzinfo=UTC),
     )
     assumption_snapshot_entry_second = EstimateSnapshotEntry(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("assumption_snapshot_entry_second"),
         estimate_version_id=estimate_version.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -485,7 +491,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
     await db_session.flush()
 
     estimate_item_second = EstimateItem(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("estimate_item_second"),
         estimate_version_id=estimate_version.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -515,7 +521,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         created_at=datetime(2026, 5, 27, 18, 11, tzinfo=UTC),
     )
     estimate_item_first = EstimateItem(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("estimate_item_first"),
         estimate_version_id=estimate_version.id,
         project_id=project.id,
         drawing_revision_id=revision.id,
@@ -554,3 +560,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         quantity_items=(quantity_item_first, quantity_item_second),
         estimate_items=(estimate_item_first, estimate_item_second),
     )
+
+
+def _fixture_uuid(name: str) -> uuid.UUID:
+    return uuid.uuid5(_FIXTURE_UUID_NAMESPACE, f"csv_export:{name}")

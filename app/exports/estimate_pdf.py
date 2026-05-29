@@ -8,7 +8,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from io import BytesIO
 from uuid import UUID
@@ -32,10 +32,14 @@ from reportlab.platypus import (  # type: ignore[import-untyped]
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.exports._base import (
+    ExportArtifactWithOptions,
+    JSONValue,
+    build_artifact,
+    normalize_datetime,
+    normalize_json_value_tree,
+)
 from app.models.estimate_version import EstimateItem, EstimateVersion
-
-type JSONScalar = str | int | float | bool | None
-type JSONValue = JSONScalar | list[JSONValue] | dict[str, JSONValue]
 
 ESTIMATE_PDF_EXPORT_MEDIA_TYPE = "application/pdf"
 ESTIMATE_PDF_EXPORT_GENERATOR_NAME = "estimate_pdf_export"
@@ -65,16 +69,8 @@ class EstimatePdfExportError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class EstimatePdfExportResult:
+class EstimatePdfExportResult(ExportArtifactWithOptions):
     """Pure rendered estimate PDF export artifact metadata."""
-
-    content_bytes: bytes
-    checksum_sha256: str
-    size_bytes: int
-    media_type: str
-    generator_name: str
-    generator_version: str
-    options: dict[str, JSONValue]
 
 
 async def render_estimate_pdf_export(
@@ -93,10 +89,9 @@ async def render_estimate_pdf_export(
 
     items = await _load_estimate_items(db, estimate_version_id)
     content_bytes = _render_estimate_pdf_bytes(estimate_version, items)
-    return EstimatePdfExportResult(
+    return build_artifact(
+        EstimatePdfExportResult,
         content_bytes=content_bytes,
-        checksum_sha256=hashlib.sha256(content_bytes).hexdigest(),
-        size_bytes=len(content_bytes),
         media_type=ESTIMATE_PDF_EXPORT_MEDIA_TYPE,
         generator_name=ESTIMATE_PDF_EXPORT_GENERATOR_NAME,
         generator_version=ESTIMATE_PDF_EXPORT_GENERATOR_VERSION,
@@ -423,24 +418,30 @@ def _normalize_options(options: Mapping[str, object] | None) -> dict[str, JSONVa
 
 
 def _normalize_json_value(value: object) -> JSONValue:
+    return normalize_json_value_tree(
+        value,
+        normalize_scalar=_normalize_json_scalar,
+        normalize_mapping_key=_normalize_mapping_key,
+        unsupported_value=_unsupported_json_value,
+    )
+
+
+def _normalize_json_scalar(value: object) -> tuple[bool, JSONValue]:
     if isinstance(value, UUID):
-        return str(value)
+        return True, str(value)
     if isinstance(value, datetime):
-        return _normalize_datetime(value)
+        return True, _normalize_datetime(value)
     if value is None or isinstance(value, (str, int, bool)):
-        return value
+        return True, value
     if isinstance(value, float):
         if not math.isfinite(value):
             raise TypeError("Estimate PDF export options must be finite JSON values.")
-        return value
-    if isinstance(value, list | tuple):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        return {
-            _normalize_mapping_key(key): _normalize_json_value(item) for key, item in value.items()
-        }
+        return True, value
+    return False, None
 
-    raise TypeError(f"Unsupported estimate PDF export value type: {type(value)!r}")
+
+def _unsupported_json_value(value: object) -> Exception:
+    return TypeError(f"Unsupported estimate PDF export value type: {type(value)!r}")
 
 
 def _normalize_mapping_key(key: object) -> str:
@@ -461,5 +462,4 @@ def _normalize_mapping_key(key: object) -> str:
 
 
 def _normalize_datetime(value: datetime) -> str:
-    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-    return normalized.isoformat().replace("+00:00", "Z")
+    return normalize_datetime(value)

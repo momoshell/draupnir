@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import csv
-import hashlib
-import json
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from io import StringIO
 from uuid import UUID
@@ -16,11 +14,16 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.exports._base import (
+    ExportArtifact,
+    JSONValue,
+    build_artifact,
+    canonical_json_text,
+    normalize_datetime,
+    normalize_json_value_tree,
+)
 from app.models.estimate_version import EstimateItem, EstimateVersion
 from app.models.quantity_takeoff import QuantityItem, QuantityTakeoff
-
-type JSONScalar = str | int | float | bool | None
-type JSONValue = JSONScalar | list[JSONValue] | dict[str, JSONValue]
 
 CSV_EXPORT_MEDIA_TYPE = "text/csv"
 
@@ -91,15 +94,8 @@ class EstimateCsvExportError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class CsvExportResult:
+class CsvExportResult(ExportArtifact):
     """Pure rendered CSV export artifact metadata."""
-
-    content_bytes: bytes
-    checksum_sha256: str
-    size_bytes: int
-    media_type: str
-    generator_name: str
-    generator_version: str
 
 
 async def render_quantity_csv_export(
@@ -224,10 +220,9 @@ def _build_result(
     generator_name: str,
     generator_version: str,
 ) -> CsvExportResult:
-    return CsvExportResult(
+    return build_artifact(
+        CsvExportResult,
         content_bytes=content_bytes,
-        checksum_sha256=hashlib.sha256(content_bytes).hexdigest(),
-        size_bytes=len(content_bytes),
         media_type=CSV_EXPORT_MEDIA_TYPE,
         generator_name=generator_name,
         generator_version=generator_version,
@@ -285,33 +280,34 @@ def _format_optional_json(value: object) -> str:
     if value is None:
         return ""
     normalized = _normalize_json_value(value)
-    return json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return canonical_json_text(normalized)
 
 
 def _normalize_json_value(value: object) -> JSONValue:
+    return normalize_json_value_tree(
+        value,
+        normalize_scalar=_normalize_json_scalar,
+        normalize_mapping_key=_normalize_mapping_key,
+        unsupported_value=_unsupported_json_value,
+    )
+
+
+def _normalize_json_scalar(value: object) -> tuple[bool, JSONValue]:
     if isinstance(value, UUID):
-        return str(value)
+        return True, str(value)
     if isinstance(value, datetime):
-        return _normalize_datetime(value)
+        return True, _normalize_datetime(value)
     if isinstance(value, date):
-        return value.isoformat()
+        return True, value.isoformat()
     if isinstance(value, Decimal):
-        return format(value, "f")
+        return True, format(value, "f")
     if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, list | tuple):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        return {
-            _normalize_mapping_key(key): _normalize_json_value(item) for key, item in value.items()
-        }
-    raise TypeError(f"Unsupported CSV export JSON value type: {type(value)!r}")
+        return True, value
+    return False, None
+
+
+def _unsupported_json_value(value: object) -> Exception:
+    return TypeError(f"Unsupported CSV export JSON value type: {type(value)!r}")
 
 
 def _normalize_mapping_key(key: object) -> str:
@@ -331,8 +327,7 @@ def _normalize_mapping_key(key: object) -> str:
 
 
 def _normalize_datetime(value: datetime) -> str:
-    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-    return normalized.isoformat().replace("+00:00", "Z")
+    return normalize_datetime(value)
 
 
 def _stringify_scalar(value: object) -> str:

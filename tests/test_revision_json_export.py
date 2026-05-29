@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from collections.abc import AsyncGenerator, Mapping
@@ -40,6 +39,11 @@ from app.models.revision_materialization import (
 from tests.conftest import requires_database
 
 pytestmark = [pytest.mark.asyncio, requires_database]
+
+_FIXTURE_UUID_NAMESPACE = uuid.UUID("a6f84dd8-3f4c-4f81-a4f9-2e8a14f7df70")
+_EXPECTED_REVISION_JSON_CHECKSUM = (
+    "5090d3538da96662cef7629a7536507b39b3c3ce2a5d34a524e2f5ae10c60056"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,9 +242,10 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
     expected_bytes = _canonical_json_bytes(expected_payload)
 
     assert first == second
+    assert first.checksum_sha256 == _EXPECTED_REVISION_JSON_CHECKSUM
     assert first == RevisionJsonExportResult(
         content_bytes=expected_bytes,
-        checksum_sha256=hashlib.sha256(expected_bytes).hexdigest(),
+        checksum_sha256=_EXPECTED_REVISION_JSON_CHECKSUM,
         size_bytes=len(expected_bytes),
         media_type=REVISION_JSON_EXPORT_MEDIA_TYPE,
         generator_name=REVISION_JSON_EXPORT_GENERATOR_NAME,
@@ -376,12 +381,12 @@ async def _seed_revision_fixture(
     entities: tuple[Mapping[str, Any], ...] = (),
 ) -> SeededRevisionFixture:
     project = Project(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("project"),
         name="Revision Export Project",
         description="Fixture project",
     )
     source_file = File(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("source_file"),
         project_id=project.id,
         original_filename="fixture.dxf",
         media_type="application/dxf",
@@ -393,7 +398,7 @@ async def _seed_revision_fixture(
         created_at=datetime(2026, 5, 27, 16, 0, tzinfo=UTC),
     )
     extraction_profile = ExtractionProfile(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("extraction_profile"),
         project_id=project.id,
         profile_version="1.0",
         layout_mode="all",
@@ -405,7 +410,7 @@ async def _seed_revision_fixture(
         created_at=datetime(2026, 5, 27, 16, 1, tzinfo=UTC),
     )
     source_job = Job(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("source_job"),
         project_id=project.id,
         file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -422,7 +427,7 @@ async def _seed_revision_fixture(
         finished_at=datetime(2026, 5, 27, 16, 8, tzinfo=UTC),
     )
     adapter_output = AdapterRunOutput(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("adapter_output"),
         project_id=project.id,
         source_file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -441,7 +446,7 @@ async def _seed_revision_fixture(
         created_at=datetime(2026, 5, 27, 16, 4, tzinfo=UTC),
     )
     revision = DrawingRevision(
-        id=uuid.uuid4(),
+        id=_fixture_uuid("revision"),
         project_id=project.id,
         source_file_id=source_file.id,
         extraction_profile_id=extraction_profile.id,
@@ -471,7 +476,7 @@ async def _seed_revision_fixture(
     manifest: RevisionEntityManifest | None = None
     if with_manifest:
         manifest = RevisionEntityManifest(
-            id=uuid.uuid4(),
+            id=_fixture_uuid("manifest"),
             project_id=project.id,
             source_file_id=source_file.id,
             extraction_profile_id=extraction_profile.id,
@@ -491,9 +496,9 @@ async def _seed_revision_fixture(
         await db_session.flush()
 
     created_layouts: list[RevisionLayout] = []
-    for spec in layouts:
+    for layout_index, spec in enumerate(layouts):
         created_layout = RevisionLayout(
-            id=uuid.uuid4(),
+            id=_fixture_uuid(f"layout:{layout_index}"),
             project_id=project.id,
             source_file_id=source_file.id,
             extraction_profile_id=extraction_profile.id,
@@ -511,9 +516,9 @@ async def _seed_revision_fixture(
     await db_session.flush()
 
     created_layers: list[RevisionLayer] = []
-    for spec in layers:
+    for layer_index, spec in enumerate(layers):
         created_layer = RevisionLayer(
-            id=uuid.uuid4(),
+            id=_fixture_uuid(f"layer:{layer_index}"),
             project_id=project.id,
             source_file_id=source_file.id,
             extraction_profile_id=extraction_profile.id,
@@ -531,9 +536,9 @@ async def _seed_revision_fixture(
     await db_session.flush()
 
     created_blocks: list[RevisionBlock] = []
-    for spec in blocks:
+    for block_index, spec in enumerate(blocks):
         created_block = RevisionBlock(
-            id=uuid.uuid4(),
+            id=_fixture_uuid(f"block:{block_index}"),
             project_id=project.id,
             source_file_id=source_file.id,
             extraction_profile_id=extraction_profile.id,
@@ -555,7 +560,7 @@ async def _seed_revision_fixture(
     block_by_ref = {block.block_ref: block for block in created_blocks}
     entity_by_ref: dict[str, RevisionEntity] = {}
 
-    for spec in entities:
+    for entity_index, spec in enumerate(entities):
         parent_entity_ref_raw = spec.get("parent_entity_ref")
         parent_entity_ref = None if parent_entity_ref_raw is None else str(parent_entity_ref_raw)
         layout_ref_raw = spec.get("layout_ref")
@@ -565,7 +570,7 @@ async def _seed_revision_fixture(
         block_ref_raw = spec.get("block_ref")
         block_ref = None if block_ref_raw is None else str(block_ref_raw)
         entity = RevisionEntity(
-            id=uuid.uuid4(),
+            id=_fixture_uuid(f"entity:{entity_index}"),
             project_id=project.id,
             source_file_id=source_file.id,
             extraction_profile_id=extraction_profile.id,
@@ -634,3 +639,7 @@ def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
         allow_nan=False,
     )
     return serialized.encode("utf-8")
+
+
+def _fixture_uuid(name: str) -> uuid.UUID:
+    return uuid.uuid5(_FIXTURE_UUID_NAMESPACE, f"revision_json_export:{name}")
