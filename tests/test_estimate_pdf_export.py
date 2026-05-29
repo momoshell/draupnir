@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import re
 import uuid
 import zlib
 from collections.abc import AsyncGenerator
@@ -25,6 +24,9 @@ from tests.conftest import requires_database
 from tests.test_csv_exports import _seed_export_fixture
 
 pytestmark = [pytest.mark.asyncio, requires_database]
+
+_EXPECTED_ESTIMATE_PDF_CHECKSUM = "375f6e7c221042ccd545ff16251f4a88078ffcf1358be8cff91a4b7f794155f0"
+_EXPECTED_ESTIMATE_PDF_ID = "c51390cb148e9cbe6dba713ed68dea55"
 
 
 @pytest_asyncio.fixture
@@ -54,12 +56,14 @@ async def test_render_estimate_pdf_export_is_deterministic_and_stable(
     assert first.options == {}
     assert first.size_bytes == len(first.content_bytes)
     assert first.checksum_sha256 == hashlib.sha256(first.content_bytes).hexdigest()
+    assert first.checksum_sha256 == _EXPECTED_ESTIMATE_PDF_CHECKSUM
 
     content = first.content_bytes
     assert content.startswith(b"%PDF-")
     assert b"/CreationDate (D:20000101000000+00'00')" in content
     assert b"/ModDate (D:20000101000000+00'00')" in content
-    assert re.search(rb"/ID\s*\[<[0-9a-f]{32}><[0-9a-f]{32}>\]", content) is not None
+    expected_id_bytes = _EXPECTED_ESTIMATE_PDF_ID.encode("ascii")
+    assert b"/ID [<" + expected_id_bytes + b"><" + expected_id_bytes + b">]" in content
 
 
 async def test_render_estimate_pdf_export_contains_expected_uncompressed_labels(

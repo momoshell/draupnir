@@ -51,8 +51,8 @@ from app.estimating.quantities.contracts import (
     RevisionGateMetadata,
 )
 from app.estimating.quantities.engine import compute_quantities
+from app.exports._base import ExportArtifact
 from app.exports.csv import (
-    CsvExportResult,
     EstimateCsvExportError,
     QuantityCsvExportError,
     render_estimate_csv_export,
@@ -60,12 +60,10 @@ from app.exports.csv import (
 )
 from app.exports.estimate_pdf import (
     EstimatePdfExportError,
-    EstimatePdfExportResult,
     render_estimate_pdf_export,
 )
 from app.exports.revision_json import (
     RevisionJsonExportError,
-    RevisionJsonExportResult,
     render_revision_json_export,
 )
 from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
@@ -396,16 +394,140 @@ class _ExportExecutionInput:
     estimate_version_id: UUID | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _RenderedExportArtifact:
-    """Deterministic rendered artifact bytes and metadata."""
+_ExportRenderFn = Callable[
+    [AsyncSession, _ExportExecutionInput],
+    Coroutine[Any, Any, ExportArtifact],
+]
+_ExportErrorDetailsFn = Callable[[_ExportExecutionInput], dict[str, Any]]
 
-    content_bytes: bytes
-    checksum_sha256: str
-    size_bytes: int
+_EXPORT_LINEAGE_ANCHOR_REVISION = "revision"
+_EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF = "quantity_takeoff"
+_EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION = "estimate_version"
+
+
+@dataclass(frozen=True, slots=True)
+class _ExportKindSpec:
+    """Registry entry for one supported export worker kind."""
+
+    format: str
     media_type: str
-    generator_name: str
-    generator_version: str
+    render_fn: _ExportRenderFn
+    error_type: type[Exception]
+    lineage_anchor: str
+    error_details_fn: _ExportErrorDetailsFn
+
+
+def _export_revision_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
+    """Build not-found details for revision-scoped exports."""
+    return {"drawing_revision_id": str(execution.drawing_revision_id)}
+
+
+def _export_quantity_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
+    """Build not-found details for quantity-scoped exports."""
+    assert execution.quantity_takeoff_id is not None
+    return {
+        "drawing_revision_id": str(execution.drawing_revision_id),
+        "quantity_takeoff_id": str(execution.quantity_takeoff_id),
+    }
+
+
+def _export_estimate_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
+    """Build not-found details for estimate-scoped exports."""
+    assert execution.estimate_version_id is not None
+    return {
+        "drawing_revision_id": str(execution.drawing_revision_id),
+        "estimate_version_id": str(execution.estimate_version_id),
+    }
+
+
+async def _render_revision_json_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render a revision JSON export artifact."""
+    return await render_revision_json_export(
+        session,
+        execution.drawing_revision_id,
+        options=execution.options_json,
+    )
+
+
+async def _render_quantity_csv_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render a quantity CSV export artifact."""
+    assert execution.quantity_takeoff_id is not None
+    return await render_quantity_csv_export(session, execution.quantity_takeoff_id)
+
+
+async def _render_estimate_csv_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render an estimate CSV export artifact."""
+    assert execution.estimate_version_id is not None
+    return await render_estimate_csv_export(session, execution.estimate_version_id)
+
+
+async def _render_estimate_pdf_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render an estimate PDF export artifact."""
+    assert execution.estimate_version_id is not None
+    return await render_estimate_pdf_export(
+        session,
+        execution.estimate_version_id,
+        options=execution.options_json,
+    )
+
+
+_EXPORT_KIND_SPECS: dict[str, _ExportKindSpec] = {
+    "revision_json": _ExportKindSpec(
+        format="json",
+        media_type="application/json",
+        render_fn=_render_revision_json_export_artifact,
+        error_type=RevisionJsonExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_REVISION,
+        error_details_fn=_export_revision_error_details,
+    ),
+    "quantity_csv": _ExportKindSpec(
+        format="csv",
+        media_type="text/csv",
+        render_fn=_render_quantity_csv_export_artifact,
+        error_type=QuantityCsvExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF,
+        error_details_fn=_export_quantity_error_details,
+    ),
+    "estimate_csv": _ExportKindSpec(
+        format="csv",
+        media_type="text/csv",
+        render_fn=_render_estimate_csv_export_artifact,
+        error_type=EstimateCsvExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION,
+        error_details_fn=_export_estimate_error_details,
+    ),
+    "estimate_pdf": _ExportKindSpec(
+        format="pdf",
+        media_type="application/pdf",
+        render_fn=_render_estimate_pdf_export_artifact,
+        error_type=EstimatePdfExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION,
+        error_details_fn=_export_estimate_error_details,
+    ),
+}
+
+
+def _get_export_kind_spec(export_kind: str) -> _ExportKindSpec:
+    """Return the worker registry entry for a supported export kind."""
+    export_spec = _EXPORT_KIND_SPECS.get(export_kind)
+    if export_spec is None:
+        raise _build_export_job_input_error(
+            "Export job kind is not supported by the worker.",
+            details={"export_kind": export_kind},
+        )
+    return export_spec
 
 
 _JobAttemptLease = job_lifecycle._JobAttemptLease
@@ -3252,15 +3374,15 @@ def _build_export_artifact_name(
     estimate_version_id: UUID | None = None,
 ) -> str:
     """Build a deterministic filename for a generated export artifact."""
-    if export_kind == "revision_json":
+    export_spec = _get_export_kind_spec(export_kind)
+    if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_REVISION:
         return f"revision-{drawing_revision_id}.{export_format}"
-    if export_kind == "quantity_csv":
+    if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF:
         assert quantity_takeoff_id is not None
         return f"quantity-takeoff-{quantity_takeoff_id}.{export_format}"
-    if export_kind in {"estimate_csv", "estimate_pdf"}:
-        assert estimate_version_id is not None
-        return f"estimate-{estimate_version_id}.{export_format}"
-    return f"export-{drawing_revision_id}.{export_format}"
+    assert export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION
+    assert estimate_version_id is not None
+    return f"estimate-{estimate_version_id}.{export_format}"
 
 
 def _build_export_job_input_error(
@@ -3318,67 +3440,19 @@ def _build_export_artifact_lineage_json(
 async def _render_export_artifact(
     session: AsyncSession,
     execution: _ExportExecutionInput,
-) -> _RenderedExportArtifact:
+) -> ExportArtifact:
     """Render bytes for a supported export job."""
+    export_spec = _get_export_kind_spec(execution.export_kind)
     try:
-        result: RevisionJsonExportResult | CsvExportResult | EstimatePdfExportResult
-        if execution.export_kind == "revision_json":
-            result = await render_revision_json_export(
-                session,
-                execution.drawing_revision_id,
-                options=execution.options_json,
-            )
-        elif execution.export_kind == "quantity_csv":
-            assert execution.quantity_takeoff_id is not None
-            result = await render_quantity_csv_export(session, execution.quantity_takeoff_id)
-        elif execution.export_kind == "estimate_csv":
-            assert execution.estimate_version_id is not None
-            result = await render_estimate_csv_export(session, execution.estimate_version_id)
-        elif execution.export_kind == "estimate_pdf":
-            assert execution.estimate_version_id is not None
-            result = await render_estimate_pdf_export(
-                session,
-                execution.estimate_version_id,
-                options=execution.options_json,
-            )
-        else:
+        result = await export_spec.render_fn(session, execution)
+    except Exception as exc:
+        if isinstance(exc, export_spec.error_type):
             raise _build_export_job_input_error(
-                "Export job kind is not supported by the worker.",
-                details={"export_kind": execution.export_kind},
-            )
-    except RevisionJsonExportError as exc:
-        raise _build_export_job_input_error(
-            str(exc),
-            error_code=ErrorCode.NOT_FOUND,
-            details={"drawing_revision_id": str(execution.drawing_revision_id)},
-        ) from exc
-    except QuantityCsvExportError as exc:
-        raise _build_export_job_input_error(
-            str(exc),
-            error_code=ErrorCode.NOT_FOUND,
-            details={
-                "drawing_revision_id": str(execution.drawing_revision_id),
-                "quantity_takeoff_id": str(execution.quantity_takeoff_id),
-            },
-        ) from exc
-    except EstimateCsvExportError as exc:
-        raise _build_export_job_input_error(
-            str(exc),
-            error_code=ErrorCode.NOT_FOUND,
-            details={
-                "drawing_revision_id": str(execution.drawing_revision_id),
-                "estimate_version_id": str(execution.estimate_version_id),
-            },
-        ) from exc
-    except EstimatePdfExportError as exc:
-        raise _build_export_job_input_error(
-            str(exc),
-            error_code=ErrorCode.NOT_FOUND,
-            details={
-                "drawing_revision_id": str(execution.drawing_revision_id),
-                "estimate_version_id": str(execution.estimate_version_id),
-            },
-        ) from exc
+                str(exc),
+                error_code=ErrorCode.NOT_FOUND,
+                details=export_spec.error_details_fn(execution),
+            ) from exc
+        raise
 
     if result.media_type != execution.media_type:
         raise ValueError("Rendered export media type does not match the persisted export job input")
@@ -3390,14 +3464,7 @@ async def _render_export_artifact(
     if len(result.content_bytes) != result.size_bytes:
         raise ValueError("Rendered export size does not match the generated bytes")
 
-    return _RenderedExportArtifact(
-        content_bytes=result.content_bytes,
-        checksum_sha256=result.checksum_sha256,
-        size_bytes=result.size_bytes,
-        media_type=result.media_type,
-        generator_name=result.generator_name,
-        generator_version=result.generator_version,
-    )
+    return result
 
 
 async def _build_export_execution_input(
@@ -3465,23 +3532,10 @@ async def _build_export_execution_input(
         ):
             raise ValueError("Export job base revision does not belong to the source file")
 
-        supported_exports: dict[str, tuple[str, str]] = {
-            "revision_json": ("json", "application/json"),
-            "quantity_csv": ("csv", "text/csv"),
-            "estimate_csv": ("csv", "text/csv"),
-            "estimate_pdf": ("pdf", "application/pdf"),
-        }
-        expected_export_metadata = supported_exports.get(export_input.export_kind)
-        if expected_export_metadata is None:
-            raise _build_export_job_input_error(
-                "Export job kind is not supported by the worker.",
-                details={"export_kind": export_input.export_kind},
-            )
-
-        expected_format, expected_media_type = expected_export_metadata
+        export_spec = _get_export_kind_spec(export_input.export_kind)
         if (
-            export_input.export_format != expected_format
-            or export_input.media_type != expected_media_type
+            export_input.export_format != export_spec.format
+            or export_input.media_type != export_spec.media_type
         ):
             raise _build_export_job_input_error(
                 "Export job metadata does not match the supported export kind.",
@@ -3493,7 +3547,7 @@ async def _build_export_execution_input(
             )
 
         options_json = deepcopy(export_input.options_json)
-        if export_input.export_kind == "revision_json":
+        if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_REVISION:
             if (
                 export_input.quantity_takeoff_id is not None
                 or export_input.estimate_version_id is not None
@@ -3558,7 +3612,7 @@ async def _build_export_execution_input(
                 },
             )
 
-        if export_input.export_kind == "quantity_csv":
+        if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF:
             if export_input.estimate_version_id is not None:
                 raise _build_export_job_input_error(
                     "Quantity CSV export input contains unexpected estimate linkage.",
@@ -3638,7 +3692,7 @@ async def _finalize_export_job(
     *,
     attempt_token: UUID,
     execution: _ExportExecutionInput,
-    rendered: _RenderedExportArtifact,
+    rendered: ExportArtifact,
 ) -> bool:
     """Atomically publish one export artifact and terminal job success."""
     session_maker = get_session_maker()

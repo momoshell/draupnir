@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.exports._base import (
+    ExportArtifactWithOptions,
+    JSONValue,
+    build_artifact,
+    canonical_json_bytes,
+    normalize_datetime,
+    normalize_json_value_tree,
+)
 from app.models.drawing_revision import DrawingRevision
 from app.models.revision_materialization import (
     RevisionBlock,
@@ -20,9 +26,6 @@ from app.models.revision_materialization import (
     RevisionLayer,
     RevisionLayout,
 )
-
-type JSONScalar = str | int | float | bool | None
-type JSONValue = JSONScalar | list[JSONValue] | dict[str, JSONValue]
 
 REVISION_JSON_EXPORT_SCHEMA_VERSION = "revision-json-export-v1"
 REVISION_JSON_EXPORT_MEDIA_TYPE = "application/json"
@@ -35,16 +38,8 @@ class RevisionJsonExportError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class RevisionJsonExportResult:
+class RevisionJsonExportResult(ExportArtifactWithOptions):
     """Pure rendered revision JSON export artifact metadata."""
-
-    content_bytes: bytes
-    checksum_sha256: str
-    size_bytes: int
-    media_type: str
-    generator_name: str
-    generator_version: str
-    options: dict[str, JSONValue]
 
 
 async def render_revision_json_export(
@@ -148,10 +143,9 @@ async def render_revision_json_export(
     }
 
     content_bytes = _canonical_json_bytes(payload)
-    return RevisionJsonExportResult(
+    return build_artifact(
+        RevisionJsonExportResult,
         content_bytes=content_bytes,
-        checksum_sha256=hashlib.sha256(content_bytes).hexdigest(),
-        size_bytes=len(content_bytes),
         media_type=REVISION_JSON_EXPORT_MEDIA_TYPE,
         generator_name=REVISION_JSON_EXPORT_GENERATOR_NAME,
         generator_version=REVISION_JSON_EXPORT_GENERATOR_VERSION,
@@ -227,32 +221,33 @@ def _normalize_options(options: Mapping[str, object] | None) -> dict[str, JSONVa
 
 
 def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
-    normalized = _normalize_json_value(payload)
-    serialized = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
+    return canonical_json_bytes(
+        payload,
+        normalize_value=_normalize_json_value,
     )
-    return serialized.encode("utf-8")
 
 
 def _normalize_json_value(value: object) -> JSONValue:
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, datetime):
-        return _normalize_datetime(value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, list | tuple):
-        return [_normalize_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        return {
-            _normalize_mapping_key(key): _normalize_json_value(item) for key, item in value.items()
-        }
+    return normalize_json_value_tree(
+        value,
+        normalize_scalar=_normalize_json_scalar,
+        normalize_mapping_key=_normalize_mapping_key,
+        unsupported_value=_unsupported_json_value,
+    )
 
-    raise TypeError(f"Unsupported revision JSON export value type: {type(value)!r}")
+
+def _normalize_json_scalar(value: object) -> tuple[bool, JSONValue]:
+    if isinstance(value, UUID):
+        return True, str(value)
+    if isinstance(value, datetime):
+        return True, _normalize_datetime(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return True, value
+    return False, None
+
+
+def _unsupported_json_value(value: object) -> Exception:
+    return TypeError(f"Unsupported revision JSON export value type: {type(value)!r}")
 
 
 def _normalize_mapping_key(key: object) -> str:
@@ -269,5 +264,4 @@ def _normalize_mapping_key(key: object) -> str:
 
 
 def _normalize_datetime(value: datetime) -> str:
-    normalized = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-    return normalized.isoformat().replace("+00:00", "Z")
+    return normalize_datetime(value)
