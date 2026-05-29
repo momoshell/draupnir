@@ -11,6 +11,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.estimating.catalog.api_checksums import formula_checksum_sha256
+from app.estimating.money import validate_catalog_money
 
 CatalogScopeType = Literal["global", "project"]
 CatalogCurrencyCode = Literal["GBP"]
@@ -47,14 +48,7 @@ def _require_json_object_array(value: object, *, field_name: str) -> list[dict[s
 
 
 def _validate_positive_money(value: Decimal, *, field_name: str) -> Decimal:
-    if not value.is_finite():
-        raise ValueError(f"{field_name} must be finite.")
-    if value <= Decimal("0"):
-        raise ValueError(f"{field_name} must be greater than zero.")
-    exponent = value.as_tuple().exponent
-    if not isinstance(exponent, int) or exponent < -6:
-        raise ValueError(f"{field_name} must use at most six decimal places.")
-    return value
+    return validate_catalog_money(value, field_name=field_name)
 
 
 def _validate_scope(scope_type: CatalogScopeType, project_id: UUID | None) -> None:
