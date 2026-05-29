@@ -10,6 +10,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import utcnow as _clock_utcnow
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
 from app.db.session import get_session_maker
@@ -68,7 +69,7 @@ class _BeginOrResumeLogKeys:
 
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(UTC)
+    return _clock_utcnow()
 
 
 def _clear_job_attempt_lease(job: Job) -> None:
