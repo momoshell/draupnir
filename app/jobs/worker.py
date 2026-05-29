@@ -24,6 +24,7 @@ from celery.signals import worker_ready
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.clock import utcnow as _clock_utcnow
 from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
@@ -72,6 +73,7 @@ from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.jobs import lifecycle as job_lifecycle
+from app.jobs import runner as job_runner
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
@@ -94,15 +96,9 @@ from app.storage.keys import build_generated_artifact_storage_key
 
 logger = get_logger(__name__)
 
-_RECOVERABLE_INGEST_JOB_TYPES = (JobType.INGEST.value, JobType.REPROCESS.value)
-_RECOVERABLE_ENQUEUE_JOB_TYPES = (
-    JobType.INGEST.value,
-    JobType.REPROCESS.value,
-    JobType.QUANTITY_TAKEOFF.value,
-    JobType.ESTIMATE.value,
-    JobType.EXPORT.value,
-)
-_KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER: frozenset[str] = frozenset()
+_RECOVERABLE_INGEST_JOB_TYPES = job_runner.INGEST_WORKER_JOB_TYPES
+_RECOVERABLE_ENQUEUE_JOB_TYPES = job_runner.RECOVERABLE_ENQUEUE_JOB_TYPES
+_KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = job_runner.JOB_TYPES_WITHOUT_ENQUEUE_PUBLISHER
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 _ENQUEUE_STATUS_PENDING = "pending"
 _ENQUEUE_STATUS_PUBLISHING = "publishing"
@@ -112,11 +108,21 @@ _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
 _ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
-_ENQUEUE_INGEST_JOB_ERROR_MESSAGE = "Failed to enqueue ingest job"
-_ENQUEUE_REPROCESS_JOB_ERROR_MESSAGE = "Failed to enqueue reprocess job"
-_ENQUEUE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to enqueue quantity takeoff job"
-_ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to enqueue estimate job"
-_ENQUEUE_EXPORT_JOB_ERROR_MESSAGE = "Failed to enqueue export job"
+_ENQUEUE_INGEST_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.INGEST.value
+]
+_ENQUEUE_REPROCESS_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.REPROCESS.value
+]
+_ENQUEUE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.QUANTITY_TAKEOFF.value
+]
+_ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.ESTIMATE.value
+]
+_ENQUEUE_EXPORT_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.EXPORT.value
+]
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
@@ -189,17 +195,16 @@ def is_recoverable_enqueue_job_type(job_type: JobType | str) -> bool:
 def get_job_enqueue_publisher(job_type: JobType | str) -> Callable[[UUID], None] | None:
     """Return the queue publisher registered for a persisted worker job type."""
     normalized_job_type = job_type.value if isinstance(job_type, JobType) else job_type
-    if normalized_job_type in _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER:
+    handler = job_runner.get_job_handler(normalized_job_type)
+    if handler is None or normalized_job_type in _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER:
         return None
-
-    registry: dict[str, Callable[[UUID], None]] = {
-        JobType.INGEST.value: enqueue_ingest_job,
-        JobType.REPROCESS.value: enqueue_ingest_job,
-        JobType.QUANTITY_TAKEOFF.value: enqueue_quantity_takeoff_job,
-        JobType.ESTIMATE.value: enqueue_estimate_job,
-        JobType.EXPORT.value: enqueue_export_job,
-    }
-    return registry.get(normalized_job_type)
+    publisher_name = handler.enqueue_publisher_name
+    if publisher_name is None:
+        return None
+    publisher = globals().get(publisher_name)
+    if publisher is None:
+        return None
+    return cast(Callable[[UUID], None], publisher)
 
 
 _InactiveSourceError = job_lifecycle._InactiveSourceError
@@ -271,6 +276,110 @@ class _ExportJobInputError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+type _RegisteredJobInputError = (
+    _QuantityTakeoffJobError | _EstimateJobInputError | _ExportJobInputError
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredJobAttemptResult:
+    """Deferred finalization kwargs returned by a registered job execution step."""
+
+    finalize_kwargs: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredJobProcessSpec:
+    """Shared shell configuration for registered persisted worker jobs."""
+
+    job_type_name: job_runner.JobTypeName
+    input_error_type: type[Exception] | None
+    input_failure_log_event: str | None
+    stale_attempt_log_event: str
+    revision_conflict_log_event: str
+    cancelled_during_execution_log_event: str
+    cancelled_during_finalization_log_event: str
+    process_failed_log_event: str
+    finalization_failed_log_event: str
+    succeeded_log_event: str
+    process_error_message: str
+    finalize_error_message: str
+    execution_result_arg_name: str | None = None
+    execution_error_type: type[Exception] | None = None
+    execution_error_handler_name: str | None = None
+    inactive_source_log_event: str | None = None
+    finalization_exception_log_fields_name: str | None = None
+    reraise_revision_conflict: bool = False
+
+
+_INGEST_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="ingest",
+    input_error_type=None,
+    input_failure_log_event=None,
+    stale_attempt_log_event="ingest_job_stale_attempt_skipped",
+    revision_conflict_log_event="ingest_job_revision_conflict",
+    cancelled_during_execution_log_event="ingest_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="ingest_job_cancelled_during_finalization",
+    process_failed_log_event="ingest_job_failed",
+    finalization_failed_log_event="ingest_job_finalization_failed",
+    succeeded_log_event="ingest_job_succeeded",
+    process_error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE,
+    execution_result_arg_name="payload",
+    execution_error_type=IngestionRunnerError,
+    execution_error_handler_name="_handle_ingest_runner_error",
+    inactive_source_log_event="ingest_job_cancelled_inactive_source",
+    finalization_exception_log_fields_name="_build_ingest_finalization_error_log_fields",
+    reraise_revision_conflict=True,
+)
+
+
+_QUANTITY_TAKEOFF_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="quantity_takeoff",
+    input_error_type=_QuantityTakeoffJobError,
+    input_failure_log_event="quantity_takeoff_job_input_failed",
+    stale_attempt_log_event="quantity_takeoff_job_stale_attempt_skipped",
+    revision_conflict_log_event="quantity_takeoff_job_revision_conflict",
+    cancelled_during_execution_log_event="quantity_takeoff_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="quantity_takeoff_job_cancelled_during_finalization",
+    process_failed_log_event="quantity_takeoff_job_failed",
+    finalization_failed_log_event="quantity_takeoff_job_finalization_failed",
+    succeeded_log_event="quantity_takeoff_job_succeeded",
+    process_error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
+)
+
+_ESTIMATE_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="estimate",
+    input_error_type=_EstimateJobInputError,
+    input_failure_log_event="estimate_job_input_failed",
+    stale_attempt_log_event="estimate_job_stale_attempt_skipped",
+    revision_conflict_log_event="estimate_job_revision_conflict",
+    cancelled_during_execution_log_event="estimate_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="estimate_job_cancelled_during_finalization",
+    process_failed_log_event="estimate_job_failed",
+    finalization_failed_log_event="estimate_job_finalization_failed",
+    succeeded_log_event="estimate_job_succeeded",
+    process_error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
+)
+
+_EXPORT_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="export",
+    input_error_type=_ExportJobInputError,
+    input_failure_log_event="export_job_input_failed",
+    stale_attempt_log_event="export_job_stale_attempt_skipped",
+    revision_conflict_log_event="export_job_revision_conflict",
+    cancelled_during_execution_log_event="export_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="export_job_cancelled_during_finalization",
+    process_failed_log_event="export_job_failed",
+    finalization_failed_log_event="export_job_finalization_failed",
+    succeeded_log_event="export_job_succeeded",
+    process_error_message=_PROCESS_EXPORT_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_EXPORT_JOB_ERROR_MESSAGE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,7 +563,7 @@ celery_app.autodiscover_tasks(["app.jobs"], force=True)
 
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(UTC)
+    return _clock_utcnow()
 
 
 def _get_worker_loop_runner() -> asyncio.Runner:
@@ -2497,13 +2606,7 @@ async def _cleanup_failed_storage_writes(
 
 def _get_enqueue_job_error_message(job_type: str) -> str:
     """Return the persisted enqueue failure message for a worker job type."""
-    return {
-        JobType.INGEST.value: _ENQUEUE_INGEST_JOB_ERROR_MESSAGE,
-        JobType.REPROCESS.value: _ENQUEUE_REPROCESS_JOB_ERROR_MESSAGE,
-        JobType.QUANTITY_TAKEOFF.value: _ENQUEUE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
-        JobType.ESTIMATE.value: _ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE,
-        JobType.EXPORT.value: _ENQUEUE_EXPORT_JOB_ERROR_MESSAGE,
-    }.get(job_type, "Failed to enqueue job")
+    return job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE.get(job_type, "Failed to enqueue job")
 
 
 async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> IngestionRunRequest:
@@ -4583,12 +4686,34 @@ async def _cancel_job_for_inactive_source(
     )
 
 
-async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
-    """Claim, resume, or cancel a persisted ingest job under a row lock."""
-    return await job_lifecycle._begin_or_resume_ingest_job(
+def _get_begin_or_resume_route(process_name: str) -> job_runner.BeginOrResumeRoute:
+    """Return registry-backed begin/resume metadata for a worker process."""
+    route = job_runner.get_begin_or_resume_route(process_name)
+    if route is None:
+        raise LookupError(f"No begin/resume route registered for process '{process_name}'")
+    return route
+
+
+async def _begin_or_resume_registered_job(
+    job_id: UUID,
+    *,
+    process_name: str,
+) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted worker job via registry metadata."""
+    route = _get_begin_or_resume_route(process_name)
+    return await job_lifecycle._begin_or_resume_job(
         job_id,
+        supported_job_types=route.supported_job_types,
         terminal_job_statuses=_TERMINAL_JOB_STATUSES,
         stale_after=_RUNNING_JOB_STALE_AFTER,
+        log_keys=job_lifecycle._BeginOrResumeLogKeys(
+            unsupported_type=route.log_keys.unsupported_type,
+            terminal_status=route.log_keys.terminal_status,
+            inactive_source=route.log_keys.inactive_source,
+            reclaimed_stale_running=route.log_keys.reclaimed_stale_running,
+            duplicate_delivery=route.log_keys.duplicate_delivery,
+            cancelled=route.log_keys.cancelled,
+        ),
         session_maker_factory=get_session_maker,
         lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
         cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
@@ -4600,55 +4725,27 @@ async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
     )
 
 
+async def _begin_or_resume_ingest_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted ingest job under a row lock."""
+    return await _begin_or_resume_registered_job(job_id, process_name="process_ingest_job")
+
+
 async def _begin_or_resume_quantity_takeoff_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted quantity takeoff job under a row lock."""
-    return await job_lifecycle._begin_or_resume_quantity_takeoff_job(
+    return await _begin_or_resume_registered_job(
         job_id,
-        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
-        stale_after=_RUNNING_JOB_STALE_AFTER,
-        session_maker_factory=get_session_maker,
-        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
-        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
-        claim_job_attempt_lease_func=_claim_job_attempt_lease,
-        is_stale_running_job_func=_is_stale_running_job,
-        finalize_job_cancelled_func=_finalize_job_cancelled,
-        emit_job_event_func=emit_job_event,
-        logger_instance=logger,
+        process_name="process_quantity_takeoff_job",
     )
 
 
 async def _begin_or_resume_estimate_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted estimate job under a row lock."""
-    return await job_lifecycle._begin_or_resume_estimate_job(
-        job_id,
-        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
-        stale_after=_RUNNING_JOB_STALE_AFTER,
-        session_maker_factory=get_session_maker,
-        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
-        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
-        claim_job_attempt_lease_func=_claim_job_attempt_lease,
-        is_stale_running_job_func=_is_stale_running_job,
-        finalize_job_cancelled_func=_finalize_job_cancelled,
-        emit_job_event_func=emit_job_event,
-        logger_instance=logger,
-    )
+    return await _begin_or_resume_registered_job(job_id, process_name="process_estimate_job")
 
 
 async def _begin_or_resume_export_job(job_id: UUID) -> _JobAttemptLease | None:
     """Claim, resume, or cancel a persisted export job under a row lock."""
-    return await job_lifecycle._begin_or_resume_export_job(
-        job_id,
-        terminal_job_statuses=_TERMINAL_JOB_STATUSES,
-        stale_after=_RUNNING_JOB_STALE_AFTER,
-        session_maker_factory=get_session_maker,
-        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
-        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
-        claim_job_attempt_lease_func=_claim_job_attempt_lease,
-        is_stale_running_job_func=_is_stale_running_job,
-        finalize_job_cancelled_func=_finalize_job_cancelled,
-        emit_job_event_func=emit_job_event,
-        logger_instance=logger,
-    )
+    return await _begin_or_resume_registered_job(job_id, process_name="process_export_job")
 
 
 async def _execute_ingest_job_attempt(
@@ -4688,100 +4785,308 @@ async def _execute_ingest_job_attempt(
         )
 
 
-async def process_ingest_job(job_id: UUID) -> None:
-    """Load a persisted ingest job, run ingestion, and persist state transitions."""
+async def _handle_ingest_runner_error(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    exc: IngestionRunnerError,
+) -> None:
+    """Persist and log the expected ingest runner failure contract."""
+    if exc.error_code is ErrorCode.JOB_CANCELLED:
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=attempt_token,
+            log_event="ingest_job_cancelled_during_execution",
+            log_fields={"error_code": exc.error_code.value},
+        )
+        return
+
+    await _mark_job_failed(
+        job_id,
+        error_message=exc.message,
+        error_code=exc.error_code,
+        attempt_token=attempt_token,
+    )
+    logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
+
+
+def _build_ingest_finalization_error_log_fields(exc: Exception) -> dict[str, str]:
+    """Preserve the legacy ingest finalization error log payload."""
+    return {"error": str(exc)}
+
+
+def _get_registered_job_handler(job_type_name: job_runner.JobTypeName) -> job_runner.JobHandler:
+    """Return registered worker metadata for one persisted job type."""
+    handler = job_runner.get_job_handler(job_type_name)
+    if handler is None:
+        raise LookupError(f"No worker handler registered for job type '{job_type_name}'")
+    return handler
+
+
+def _resolve_registered_job_callable(name: str) -> Any:
+    """Late-bind a worker callable by name for monkeypatch-friendly wrappers."""
+    resolved = globals().get(name)
+    if resolved is None:
+        raise LookupError(f"Worker callable '{name}' is not defined")
+    return resolved
+
+
+async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSpec) -> None:
+    """Run one registered persisted worker job through the shared execution shell."""
     _ensure_worker_database_configured()
 
-    lease = await _begin_or_resume_ingest_job(job_id)
+    handler = _get_registered_job_handler(spec.job_type_name)
+    execute_name = handler.execute_name
+    finalize_name = handler.finalize_name
+    if execute_name is None:
+        raise LookupError(f"Worker handler '{spec.job_type_name}' is missing execute_name")
+    if finalize_name is None:
+        raise LookupError(f"Worker handler '{spec.job_type_name}' is missing finalize_name")
+
+    lease = await _begin_or_resume_registered_job(job_id, process_name=handler.process_name)
     if lease is None:
         return
 
-    try:
-        payload = await _execute_ingest_job_attempt(job_id, attempt_token=lease.token)
-    except _InactiveSourceError:
-        logger.info("ingest_job_cancelled_inactive_source", job_id=str(job_id))
-        return
-    except _StaleJobAttemptError:
-        logger.info("ingest_job_stale_attempt_skipped", job_id=str(job_id))
-        return
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="ingest_job_revision_conflict",
-            exc=exc,
-        )
-        raise
-    except IngestionRunnerError as exc:
-        if exc.error_code is ErrorCode.JOB_CANCELLED:
-            await _mark_job_cancelled_with_log(
-                job_id,
-                attempt_token=lease.token,
-                log_event="ingest_job_cancelled_during_execution",
-                log_fields={"error_code": exc.error_code.value},
-            )
-        else:
-            await _mark_job_failed(
-                job_id,
-                error_message=exc.message,
-                error_code=exc.error_code,
-                attempt_token=lease.token,
-            )
-            logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
-        raise
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="ingest_job_cancelled_during_execution",
-        )
-        raise
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_PROCESS_INGEST_JOB_ERROR_MESSAGE,
-            log_event="ingest_job_failed",
-        )
-        raise
+    execute_job = cast(Any, _resolve_registered_job_callable(execute_name))
+    finalize_job = cast(Any, _resolve_registered_job_callable(finalize_name))
 
     try:
-        finalized = await _finalize_ingest_job(
-            job_id,
-            attempt_token=lease.token,
-            payload=payload,
-        )
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="ingest_job_cancelled_during_finalization",
-        )
-        raise
+        execution_result = await execute_job(job_id, attempt_token=lease.token)
+    except _InactiveSourceError:
+        if spec.inactive_source_log_event is None:
+            raise
+        logger.info(spec.inactive_source_log_event, job_id=str(job_id))
+        return
+    except _StaleJobAttemptError:
+        logger.info(spec.stale_attempt_log_event, job_id=str(job_id))
+        return
     except _RevisionConflictError as exc:
         await _mark_job_failed_for_revision_conflict(
             job_id,
             attempt_token=lease.token,
-            log_event="ingest_job_revision_conflict",
+            log_event=spec.revision_conflict_log_event,
             exc=exc,
+        )
+        if spec.reraise_revision_conflict:
+            raise
+        return
+    except asyncio.CancelledError:
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event=spec.cancelled_during_execution_log_event,
         )
         raise
     except Exception as exc:
+        if spec.input_error_type is not None and isinstance(exc, spec.input_error_type):
+            input_error = cast(_RegisteredJobInputError, exc)
+            failure_details = input_error.details
+            await _mark_job_failed(
+                job_id,
+                error_message=input_error.message,
+                error_code=input_error.error_code,
+                attempt_token=lease.token,
+                error_details=failure_details,
+            )
+            if spec.input_failure_log_event is None:
+                raise AssertionError(
+                    f"Registered job '{spec.job_type_name}' is missing input_failure_log_event"
+                ) from exc
+            logger.warning(
+                spec.input_failure_log_event,
+                job_id=str(job_id),
+                error_code=input_error.error_code.value,
+                **(failure_details or {}),
+            )
+            return
+
+        if spec.execution_error_type is not None and isinstance(exc, spec.execution_error_type):
+            if spec.execution_error_handler_name is None:
+                raise AssertionError(
+                    f"Registered job '{spec.job_type_name}' is missing execution_error_handler_name"
+                ) from exc
+            handle_execution_error = cast(
+                Any,
+                _resolve_registered_job_callable(spec.execution_error_handler_name),
+            )
+            await handle_execution_error(job_id, attempt_token=lease.token, exc=exc)
+            raise
+
         await _mark_job_failed_with_internal_error_log(
             job_id,
             attempt_token=lease.token,
-            error_message=_FINALIZE_INGEST_JOB_ERROR_MESSAGE,
-            log_event="ingest_job_finalization_failed",
-            log_fields={"error": str(exc)},
+            error_message=spec.process_error_message,
+            log_event=spec.process_failed_log_event,
+        )
+        raise
+
+    if execution_result is None:
+        return
+
+    if isinstance(execution_result, _RegisteredJobAttemptResult):
+        finalize_kwargs = execution_result.finalize_kwargs
+    else:
+        if spec.execution_result_arg_name is None:
+            raise TypeError(
+                "Registered job "
+                f"'{spec.job_type_name}' returned a raw execution result without "
+                "execution_result_arg_name"
+            )
+        finalize_kwargs = {spec.execution_result_arg_name: execution_result}
+
+    try:
+        finalized = await finalize_job(
+            job_id,
+            attempt_token=lease.token,
+            **finalize_kwargs,
+        )
+    except asyncio.CancelledError:
+        await _mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=lease.token,
+            log_event=spec.cancelled_during_finalization_log_event,
+        )
+        raise
+    except _RevisionConflictError as exc:
+        await _mark_job_failed_for_revision_conflict(
+            job_id,
+            attempt_token=lease.token,
+            log_event=spec.revision_conflict_log_event,
+            exc=exc,
+        )
+        if spec.reraise_revision_conflict:
+            raise
+        return
+    except Exception as exc:
+        log_fields: dict[str, Any] | None = None
+        if spec.finalization_exception_log_fields_name is not None:
+            build_log_fields = cast(
+                Callable[[Exception], dict[str, Any]],
+                _resolve_registered_job_callable(spec.finalization_exception_log_fields_name),
+            )
+            log_fields = build_log_fields(exc)
+        await _mark_job_failed_with_internal_error_log(
+            job_id,
+            attempt_token=lease.token,
+            error_message=spec.finalize_error_message,
+            log_event=spec.finalization_failed_log_event,
+            log_fields=log_fields,
         )
         raise
 
     if finalized:
-        logger.info("ingest_job_succeeded", job_id=str(job_id))
+        logger.info(spec.succeeded_log_event, job_id=str(job_id))
 
 
-async def recover_incomplete_ingest_jobs() -> list[UUID]:
-    """Requeue incomplete persisted ingest/reprocess/quantity/estimate jobs on worker startup."""
+async def _execute_quantity_takeoff_job_attempt(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _RegisteredJobAttemptResult | None:
+    """Build quantity inputs, compute deterministic outputs, and defer finalization."""
+    execution = await _build_quantity_takeoff_execution_input(job_id, attempt_token=attempt_token)
+    if execution.quantity_gate in {"review_gated", "blocked"}:
+        error_details = _quantity_gate_details(
+            drawing_revision_id=execution.drawing_revision_id,
+            review_state=execution.review_state,
+            validation_status=execution.validation_status,
+            quantity_gate=execution.quantity_gate,
+        )
+        await _mark_job_failed(
+            job_id,
+            error_message=_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE,
+            error_code=ErrorCode.INPUT_INVALID,
+            attempt_token=attempt_token,
+            error_details=error_details,
+        )
+        logger.warning(
+            "quantity_takeoff_job_gate_blocked",
+            job_id=str(job_id),
+            error_code=ErrorCode.INPUT_INVALID.value,
+            **error_details,
+        )
+        return None
+
+    result = compute_quantities(execution.gate, execution.entities)
+    if result.conflicts:
+        error_details = {
+            "drawing_revision_id": str(execution.drawing_revision_id),
+            "quantity_gate": execution.quantity_gate,
+            "conflict_count": len(result.conflicts),
+            "conflicts": _build_quantity_conflict_summaries(result.conflicts),
+        }
+        await _mark_job_failed(
+            job_id,
+            error_message=_QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE,
+            error_code=ErrorCode.INPUT_INVALID,
+            attempt_token=attempt_token,
+            error_details=error_details,
+        )
+        logger.warning(
+            "quantity_takeoff_job_conflicts_detected",
+            job_id=str(job_id),
+            error_code=ErrorCode.INPUT_INVALID.value,
+            **error_details,
+        )
+        return None
+
+    return _RegisteredJobAttemptResult(finalize_kwargs={"execution": execution, "result": result})
+
+
+async def _execute_estimate_job_attempt(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _RegisteredJobAttemptResult:
+    """Build deterministic estimate inputs and defer output persistence."""
+    engine_input = await _build_estimate_engine_input(job_id, attempt_token=attempt_token)
+    try:
+        estimate_output = compose_estimate(engine_input)
+    except EstimateEngineError as exc:
+        raise _EstimateJobInputError(
+            error_code=ErrorCode.INPUT_INVALID,
+            message=_ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
+            details={"reason": exc.reason},
+        ) from exc
+
+    logger.info(
+        "estimate_job_composed_pending_finalization",
+        job_id=str(job_id),
+        quantity_entry_count=len(engine_input.quantity_entries),
+        rate_entry_count=len(engine_input.rate_entries),
+        material_entry_count=len(engine_input.material_entries),
+        formula_entry_count=len(engine_input.formula_entries),
+        line_count=len(engine_input.line_inputs),
+    )
+    return _RegisteredJobAttemptResult(finalize_kwargs={"output": estimate_output})
+
+
+async def _execute_export_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _RegisteredJobAttemptResult:
+    """Build export inputs, render deterministic bytes, and defer finalization."""
+    execution = await _build_export_execution_input(job_id, attempt_token=attempt_token)
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        rendered = await _render_export_artifact(session, execution)
+
+    return _RegisteredJobAttemptResult(
+        finalize_kwargs={"execution": execution, "rendered": rendered}
+    )
+
+
+async def process_ingest_job(job_id: UUID) -> None:
+    """Load a persisted ingest job, run ingestion, and persist state transitions."""
+    await _process_registered_job(job_id, spec=_INGEST_PROCESS_SPEC)
+
+
+async def recover_incomplete_jobs() -> list[UUID]:
+    """Requeue incomplete persisted worker jobs on worker startup."""
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -4850,8 +5155,13 @@ async def recover_incomplete_ingest_jobs() -> list[UUID]:
     return enqueued_job_ids
 
 
+async def recover_incomplete_ingest_jobs() -> list[UUID]:
+    """Compatibility alias for incomplete worker job recovery."""
+    return await recover_incomplete_jobs()
+
+
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
-    """Requeue incomplete ingest/reprocess/quantity/estimate jobs when a worker starts."""
+    """Requeue incomplete persisted worker jobs when a worker starts."""
     try:
         recovered_job_ids = _run_worker_loop(recover_incomplete_ingest_jobs)
     except Exception as exc:
@@ -4886,134 +5196,7 @@ def enqueue_ingest_job(job_id: UUID) -> None:
 
 async def process_quantity_takeoff_job(job_id: UUID) -> None:
     """Load a persisted quantity takeoff job and atomically persist its result."""
-    _ensure_worker_database_configured()
-
-    lease = await _begin_or_resume_quantity_takeoff_job(job_id)
-    if lease is None:
-        return
-
-    try:
-        execution = await _build_quantity_takeoff_execution_input(job_id, attempt_token=lease.token)
-        if execution.quantity_gate in {"review_gated", "blocked"}:
-            error_details = _quantity_gate_details(
-                drawing_revision_id=execution.drawing_revision_id,
-                review_state=execution.review_state,
-                validation_status=execution.validation_status,
-                quantity_gate=execution.quantity_gate,
-            )
-            await _mark_job_failed(
-                job_id,
-                error_message=_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE,
-                error_code=ErrorCode.INPUT_INVALID,
-                attempt_token=lease.token,
-                error_details=error_details,
-            )
-            logger.warning(
-                "quantity_takeoff_job_gate_blocked",
-                job_id=str(job_id),
-                error_code=ErrorCode.INPUT_INVALID.value,
-                **error_details,
-            )
-            return
-
-        result = compute_quantities(execution.gate, execution.entities)
-        if result.conflicts:
-            error_details = {
-                "drawing_revision_id": str(execution.drawing_revision_id),
-                "quantity_gate": execution.quantity_gate,
-                "conflict_count": len(result.conflicts),
-                "conflicts": _build_quantity_conflict_summaries(result.conflicts),
-            }
-            await _mark_job_failed(
-                job_id,
-                error_message=_QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE,
-                error_code=ErrorCode.INPUT_INVALID,
-                attempt_token=lease.token,
-                error_details=error_details,
-            )
-            logger.warning(
-                "quantity_takeoff_job_conflicts_detected",
-                job_id=str(job_id),
-                error_code=ErrorCode.INPUT_INVALID.value,
-                **error_details,
-            )
-            return
-    except _StaleJobAttemptError:
-        logger.info("quantity_takeoff_job_stale_attempt_skipped", job_id=str(job_id))
-        return
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="quantity_takeoff_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except _QuantityTakeoffJobError as exc:
-        failure_details: dict[str, Any] | None = exc.details
-        await _mark_job_failed(
-            job_id,
-            error_message=exc.message,
-            error_code=exc.error_code,
-            attempt_token=lease.token,
-            error_details=failure_details,
-        )
-        logger.warning(
-            "quantity_takeoff_job_input_failed",
-            job_id=str(job_id),
-            error_code=exc.error_code.value,
-            **(failure_details or {}),
-        )
-        return
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="quantity_takeoff_job_cancelled_during_execution",
-        )
-        raise
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
-            log_event="quantity_takeoff_job_failed",
-        )
-        raise
-
-    try:
-        finalized = await _finalize_quantity_takeoff_job(
-            job_id,
-            attempt_token=lease.token,
-            execution=execution,
-            result=result,
-        )
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="quantity_takeoff_job_cancelled_during_finalization",
-        )
-        raise
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="quantity_takeoff_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE,
-            log_event="quantity_takeoff_job_finalization_failed",
-        )
-        raise
-
-    if finalized:
-        logger.info("quantity_takeoff_job_succeeded", job_id=str(job_id))
+    await _process_registered_job(job_id, spec=_QUANTITY_TAKEOFF_PROCESS_SPEC)
 
 
 @celery_app.task(
@@ -5034,116 +5217,7 @@ def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
 
 async def process_estimate_job(job_id: UUID) -> None:
     """Load a persisted estimate job and assemble deterministic engine inputs."""
-    _ensure_worker_database_configured()
-
-    lease = await _begin_or_resume_estimate_job(job_id)
-    if lease is None:
-        return
-
-    try:
-        engine_input = await _build_estimate_engine_input(job_id, attempt_token=lease.token)
-        estimate_output = compose_estimate(engine_input)
-    except _StaleJobAttemptError:
-        logger.info("estimate_job_stale_attempt_skipped", job_id=str(job_id))
-        return
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="estimate_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except _EstimateJobInputError as exc:
-        failure_details = exc.details
-        await _mark_job_failed(
-            job_id,
-            error_message=exc.message,
-            error_code=exc.error_code,
-            attempt_token=lease.token,
-            error_details=failure_details,
-        )
-        logger.warning(
-            "estimate_job_input_failed",
-            job_id=str(job_id),
-            error_code=exc.error_code.value,
-            **(failure_details or {}),
-        )
-        return
-    except EstimateEngineError as exc:
-        failure_details = {"reason": exc.reason}
-        await _mark_job_failed(
-            job_id,
-            error_message=_ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
-            error_code=ErrorCode.INPUT_INVALID,
-            attempt_token=lease.token,
-            error_details=failure_details,
-        )
-        logger.warning(
-            "estimate_job_input_failed",
-            job_id=str(job_id),
-            error_code=ErrorCode.INPUT_INVALID.value,
-            **failure_details,
-        )
-        return
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="estimate_job_cancelled_during_execution",
-        )
-        raise
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_PROCESS_ESTIMATE_JOB_ERROR_MESSAGE,
-            log_event="estimate_job_failed",
-        )
-        raise
-
-    logger.info(
-        "estimate_job_composed_pending_finalization",
-        job_id=str(job_id),
-        quantity_entry_count=len(engine_input.quantity_entries),
-        rate_entry_count=len(engine_input.rate_entries),
-        material_entry_count=len(engine_input.material_entries),
-        formula_entry_count=len(engine_input.formula_entries),
-        line_count=len(engine_input.line_inputs),
-    )
-
-    try:
-        finalized = await _finalize_estimate_job(
-            job_id,
-            attempt_token=lease.token,
-            output=estimate_output,
-        )
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="estimate_job_cancelled_during_finalization",
-        )
-        raise
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="estimate_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE,
-            log_event="estimate_job_finalization_failed",
-        )
-        raise
-
-    if finalized:
-        logger.info("estimate_job_succeeded", job_id=str(job_id))
+    await _process_registered_job(job_id, spec=_ESTIMATE_PROCESS_SPEC)
 
 
 @celery_app.task(
@@ -5164,95 +5238,7 @@ def enqueue_estimate_job(job_id: UUID) -> None:
 
 async def process_export_job(job_id: UUID) -> None:
     """Load a persisted export job and atomically persist its generated artifact."""
-    _ensure_worker_database_configured()
-
-    lease = await _begin_or_resume_export_job(job_id)
-    if lease is None:
-        return
-
-    try:
-        execution = await _build_export_execution_input(job_id, attempt_token=lease.token)
-        session_maker = get_session_maker()
-        if session_maker is None:
-            raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-        async with session_maker() as session:
-            rendered = await _render_export_artifact(session, execution)
-    except _StaleJobAttemptError:
-        logger.info("export_job_stale_attempt_skipped", job_id=str(job_id))
-        return
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="export_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except _ExportJobInputError as exc:
-        failure_details = exc.details
-        await _mark_job_failed(
-            job_id,
-            error_message=exc.message,
-            error_code=exc.error_code,
-            attempt_token=lease.token,
-            error_details=failure_details,
-        )
-        logger.warning(
-            "export_job_input_failed",
-            job_id=str(job_id),
-            error_code=exc.error_code.value,
-            **(failure_details or {}),
-        )
-        return
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="export_job_cancelled_during_execution",
-        )
-        raise
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_PROCESS_EXPORT_JOB_ERROR_MESSAGE,
-            log_event="export_job_failed",
-        )
-        raise
-
-    try:
-        finalized = await _finalize_export_job(
-            job_id,
-            attempt_token=lease.token,
-            execution=execution,
-            rendered=rendered,
-        )
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event="export_job_cancelled_during_finalization",
-        )
-        raise
-    except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event="export_job_revision_conflict",
-            exc=exc,
-        )
-        return
-    except Exception:
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=_FINALIZE_EXPORT_JOB_ERROR_MESSAGE,
-            log_event="export_job_finalization_failed",
-        )
-        raise
-
-    if finalized:
-        logger.info("export_job_succeeded", job_id=str(job_id))
+    await _process_registered_job(job_id, spec=_EXPORT_PROCESS_SPEC)
 
 
 @celery_app.task(

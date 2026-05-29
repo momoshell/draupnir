@@ -1,6 +1,7 @@
 """Quantity worker integration tests."""
 
 import json
+import types
 import uuid
 from copy import deepcopy
 from dataclasses import replace
@@ -2013,3 +2014,68 @@ class TestJobsWorkerQuantity:
             "expected_entities": 1,
             "loaded_entities": 0,
         }
+
+    async def test_process_quantity_takeoff_job_uses_late_bound_registered_runner_callables(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quantity wrapper should late-bind registered execution/finalization callables."""
+        _ = self
+
+        job_id = uuid.uuid4()
+        attempt_token = uuid.uuid4()
+        calls: list[tuple[Any, ...]] = []
+
+        monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
+
+        async def _fake_begin_or_resume_registered_job(
+            job_id_value: uuid.UUID,
+            *,
+            process_name: str,
+        ) -> Any:
+            calls.append(("begin", job_id_value, process_name))
+            return types.SimpleNamespace(token=attempt_token)
+
+        async def _fake_execute_quantity_takeoff_job_attempt(
+            job_id_value: uuid.UUID,
+            *,
+            attempt_token: uuid.UUID,
+        ) -> Any:
+            calls.append(("execute", job_id_value, attempt_token))
+            return worker_module._RegisteredJobAttemptResult(
+                finalize_kwargs={"execution": "execution", "result": "result"}
+            )
+
+        async def _fake_finalize_quantity_takeoff_job(
+            job_id_value: uuid.UUID,
+            *,
+            attempt_token: uuid.UUID,
+            execution: str,
+            result: str,
+        ) -> bool:
+            calls.append(("finalize", job_id_value, attempt_token, execution, result))
+            return True
+
+        monkeypatch.setattr(
+            worker_module,
+            "_begin_or_resume_registered_job",
+            _fake_begin_or_resume_registered_job,
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "_execute_quantity_takeoff_job_attempt",
+            _fake_execute_quantity_takeoff_job_attempt,
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "_finalize_quantity_takeoff_job",
+            _fake_finalize_quantity_takeoff_job,
+        )
+
+        await worker_module.process_quantity_takeoff_job(job_id)
+
+        assert calls == [
+            ("begin", job_id, "process_quantity_takeoff_job"),
+            ("execute", job_id, attempt_token),
+            ("finalize", job_id, attempt_token, "execution", "result"),
+        ]

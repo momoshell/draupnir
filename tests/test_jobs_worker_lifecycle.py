@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 import app.api.v1.files as files_api
 import app.db.session as session_module
+import app.jobs.runner as runner_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.ingestion.contracts import CancellationHandle
@@ -34,6 +35,269 @@ from tests.jobs_test_helpers import (
     _upload_file,
     fake_ingestion_runner,
 )
+
+
+def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
+    """Runner registry should explicitly describe the persisted worker job types."""
+    expected_recoverable_job_types = (
+        JobType.INGEST.value,
+        JobType.REPROCESS.value,
+        JobType.QUANTITY_TAKEOFF.value,
+        JobType.ESTIMATE.value,
+        JobType.EXPORT.value,
+    )
+    expected_ingest_worker_job_types = (
+        JobType.INGEST.value,
+        JobType.REPROCESS.value,
+    )
+    expected_begin_or_resume_routes = {
+        "process_ingest_job": (
+            JobType.INGEST.value,
+            JobType.REPROCESS.value,
+        ),
+        "process_quantity_takeoff_job": (JobType.QUANTITY_TAKEOFF.value,),
+        "process_estimate_job": (JobType.ESTIMATE.value,),
+        "process_export_job": (JobType.EXPORT.value,),
+    }
+
+    assert [handler.job_type_name for handler in runner_module.JOB_HANDLERS] == [
+        JobType.INGEST.value,
+        JobType.REPROCESS.value,
+        JobType.QUANTITY_TAKEOFF.value,
+        JobType.ESTIMATE.value,
+        JobType.EXPORT.value,
+    ]
+    assert expected_recoverable_job_types == runner_module.RECOVERABLE_ENQUEUE_JOB_TYPES
+    assert expected_ingest_worker_job_types == runner_module.INGEST_WORKER_JOB_TYPES
+    assert {
+        route.process_name: route.supported_job_types
+        for route in runner_module.BEGIN_OR_RESUME_ROUTES
+    } == expected_begin_or_resume_routes
+
+    ingest_handler = runner_module.get_job_handler(JobType.INGEST.value)
+    reprocess_handler = runner_module.get_job_handler(JobType.REPROCESS.value)
+    export_handler = runner_module.get_job_handler(JobType.EXPORT.value)
+    ingest_route = runner_module.get_begin_or_resume_route("process_ingest_job")
+    export_route = runner_module.get_begin_or_resume_route("process_export_job")
+
+    assert ingest_handler is not None
+    assert reprocess_handler is not None
+    assert export_handler is not None
+    assert ingest_route is not None
+    assert export_route is not None
+    assert reprocess_handler.execute_name == ingest_handler.execute_name
+    assert ingest_handler.execute_name == "_execute_ingest_job_attempt"
+    assert reprocess_handler.finalize_name == ingest_handler.finalize_name == "_finalize_ingest_job"
+    assert reprocess_handler.process_name == ingest_handler.process_name == "process_ingest_job"
+    assert reprocess_handler.run_task_name == ingest_handler.run_task_name == "run_ingest_job"
+    assert (
+        reprocess_handler.enqueue_publisher_name
+        == ingest_handler.enqueue_publisher_name
+        == "enqueue_ingest_job"
+    )
+    assert ingest_route.supported_job_types == expected_ingest_worker_job_types
+    assert ingest_route.log_keys.terminal_status == "ingest_job_cancel_skipped_terminal_status"
+    assert reprocess_handler.enqueue_error_message == "Failed to enqueue reprocess job"
+    assert export_handler.execute_name == "_execute_export_job"
+    assert export_handler.finalize_name == "_finalize_export_job"
+    assert export_handler.process_name == "process_export_job"
+    assert export_handler.run_task_name == "run_export_job"
+    assert export_handler.enqueue_publisher_name == "enqueue_export_job"
+    assert export_handler.enqueue_error_message == "Failed to enqueue export job"
+    assert export_route.supported_job_types == (JobType.EXPORT.value,)
+    assert (
+        export_route.log_keys.reclaimed_stale_running == "export_job_reclaimed_stale_running_status"
+    )
+
+
+def test_worker_registry_derived_helpers_preserve_public_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker metadata helpers should remain registry-derived and monkeypatch-friendly."""
+    published_ingest_job_ids: list[uuid.UUID] = []
+    published_export_job_ids: list[uuid.UUID] = []
+
+    def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+        published_ingest_job_ids.append(job_id)
+
+    def _fake_export_enqueue(job_id: uuid.UUID) -> None:
+        published_export_job_ids.append(job_id)
+
+    monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
+    monkeypatch.setattr(worker_module, "enqueue_export_job", _fake_export_enqueue)
+
+    assert worker_module.is_ingest_worker_job_type(JobType.INGEST) is True
+    assert worker_module.is_ingest_worker_job_type(JobType.REPROCESS.value) is True
+    assert worker_module.is_ingest_worker_job_type(JobType.ESTIMATE) is False
+
+    for job_type in (
+        JobType.INGEST,
+        JobType.REPROCESS,
+        JobType.QUANTITY_TAKEOFF,
+        JobType.ESTIMATE,
+        JobType.EXPORT,
+    ):
+        assert worker_module.is_recoverable_enqueue_job_type(job_type) is True
+
+    publisher = worker_module.get_job_enqueue_publisher(JobType.REPROCESS)
+    assert publisher is _fake_recovery_enqueue
+    export_publisher = worker_module.get_job_enqueue_publisher(JobType.EXPORT)
+    assert export_publisher is _fake_export_enqueue
+
+    sample_job_id = uuid.uuid4()
+    assert publisher is not None
+    publisher(sample_job_id)
+    assert published_ingest_job_ids == [sample_job_id]
+
+    sample_export_job_id = uuid.uuid4()
+    assert export_publisher is not None
+    export_publisher(sample_export_job_id)
+    assert published_export_job_ids == [sample_export_job_id]
+
+    assert worker_module._get_enqueue_job_error_message(JobType.REPROCESS.value) == (
+        "Failed to enqueue reprocess job"
+    )
+    assert worker_module._get_enqueue_job_error_message(JobType.EXPORT.value) == (
+        "Failed to enqueue export job"
+    )
+    assert worker_module._get_enqueue_job_error_message("unknown") == "Failed to enqueue job"
+
+
+@pytest.mark.asyncio
+async def test_process_ingest_job_wrapper_late_binds_registered_callables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ingest wrapper should late-bind registered execution/finalization callables."""
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    payload = _build_fake_ingest_payload(
+        IngestionRunRequest(
+            job_id=job_id,
+            file_id=uuid.uuid4(),
+            checksum_sha256=hashlib.sha256(_TEST_UPLOAD_BODY).hexdigest(),
+            detected_format="pdf",
+            media_type="application/pdf",
+            original_name="plan.pdf",
+            extraction_profile_id=None,
+            initial_job_id=job_id,
+        )
+    )
+    observed_calls: list[tuple[Any, ...]] = []
+
+    async def _fake_begin_or_resume_registered_job(
+        received_job_id: uuid.UUID,
+        *,
+        process_name: str,
+    ) -> types.SimpleNamespace:
+        observed_calls.append(("begin", received_job_id, process_name))
+        return types.SimpleNamespace(token=attempt_token)
+
+    async def _fake_execute_ingest_job_attempt(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> IngestFinalizationPayload:
+        observed_calls.append(("execute", received_job_id, attempt_token))
+        return payload
+
+    async def _fake_finalize_ingest_job(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+        payload: IngestFinalizationPayload,
+    ) -> bool:
+        observed_calls.append(("finalize", received_job_id, attempt_token, payload))
+        return True
+
+    monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "_begin_or_resume_registered_job",
+        _fake_begin_or_resume_registered_job,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_execute_ingest_job_attempt",
+        _fake_execute_ingest_job_attempt,
+    )
+    monkeypatch.setattr(worker_module, "_finalize_ingest_job", _fake_finalize_ingest_job)
+
+    await worker_module.process_ingest_job(job_id)
+
+    assert observed_calls == [
+        ("begin", job_id, "process_ingest_job"),
+        ("execute", job_id, attempt_token),
+        ("finalize", job_id, attempt_token, payload),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_export_job_wrapper_late_binds_registered_callables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Export wrapper should late-bind registered execution/finalization callables."""
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    observed_calls: list[tuple[Any, ...]] = []
+
+    async def _fake_begin_or_resume_registered_job(
+        received_job_id: uuid.UUID,
+        *,
+        process_name: str,
+    ) -> types.SimpleNamespace:
+        observed_calls.append(("begin", received_job_id, process_name))
+        return types.SimpleNamespace(token=attempt_token)
+
+    async def _fake_execute_export_job(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> worker_module._RegisteredJobAttemptResult:
+        observed_calls.append(("execute", received_job_id, attempt_token))
+        return worker_module._RegisteredJobAttemptResult(
+            finalize_kwargs={"execution": "execution", "rendered": "rendered"}
+        )
+
+    async def _fake_finalize_export_job(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+        execution: str,
+        rendered: str,
+    ) -> bool:
+        observed_calls.append(("finalize", received_job_id, attempt_token, execution, rendered))
+        return True
+
+    monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "_begin_or_resume_registered_job",
+        _fake_begin_or_resume_registered_job,
+    )
+    monkeypatch.setattr(worker_module, "_execute_export_job", _fake_execute_export_job)
+    monkeypatch.setattr(worker_module, "_finalize_export_job", _fake_finalize_export_job)
+
+    await worker_module.process_export_job(job_id)
+
+    assert observed_calls == [
+        ("begin", job_id, "process_export_job"),
+        ("execute", job_id, attempt_token),
+        ("finalize", job_id, attempt_token, "execution", "rendered"),
+    ]
+
+
+def test_worker_task_names_preserve_public_compatibility() -> None:
+    """Celery task names should stay aligned with the registered public wrappers."""
+    assert worker_module.run_ingest_job.name == "app.jobs.worker.run_ingest_job"
+    assert worker_module.run_export_job.name == "app.jobs.worker.run_export_job"
+
+    ingest_handler = runner_module.get_job_handler(JobType.INGEST.value)
+    export_handler = runner_module.get_job_handler(JobType.EXPORT.value)
+
+    assert ingest_handler is not None
+    assert export_handler is not None
+    assert ingest_handler.run_task_name == worker_module.run_ingest_job.__name__
+    assert export_handler.run_task_name == worker_module.run_export_job.__name__
 
 
 @pytest.mark.usefixtures(fake_ingestion_runner.__name__)
@@ -184,6 +448,67 @@ class TestJobsWorkerLifecycle:
         assert updated_job.job_type == "reprocess"
         assert updated_job.status == "succeeded"
         assert updated_job.attempts == 1
+
+    async def test_recover_incomplete_jobs_requeues_stranded_pending_export_jobs(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Canonical recovery should requeue pending export jobs through the registry."""
+        _ = self
+        _ = cleanup_projects
+
+        recovered_job_ids: list[str] = []
+
+        def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
+            recovered_job_ids.append(str(job_id))
+
+        async def _skip_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (job_id, publisher, suppress_exceptions, kwargs)
+            return False
+
+        monkeypatch.setattr(files_api, "publish_job_enqueue_intent", _skip_publish)
+        monkeypatch.setattr(worker_module, "enqueue_export_job", _fake_recovery_enqueue)
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        initial_job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(initial_job.id)
+        reprocess_response = await async_client.post(
+            f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
+            json={"extraction_profile_id": str(initial_job.extraction_profile_id)},
+        )
+        assert reprocess_response.status_code == 202
+        job = await _get_job(uuid.UUID(reprocess_response.json()["id"]))
+        enqueued_job_ids.clear()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.job_type = JobType.EXPORT.value
+            persisted_job.extraction_profile_id = None
+            await session.commit()
+
+        requeued = await worker_module.recover_incomplete_jobs()
+
+        assert recovered_job_ids == [str(job.id)]
+        assert requeued == [job.id]
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.job_type == JobType.EXPORT.value
+        assert updated_job.status == "pending"
+        assert updated_job.enqueue_status == "published"
+        assert updated_job.enqueue_attempts == 1
 
     async def test_process_ingest_job_cancels_mid_run_when_project_is_deleted(
         self,

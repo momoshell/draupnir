@@ -6,10 +6,11 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from app.core.clock import utcnow as _clock_utcnow
 from app.ingestion.contracts import AdapterResult, InputFamily
 from app.ingestion.validation import (
     VALIDATION_REPORT_SCHEMA_VERSION,
@@ -63,7 +64,7 @@ class IngestFinalizationContext:
 
 def utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(UTC)
+    return _clock_utcnow()
 
 
 def resolve_revision_kind(job_id: UUID, *, initial_job_id: UUID | None) -> str:
@@ -190,6 +191,8 @@ def _resolve_canonical_schema_version(canonical_json: dict[str, Any]) -> str:
     canonical_json["canonical_entity_schema_version"] = _CANONICAL_ENTITY_SCHEMA_VERSION
     canonical_json.setdefault("schema_version", _CANONICAL_ENTITY_SCHEMA_VERSION)
     return _CANONICAL_ENTITY_SCHEMA_VERSION
+
+
 def _json_compatible(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return _json_compatible(asdict(value))
