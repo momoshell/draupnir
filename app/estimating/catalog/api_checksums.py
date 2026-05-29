@@ -16,8 +16,9 @@ from app.estimating.formulas import (
     ValueContract,
     validate_formula_definition_json,
 )
+from app.estimating.money import CATALOG_QUANTUM, validate_catalog_money
 
-_SIX_DECIMAL_PLACES = Decimal("0.000001")
+_SIX_DECIMAL_PLACES = CATALOG_QUANTUM
 _ZERO = Decimal("0.000000")
 
 
@@ -225,15 +226,7 @@ def _validate_gbp_currency(currency: str) -> None:
 
 
 def _validate_positive_money(value: Decimal, *, field_name: str) -> None:
-    if not isinstance(value, Decimal):
-        raise ValueError(f"{field_name} must be a Decimal.")
-    if not value.is_finite():
-        raise ValueError(f"{field_name} must be finite.")
-    if value <= Decimal("0"):
-        raise ValueError(f"{field_name} must be greater than zero.")
-    exponent = value.as_tuple().exponent
-    if not isinstance(exponent, int) or exponent < -6:
-        raise ValueError(f"{field_name} must use at most six decimal places.")
+    validate_catalog_money(value, field_name=field_name, require_decimal=True)
 
 
 def _validate_effective_window(effective_from: date, effective_to: date | None) -> None:

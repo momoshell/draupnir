@@ -27,10 +27,24 @@ from app.estimating.formulas import (
     RoundingSpec,
     ValueContract,
 )
+from app.estimating.money import round_money
 
 QUANTITY_M = ValueContract(kind="quantity", unit="m")
 RATE_GBP_PER_M = ValueContract(kind="rate", currency="GBP", per_unit="m")
 MONEY_GBP = ValueContract(kind="money", currency="GBP")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("0"), Decimal("0.00")),
+        (Decimal("2.225"), Decimal("2.23")),
+        (Decimal("5.555"), Decimal("5.56")),
+        (Decimal("30.864195"), Decimal("30.86")),
+    ],
+)
+def test_round_money_uses_gbp_cent_half_up(value: Decimal, expected: Decimal) -> None:
+    assert round_money(value) == expected
 
 
 def _formula_definition() -> FormulaDefinition:
@@ -566,6 +580,51 @@ def test_compose_estimate_rejects_negative_adjustment_lines() -> None:
         compose_estimate(broken_input)
 
     assert exc_info.value.reason == "negative_adjustment"
+
+
+def test_compose_estimate_rejects_invalid_rate_scale() -> None:
+    engine_input = _valid_engine_input()
+    broken_input = EstimateEngineInput(
+        estimate_job_id=engine_input.estimate_job_id,
+        project_id=engine_input.project_id,
+        file_id=engine_input.file_id,
+        drawing_revision_id=engine_input.drawing_revision_id,
+        quantity_takeoff_id=engine_input.quantity_takeoff_id,
+        source_job_id=engine_input.source_job_id,
+        quantity_gate=engine_input.quantity_gate,
+        trusted_totals=engine_input.trusted_totals,
+        tax_rate=engine_input.tax_rate,
+        quantity_entries=engine_input.quantity_entries,
+        rate_entries=(
+            EstimateRateEntryInput(
+                entry_key="rate:installer",
+                entry_label="Installer labour",
+                sort_order=3,
+                source_rate_id=uuid4(),
+                source_checksum_sha256="c" * 64,
+                unit="m",
+                effective_date=date(2026, 1, 1),
+                unit_amount=Decimal("12.3456789"),
+            ),
+        ),
+        material_entries=(),
+        formula_entries=(),
+        assumption_entries=(),
+        line_inputs=(
+            EstimateLineInputSpec(
+                line_key="line:labour",
+                line_type="rate",
+                description="Installer labour",
+                quantity_entry_key="quantity:labour",
+                rate_entry_key="rate:installer",
+            ),
+        ),
+    )
+
+    with pytest.raises(EstimateEngineError) as exc_info:
+        compose_estimate(broken_input)
+
+    assert exc_info.value.reason == "invalid_rate_scale"
 
 
 @pytest.mark.parametrize(

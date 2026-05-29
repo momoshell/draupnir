@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import csv
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from io import StringIO
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.estimating.money import (
+    format_catalog_decimal as shared_format_catalog_decimal,
+)
+from app.estimating.money import (
+    format_money,
+)
 from app.exports._base import (
     ExportArtifact,
     JSONValue,
@@ -80,8 +86,6 @@ ESTIMATE_CSV_EXPORT_HEADERS: tuple[str, ...] = (
     "created_at",
 )
 
-_MONEY_QUANTUM = Decimal("0.01")
-_RATE_QUANTITY_QUANTUM = Decimal("0.000001")
 _SPREADSHEET_FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
@@ -197,13 +201,13 @@ def _iter_estimate_rows(
             _escape_spreadsheet_text_cell(item.line_type),
             _escape_spreadsheet_text_cell(item.description),
             _escape_spreadsheet_text_cell(item.currency),
-            _format_optional_decimal(item.quantity_value, quantum=_RATE_QUANTITY_QUANTUM),
+            _format_optional_decimal(item.quantity_value, formatter=_format_catalog_decimal),
             _escape_spreadsheet_text_cell(item.quantity_unit or ""),
-            _format_optional_decimal(item.unit_rate_amount, quantum=_RATE_QUANTITY_QUANTUM),
+            _format_optional_decimal(item.unit_rate_amount, formatter=_format_catalog_decimal),
             item.effective_date.isoformat() if item.effective_date is not None else "",
-            _format_decimal(item.subtotal_amount, quantum=_MONEY_QUANTUM),
-            _format_decimal(item.tax_amount, quantum=_MONEY_QUANTUM),
-            _format_decimal(item.total_amount, quantum=_MONEY_QUANTUM),
+            _format_money(item.subtotal_amount),
+            _format_money(item.tax_amount),
+            _format_money(item.total_amount),
             _format_optional_json(item.rounding_json),
             _format_optional_uuid(item.quantity_snapshot_entry_id),
             _format_optional_uuid(item.rate_snapshot_entry_id),
@@ -251,17 +255,22 @@ def _format_quantity_item_value(value: float | None) -> str:
     return format(value, ".15g")
 
 
-def _format_decimal(value: Decimal, *, quantum: Decimal) -> str:
-    normalized = value.quantize(quantum, rounding=ROUND_HALF_UP)
-    if normalized.is_zero():
-        normalized = abs(normalized)
-    return format(normalized, "f")
+def _format_money(value: Decimal) -> str:
+    return format_money(value, normalize_zero=True)
 
 
-def _format_optional_decimal(value: Decimal | None, *, quantum: Decimal) -> str:
+def _format_catalog_decimal(value: Decimal) -> str:
+    return shared_format_catalog_decimal(value, normalize_zero=True)
+
+
+def _format_optional_decimal(
+    value: Decimal | None,
+    *,
+    formatter: Callable[[Decimal], str],
+) -> str:
     if value is None:
         return ""
-    return _format_decimal(value, quantum=quantum)
+    return formatter(value)
 
 
 def _format_optional_uuid(value: UUID | None) -> str:

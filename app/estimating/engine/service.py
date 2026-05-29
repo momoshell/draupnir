@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
@@ -31,11 +31,11 @@ from app.estimating.formulas import (
     ValueContract,
     evaluate_formula,
 )
+from app.estimating.money import CATALOG_QUANTUM, round_money
 
 type _SnapshotValueType = Literal["quantity_input", "rate", "material", "assumption"]
 
-_MONEY_QUANTUM = Decimal("0.01")
-_CATALOG_QUANTUM = Decimal("0.000001")
+_CATALOG_QUANTUM = CATALOG_QUANTUM
 _CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -675,7 +675,7 @@ def _apply_formula_rounding(amount: Decimal, rounding_spec: RoundingSpec | None)
 
 
 def _money(value: Decimal) -> Decimal:
-    return value.quantize(_MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    return round_money(value)
 
 
 def _quantity_decimal(value: Decimal) -> Decimal:

@@ -6,10 +6,10 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 from io import BytesIO
 from uuid import UUID
 
@@ -32,6 +32,7 @@ from reportlab.platypus import (  # type: ignore[import-untyped]
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.estimating.money import format_catalog_decimal, format_money
 from app.exports._base import (
     ExportArtifactWithOptions,
     JSONValue,
@@ -47,8 +48,6 @@ ESTIMATE_PDF_EXPORT_GENERATOR_VERSION = "1"
 
 _PAGE_SIZE = A4
 _PAGE_MARGIN = 15 * mm
-_MONEY_QUANTUM = Decimal("0.01")
-_RATE_QUANTITY_QUANTUM = Decimal("0.000001")
 _PDF_INFO_TIMESTAMP = b"D:20000101000000+00'00'"
 _PDF_ID_PLACEHOLDER = b"0" * 32
 _LINE_TABLE_COLUMN_WIDTHS = (
@@ -296,24 +295,29 @@ def _build_items_table(
                 _paragraph(item.line_type, body_style),
                 _paragraph(item.description, body_style),
                 _paragraph(
-                    _format_optional_decimal(item.quantity_value, quantum=_RATE_QUANTITY_QUANTUM),
+                    _format_optional_decimal(
+                        item.quantity_value,
+                        formatter=format_catalog_decimal,
+                    ),
                     body_right_style,
                 ),
                 _paragraph(item.quantity_unit or "", body_style),
                 _paragraph(
-                    _format_optional_decimal(item.unit_rate_amount, quantum=_RATE_QUANTITY_QUANTUM),
+                    _format_optional_decimal(
+                        item.unit_rate_amount, formatter=format_catalog_decimal
+                    ),
                     body_right_style,
                 ),
                 _paragraph(
-                    _format_decimal(item.subtotal_amount, quantum=_MONEY_QUANTUM),
+                    format_money(item.subtotal_amount),
                     body_right_style,
                 ),
                 _paragraph(
-                    _format_decimal(item.tax_amount, quantum=_MONEY_QUANTUM),
+                    format_money(item.tax_amount),
                     body_right_style,
                 ),
                 _paragraph(
-                    _format_decimal(item.total_amount, quantum=_MONEY_QUANTUM),
+                    format_money(item.total_amount),
                     body_right_style,
                 ),
             ]
@@ -359,7 +363,7 @@ def _totals_row(
     return [
         _paragraph(label, body_style),
         "",
-        _paragraph(_format_decimal(amount, quantum=_MONEY_QUANTUM), body_right_style),
+        _paragraph(format_money(amount), body_right_style),
     ]
 
 
@@ -373,15 +377,14 @@ def _escape_paragraph_text(value: str) -> str:
     )
 
 
-def _format_decimal(value: Decimal, *, quantum: Decimal) -> str:
-    normalized = value.quantize(quantum, rounding=ROUND_HALF_UP)
-    return format(normalized, "f")
-
-
-def _format_optional_decimal(value: Decimal | None, *, quantum: Decimal) -> str:
+def _format_optional_decimal(
+    value: Decimal | None,
+    *,
+    formatter: Callable[[Decimal], str],
+) -> str:
     if value is None:
         return ""
-    return _format_decimal(value, quantum=quantum)
+    return formatter(value)
 
 
 def _normalize_pdf_bytes(content_bytes: bytes) -> bytes:

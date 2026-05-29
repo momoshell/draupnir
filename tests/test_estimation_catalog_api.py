@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 from sqlalchemy import select
 
 import app.db.session as session_module
@@ -17,7 +18,9 @@ from app.estimating.catalog.api_checksums import (
     material_checksum_sha256,
     rate_checksum_sha256,
 )
+from app.estimating.money import CATALOG_QUANTUM, GBP_MONEY_QUANTUM, validate_catalog_money
 from app.models.project import Project
+from app.schemas.estimation_catalog import EstimationRateCreate
 from tests.conftest import requires_database
 
 
@@ -189,6 +192,39 @@ def test_formula_checksum_is_deterministic_for_json_key_order_and_changes_with_c
     # Assert
     assert checksum_a == checksum_b
     assert checksum_a != checksum_changed
+
+
+def test_validate_catalog_money_uses_shared_scale_constants_and_returns_original_decimal() -> None:
+    value = Decimal("12.500000")
+
+    assert Decimal("0.01") == GBP_MONEY_QUANTUM
+    assert Decimal("0.000001") == CATALOG_QUANTUM
+    assert validate_catalog_money(value, field_name="amount") is value
+
+
+def test_rate_checksum_requires_decimal_amount_type() -> None:
+    payload = _valid_rate_payload(project_id=str(uuid4()))
+
+    with pytest.raises(ValueError, match="amount must be a Decimal\\."):
+        rate_checksum_sha256(
+            scope_type=payload["scope_type"],
+            project_id=UUID(payload["project_id"]),
+            rate_key=payload["rate_key"],
+            source=payload["source"],
+            metadata_json=payload["metadata_json"],
+            name=payload["name"],
+            item_type=payload["item_type"],
+            per_unit=payload["per_unit"],
+            currency=payload["currency"],
+            amount=payload["amount"],
+            effective_from=date.fromisoformat(payload["effective_from"]),
+            effective_to=None,
+        )
+
+
+def test_estimation_rate_schema_amount_validator_keeps_existing_message() -> None:
+    with pytest.raises(ValueError, match="amount must use at most six decimal places\\."):
+        EstimationRateCreate.validate_amount(Decimal("12.5000001"))
 
 
 def _missing_uuid() -> str:
