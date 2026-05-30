@@ -1,0 +1,6 @@
+# Issue #297 profiling note
+
+- Repro command (local snapshot, not a permanent benchmark): `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_api and not compose_smoke" PROFILE_INTEGRATION_DURATIONS=50 PROFILE_INTEGRATION_DURATIONS_MIN=0.2`
+- Timing snapshot: collect-only preflight `1.718s`, full pytest run (includes normal collection) `73.203s`, combined wall clock `74.921s`; results `161 passed, 814 deselected, 8 warnings`.
+- Top runtime contributors in the `db_api` lane: six export-create API cases at `6.10s`-`6.14s` each — idempotency different-payload rejection, `estimate_csv` persistence, `estimate_pdf` persistence, replay idempotent request, `revision_json` persistence, and `quantity_csv` persistence; file upload size/format setup phases at roughly `0.36s`-`0.42s`; one revision quantity→estimate flow call at `0.39s`; one revision materialization filter call at `0.24s`; one project update setup at `0.23s`.
+- Follow-up recommendations: profile the export-create tests together first (likely shared fixture/setup or repeated DB/app startup cost), then trim file-upload fixture overhead, and finally review the quantity→estimate/materialization paths for avoidable setup duplication or unnecessary DB work.

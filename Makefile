@@ -11,6 +11,7 @@
 #   make test        — Run full pytest suite
 #   make smoke       — Run fast smoke pytest lane
 #   make integration — Run full DB-backed integration pytest lane
+#   make profile-integration — Profile DB-backed integration lane timing
 #   make integration-db-api — Run DB API integration pytest lane
 #   make integration-db-worker — Run DB worker integration pytest lane
 #   make integration-db-estimation-export — Run DB estimation/export integration pytest lane
@@ -20,6 +21,12 @@
 #   make format      — Run ruff formatter on app/ and tests/
 #   make check       — Run lint + typecheck + test
 #   make hooks       — Install pre-commit + adaptive pre-push hooks
+#
+# profile-integration overrides:
+#   PROFILE_INTEGRATION_MARKER      — pytest -m expression (default: integration lane)
+#   PROFILE_INTEGRATION_DURATIONS   — slow test count for --durations output
+#   PROFILE_INTEGRATION_DURATIONS_MIN — minimum seconds for --durations-min
+#   PROFILE_INTEGRATION_PYTEST_ARGS — extra pytest args passed through to the runner
 #   make up          — Start Docker Compose stack
 #   make down        — Stop Docker Compose stack
 #   make logs        — Follow Docker Compose logs
@@ -32,6 +39,10 @@
 UV_SYNC_ARGS = --extra db --extra jobs --extra ingestion --extra dev --extra test
 PRE_PUSH_HOOK = .git/hooks/pre-push
 PRE_PUSH_HOOK_VERSION = v1
+PROFILE_INTEGRATION_MARKER ?= $(PYTEST_INTEGRATION_EXPRESSION)
+PROFILE_INTEGRATION_DURATIONS ?= 50
+PROFILE_INTEGRATION_DURATIONS_MIN ?= 0.2
+PROFILE_INTEGRATION_PYTEST_ARGS ?=
 PYTEST_SMOKE_EXPRESSION = smoke and not integration and not compose_smoke
 PYTEST_INTEGRATION_EXPRESSION = integration and not compose_smoke
 PYTEST_DB_API_EXPRESSION = integration and db_api and not compose_smoke
@@ -42,7 +53,7 @@ PYTEST_DB_MIGRATION_EXPRESSION = integration and db_migration and not compose_sm
 PYTEST_COMPOSE_SMOKE_EXPRESSION = compose_smoke
 SMOKE_BASE_URL ?= http://localhost:8000
 
-.PHONY: sync lint typecheck test smoke integration integration-db-api integration-db-worker integration-db-estimation-export integration-db-lineage integration-db-migration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
+.PHONY: sync lint typecheck test smoke integration profile-integration integration-db-api integration-db-worker integration-db-estimation-export integration-db-lineage integration-db-migration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
 
 sync:
 	uv sync $(UV_SYNC_ARGS)
@@ -62,6 +73,10 @@ smoke:
 integration:
 	uv run alembic upgrade head
 	uv run pytest -m "$(PYTEST_INTEGRATION_EXPRESSION)"
+
+profile-integration:
+	uv run alembic upgrade head
+	uv run python scripts/profile_integration_lane.py --marker "$(PROFILE_INTEGRATION_MARKER)" --durations $(PROFILE_INTEGRATION_DURATIONS) --durations-min $(PROFILE_INTEGRATION_DURATIONS_MIN) $(PROFILE_INTEGRATION_PYTEST_ARGS)
 
 compose-smoke:
 	COMPOSE_SMOKE=1 SMOKE_BASE_URL="$(SMOKE_BASE_URL)" uv run pytest -m "$(PYTEST_COMPOSE_SMOKE_EXPRESSION)"
