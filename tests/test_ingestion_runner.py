@@ -45,14 +45,25 @@ from app.storage.memory import MemoryStorage
 
 _DXF_SMOKE_FIXTURE = Path(__file__).parent / "fixtures" / "dxf" / "simple-line.dxf"
 _IFC_SMOKE_BODY = (
-    b"ISO-10303-21;\n"
-    b"HEADER;\n"
-    b"FILE_SCHEMA(('IFC4'));\n"
-    b"ENDSEC;\n"
-    b"DATA;\n"
-    b"ENDSEC;\n"
-    b"END-ISO-10303-21;\n"
+    b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
 )
+
+
+def _fake_line_entity(*, adapter_key: str, source_ref: str) -> dict[str, Any]:
+    return {
+        "kind": "line",
+        "provenance": {
+            "origin": "adapter_normalized",
+            "adapter": adapter_key,
+            "source_ref": source_ref,
+            "source_identity": f"{adapter_key}:line:0",
+            "source_hash": hashlib.sha256(
+                f"{adapter_key}:{source_ref}:line:0".encode()
+            ).hexdigest(),
+            "extraction_path": "$.entities[0]",
+            "notes": [],
+        },
+    }
 
 
 class _FakeAdapter:
@@ -70,7 +81,14 @@ class _FakeAdapter:
         assert options.timeout is not None
         assert 0 < options.timeout.seconds <= 300
         return AdapterResult(
-            canonical={"entities": ({"kind": "line"},)},
+            canonical={
+                "entities": (
+                    _fake_line_entity(
+                        adapter_key="fake-raster",
+                        source_ref="originals/source.pdf",
+                    ),
+                )
+            },
             provenance=(
                 ProvenanceRecord(
                     stage="extract",
@@ -674,7 +692,14 @@ async def test_run_ingestion_passes_progress_and_cancellation_to_adapter(
             )
             options.on_progress(update)
             return AdapterResult(
-                canonical={"entities": ({"kind": "line"},)},
+                canonical={
+                    "entities": (
+                        _fake_line_entity(
+                            adapter_key="fake-dxf",
+                            source_ref="originals/source.dxf",
+                        ),
+                    )
+                },
                 provenance=(
                     ProvenanceRecord(
                         stage="extract",
@@ -847,9 +872,7 @@ async def test_run_ingestion_smoke_uses_real_ezdxf_adapter(tmp_path: Path) -> No
         "conversion_target": "meter",
         "conversion_factor": 1.0,
     }
-    assert payload.canonical_json["layers"] == [
-        {"name": "0", "color": 7, "linetype": "Continuous"}
-    ]
+    assert payload.canonical_json["layers"] == [{"name": "0", "color": 7, "linetype": "Continuous"}]
     assert payload.canonical_json["blocks"] == []
     assert payload.canonical_json["xrefs"] == []
     assert payload.report_json["summary"]["entity_counts"] == {
