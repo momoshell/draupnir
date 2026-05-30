@@ -64,19 +64,107 @@ _TEST_ONLY_CLEANUP_TABLES: tuple[str, ...] = ("idempotency_keys",)
 
 _DATABASE_REQUIRED_REASON = "DATABASE_URL not set - skipping database tests"
 
+_DB_LANE_MARKERS: frozenset[str] = frozenset(
+    {
+        "db_api",
+        "db_worker",
+        "db_estimation_export",
+        "db_lineage",
+        "db_migration",
+    }
+)
+
+_DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
+    "projects": "db_api",
+    "files": "db_api",
+    "idempotency": "db_api",
+    "extraction_profiles": "db_api",
+    "quantity_takeoff_api": "db_api",
+    "estimate_read_api": "db_api",
+    "export_create_api": "db_api",
+    "revision_materialization_api": "db_api",
+    "validation_report_api": "db_api",
+    "revision_quantity_estimate_flow": "db_api",
+    "smoke": "db_api",
+    "jobs": "db_worker",
+    "jobs_api": "db_worker",
+    "jobs_worker_ingest": "db_worker",
+    "jobs_worker_lifecycle": "db_worker",
+    "jobs_worker_quantity": "db_worker",
+    "jobs_worker_estimate": "db_worker",
+    "jobs_worker_exports": "db_worker",
+    "ingest_output_persistence": "db_worker",
+    "csv_exports": "db_estimation_export",
+    "revision_json_export": "db_estimation_export",
+    "estimate_pdf_export": "db_estimation_export",
+    "estimate_engine_persistence_payloads": "db_estimation_export",
+    "estimate_job_input_contract": "db_estimation_export",
+    "estimate_snapshot_item_persistence": "db_estimation_export",
+    "estimate_version_persistence": "db_estimation_export",
+    "estimation_catalog_api": "db_estimation_export",
+    "estimation_catalog_persistence": "db_estimation_export",
+    "estimation_catalog_resolver": "db_estimation_export",
+    "export_job_input_contract": "db_estimation_export",
+    "quantity_takeoff_persistence": "db_estimation_export",
+    "append_only_lineage_tables": "db_lineage",
+    "lineage_delete_restrictions": "db_lineage",
+    "db": "db_migration",
+    "jobs_base_revision_migration": "db_migration",
+    "jobs_revision_scoped_contract_migration": "db_migration",
+}
+
 # Marker for tests that require a running database.
 requires_database = pytest.mark.integration
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Skip integration tests when DATABASE_URL is not configured."""
-    if os.environ.get("DATABASE_URL"):
-        return
+def _item_test_file_key(item: pytest.Item) -> str:
+    """Return normalized `tests/test_*.py` key for lane assignment."""
 
+    item_path = getattr(item, "path", None)
+    path = Path(str(item_path)) if item_path is not None else Path(str(item.fspath))
+    return path.stem.removeprefix("test_")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Assign DB lanes for integration tests and skip when DB URL is missing."""
+
+    has_database_url = bool(os.environ.get("DATABASE_URL"))
     skip_database = pytest.mark.skip(reason=_DATABASE_REQUIRED_REASON)
+    lane_errors: list[str] = []
+
     for item in items:
-        if "integration" in item.keywords:
+        is_integration = "integration" in item.keywords
+        if not is_integration:
+            continue
+
+        if "compose_smoke" not in item.keywords:
+            file_key = _item_test_file_key(item)
+            expected_lane = _DB_LANE_BY_TEST_FILE_KEY.get(file_key)
+            if expected_lane is None:
+                lane_errors.append(
+                    f"{item.nodeid}: missing DB lane mapping for test file key '{file_key}'"
+                )
+            else:
+                item.add_marker(getattr(pytest.mark, expected_lane))
+
+            assigned_lanes = sorted(
+                marker for marker in _DB_LANE_MARKERS if marker in item.keywords
+            )
+            if len(assigned_lanes) != 1:
+                lane_errors.append(
+                    f"{item.nodeid}: expected exactly one DB lane marker; found {assigned_lanes}"
+                )
+
+        if not has_database_url:
             item.add_marker(skip_database)
+
+    if lane_errors:
+        details = "\n - ".join(lane_errors)
+        raise pytest.UsageError(
+            "DB lane marker assignment failed for integration collection."
+            f"\n - {details}\n"
+            "Update _DB_LANE_BY_TEST_FILE_KEY in tests/conftest.py."
+        )
 
 
 @pytest_asyncio.fixture(autouse=True)

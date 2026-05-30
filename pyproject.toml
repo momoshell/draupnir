@@ -208,5 +208,10 @@ asyncio_mode = "auto"
 markers = [
     "smoke: fast in-memory smoke lane",
     "integration: tests that require database or integration resources",
+    "db_api: database integration lane for API surface tests",
+    "db_worker: database integration lane for worker/job lifecycle tests",
+    "db_estimation_export: database integration lane for estimation and export persistence tests",
+    "db_lineage: database integration lane for append-only lineage protection tests",
+    "db_migration: database integration lane for DB session and migration contract tests",
     "compose_smoke: compose-backed real-server smoke lane",
 ]

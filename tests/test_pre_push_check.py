@@ -160,10 +160,12 @@ def test_main_requires_database_url_for_sensitive_changes() -> None:
     error_output = stderr.getvalue()
     assert "DATABASE_URL" in error_output
     assert "uv run alembic upgrade head" in error_output
+    assert 'uv run pytest -m "integration and not compose_smoke"' in error_output
+    assert "DB integration lane" in error_output
     assert "app/db/session.py" in error_output
 
 
-def test_main_runs_migration_before_pytest_for_sensitive_changes() -> None:
+def test_main_runs_migration_before_db_integration_pytest_for_sensitive_changes() -> None:
     query = QueryStub(
         {
             ("git", "diff", "--name-only", "def456..abc123"): (
@@ -188,9 +190,11 @@ def test_main_runs_migration_before_pytest_for_sensitive_changes() -> None:
     assert exit_code == 0
     assert exec_runner.calls == [
         ("uv", "run", "alembic", "upgrade", "head"),
-        ("uv", "run", "pytest"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
     ]
-    assert "running alembic upgrade head" in stderr.getvalue()
+    error_output = stderr.getvalue()
+    assert "DB integration lane" in error_output
+    assert 'pytest -m "integration and not compose_smoke"' in error_output
 
 
 def test_main_rejects_non_local_or_non_test_database_url() -> None:

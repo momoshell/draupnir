@@ -15,6 +15,13 @@ from urllib.parse import urlparse
 
 ZERO_OID = "0" * 40
 EXAMPLE_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test"
+DB_INTEGRATION_PYTEST_ARGS = [
+    "uv",
+    "run",
+    "pytest",
+    "-m",
+    "integration and not compose_smoke",
+]
 SENSITIVE_PREFIXES = (
     "app/api/",
     "app/models/",
@@ -218,9 +225,9 @@ def format_database_url_message(sensitive_paths: Sequence[str]) -> str:
         f"{changed_lines}\n"
         "Set DATABASE_URL and rerun push. Example:\n"
         f"  export DATABASE_URL={EXAMPLE_DATABASE_URL}\n"
-        "This gate mirrors CI with:\n"
+        "This gate runs the DB integration lane with:\n"
         "  uv run alembic upgrade head\n"
-        "  uv run pytest"
+        '  uv run pytest -m "integration and not compose_smoke"'
     )
 
 
@@ -274,8 +281,10 @@ def run_gate(
                 file=stderr,
             )
             return 1
+        db_integration_lane = 'pytest -m "integration and not compose_smoke"'
         print(
-            "pre-push check: DB-sensitive changes detected; running alembic upgrade head.",
+            "pre-push check: DB-sensitive changes detected; running DB integration lane "
+            f"via alembic upgrade head then {db_integration_lane}.",
             file=stderr,
         )
         migration_code = exec_runner(["uv", "run", "alembic", "upgrade", "head"])
@@ -283,7 +292,8 @@ def run_gate(
             return migration_code
     else:
         print("pre-push check: no DB-sensitive changes detected.", file=stderr)
-    return exec_runner(["uv", "run", "pytest"])
+        return exec_runner(["uv", "run", "pytest"])
+    return exec_runner(DB_INTEGRATION_PYTEST_ARGS)
 
 
 def main(
