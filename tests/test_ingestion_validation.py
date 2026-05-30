@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.ingestion.canonical.entity_provenance import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterResult,
     AdapterWarning,
@@ -35,9 +36,39 @@ _EXPECTED_CHECK_KEYS = [
     "block_transform_validity",
     "layer_mapping_completeness",
     "xref_resolution_status",
+    "entity_provenance_contract",
     "pdf_scale_presence_calibration_status",
     "ifc_schema_support",
 ]
+
+
+def _valid_entity_provenance(index: int) -> dict[str, JSONValue]:
+    source_ref = f"entities/{index}"
+    source_identity = f"entity-{index}"
+    source_hash = f"{index:064x}"
+
+    _ = build_entity_provenance(
+        origin="adapter_normalized",
+        adapter="dxf",
+        source_ref=source_ref,
+        source_identity=source_identity,
+        source_hash=source_hash,
+        extraction_path=["entities", index - 1],
+        notes=[],
+    )
+    return {
+        "origin": "adapter_normalized",
+        "adapter": "dxf",
+        "source_ref": source_ref,
+        "source_identity": source_identity,
+        "source_hash": source_hash,
+        "extraction_path": ("entities", index - 1),
+        "notes": (),
+    }
+
+
+def _with_valid_provenance(entity: Mapping[str, JSONValue], *, index: int) -> dict[str, JSONValue]:
+    return {**entity, "provenance": _valid_entity_provenance(index)}
 
 
 def _build_complete_canonical(
@@ -48,13 +79,18 @@ def _build_complete_canonical(
     ifc_schema: str | None = None,
     xrefs: tuple[Mapping[str, JSONValue], ...] | None = (),
 ) -> dict[str, JSONValue]:
-    canonical_entities = entities or (
+    default_entities: tuple[Mapping[str, JSONValue], ...] = (
         {
             "kind": "line",
             "layer": "A-WALL",
             "start": {"x": 0.0, "y": 0.0},
             "end": {"x": 1.0, "y": 0.0},
         },
+    )
+    source_entities = entities if entities is not None else default_entities
+    canonical_entities = tuple(
+        _with_valid_provenance(entity, index=index)
+        for index, entity in enumerate(source_entities, start=1)
     )
     canonical: dict[str, JSONValue] = {
         "units": {"normalized": "meter"},
@@ -84,7 +120,7 @@ def _build_result(
     warnings: tuple[AdapterWarning, ...] = (),
 ) -> AdapterResult:
     if canonical is None:
-        canonical = {"entities": ({"kind": "line"},)}
+        canonical = {"entities": (_with_valid_provenance({"kind": "line"}, index=1),)}
 
     return AdapterResult(
         canonical=canonical,
@@ -158,7 +194,9 @@ def test_build_validation_outcome_missing_pdf_scale_requires_review() -> None:
         generated_at=_GENERATED_AT,
     )
 
-    pdf_scale_check = outcome.report_json["checks"][7]
+    pdf_scale_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "pdf_scale_presence_calibration_status"
+    ]
 
     assert pdf_scale_check["check_key"] == "pdf_scale_presence_calibration_status"
     assert pdf_scale_check["status"] == "review_required"
@@ -184,7 +222,9 @@ def test_build_validation_outcome_missing_ifc_schema_blocks_quantities() -> None
         generated_at=_GENERATED_AT,
     )
 
-    ifc_schema_check = outcome.report_json["checks"][8]
+    ifc_schema_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "ifc_schema_support"
+    ]
 
     assert ifc_schema_check["check_key"] == "ifc_schema_support"
     assert ifc_schema_check["status"] == "fail"
@@ -299,18 +339,23 @@ def test_build_validation_outcome_emits_required_checks_in_deterministic_order()
     checks = outcome.report_json["checks"]
 
     assert [check["check_key"] for check in checks] == _EXPECTED_CHECK_KEYS
-    assert [check["status"] for check in checks[:7]] == ["pass"] * 7
+    assert [check["status"] for check in checks[:8]] == ["pass"] * 8
     assert checks[3]["details"] == {"applicable": False}
     assert checks[4]["details"] == {"applicable": False}
     assert checks[6]["details"] == {"applicable": False}
-    assert checks[7]["details"] == {"applicable": False}
+    assert checks[7]["details"] == {
+        "applicable": True,
+        "entity_count": 1,
+        "validated_entity_count": 1,
+    }
     assert checks[8]["details"] == {"applicable": False}
+    assert checks[9]["details"] == {"applicable": False}
 
 
 def test_build_validation_outcome_minimal_dxf_requires_review_for_missing_mvp_checks() -> None:
     outcome = build_validation_outcome(
         input_family=InputFamily.DXF,
-        canonical_json={"entities": ({"kind": "line"},)},
+        canonical_json={"entities": (_with_valid_provenance({"kind": "line"}, index=1),)},
         canonical_entity_schema_version="0.1",
         result=_build_result(score=0.99),
         generated_at=_GENERATED_AT,
@@ -377,10 +422,7 @@ def test_build_validation_outcome_review_gates_two_point_closed_area_entities(
     checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
 
     assert checks_by_key["geometry_validity"]["status"] == "review_required"
-    assert (
-        checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"]
-        == "pass"
-    )
+    assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "needs_review"
     assert outcome.review_state == "review_required"
     assert outcome.quantity_gate == "review_gated"
@@ -492,10 +534,7 @@ def test_build_validation_outcome_accepts_non_degenerate_closed_polygon() -> Non
     checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
 
     assert checks_by_key["geometry_validity"]["status"] == "pass"
-    assert (
-        checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"]
-        == "pass"
-    )
+    assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "valid"
     assert outcome.review_state == "approved"
     assert outcome.quantity_gate == "allowed"
@@ -526,10 +565,7 @@ def test_build_validation_outcome_keeps_explicit_geometry_validity_override() ->
     checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
 
     assert checks_by_key["geometry_validity"]["status"] == "pass"
-    assert (
-        checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"]
-        == "pass"
-    )
+    assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "valid"
     assert outcome.review_state == "approved"
     assert outcome.quantity_gate == "allowed"
@@ -567,7 +603,9 @@ def test_build_validation_outcome_rejects_invalid_or_unconfirmed_pdf_scale_value
         generated_at=_GENERATED_AT,
     )
 
-    pdf_scale_check = outcome.report_json["checks"][7]
+    pdf_scale_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "pdf_scale_presence_calibration_status"
+    ]
 
     assert pdf_scale_check["status"] == check_status
     assert outcome.validation_status == validation_status
@@ -575,8 +613,9 @@ def test_build_validation_outcome_rejects_invalid_or_unconfirmed_pdf_scale_value
     assert outcome.quantity_gate == quantity_gate
 
 
-def test_build_validation_outcome_review_gates_placeholder_mode_without_placeholder_semantics(
-) -> None:
+def test_build_validation_outcome_review_gates_placeholder_mode_without_placeholder_semantics() -> (
+    None
+):
     outcome = build_validation_outcome(
         input_family=InputFamily.DWG,
         canonical_json={
@@ -626,8 +665,9 @@ def test_build_validation_outcome_review_gates_placeholder_mode_without_placehol
     }
 
 
-def test_build_validation_outcome_forces_review_gated_placeholder_semantics_when_inconsistent(
-) -> None:
+def test_build_validation_outcome_forces_review_gated_placeholder_semantics_when_inconsistent() -> (
+    None
+):
     canonical_json: dict[str, JSONValue] = {
         "entities": (),
         "metadata": {
@@ -717,6 +757,99 @@ def test_build_validation_outcome_includes_raw_provenance_in_report_json() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    ("entity", "error_fragment"),
+    [
+        (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            "must be a mapping",
+        ),
+        (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+                "provenance": {
+                    "origin": "adapter_normalized",
+                    "adapter": {"key": "dxf"},
+                    "source_ref": "entities/1",
+                    "source_identity": "entity-1",
+                    "extraction_path": ["entities", 0],
+                    "notes": [],
+                },
+            },
+            "missing required key",
+        ),
+        (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+                "provenance": {
+                    **_valid_entity_provenance(1),
+                    "origin": "not_allowed",
+                },
+            },
+            "origin must be one of",
+        ),
+        (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+                "provenance": {
+                    **_valid_entity_provenance(1),
+                    "source_hash": "not-a-hash",
+                },
+            },
+            "source_hash must be a raw 64-character SHA-256 hex string",
+        ),
+    ],
+)
+def test_build_validation_outcome_rejects_entity_provenance_contract_failures(
+    entity: Mapping[str, JSONValue],
+    error_fragment: str,
+) -> None:
+    canonical_json: dict[str, JSONValue] = {
+        "units": {"normalized": "meter"},
+        "coordinate_system": {"name": "local"},
+        "layouts": ({"name": "Model"},),
+        "layers": ({"name": "A-WALL"},),
+        "blocks": (),
+        "entities": (entity,),
+        "xrefs": (),
+    }
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical_json,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99, canonical=canonical_json),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    provenance_findings = [
+        finding
+        for finding in outcome.report_json["findings"]
+        if finding["check_key"] == "entity_provenance_contract"
+    ]
+
+    assert checks_by_key["entity_provenance_contract"]["status"] == "fail"
+    assert outcome.validation_status == "invalid"
+    assert outcome.review_state == "rejected"
+    assert outcome.quantity_gate == "blocked"
+    assert provenance_findings
+    assert error_fragment in provenance_findings[0]["details"]["invalid_entities"][0]["error"]
+
+
 def test_build_ingest_finalization_payload_calls_validation_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -748,13 +881,13 @@ def test_build_ingest_finalization_payload_calls_validation_once(
             "validator_version": "0.1",
             "confidence": {},
             "summary": {
-                "checks_total": 9,
+                "checks_total": 10,
                 "findings_total": 0,
                 "warnings_total": 0,
                 "errors_total": 0,
                 "critical_total": 0,
                 "check_status_totals": {
-                    "pass": 9,
+                    "pass": 10,
                     "warning": 0,
                     "review_required": 0,
                     "fail": 0,
@@ -809,3 +942,78 @@ def test_build_ingest_finalization_payload_calls_validation_once(
     assert calls == [(InputFamily.DXF, "0.1")]
     assert payload.validation_status == "valid"
     assert payload.review_state == "approved"
+
+
+def test_build_ingest_finalization_payload_rejects_invalid_entity_provenance() -> None:
+    context = IngestFinalizationContext(
+        job_id=uuid4(),
+        file_id=uuid4(),
+        extraction_profile_id=None,
+        initial_job_id=None,
+        input_family=InputFamily.DXF,
+        adapter_key="ezdxf",
+        adapter_version="test-1.0",
+    )
+    canonical_json: dict[str, JSONValue] = {
+        "units": {"normalized": "meter"},
+        "coordinate_system": {"name": "local"},
+        "layouts": ({"name": "Model"},),
+        "layers": ({"name": "A-WALL"},),
+        "blocks": (),
+        "entities": (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+                "provenance": {
+                    **_valid_entity_provenance(1),
+                    "source_hash": "not-a-hash",
+                },
+            },
+        ),
+        "xrefs": (),
+    }
+
+    payload = build_ingest_finalization_payload(
+        context,
+        result=_build_result(score=0.99, canonical=canonical_json),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in payload.report_json["checks"]}
+    provenance_findings = [
+        finding
+        for finding in payload.report_json["findings"]
+        if finding["check_key"] == "entity_provenance_contract"
+    ]
+
+    assert checks_by_key["entity_provenance_contract"]["status"] == "fail"
+    assert payload.validation_status == "invalid"
+    assert payload.review_state == "rejected"
+    assert payload.quantity_gate == "blocked"
+    assert provenance_findings
+    assert (
+        "source_hash must be a raw 64-character SHA-256 hex string"
+        in (provenance_findings[0]["details"]["invalid_entities"][0]["error"])
+    )
+    assert payload.provenance_json == {
+        "schema_version": "0.1",
+        "adapter": {"key": "ezdxf", "version": "test-1.0"},
+        "source": {
+            "file_id": str(context.file_id),
+            "job_id": str(context.job_id),
+            "extraction_profile_id": None,
+            "input_family": InputFamily.DXF.value,
+            "revision_kind": "reprocess",
+        },
+        "records": [
+            {
+                "stage": "extract",
+                "adapter_key": InputFamily.DXF.value,
+                "source_ref": "originals/source.dat",
+                "details": None,
+            }
+        ],
+        "generated_at": _GENERATED_AT.isoformat(),
+    }

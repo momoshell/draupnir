@@ -16,6 +16,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
+from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterDiagnostic,
@@ -678,9 +679,7 @@ def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
             return ()
         return tuple(_iter_mapping_candidates(objects))
     if isinstance(payload, list):
-        return tuple(
-            item for item in payload if isinstance(item, Mapping)
-        )
+        return tuple(item for item in payload if isinstance(item, Mapping))
     return ()
 
 
@@ -738,11 +737,19 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "end": end,
         },
     )
+    provenance = _entity_provenance(
+        record,
+        record_type="LINE",
+        source_handle=source_handle,
+        safe_projection=safe_projection,
+        notes=("units_unconfirmed",),
+    )
 
     return {
         "entity_id": entity_id,
         "entity_type": "line",
         "entity_schema_version": _SCHEMA_VERSION,
+        **provenance,
         "source_entity_handle": source_handle,
         "layout_name": layout_name,
         "layer_name": layer_name,
@@ -781,13 +788,7 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
                 }
             },
         },
-        "provenance": _entity_provenance(
-            record,
-            record_type="LINE",
-            source_handle=source_handle,
-            safe_projection=safe_projection,
-            notes=("units_unconfirmed",),
-        ),
+        "provenance": provenance,
         "confidence": {
             "score": _LINE_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
@@ -807,11 +808,19 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
     block_name = _extract_block_name(record)
     source_handle = _extract_handle(record)
     safe_projection = _safe_record_projection(record, record_type=record_type, geometry=None)
+    provenance = _entity_provenance(
+        record,
+        record_type=record_type,
+        source_handle=source_handle,
+        safe_projection=safe_projection,
+        notes=("units_unconfirmed", reason),
+    )
 
     return {
         "entity_id": _entity_id(record, record_type="unknown"),
         "entity_type": "unknown",
         "entity_schema_version": _SCHEMA_VERSION,
+        **provenance,
         "source_entity_handle": source_handle,
         "layout_name": layout_name,
         "layer_name": layer_name,
@@ -841,13 +850,7 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
             "record_type": record_type,
             "handle": source_handle,
         },
-        "provenance": _entity_provenance(
-            record,
-            record_type=record_type,
-            source_handle=source_handle,
-            safe_projection=safe_projection,
-            notes=("units_unconfirmed", reason),
-        ),
+        "provenance": provenance,
         "confidence": {
             "score": _UNKNOWN_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
@@ -997,27 +1000,61 @@ def _entity_provenance(
     safe_projection: _JSONDict,
     notes: tuple[str, ...],
 ) -> _JSONDict:
+    extraction_path = ("OBJECTS", record_type)
     source_locator = _source_locator(record, record_type=record_type)
     source_hash = _canonical_hash_json_value(safe_projection)
-    return {
-        "origin": "adapter_normalized",
-        "adapter": {"key": _DESCRIPTOR.key},
-        "adapter_key": _DESCRIPTOR.key,
-        "source": source_locator,
-        "source_section": "OBJECTS",
-        "source_ref": source_locator,
-        "source_entity_ref": source_locator,
-        "source_locator": source_locator,
-        "entity_ref": source_locator,
-        "source_identity": source_handle or _entity_id(record, record_type=record_type.lower()),
-        "source_hash": source_hash,
-        "normalized_source_hash": source_hash,
-        "native_handle": source_handle,
-        "source_entity_handle": source_handle,
-        "record_hash": _hash_json_value(safe_projection),
-        "extraction_path": ("OBJECTS", record_type),
-        "notes": notes,
-    }
+    source_identity = source_handle or _entity_id(record, record_type=record_type.lower())
+    record_hash = _hash_json_value(safe_projection)
+    provenance = cast(
+        _JSONDict,
+        build_entity_provenance(
+            origin="adapter_normalized",
+            adapter={"key": _DESCRIPTOR.key},
+            source_ref=source_locator,
+            source_identity=source_identity,
+            source_hash=source_hash,
+            extraction_path=list(extraction_path),
+            notes=list(notes),
+            extra={
+                "native": {
+                    _DESCRIPTOR.key: {
+                        "section": "OBJECTS",
+                        "record_type": record_type,
+                        "handle": source_handle,
+                    }
+                },
+                "legacy_aliases": {
+                    "adapter_key": _DESCRIPTOR.key,
+                    "source": source_locator,
+                    "source_section": "OBJECTS",
+                    "source_entity_ref": source_locator,
+                    "source_locator": source_locator,
+                    "entity_ref": source_locator,
+                    "normalized_source_hash": source_hash,
+                    "native_handle": source_handle,
+                    "source_entity_handle": source_handle,
+                    "record_hash": record_hash,
+                },
+            },
+        ),
+    )
+    provenance.update(
+        {
+            "adapter_key": _DESCRIPTOR.key,
+            "source": source_locator,
+            "source_section": "OBJECTS",
+            "source_entity_ref": source_locator,
+            "source_locator": source_locator,
+            "entity_ref": source_locator,
+            "normalized_source_hash": source_hash,
+            "native_handle": source_handle,
+            "source_entity_handle": source_handle,
+            "record_hash": record_hash,
+        }
+    )
+    provenance["extraction_path"] = extraction_path
+    provenance["notes"] = notes
+    return provenance
 
 
 def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:

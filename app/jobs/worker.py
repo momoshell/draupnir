@@ -66,6 +66,7 @@ from app.exports.revision_json import (
     RevisionJsonExportError,
     render_revision_json_export,
 )
+from app.ingestion.canonical import EntityProvenanceError, canonicalize_entity_provenance
 from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
@@ -155,16 +156,6 @@ _QUANTITY_CONFLICT_ENTITY_ID_LIMIT = 10
 _QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT = 10
 _QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT = 3
 _QUANTITY_CONFLICT_TEXT_LIMIT = 200
-_CANONICAL_ENTITY_PROVENANCE_ORIGINS = frozenset(
-    {
-        "source_direct",
-        "adapter_normalized",
-        "inferred",
-        "user_created",
-        "agent_proposed",
-        "generated_export",
-    }
-)
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -2140,19 +2131,81 @@ def _entity_provenance_json(entity_payload_json: dict[str, Any]) -> dict[str, An
         legacy_provenance = entity_payload_json.get("provenance")
         provenance = legacy_provenance if isinstance(legacy_provenance, dict) else {}
 
-    origin = _first_string_ref(provenance.get("origin"), entity_payload_json.get("origin"))
-    if origin is not None and origin not in _CANONICAL_ENTITY_PROVENANCE_ORIGINS:
-        raise ValueError(f"Invalid entity provenance origin '{origin}'")
+    canonical_input = deepcopy(provenance)
+    for key in (
+        "origin",
+        "adapter",
+        "source_ref",
+        "source_entity_ref",
+        "source_identity",
+        "source_handle",
+        "dxf_handle",
+        "source_entity_handle",
+        "native_handle",
+        "source_id",
+        "source_hash",
+        "normalized_source_hash",
+        "record_hash",
+        "extraction_path",
+        "notes",
+    ):
+        if key not in canonical_input and key in entity_payload_json:
+            canonical_input[key] = deepcopy(entity_payload_json[key])
 
-    extraction_path_value = (
-        provenance.get("extraction_path")
-        if "extraction_path" in provenance
-        else entity_payload_json.get("extraction_path")
-    )
-    notes_value = (
-        provenance.get("notes") if "notes" in provenance else entity_payload_json.get("notes")
-    )
-    adapter_json = provenance.get("adapter")
+    try:
+        canonical_provenance = canonicalize_entity_provenance(canonical_input)
+    except EntityProvenanceError:
+        origin = _string_ref(canonical_input.get("origin"))
+        if origin is None and any(
+            key in canonical_input
+            for key in (
+                "adapter",
+                "source_ref",
+                "source_entity_ref",
+                "source_handle",
+                "dxf_handle",
+                "source_entity_handle",
+                "native_handle",
+                "source_hash",
+                "normalized_source_hash",
+                "record_hash",
+            )
+        ):
+            origin = "adapter_normalized"
+
+        adapter_json = canonical_input.get("adapter")
+        if isinstance(adapter_json, dict):
+            adapter = deepcopy(adapter_json)
+        elif adapter_json is None:
+            adapter = {}
+        else:
+            adapter = {"value": deepcopy(adapter_json)}
+
+        return {
+            "origin": origin,
+            "adapter": adapter,
+            "source_ref": _first_string_ref(
+                canonical_input.get("source_ref"),
+                canonical_input.get("source_entity_ref"),
+            ),
+            "source_identity": _first_string_ref(
+                canonical_input.get("source_identity"),
+                canonical_input.get("source_handle"),
+                canonical_input.get("dxf_handle"),
+                canonical_input.get("source_entity_handle"),
+                canonical_input.get("native_handle"),
+                canonical_input.get("source_id"),
+            ),
+            "source_hash": _first_hash_ref(
+                canonical_input.get("source_hash"),
+                canonical_input.get("normalized_source_hash"),
+                canonical_input.get("record_hash"),
+            ),
+            "extraction_path": _json_array(canonical_input.get("extraction_path")),
+            "notes": _json_array(canonical_input.get("notes")),
+        }
+
+    adapter_json = canonical_provenance["adapter"]
     if isinstance(adapter_json, dict):
         adapter = deepcopy(adapter_json)
     elif adapter_json is None:
@@ -2161,38 +2214,13 @@ def _entity_provenance_json(entity_payload_json: dict[str, Any]) -> dict[str, An
         adapter = {"value": deepcopy(adapter_json)}
 
     return {
-        "origin": origin or "adapter_normalized",
+        "origin": canonical_provenance["origin"],
         "adapter": adapter,
-        "source_ref": _first_string_ref(
-            provenance.get("source_ref"),
-            entity_payload_json.get("source_ref"),
-            provenance.get("source_entity_ref"),
-            entity_payload_json.get("source_entity_ref"),
-        ),
-        "source_identity": _first_string_ref(
-            provenance.get("source_identity"),
-            entity_payload_json.get("source_identity"),
-            provenance.get("source_handle"),
-            entity_payload_json.get("source_handle"),
-            provenance.get("dxf_handle"),
-            entity_payload_json.get("dxf_handle"),
-            provenance.get("source_entity_handle"),
-            entity_payload_json.get("source_entity_handle"),
-            provenance.get("native_handle"),
-            entity_payload_json.get("native_handle"),
-            provenance.get("source_id"),
-            entity_payload_json.get("source_id"),
-        ),
-        "source_hash": _first_hash_ref(
-            provenance.get("source_hash"),
-            entity_payload_json.get("source_hash"),
-            provenance.get("normalized_source_hash"),
-            entity_payload_json.get("normalized_source_hash"),
-            provenance.get("record_hash"),
-            entity_payload_json.get("record_hash"),
-        ),
-        "extraction_path": _json_array(extraction_path_value),
-        "notes": _json_array(notes_value),
+        "source_ref": _string_ref(canonical_provenance["source_ref"]),
+        "source_identity": _string_ref(canonical_provenance["source_identity"]),
+        "source_hash": _hash_ref(canonical_provenance["source_hash"]),
+        "extraction_path": _json_array(canonical_provenance["extraction_path"]),
+        "notes": _json_array(canonical_provenance["notes"]),
     }
 
 

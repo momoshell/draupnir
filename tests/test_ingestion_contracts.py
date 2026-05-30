@@ -423,10 +423,7 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
 ) -> None:
     source_path = tmp_path / "raster.pdf"
     source_path.write_bytes(
-        b"%PDF-1.4\n"
-        b"1 0 obj << /Type /Page >> endobj\n"
-        b"2 0 obj << /Type /Page >> endobj\n"
-        b"%%EOF\n"
+        b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Page >> endobj\n%%EOF\n"
     )
     adapter = vtracer_tesseract_adapter.create_adapter()
 
@@ -587,10 +584,7 @@ async def test_vtracer_tesseract_adapter_passes_shared_contract_harness(
 ) -> None:
     source_path = tmp_path / "raster.pdf"
     source_path.write_bytes(
-        b"%PDF-1.4\n"
-        b"1 0 obj << /Type /Page >> endobj\n"
-        b"2 0 obj << /Type /Page >> endobj\n"
-        b"%%EOF\n"
+        b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Page >> endobj\n%%EOF\n"
     )
     adapter = vtracer_tesseract_adapter.create_adapter()
 
@@ -722,10 +716,7 @@ async def test_vtracer_tesseract_ingest_enforces_page_cap(
 ) -> None:
     source_path = tmp_path / "raster.pdf"
     source_path.write_bytes(
-        b"%PDF-1.4\n"
-        b"1 0 obj << /Type /Page >> endobj\n"
-        b"2 0 obj << /Type /Page >> endobj\n"
-        b"%%EOF\n"
+        b"%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n2 0 obj << /Type /Page >> endobj\n%%EOF\n"
     )
     adapter = vtracer_tesseract_adapter.create_adapter()
 
@@ -1029,6 +1020,22 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
     _assert_canonical_source_hash(cast(str, provenance["source_hash"]))
     assert provenance["extraction_path"] == ("get_drawings", "page-1", "drawing-0", "l")
     assert provenance["notes"] == ("vector_pdf_unconfirmed_scale",)
+    assert provenance["extra"] == {
+        "native": {
+            "pymupdf": {
+                "page_number": 1,
+                "drawing_index": 0,
+                "operator": "l",
+                "item_indices": (0, 1),
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "pymupdf",
+            "source": "pymupdf.get_drawings",
+            "source_entity_ref": "pdf://page-1/drawing-0/l/items:0,1",
+            "normalized_source_hash": provenance["source_hash"],
+        },
+    }
 
     geometry = cast(dict[str, Any], entity["geometry"])
     assert geometry["kind"] == entity["entity_type"]
@@ -1611,13 +1618,7 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         "width": 1.0,
         "color": (0.1, 0.2, 0.3),
     }
-    document = _FakeDocument(
-        [
-            _FakePage(
-                drawings=[drawing]
-            )
-        ]
-    )
+    document = _FakeDocument([_FakePage(drawings=[drawing])])
 
     result = await _ingest_fake_document(monkeypatch, tmp_path, document)
 
@@ -1662,6 +1663,30 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         ),
         "extraction_path": ("get_drawings", "page-1", "drawing-0", "l"),
         "notes": ("vector_pdf_unconfirmed_scale",),
+        "extra": {
+            "native": {
+                "pymupdf": {
+                    "page_number": 1,
+                    "drawing_index": 0,
+                    "operator": "l",
+                    "item_indices": (0,),
+                }
+            },
+            "legacy_aliases": {
+                "adapter_key": "pymupdf",
+                "source": "pymupdf.get_drawings",
+                "source_entity_ref": "pdf://page-1/drawing-0/l/items:0",
+                "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+                    pymupdf_adapter._entity_source_payload(
+                        page_number=1,
+                        operator="l",
+                        drawing=drawing,
+                        item_indices=(0,),
+                        item_index=None,
+                    )
+                ),
+            },
+        },
     }
     _assert_canonical_source_hash(cast(str, first_entity["provenance"]["source_hash"]))
 
@@ -1723,6 +1748,30 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         ),
         "extraction_path": ("get_drawings", "page-1", "drawing-0", "c"),
         "notes": ("vector_pdf_unconfirmed_scale",),
+        "extra": {
+            "native": {
+                "pymupdf": {
+                    "page_number": 1,
+                    "drawing_index": 0,
+                    "operator": "c",
+                    "item_index": 1,
+                }
+            },
+            "legacy_aliases": {
+                "adapter_key": "pymupdf",
+                "source": "pymupdf.get_drawings",
+                "source_entity_ref": "pdf://page-1/drawing-0/c/item:1",
+                "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+                    pymupdf_adapter._entity_source_payload(
+                        page_number=1,
+                        operator="c",
+                        drawing=drawing,
+                        item_indices=None,
+                        item_index=1,
+                    )
+                ),
+            },
+        },
     }
     _assert_canonical_source_hash(cast(str, unknown_entity["provenance"]["source_hash"]))
 
@@ -1764,6 +1813,30 @@ async def test_pymupdf_ingest_retains_unsupported_path_operator_as_unknown_entit
         ),
         "extraction_path": ("get_drawings", "page-1", "drawing-0", "l"),
         "notes": ("vector_pdf_unconfirmed_scale",),
+        "extra": {
+            "native": {
+                "pymupdf": {
+                    "page_number": 1,
+                    "drawing_index": 0,
+                    "operator": "l",
+                    "item_indices": (2, 3),
+                }
+            },
+            "legacy_aliases": {
+                "adapter_key": "pymupdf",
+                "source": "pymupdf.get_drawings",
+                "source_entity_ref": "pdf://page-1/drawing-0/l/items:2,3",
+                "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+                    pymupdf_adapter._entity_source_payload(
+                        page_number=1,
+                        operator="l",
+                        drawing=drawing,
+                        item_indices=(2, 3),
+                        item_index=None,
+                    )
+                ),
+            },
+        },
     }
     _assert_canonical_source_hash(cast(str, final_entity["provenance"]["source_hash"]))
 
@@ -1792,13 +1865,7 @@ async def test_pymupdf_ingest_emits_rect_entity_with_canonical_provenance(
         "width": 1.0,
         "color": (0.1, 0.2, 0.3),
     }
-    document = _FakeDocument(
-        [
-            _FakePage(
-                drawings=[drawing]
-            )
-        ]
-    )
+    document = _FakeDocument([_FakePage(drawings=[drawing])])
 
     result = await _ingest_fake_document(monkeypatch, tmp_path, document)
 
@@ -1837,6 +1904,30 @@ async def test_pymupdf_ingest_emits_rect_entity_with_canonical_provenance(
         ),
         "extraction_path": ("get_drawings", "page-1", "drawing-0", "re"),
         "notes": ("vector_pdf_unconfirmed_scale",),
+        "extra": {
+            "native": {
+                "pymupdf": {
+                    "page_number": 1,
+                    "drawing_index": 0,
+                    "operator": "re",
+                    "item_indices": (0,),
+                }
+            },
+            "legacy_aliases": {
+                "adapter_key": "pymupdf",
+                "source": "pymupdf.get_drawings",
+                "source_entity_ref": "pdf://page-1/drawing-0/re/items:0",
+                "normalized_source_hash": pymupdf_adapter._entity_source_hash(
+                    pymupdf_adapter._entity_source_payload(
+                        page_number=1,
+                        operator="re",
+                        drawing=drawing,
+                        item_indices=(0,),
+                        item_index=None,
+                    )
+                ),
+            },
+        },
     }
     _assert_canonical_source_hash(cast(str, entity["provenance"]["source_hash"]))
 

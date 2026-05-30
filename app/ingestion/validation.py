@@ -9,6 +9,10 @@ from math import isfinite
 from typing import Any, Final
 from uuid import UUID
 
+from app.ingestion.canonical.entity_provenance import (
+    EntityProvenanceError,
+    validate_entity_provenance,
+)
 from app.ingestion.contracts import AdapterResult, InputFamily
 
 VALIDATION_REPORT_SCHEMA_VERSION: Final[str] = "0.1"
@@ -78,6 +82,7 @@ _REQUIRED_CHECK_KEYS: Final[tuple[str, ...]] = (
     "block_transform_validity",
     "layer_mapping_completeness",
     "xref_resolution_status",
+    "entity_provenance_contract",
     "pdf_scale_presence_calibration_status",
     "ifc_schema_support",
 )
@@ -368,6 +373,7 @@ def _build_required_checks(
         _build_block_transform_check,
         _build_layer_mapping_check,
         _build_xref_check,
+        _build_entity_provenance_check,
     ):
         check, check_requires_review, check_invalid = builder(
             canonical_json=canonical_json,
@@ -556,8 +562,7 @@ def _build_units_check(
         check_key=check_key,
         severity="warning",
         message=(
-            "Units metadata is missing or unnormalized and requires review before "
-            "quantities run."
+            "Units metadata is missing or unnormalized and requires review before quantities run."
         ),
         target_type="revision",
         target_ref=_SOURCE_DOCUMENT_REF,
@@ -688,8 +693,7 @@ def _build_geometry_validity_check(
         check_key=check_key,
         severity="warning",
         message=(
-            "Geometry validity could not be confirmed and requires review before "
-            "quantities run."
+            "Geometry validity could not be confirmed and requires review before quantities run."
         ),
         target_type="revision",
         target_ref=_SOURCE_DOCUMENT_REF,
@@ -746,8 +750,7 @@ def _build_closed_polygon_check(
             check_key=check_key,
             severity="error",
             message=(
-                "Area-bearing polygons are not closed and cannot drive deterministic "
-                "quantities."
+                "Area-bearing polygons are not closed and cannot drive deterministic quantities."
             ),
             target_type="revision",
             target_ref=_SOURCE_DOCUMENT_REF,
@@ -1142,6 +1145,84 @@ def _build_xref_check(
     )
 
 
+def _build_entity_provenance_check(
+    *, canonical_json: Mapping[str, Any], add_finding: Any
+) -> tuple[dict[str, Any], bool, bool]:
+    check_key = "entity_provenance_contract"
+    entities = _entity_mappings(canonical_json)
+    if not entities:
+        return (
+            _not_applicable_check(
+                check_key,
+                "Entity provenance contract is not applicable because no entities were reported.",
+            ),
+            False,
+            False,
+        )
+
+    invalid_entities: list[dict[str, str]] = []
+    for index, entity in enumerate(entities, start=1):
+        try:
+            provenance = entity.get("provenance")
+            if not isinstance(provenance, Mapping):
+                raise EntityProvenanceError("Entity provenance must be a mapping.")
+            validate_entity_provenance(provenance)
+        except EntityProvenanceError as exc:
+            invalid_entities.append(
+                {
+                    "entity_ref": _entity_ref(entity, index=index),
+                    "error": str(exc),
+                }
+            )
+
+    if not invalid_entities:
+        return (
+            _check(
+                check_key=check_key,
+                status="pass",
+                summary_message="Entity provenance contract reported no blocking issues.",
+                details={
+                    "applicable": True,
+                    "entity_count": len(entities),
+                    "validated_entity_count": len(entities),
+                },
+            ),
+            False,
+            False,
+        )
+
+    finding_ref = add_finding(
+        check_key=check_key,
+        severity="error",
+        message="One or more canonical entities failed the provenance contract.",
+        target_type="revision",
+        target_ref=_SOURCE_DOCUMENT_REF,
+        quantity_effect="blocks_quantity",
+        source="validator",
+        details={
+            "entity_count": len(entities),
+            "invalid_entity_count": len(invalid_entities),
+            "invalid_entities": invalid_entities,
+        },
+    )
+    return (
+        _check(
+            check_key=check_key,
+            status="fail",
+            summary_message="Entity provenance contract failed.",
+            finding_refs=[finding_ref],
+            details={
+                "applicable": True,
+                "entity_count": len(entities),
+                "invalid_entity_count": len(invalid_entities),
+                "invalid_entities": invalid_entities,
+            },
+        ),
+        False,
+        True,
+    )
+
+
 def _build_pdf_scale_check(
     *,
     input_family: InputFamily,
@@ -1524,9 +1605,7 @@ def _entity_has_valid_geometry(entity: Mapping[str, Any]) -> bool | None:
     if kind in _POLYGON_ENTITY_KINDS:
         return _has_valid_polygon_area_geometry(
             entity.get("points")
-        ) or _has_valid_polygon_area_geometry(
-            entity.get("vertices")
-        )
+        ) or _has_valid_polygon_area_geometry(entity.get("vertices"))
     if kind in _POINT_ENTITY_KINDS:
         return (
             _has_coordinate_value(entity.get("point"))
@@ -1536,14 +1615,10 @@ def _entity_has_valid_geometry(entity: Mapping[str, Any]) -> bool | None:
         )
     if kind in _CENTER_RADIUS_ENTITY_KINDS:
         return (
-            (
-                _has_coordinate_value(entity.get("center"))
-                or _has_coordinate_value(entity.get("origin"))
-            )
-            and (
-                _is_positive_number(entity.get("radius"))
-                or _is_positive_number(entity.get("diameter"))
-            )
+            _has_coordinate_value(entity.get("center"))
+            or _has_coordinate_value(entity.get("origin"))
+        ) and (
+            _is_positive_number(entity.get("radius")) or _is_positive_number(entity.get("diameter"))
         )
     if kind in _BLOCK_REFERENCE_ENTITY_KINDS:
         return (
@@ -1683,6 +1758,17 @@ def _xref_ref(xref: Mapping[str, Any], *, index: int) -> str:
             return value
 
     return f"xref-{index}"
+
+
+def _entity_ref(entity: Mapping[str, Any], *, index: int) -> str:
+    for key in ("source_identity", "source_ref", "entity_id", "id", "handle", "ref"):
+        value = entity.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if value is not None:
+            return str(value)
+
+    return f"entity-{index}"
 
 
 def _is_valid_pdf_scale(candidate: Any) -> bool:
