@@ -155,11 +155,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 
-      - name: Run Alembic migrations
-        run: uv run alembic upgrade head
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
-
       - name: Run pytest integration lane
         run: uv run python scripts/profile_integration_lane.py --marker "integration and ${{ matrix.marker }} and not compose_smoke" --durations 50 --durations-min 0.2
         env:
