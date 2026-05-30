@@ -70,9 +70,10 @@ def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() ->
         [
             profile_integration_lane.CommandResult(returncode=0),
             profile_integration_lane.CommandResult(returncode=0),
+            profile_integration_lane.CommandResult(returncode=0),
         ]
     )
-    clock = ClockStub([10.0, 10.25, 20.0, 21.75])
+    clock = ClockStub([1.0, 1.5, 10.0, 10.25, 20.0, 21.75])
     stdout = io.StringIO()
     stderr = io.StringIO()
 
@@ -94,6 +95,16 @@ def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() ->
 
     assert exit_code == 0
     assert runner.calls == [
+        (
+            (
+                "uv",
+                "run",
+                "alembic",
+                "upgrade",
+                "head",
+            ),
+            True,
+        ),
         (
             (
                 "uv",
@@ -123,27 +134,72 @@ def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() ->
     ]
     assert stdout.getvalue() == ""
     error_output = stderr.getvalue()
+    assert "[profile] migration command:" in error_output
     assert "[profile] collect-only command:" in error_output
     assert "[profile] full pytest run command:" in error_output
+    assert "[profile] migration elapsed: 0.500s (exit 0)" in error_output
     assert "[profile] collect-only elapsed: 0.250s (exit 0)" in error_output
     assert "[profile] full pytest run elapsed: 1.750s (exit 0)" in error_output
     assert (
-        "[profile] summary: collect-only=0.250s full-pytest-run=1.750s combined-wall=2.000s"
-        in error_output
+        "[profile] summary: migration=0.500s collect-only=0.250s "
+        "full-pytest-run=1.750s combined-wall=2.500s" in error_output
     )
+
+
+def test_main_returns_migration_failure_and_skips_collect_only_and_execution() -> None:
+    runner = RunnerStub(
+        [
+            profile_integration_lane.CommandResult(
+                returncode=1,
+                stdout="migration stdout\n",
+                stderr="migration stderr\n",
+            )
+        ]
+    )
+    clock = ClockStub([1.0, 1.2])
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    exit_code = profile_integration_lane.main(
+        ["--marker", "integration and db_api and not compose_smoke"],
+        runner=runner,
+        clock=clock,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert runner.calls == [
+        (
+            (
+                "uv",
+                "run",
+                "alembic",
+                "upgrade",
+                "head",
+            ),
+            True,
+        )
+    ]
+    assert stdout.getvalue() == "migration stdout\n"
+    error_output = stderr.getvalue()
+    assert "migration stderr\n" in error_output
+    assert "[profile] collect-only skipped after migration failure." in error_output
+    assert "[profile] full pytest run skipped after migration failure." in error_output
 
 
 def test_main_returns_collection_failure_and_skips_execution() -> None:
     runner = RunnerStub(
         [
+            profile_integration_lane.CommandResult(returncode=0),
             profile_integration_lane.CommandResult(
                 returncode=2,
                 stdout="collection stdout\n",
                 stderr="collection stderr\n",
-            )
+            ),
         ]
     )
-    clock = ClockStub([1.0, 1.1])
+    clock = ClockStub([1.0, 1.2, 2.0, 2.1])
     stdout = io.StringIO()
     stderr = io.StringIO()
 
@@ -161,6 +217,16 @@ def test_main_returns_collection_failure_and_skips_execution() -> None:
             (
                 "uv",
                 "run",
+                "alembic",
+                "upgrade",
+                "head",
+            ),
+            True,
+        ),
+        (
+            (
+                "uv",
+                "run",
                 "pytest",
                 "-m",
                 "integration and db_api and not compose_smoke",
@@ -168,9 +234,10 @@ def test_main_returns_collection_failure_and_skips_execution() -> None:
                 "-q",
             ),
             True,
-        )
+        ),
     ]
     assert stdout.getvalue() == "collection stdout\n"
     error_output = stderr.getvalue()
+    assert "[profile] migration elapsed: 0.200s (exit 0)" in error_output
     assert "collection stderr\n" in error_output
     assert "[profile] full pytest run skipped after collect-only failure." in error_output

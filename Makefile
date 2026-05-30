@@ -75,7 +75,6 @@ integration:
 	uv run pytest -m "$(PYTEST_INTEGRATION_EXPRESSION)"
 
 profile-integration:
-	uv run alembic upgrade head
 	uv run python scripts/profile_integration_lane.py --marker "$(PROFILE_INTEGRATION_MARKER)" --durations $(PROFILE_INTEGRATION_DURATIONS) --durations-min $(PROFILE_INTEGRATION_DURATIONS_MIN) $(PROFILE_INTEGRATION_PYTEST_ARGS)
 
 compose-smoke:
