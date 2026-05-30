@@ -7,9 +7,10 @@ import hmac
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
 
 from fastapi import Header, HTTPException, status
 from fastapi.responses import JSONResponse, Response
@@ -41,6 +42,72 @@ class IdempotencyReplay:
 
 
 IdempotencyClaim = IdempotencyReservation | IdempotencyReplay
+
+
+@dataclass(frozen=True)
+class IdempotentMutationSuccess[ResultT]:
+    """Successful mutation result awaiting response serialization."""
+
+    value: ResultT
+    status_code: int
+    after_commit: Callable[[], Awaitable[None]] | None = None
+
+
+@dataclass(frozen=True)
+class IdempotentMutationKnownError:
+    """Explicit known-error snapshot that should be finalized and replayed."""
+
+    status_code: int
+    response_body: dict[str, Any] | None
+    after_commit: Callable[[], Awaitable[None]] | None = None
+
+
+class ReplayIdempotencyResponseCallable(Protocol):
+    """Typed replay helper contract for idempotent mutation orchestration."""
+
+    async def __call__(
+        self,
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+    ) -> Response | None: ...
+
+
+class ClaimIdempotencyResponseCallable(Protocol):
+    """Typed claim helper contract for idempotent mutation orchestration."""
+
+    async def __call__(
+        self,
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None: ...
+
+
+class CompleteIdempotencyResponseCallable(Protocol):
+    """Typed completion helper contract for idempotent mutation orchestration."""
+
+    async def __call__(
+        self,
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response: ...
+
+
+@dataclass(frozen=True)
+class IdempotentMutationOps:
+    """Injectable idempotency helper operations for mutation orchestration."""
+
+    replay: ReplayIdempotencyResponseCallable
+    claim: ClaimIdempotencyResponseCallable
+    complete: CompleteIdempotencyResponseCallable
 
 
 def _resolve_hash_secret() -> str:
@@ -292,3 +359,77 @@ async def complete_idempotency_response(
     if status_code == status.HTTP_204_NO_CONTENT:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     return JSONResponse(status_code=status_code, content=response_body)
+
+
+DEFAULT_IDEMPOTENT_MUTATION_OPS = IdempotentMutationOps(
+    replay=replay_idempotency_response,
+    claim=claim_idempotency_response,
+    complete=complete_idempotency_response,
+)
+
+
+async def run_idempotent_mutation[ResultT](
+    db: AsyncSession,
+    *,
+    key: str | None,
+    fingerprint: str,
+    method: str,
+    path: str,
+    mutate: Callable[
+        [],
+        Awaitable[IdempotentMutationSuccess[ResultT] | IdempotentMutationKnownError],
+    ],
+    serialize_result: Callable[[ResultT], dict[str, Any] | None],
+    preclaim: Callable[[], Awaitable[Response | None]] | None = None,
+    reload_after_claim: Callable[[], Awaitable[None]] | None = None,
+    ops: IdempotentMutationOps | None = None,
+) -> Response:
+    """Run the shared replay/claim/mutate/complete/commit mutation flow."""
+
+    resolved_ops = ops or DEFAULT_IDEMPOTENT_MUTATION_OPS
+    replay_response = await resolved_ops.replay(
+        db,
+        key=key,
+        fingerprint=fingerprint,
+    )
+    if replay_response is not None:
+        return replay_response
+
+    if preclaim is not None:
+        preclaim_response = await preclaim()
+        if preclaim_response is not None:
+            return preclaim_response
+
+    reservation_or_response = await resolved_ops.claim(
+        db,
+        key=key,
+        fingerprint=fingerprint,
+        method=method,
+        path=path,
+    )
+    if isinstance(reservation_or_response, Response):
+        return reservation_or_response
+
+    if reservation_or_response is not None and reload_after_claim is not None:
+        await reload_after_claim()
+
+    mutation_result = await mutate()
+    if isinstance(mutation_result, IdempotentMutationKnownError):
+        response_body = mutation_result.response_body
+        after_commit = mutation_result.after_commit
+        status_code = mutation_result.status_code
+    else:
+        response_body = serialize_result(mutation_result.value)
+        after_commit = mutation_result.after_commit
+        status_code = mutation_result.status_code
+
+    response = await resolved_ops.complete(
+        db,
+        reservation_or_response,
+        status_code=status_code,
+        response_body=response_body,
+    )
+    await db.commit()
+    if after_commit is not None:
+        await after_commit()
+    return response

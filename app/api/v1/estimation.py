@@ -16,12 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.api.idempotency import (
-    IdempotencyReservation,
+    IdempotentMutationKnownError,
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
     build_idempotency_fingerprint,
     claim_idempotency_response,
     complete_idempotency_response,
     get_idempotency_key,
     replay_idempotency_response,
+    run_idempotent_mutation,
 )
 from app.api.pagination import decode_cursor_payload, encode_cursor_payload, raise_invalid_cursor
 from app.core.errors import ErrorCode
@@ -56,6 +59,12 @@ from app.schemas.estimation_catalog import (
 )
 
 estimation_router = APIRouter()
+
+_IDEMPOTENT_MUTATION_OPS = IdempotentMutationOps(
+    replay=replay_idempotency_response,
+    claim=claim_idempotency_response,
+    complete=complete_idempotency_response,
+)
 
 
 class _TimestampCursor(BaseModel):
@@ -111,22 +120,11 @@ def _catalog_conflict_body(kind: str) -> dict[str, Any]:
     )
 
 
-async def _raise_catalog_conflict(
-    db: AsyncSession,
-    reservation: IdempotencyReservation | None,
-    *,
-    kind: str,
-) -> None:
-    error_body = _catalog_conflict_body(kind)
-    if reservation is not None:
-        await complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_409_CONFLICT,
-            response_body=error_body,
-        )
-        await db.commit()
-    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error_body)
+def _catalog_conflict_result(kind: str) -> IdempotentMutationKnownError:
+    return IdempotentMutationKnownError(
+        status_code=status.HTTP_409_CONFLICT,
+        response_body=_catalog_conflict_body(kind),
+    )
 
 
 def _raise_input_invalid(message: str) -> None:
@@ -203,73 +201,57 @@ async def _create_catalog_entry[
     build_supersession: Callable[[CatalogPredecessorT, CatalogEntryT], Any] | None,
     serialize_created: Callable[[CatalogEntryT, UUID | None], CatalogReadT],
 ) -> CatalogReadT | Response:
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            fingerprint_namespace,
-            payload.model_dump(mode="json"),
-        )
-        replay = await replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay is not None:
-            return replay
-
-    if project_id is not None:
-        await _get_active_project_or_404(db, project_id)
-
+    fingerprint = build_idempotency_fingerprint(
+        fingerprint_namespace,
+        payload.model_dump(mode="json"),
+    )
     predecessor: CatalogPredecessorT | None = None
-    if supersedes_id is not None:
-        predecessor = await get_predecessor(db, supersedes_id)
-        validate_predecessor(payload, predecessor)
-        if validate_effective_window is not None:
-            validate_effective_window(payload, predecessor)
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=path,
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
+    async def _preclaim() -> Response | None:
+        nonlocal predecessor
+        if project_id is not None:
+            await _get_active_project_or_404(db, project_id)
+        predecessor = None
+        if supersedes_id is not None:
+            predecessor = await get_predecessor(db, supersedes_id)
+            validate_predecessor(payload, predecessor)
+            if validate_effective_window is not None:
+                validate_effective_window(payload, predecessor)
+        return None
 
-    entry = build_entry(payload)
-    db.add(entry)
+    async def _reload_after_claim() -> None:
+        await _preclaim()
 
-    try:
-        await db.flush()
-        if predecessor is not None and build_supersession is not None:
-            db.add(build_supersession(predecessor, entry))
+    async def _mutate() -> IdempotentMutationSuccess[CatalogReadT] | IdempotentMutationKnownError:
+        entry = build_entry(payload)
+        db.add(entry)
+        try:
             await db.flush()
-        await db.refresh(entry)
-    except IntegrityError:
-        await db.rollback()
-        await _raise_catalog_conflict(db, reservation, kind=conflict_kind)
+            if predecessor is not None and build_supersession is not None:
+                db.add(build_supersession(predecessor, entry))
+                await db.flush()
+            await db.refresh(entry)
+        except IntegrityError:
+            await db.rollback()
+            return _catalog_conflict_result(conflict_kind)
 
-    body = serialize_created(entry, supersedes_id)
-    response_body = body.model_dump(mode="json")
-    idempotent_response: Response | None = None
-    if reservation is not None:
-        idempotent_response = await complete_idempotency_response(
-            db,
-            reservation,
+        return IdempotentMutationSuccess(
+            value=serialize_created(entry, supersedes_id),
             status_code=status.HTTP_201_CREATED,
-            response_body=response_body,
         )
-    await db.commit()
 
-    if idempotent_response is not None:
-        return idempotent_response
-    return body
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="POST",
+        path=path,
+        preclaim=_preclaim,
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=lambda body: body.model_dump(mode="json"),
+        ops=_IDEMPOTENT_MUTATION_OPS,
+    )
 
 
 async def _get_catalog_entry_or_404[CatalogReadT: BaseModel](

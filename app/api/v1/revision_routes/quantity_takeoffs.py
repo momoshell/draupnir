@@ -5,13 +5,17 @@ from typing import Annotated, Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
     IdempotencyReservation,
+    IdempotentMutationKnownError,
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
     get_idempotency_key,
+    run_idempotent_mutation,
 )
 from app.api.idempotency import (
     build_idempotency_fingerprint as _build_idempotency_fingerprint_direct,
@@ -236,6 +240,36 @@ async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
     return await helper(*args, **kwargs)
 
 
+async def _complete_mutation_response(
+    db: AsyncSession,
+    reservation: IdempotencyReservation | None,
+    *,
+    status_code: int,
+    response_body: dict[str, Any] | None,
+) -> Response:
+    """Finalize create responses while preserving non-idempotent behavior."""
+
+    if reservation is None:
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    return await _complete_idempotency_response(
+        db,
+        reservation,
+        status_code=status_code,
+        response_body=response_body,
+    )
+
+
+def _idempotent_mutation_ops() -> IdempotentMutationOps:
+    """Return compatibility-aware idempotency operations for mutation helpers."""
+
+    return IdempotentMutationOps(
+        replay=_replay_idempotency_response,
+        claim=_claim_idempotency_response,
+        complete=_complete_mutation_response,
+    )
+
+
 def _prepare_job_enqueue_intent(job: Job) -> None:
     """Compatibility wrapper for enqueue intent staging."""
 
@@ -450,94 +484,75 @@ async def create_revision_quantity_takeoff(
 ) -> Job | Response:
     """Create a pending quantity takeoff job for an active drawing revision."""
 
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = _build_idempotency_fingerprint(
-            f"revisions.quantity_takeoffs:{revision_id}",
-            {"revision_id": str(revision_id)},
-        )
-        replay_response = await _replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay_response is not None:
-            return replay_response
-
-    revision = await _get_active_revision(revision_id, db)
-    if revision is None:
-        raise_not_found("Drawing revision", str(revision_id))
-    assert revision is not None
-    await _get_active_revision_manifest_or_409(revision_id, db)
-    report = await _get_active_validation_report_or_404(revision_id, db)
-    if report.quantity_gate in {
-        QuantityGate.REVIEW_GATED.value,
-        QuantityGate.BLOCKED.value,
-    }:
-        _raise_quantity_takeoff_gate_invalid(report)
-
-    locked_revision = await _get_active_revision(revision_id, db, for_update=True)
-    if locked_revision is None:
-        raise_not_found("Drawing revision", str(revision_id))
-    revision = locked_revision
-    assert revision is not None
-
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await _claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=f"/revisions/{revision_id}/quantity-takeoffs",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
-
-    quantity_job = Job(
-        id=uuid4(),
-        project_id=revision.project_id,
-        file_id=revision.source_file_id,
-        extraction_profile_id=None,
-        base_revision_id=revision.id,
-        parent_job_id=None,
-        job_type=JobType.QUANTITY_TAKEOFF.value,
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        enqueue_status="pending",
-        enqueue_attempts=0,
-        cancel_requested=False,
-        error_code=None,
-        error_message=None,
-        started_at=None,
-        finished_at=None,
-    )
-    db.add(quantity_job)
-    _prepare_job_enqueue_intent(quantity_job)
-    await db.flush()
-    await db.refresh(quantity_job)
-
-    success_response: Response | None = None
-    if reservation is not None:
-        success_response = await _complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_202_ACCEPTED,
-            response_body=JobRead.model_validate(quantity_job).model_dump(mode="json"),
-        )
-
-    await db.commit()
-    await _publish_job_enqueue_intent(
-        quantity_job.id,
-        publisher=_revisions_module().enqueue_quantity_takeoff_job,
-        suppress_exceptions=True,
+    fingerprint = _build_idempotency_fingerprint(
+        f"revisions.quantity_takeoffs:{revision_id}",
+        {"revision_id": str(revision_id)},
     )
 
-    if success_response is not None:
-        return success_response
+    async def _preclaim() -> Response | None:
+        revision = await _get_active_revision(revision_id, db)
+        if revision is None:
+            raise_not_found("Drawing revision", str(revision_id))
 
-    return quantity_job
+        await _get_active_revision_manifest_or_409(revision_id, db)
+        report = await _get_active_validation_report_or_404(revision_id, db)
+        if report.quantity_gate in {
+            QuantityGate.REVIEW_GATED.value,
+            QuantityGate.BLOCKED.value,
+        }:
+            _raise_quantity_takeoff_gate_invalid(report)
+        return None
+
+    async def _mutate() -> IdempotentMutationSuccess[Job] | IdempotentMutationKnownError:
+        revision = await _get_active_revision(revision_id, db, for_update=True)
+        if revision is None:
+            raise_not_found("Drawing revision", str(revision_id))
+
+        quantity_job = Job(
+            id=uuid4(),
+            project_id=revision.project_id,
+            file_id=revision.source_file_id,
+            extraction_profile_id=None,
+            base_revision_id=revision.id,
+            parent_job_id=None,
+            job_type=JobType.QUANTITY_TAKEOFF.value,
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            enqueue_status="pending",
+            enqueue_attempts=0,
+            cancel_requested=False,
+            error_code=None,
+            error_message=None,
+            started_at=None,
+            finished_at=None,
+        )
+        db.add(quantity_job)
+        _prepare_job_enqueue_intent(quantity_job)
+        await db.flush()
+        await db.refresh(quantity_job)
+
+        async def _after_commit() -> None:
+            await _publish_job_enqueue_intent(
+                quantity_job.id,
+                publisher=_revisions_module().enqueue_quantity_takeoff_job,
+                suppress_exceptions=True,
+            )
+
+        return IdempotentMutationSuccess(
+            quantity_job,
+            status.HTTP_202_ACCEPTED,
+            after_commit=_after_commit,
+        )
+
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="POST",
+        path=f"/revisions/{revision_id}/quantity-takeoffs",
+        preclaim=_preclaim,
+        mutate=_mutate,
+        serialize_result=lambda job: JobRead.model_validate(job).model_dump(mode="json"),
+        ops=_idempotent_mutation_ops(),
+    )

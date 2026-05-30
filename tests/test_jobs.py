@@ -1522,6 +1522,33 @@ class TestJobs:
         assert unchanged.cancel_requested is False
         assert unchanged.attempts == 1
 
+    async def test_cancel_job_replays_terminal_no_op_with_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Cancel should snapshot and replay terminal no-op responses."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await worker_module.process_ingest_job(job.id)
+
+        headers = {"Idempotency-Key": "cancel-terminal-replay"}
+        first = await async_client.post(f"/v1/jobs/{job.id}/cancel", headers=headers)
+        second = await async_client.post(f"/v1/jobs/{job.id}/cancel", headers=headers)
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json() == first.json()
+        unchanged = await _get_job(job.id)
+        assert unchanged.status == "succeeded"
+        assert unchanged.cancel_requested is False
+
     async def test_retry_job_requeues_failed_job_below_max_attempts(
         self,
         async_client: httpx.AsyncClient,
@@ -1573,6 +1600,59 @@ class TestJobs:
         assert updated.status == "pending"
         assert updated.error_code is None
         assert updated.error_message is None
+
+    async def test_retry_job_publishes_only_after_commit(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry publish should observe committed state only after mutation commit."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        observed_publish_states: list[tuple[str, str]] = []
+
+        async def _observe_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            persisted = await _get_job(job_id)
+            observed_publish_states.append((persisted.status, persisted.enqueue_status))
+            assert persisted.cancel_requested is False
+            assert persisted.error_code is None
+            assert persisted.error_message is None
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _observe_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=1,
+            max_attempts=3,
+            cancel_requested=True,
+            error_message="previous failure",
+        )
+
+        response = await async_client.post(f"/v1/jobs/{job.id}/retry")
+
+        assert response.status_code == 202
+        assert observed_publish_states == [("pending", "pending")]
 
     async def test_retry_job_succeeds_when_publish_is_deferred(
         self,
@@ -2084,6 +2164,62 @@ class TestJobs:
         unchanged = await _get_job(job.id)
         assert unchanged.status == "cancelled"
         assert unchanged.attempts == 1
+
+    async def test_retry_job_replays_attempt_limit_no_op_with_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retry should snapshot and replay attempt-limit no-op responses."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        retried_job_ids: list[str] = []
+
+        async def _fake_retry_publish(
+            job_id: uuid.UUID,
+            *,
+            publisher: Any | None = None,
+            suppress_exceptions: bool = False,
+            **kwargs: Any,
+        ) -> bool:
+            _ = (publisher, suppress_exceptions, kwargs)
+            retried_job_ids.append(str(job_id))
+            return True
+
+        monkeypatch.setattr(
+            jobs_api,
+            "publish_job_enqueue_intent",
+            _fake_retry_publish,
+            raising=False,
+        )
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(
+            job.id,
+            status="failed",
+            attempts=3,
+            max_attempts=3,
+            error_message="maxed out",
+        )
+
+        headers = {"Idempotency-Key": "retry-attempt-limit-replay"}
+        first = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=headers)
+        second = await async_client.post(f"/v1/jobs/{job.id}/retry", headers=headers)
+
+        assert first.status_code == 202
+        assert second.status_code == 202
+        assert second.json() == first.json()
+        assert retried_job_ids == []
+        unchanged = await _get_job(job.id)
+        assert unchanged.status == "failed"
+        assert unchanged.attempts == 3
+        assert unchanged.max_attempts == 3
 
     @pytest.mark.parametrize(
         ("status", "attempts", "max_attempts", "error_code", "error_message"),

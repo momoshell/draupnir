@@ -6,13 +6,17 @@ from typing import Annotated, Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
     IdempotencyReservation,
+    IdempotentMutationKnownError,
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
     get_idempotency_key,
+    run_idempotent_mutation,
 )
 from app.api.idempotency import (
     build_idempotency_fingerprint as _build_idempotency_fingerprint_direct,
@@ -257,6 +261,36 @@ async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
         ),
     )
     return await helper(*args, **kwargs)
+
+
+async def _complete_mutation_response(
+    db: AsyncSession,
+    reservation: IdempotencyReservation | None,
+    *,
+    status_code: int,
+    response_body: dict[str, Any] | None,
+) -> Response:
+    """Finalize create responses while preserving non-idempotent behavior."""
+
+    if reservation is None:
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    return await _complete_idempotency_response(
+        db,
+        reservation,
+        status_code=status_code,
+        response_body=response_body,
+    )
+
+
+def _idempotent_mutation_ops() -> IdempotentMutationOps:
+    """Return compatibility-aware idempotency operations for mutation helpers."""
+
+    return IdempotentMutationOps(
+        replay=_replay_idempotency_response,
+        claim=_claim_idempotency_response,
+        complete=_complete_mutation_response,
+    )
 
 
 def _prepare_job_enqueue_intent(job: Job) -> None:
@@ -647,134 +681,127 @@ async def create_revision_estimate_version(
         )
 
     normalized_body = _normalize_estimate_request_body(request)
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = _build_idempotency_fingerprint(
-            f"revisions.quantity_takeoffs.estimate_versions:{revision_id}:{takeoff_id}",
-            {
-                "revision_id": str(revision_id),
-                "takeoff_id": str(takeoff_id),
-                "body": normalized_body,
-            },
-        )
-        replay_response = await _replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay_response is not None:
-            return replay_response
-
-    revision = await _get_active_revision(revision_id, db)
-    if revision is None:
-        raise_not_found("Drawing revision", str(revision_id))
-    assert revision is not None
-
-    takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
-    if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
-        _raise_estimate_takeoff_gate_invalid(takeoff)
-
-    locked_revision = await _get_active_revision(revision_id, db, for_update=True)
-    if locked_revision is None:
-        raise_not_found("Drawing revision", str(revision_id))
-    assert locked_revision is not None
-    revision = locked_revision
-    takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
-    if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
-        _raise_estimate_takeoff_gate_invalid(takeoff)
-
-    job_created_at = _utc_now()
-    pricing_mode, pricing_effective_date = _resolve_estimate_pricing_contract(
-        request,
-        job_created_at=job_created_at,
+    fingerprint = _build_idempotency_fingerprint(
+        f"revisions.quantity_takeoffs.estimate_versions:{revision_id}:{takeoff_id}",
+        {
+            "revision_id": str(revision_id),
+            "takeoff_id": str(takeoff_id),
+            "body": normalized_body,
+        },
     )
-    normalized_refs = await _resolve_estimate_catalog_refs(
-        revision,
-        takeoff,
-        request.catalog_refs,
-        pricing_effective_date,
+    job_created_at: datetime | None = None
+    pricing_mode: str | None = None
+    pricing_effective_date: date | None = None
+    normalized_refs: list[_NormalizedEstimateCatalogRef] | None = None
+
+    async def _preclaim() -> Response | None:
+        nonlocal job_created_at, pricing_mode, pricing_effective_date, normalized_refs
+
+        revision = await _get_active_revision(revision_id, db)
+        if revision is None:
+            raise_not_found("Drawing revision", str(revision_id))
+
+        takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
+        if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
+            _raise_estimate_takeoff_gate_invalid(takeoff)
+
+        job_created_at = _utc_now()
+        pricing_mode, pricing_effective_date = _resolve_estimate_pricing_contract(
+            request,
+            job_created_at=job_created_at,
+        )
+        normalized_refs = await _resolve_estimate_catalog_refs(
+            revision,
+            takeoff,
+            request.catalog_refs,
+            pricing_effective_date,
+            db,
+        )
+        return None
+
+    async def _mutate() -> IdempotentMutationSuccess[Job] | IdempotentMutationKnownError:
+        revision = await _get_active_revision(revision_id, db, for_update=True)
+        if revision is None:
+            raise_not_found("Drawing revision", str(revision_id))
+
+        takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
+        if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
+            _raise_estimate_takeoff_gate_invalid(takeoff)
+        assert job_created_at is not None
+        assert pricing_mode is not None
+        assert pricing_effective_date is not None
+        assert normalized_refs is not None
+
+        estimate_job = Job(
+            id=uuid4(),
+            project_id=revision.project_id,
+            file_id=revision.source_file_id,
+            extraction_profile_id=None,
+            base_revision_id=revision.id,
+            parent_job_id=(
+                takeoff.source_job_id
+                if takeoff.project_id == revision.project_id
+                and takeoff.source_file_id == revision.source_file_id
+                else None
+            ),
+            job_type=JobType.ESTIMATE.value,
+            status="pending",
+            attempts=0,
+            max_attempts=3,
+            enqueue_status="pending",
+            enqueue_attempts=0,
+            cancel_requested=False,
+            error_code=None,
+            error_message=None,
+            started_at=None,
+            finished_at=None,
+            created_at=job_created_at,
+        )
+        db.add(estimate_job)
+        _prepare_job_enqueue_intent(estimate_job)
+        await db.flush()
+        await db.refresh(estimate_job)
+
+        estimate_job_input_model, estimate_job_input_ref_model = (
+            _resolve_estimate_job_model_classes()
+        )
+        input_payload, ref_payloads = _build_estimate_job_input_payload(
+            estimate_job,
+            revision,
+            takeoff,
+            request,
+            normalized_refs,
+            pricing_mode=pricing_mode,
+            pricing_effective_date=pricing_effective_date,
+        )
+        db.add(_build_mapped_instance(estimate_job_input_model, input_payload))
+        for ref_payload in ref_payloads:
+            db.add(_build_mapped_instance(estimate_job_input_ref_model, ref_payload))
+
+        async def _after_commit() -> None:
+            await _publish_job_enqueue_intent(
+                estimate_job.id,
+                publisher=_revisions_module().enqueue_estimate_job,
+                suppress_exceptions=True,
+            )
+
+        return IdempotentMutationSuccess(
+            estimate_job,
+            status.HTTP_202_ACCEPTED,
+            after_commit=_after_commit,
+        )
+
+    return await run_idempotent_mutation(
         db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="POST",
+        path=f"/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/estimate-versions",
+        preclaim=_preclaim,
+        mutate=_mutate,
+        serialize_result=lambda job: JobRead.model_validate(job).model_dump(mode="json"),
+        ops=_idempotent_mutation_ops(),
     )
-
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await _claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=f"/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/estimate-versions",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
-
-    estimate_job = Job(
-        id=uuid4(),
-        project_id=revision.project_id,
-        file_id=revision.source_file_id,
-        extraction_profile_id=None,
-        base_revision_id=revision.id,
-        parent_job_id=(
-            takeoff.source_job_id
-            if takeoff.project_id == revision.project_id
-            and takeoff.source_file_id == revision.source_file_id
-            else None
-        ),
-        job_type=JobType.ESTIMATE.value,
-        status="pending",
-        attempts=0,
-        max_attempts=3,
-        enqueue_status="pending",
-        enqueue_attempts=0,
-        cancel_requested=False,
-        error_code=None,
-        error_message=None,
-        started_at=None,
-        finished_at=None,
-        created_at=job_created_at,
-    )
-    db.add(estimate_job)
-    _prepare_job_enqueue_intent(estimate_job)
-    await db.flush()
-    await db.refresh(estimate_job)
-
-    estimate_job_input_model, estimate_job_input_ref_model = _resolve_estimate_job_model_classes()
-    input_payload, ref_payloads = _build_estimate_job_input_payload(
-        estimate_job,
-        revision,
-        takeoff,
-        request,
-        normalized_refs,
-        pricing_mode=pricing_mode,
-        pricing_effective_date=pricing_effective_date,
-    )
-    db.add(_build_mapped_instance(estimate_job_input_model, input_payload))
-    for ref_payload in ref_payloads:
-        db.add(_build_mapped_instance(estimate_job_input_ref_model, ref_payload))
-
-    success_response: Response | None = None
-    if reservation is not None:
-        success_response = await _complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_202_ACCEPTED,
-            response_body=JobRead.model_validate(estimate_job).model_dump(mode="json"),
-        )
-
-    await db.commit()
-    await _publish_job_enqueue_intent(
-        estimate_job.id,
-        publisher=_revisions_module().enqueue_estimate_job,
-        suppress_exceptions=True,
-    )
-
-    if success_response is not None:
-        return success_response
-
-    return estimate_job
 
 
 @estimates_router.get(
