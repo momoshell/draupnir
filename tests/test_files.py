@@ -6,12 +6,12 @@ import uuid
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import select
 
 import app.api.v1.files as files_api
@@ -911,6 +911,79 @@ class TestProjectFiles:
         data = response.json()
         assert data["error"]["code"] == "NOT_FOUND"
         assert "Project" in data["error"]["message"]
+
+    async def test_upload_file_missing_project_precedes_body_validation(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """POST should return Project 404 before no-key upload body validation runs."""
+        _ = self
+        _ = cleanup_projects
+        monkeypatch.setattr(settings, "max_upload_mb", 1)
+
+        payload = b"x" * ((settings.max_upload_mb * 1024 * 1024) + 1)
+        response = await async_client.post(
+            f"/v1/projects/{uuid.uuid4()}/files",
+            files={"file": ("missing.xyz", payload, "application/octet-stream")},
+        )
+
+        assert response.status_code == 404
+        data = response.json()
+        assert data["error"]["code"] == "NOT_FOUND"
+        assert "Project" in data["error"]["message"]
+        assert data["error"]["details"] is None
+
+    async def test_upload_file_missing_project_closes_upload_on_early_validation_error(
+        self,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Early missing-project validation should still close the upload handle."""
+        _ = self
+        _ = cleanup_projects
+
+        class StubUploadFile:
+            filename = "missing.pdf"
+            content_type = "application/pdf"
+
+            def __init__(self) -> None:
+                self.close_calls = 0
+                self.read_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+
+            async def read(self, _size: int = -1) -> bytes:
+                self.read_calls += 1
+                raise AssertionError("upload body should not be read")
+
+        async def _missing_project(
+            db: Any,
+            project_id: uuid.UUID,
+            *,
+            for_update: bool = False,
+        ) -> NoReturn:
+            _ = (db, for_update)
+            raise_not_found("Project", str(project_id))
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(files_api, "_get_active_project_or_404", _missing_project)
+        upload = cast(Any, StubUploadFile())
+
+        with pytest.raises(HTTPException) as exc_info:
+            await files_api.upload_project_file(
+                uuid.uuid4(),
+                upload,
+                cast(Any, object()),
+                cast(Any, object()),
+                idempotency_key=None,
+            )
+
+        assert exc_info.value.status_code == 404
+        assert upload.close_calls == 1
+        assert upload.read_calls == 0
 
     async def test_upload_file_soft_deleted_project_returns_not_found(
         self,

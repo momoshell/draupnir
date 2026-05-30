@@ -12,6 +12,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+import app.api.v1.estimation as estimation_api
 import app.db.session as session_module
 from app.estimating.catalog.api_checksums import (
     formula_checksum_sha256,
@@ -689,6 +690,62 @@ class TestEstimationCatalogApiRateIdempotency:
         assert second_conflict_response.status_code == 409
         assert first_conflict_response.json() == second_conflict_response.json()
         assert first_conflict_response.json()["error"]["code"] == "DB_CONFLICT"
+
+    async def test_create_rate_revalidates_project_after_idempotency_claim(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Idempotency Revalidation Project")
+        payload = _valid_rate_payload(project_id=project_id)
+        headers = {"Idempotency-Key": "rate-create-revalidate-project-key"}
+        callback_order: list[str] = []
+
+        async def fake_run_idempotent_mutation(
+            db: Any,
+            *,
+            key: str | None,
+            fingerprint: str,
+            method: str,
+            path: str,
+            preclaim: Any,
+            mutate: Any,
+            serialize_result: Any,
+            ops: Any,
+            reload_after_claim: Any = None,
+        ) -> Any:
+            _ = (db, fingerprint, method, path, mutate, serialize_result, ops)
+            assert key == headers["Idempotency-Key"]
+
+            callback_order.append("preclaim")
+            await preclaim()
+            project = (
+                await db.execute(select(Project).where(Project.id == UUID(project_id)))
+            ).scalar_one()
+            project.deleted_at = project.updated_at
+            await db.flush()
+
+            assert reload_after_claim is not None
+            callback_order.append("reload_after_claim")
+            await reload_after_claim()
+
+            pytest.fail("reload_after_claim should raise before mutate")
+
+        monkeypatch.setattr(estimation_api, "run_idempotent_mutation", fake_run_idempotent_mutation)
+
+        response = await async_client.post(
+            "/v1/estimation/catalog/rates",
+            json=payload,
+            headers=headers,
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "NOT_FOUND"
+        assert callback_order == ["preclaim", "reload_after_claim"]
 
 
 @requires_database

@@ -12,15 +12,14 @@ import pytest
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.api.idempotency as idempotency_api
-import app.api.v1.files as files_api
-import app.api.v1.jobs as jobs_api
-import app.db.session as session_module
-import app.jobs.worker as worker_module
 from app.api.idempotency import (
     IdempotencyReplay,
     IdempotencyReservation,
+    IdempotentMutationKnownError,
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
     build_idempotency_fingerprint,
     claim_idempotency_response,
     complete_idempotency_response,
@@ -29,9 +28,14 @@ from app.api.idempotency import (
     mark_idempotency_completed,
     replay_idempotency,
     replay_idempotency_response,
+    run_idempotent_mutation,
 )
+from app.api.v1 import files as files_api
+from app.api.v1 import jobs as jobs_api
 from app.core.config import settings
 from app.core.errors import ErrorCode
+from app.db import session as session_module
+from app.jobs import worker as worker_module
 from app.jobs.worker import process_ingest_job
 from app.models.drawing_revision import DrawingRevision
 from app.models.idempotency_key import IdempotencyKey, IdempotencyStatus
@@ -147,7 +151,7 @@ async def test_replay_idempotency_response_unwraps_replay(monkeypatch: pytest.Mo
         assert fingerprint == "fingerprint-2"
         return IdempotencyReplay(response=replay_response)
 
-    monkeypatch.setattr(idempotency_api, "replay_idempotency", _fake_replay_idempotency)
+    monkeypatch.setattr("app.api.idempotency.replay_idempotency", _fake_replay_idempotency)
 
     result = await replay_idempotency_response(
         cast(Any, object()),
@@ -195,7 +199,7 @@ async def test_claim_idempotency_response_unwraps_replay(monkeypatch: pytest.Mon
         )
         return IdempotencyReplay(response=replay_response)
 
-    monkeypatch.setattr(idempotency_api, "claim_idempotency", _fake_claim_idempotency)
+    monkeypatch.setattr("app.api.idempotency.claim_idempotency", _fake_claim_idempotency)
 
     result = await claim_idempotency_response(
         cast(Any, object()),
@@ -230,6 +234,464 @@ class _FakeIdempotencySession:
 
     async def commit(self) -> None:
         self.commit_calls += 1
+
+
+class _CommitTrackingSession:
+    """Minimal session double that records commit ordering for orchestration tests."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.commit_calls = 0
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        self._events.append("commit")
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_supports_no_key_execution() -> None:
+    """Shared orchestration should no-op idempotency helpers when the key is absent."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert key is None
+        assert fingerprint == "fingerprint-7"
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert key is None
+        assert (fingerprint, method, path) == ("fingerprint-7", "POST", "/v1/projects")
+        return None
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = db
+        events.append("complete")
+        assert reservation is None
+        assert status_code == 201
+        assert response_body == {"id": "project-1"}
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    async def _preclaim() -> Response | None:
+        events.append("preclaim")
+        return None
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        return IdempotentMutationSuccess(value="project-1", status_code=201)
+
+    def _serialize(value: str) -> dict[str, Any]:
+        events.append("serialize")
+        return {"id": value}
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key=None,
+        fingerprint="fingerprint-7",
+        method="POST",
+        path="/v1/projects",
+        preclaim=_preclaim,
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response.status_code == 201
+    assert json.loads(bytes(response.body)) == {"id": "project-1"}
+    assert session.commit_calls == 1
+    assert events == ["replay", "preclaim", "claim", "mutate", "serialize", "complete", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_short_circuits_replay_response() -> None:
+    """Replay responses should return before preclaim, claim, mutation, or commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    replay_response = Response(status_code=204)
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("replay-key-2", "fingerprint-8")
+        return replay_response
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = (db, key, fingerprint, method, path)
+        raise AssertionError("claim should not run after replay short-circuit")
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = (db, reservation, status_code, response_body)
+        raise AssertionError("complete should not run after replay short-circuit")
+
+    async def _mutate() -> IdempotentMutationSuccess[dict[str, Any]]:
+        raise AssertionError("mutate should not run after replay short-circuit")
+
+    def _serialize(_: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("serialize should not run after replay short-circuit")
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key="replay-key-2",
+        fingerprint="fingerprint-8",
+        method="POST",
+        path="/v1/projects",
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response is replay_response
+    assert session.commit_calls == 0
+    assert events == ["replay"]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_short_circuits_claim_response() -> None:
+    """Claim responses should return before reload, mutation, completion, or commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    claim_response = JSONResponse(status_code=409, content={"error": {"code": "conflict"}})
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("claim-key-2", "fingerprint-9")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "claim-key-2",
+            "fingerprint-9",
+            "PATCH",
+            "/v1/projects/project-1",
+        )
+        return claim_response
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = (db, reservation, status_code, response_body)
+        raise AssertionError("complete should not run after claim short-circuit")
+
+    async def _preclaim() -> Response | None:
+        events.append("preclaim")
+        return None
+
+    async def _reload_after_claim() -> None:
+        raise AssertionError("reload should not run after claim short-circuit")
+
+    async def _mutate() -> IdempotentMutationSuccess[dict[str, Any]]:
+        raise AssertionError("mutate should not run after claim short-circuit")
+
+    def _serialize(_: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("serialize should not run after claim short-circuit")
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key="claim-key-2",
+        fingerprint="fingerprint-9",
+        method="PATCH",
+        path="/v1/projects/project-1",
+        preclaim=_preclaim,
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response is claim_response
+    assert session.commit_calls == 0
+    assert events == ["replay", "preclaim", "claim"]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_reloads_serializes_and_runs_after_commit() -> None:
+    """Successful orchestration should reload after claim and run hooks after commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    expected_reservation = IdempotencyReservation(record_id=uuid.uuid4())
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("success-key-1", "fingerprint-10")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "success-key-1",
+            "fingerprint-10",
+            "POST",
+            "/v1/projects",
+        )
+        return expected_reservation
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = db
+        events.append("complete")
+        assert reservation == expected_reservation
+        assert status_code == 201
+        assert response_body == {"id": "project-2"}
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    async def _preclaim() -> Response | None:
+        events.append("preclaim")
+        return None
+
+    async def _reload_after_claim() -> None:
+        events.append("reload")
+
+    async def _after_commit() -> None:
+        events.append("after_commit")
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        return IdempotentMutationSuccess(
+            value="project-2",
+            status_code=201,
+            after_commit=_after_commit,
+        )
+
+    def _serialize(value: str) -> dict[str, Any]:
+        events.append("serialize")
+        return {"id": value}
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key="success-key-1",
+        fingerprint="fingerprint-10",
+        method="POST",
+        path="/v1/projects",
+        preclaim=_preclaim,
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response.status_code == 201
+    assert json.loads(bytes(response.body)) == {"id": "project-2"}
+    assert session.commit_calls == 1
+    assert events == [
+        "replay",
+        "preclaim",
+        "claim",
+        "reload",
+        "mutate",
+        "serialize",
+        "complete",
+        "commit",
+        "after_commit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_completes_known_error_snapshot() -> None:
+    """Known local errors should snapshot and commit without calling the serializer."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    expected_reservation = IdempotencyReservation(record_id=uuid.uuid4())
+    response_body = {
+        "error": {
+            "code": "STORAGE_FAILED",
+            "message": "Failed to persist uploaded file.",
+            "details": None,
+        }
+    }
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("known-error-key-1", "fingerprint-11")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "known-error-key-1",
+            "fingerprint-11",
+            "POST",
+            "/v1/projects/project-1/files",
+        )
+        return expected_reservation
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = db
+        events.append("complete")
+        assert reservation == expected_reservation
+        assert status_code == 500
+        assert response_body == {
+            "error": {
+                "code": "STORAGE_FAILED",
+                "message": "Failed to persist uploaded file.",
+                "details": None,
+            }
+        }
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    async def _mutate() -> IdempotentMutationKnownError:
+        events.append("mutate")
+        return IdempotentMutationKnownError(status_code=500, response_body=response_body)
+
+    def _serialize(_: str) -> dict[str, Any]:
+        raise AssertionError("serialize should not run for known-error snapshots")
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key="known-error-key-1",
+        fingerprint="fingerprint-11",
+        method="POST",
+        path="/v1/projects/project-1/files",
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response.status_code == 500
+    assert json.loads(bytes(response.body)) == response_body
+    assert session.commit_calls == 1
+    assert events == ["replay", "claim", "mutate", "complete", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_propagates_arbitrary_exceptions() -> None:
+    """Unexpected exceptions should escape without completion snapshots or commits."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("exception-key-1", "fingerprint-12")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "exception-key-1",
+            "fingerprint-12",
+            "DELETE",
+            "/v1/projects/project-2",
+        )
+        return IdempotencyReservation(record_id=uuid.uuid4())
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = (db, reservation, status_code, response_body)
+        raise AssertionError("complete should not run for arbitrary exceptions")
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        raise RuntimeError("boom")
+
+    def _serialize(_: str) -> dict[str, Any]:
+        raise AssertionError("serialize should not run for arbitrary exceptions")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await run_idempotent_mutation(
+            cast(Any, session),
+            key="exception-key-1",
+            fingerprint="fingerprint-12",
+            method="DELETE",
+            path="/v1/projects/project-2",
+            mutate=_mutate,
+            serialize_result=_serialize,
+            ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+        )
+
+    assert session.commit_calls == 0
+    assert events == ["replay", "claim", "mutate"]
 
 
 @pytest.mark.asyncio

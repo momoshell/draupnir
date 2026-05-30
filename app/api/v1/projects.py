@@ -1,7 +1,7 @@
 """Project CRUD endpoints."""
 
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
@@ -10,12 +10,14 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
-    IdempotencyReservation,
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
     build_idempotency_fingerprint,
     claim_idempotency_response,
     complete_idempotency_response,
     get_idempotency_key,
     replay_idempotency_response,
+    run_idempotent_mutation,
 )
 from app.api.pagination import (
     decode_cursor_payload,
@@ -37,6 +39,12 @@ from app.schemas.project import (
 )
 
 project_router = APIRouter()
+
+_IDEMPOTENT_MUTATION_OPS = IdempotentMutationOps(
+    replay=replay_idempotency_response,
+    claim=claim_idempotency_response,
+    complete=complete_idempotency_response,
+)
 
 
 async def _get_active_project_or_404(
@@ -85,44 +93,41 @@ async def create_project(
     project_in: ProjectCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
-) -> Project | Response:
+) -> Response:
     """Create a new project."""
-    claim = await claim_idempotency_response(
-        db,
-        key=idempotency_key,
-        fingerprint=build_idempotency_fingerprint(
-            "projects.create",
-            project_in.model_dump(mode="json", exclude_unset=True),
-        ),
-        method="POST",
-        path="/projects",
+    fingerprint = build_idempotency_fingerprint(
+        "projects.create",
+        project_in.model_dump(mode="json", exclude_unset=True),
     )
-    if isinstance(claim, Response):
-        return claim
-    reservation = claim
 
-    project = Project(
-        name=project_in.name,
-        description=project_in.description,
-        default_unit_system=project_in.default_unit_system,
-        default_currency=project_in.default_currency,
-    )
-    db.add(project)
-    if reservation is not None:
+    async def _mutate() -> IdempotentMutationSuccess[Project]:
+        project = Project(
+            name=project_in.name,
+            description=project_in.description,
+            default_unit_system=project_in.default_unit_system,
+            default_currency=project_in.default_currency,
+        )
+        db.add(project)
         await db.flush()
         await db.refresh(project)
-        response = await complete_idempotency_response(
-            db,
-            reservation,
+        return IdempotentMutationSuccess(
+            value=project,
             status_code=status.HTTP_201_CREATED,
-            response_body=ProjectRead.model_validate(project).model_dump(mode="json"),
         )
-        await db.commit()
-        return response
 
-    await db.commit()
-    await db.refresh(project)
-    return project
+    def _serialize_project(project: Project) -> dict[str, Any]:
+        return ProjectRead.model_validate(project).model_dump(mode="json")
+
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="POST",
+        path="/projects",
+        mutate=_mutate,
+        serialize_result=_serialize_project,
+        ops=_IDEMPOTENT_MUTATION_OPS,
+    )
 
 
 @project_router.get(
@@ -195,58 +200,53 @@ async def update_project(
     project_in: ProjectUpdate,
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
-) -> Project | Response:
+) -> Response:
     """Update an existing project."""
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            f"projects.update:{project_id}",
-            project_in.model_dump(mode="json", exclude_unset=True),
-        )
-        replay = await replay_idempotency_response(
-            db,
-            fingerprint=fingerprint,
-            key=idempotency_key,
-        )
-        if replay is not None:
-            return replay
+    fingerprint = build_idempotency_fingerprint(
+        f"projects.update:{project_id}",
+        project_in.model_dump(mode="json", exclude_unset=True),
+    )
+    project: Project | None = None
 
-    project = await _get_active_project_or_404(db, project_id)
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="PATCH",
-            path=f"/projects/{project_id}",
-        )
-        if isinstance(claim, Response):
-            return claim
-        reservation = claim
+    async def _preclaim() -> Response | None:
+        nonlocal project
+        project = await _get_active_project_or_404(db, project_id)
+        return None
+
+    async def _reload_after_claim() -> None:
+        nonlocal project
         project = await _get_active_project_or_404(db, project_id)
 
-    # Update only provided fields
-    update_data = project_in.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(project, field, value)
-
-    if reservation is not None:
+    async def _mutate() -> IdempotentMutationSuccess[Project]:
+        nonlocal project
+        if project is None:
+            project = await _get_active_project_or_404(db, project_id)
+        assert project is not None
+        update_data = project_in.model_dump(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(project, field, value)
         await db.flush()
         await db.refresh(project)
-        response = await complete_idempotency_response(
-            db,
-            reservation,
+        return IdempotentMutationSuccess(
+            value=project,
             status_code=status.HTTP_200_OK,
-            response_body=ProjectRead.model_validate(project).model_dump(mode="json"),
         )
-        await db.commit()
-        return response
 
-    await db.commit()
-    await db.refresh(project)
-    return project
+    def _serialize_project(project: Project) -> dict[str, Any]:
+        return ProjectRead.model_validate(project).model_dump(mode="json")
+
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="PATCH",
+        path=f"/projects/{project_id}",
+        preclaim=_preclaim,
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=_serialize_project,
+        ops=_IDEMPOTENT_MUTATION_OPS,
+    )
 
 
 @project_router.delete(
@@ -259,79 +259,79 @@ async def delete_project(
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> Response:
     """Delete a project."""
-    reservation: IdempotencyReservation | None = None
-    fingerprint: str | None = None
-    if idempotency_key is not None:
-        fingerprint = build_idempotency_fingerprint(
-            f"projects.delete:{project_id}",
-            {"project_id": str(project_id)},
-        )
-        replay = await replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay is not None:
-            return replay
+    fingerprint = build_idempotency_fingerprint(
+        f"projects.delete:{project_id}",
+        {"project_id": str(project_id)},
+    )
+    project: Project | None = None
 
-    await _get_active_project_or_404(db, project_id)
+    async def _preclaim() -> Response | None:
+        await _get_active_project_or_404(db, project_id)
+        return None
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="DELETE",
-            path=f"/projects/{project_id}",
-        )
-        if isinstance(claim, Response):
-            return claim
-        reservation = claim
+    async def _reload_after_claim() -> None:
+        nonlocal project
+        project = await _get_active_project_or_404(db, project_id, for_update=True)
 
-    project = await _get_active_project_or_404(db, project_id, for_update=True)
-    locked_jobs = (
-        (
-            await db.execute(
-                select(Job)
-                .where((Job.project_id == project_id) & (Job.status.in_(("pending", "running"))))
-                .order_by(Job.created_at.asc(), Job.id.asc())
-                .with_for_update(of=Job)
+    async def _mutate() -> IdempotentMutationSuccess[None]:
+        nonlocal project
+        if project is None:
+            project = await _get_active_project_or_404(db, project_id, for_update=True)
+        assert project is not None
+        locked_jobs = (
+            (
+                await db.execute(
+                    select(Job)
+                    .where(
+                        (Job.project_id == project_id) & (Job.status.in_(("pending", "running")))
+                    )
+                    .order_by(Job.created_at.asc(), Job.id.asc())
+                    .with_for_update(of=Job)
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    deleted_at = datetime.now(UTC)
-    project.deleted_at = deleted_at
-    for job in locked_jobs:
-        job.status = "cancelled"
-        job.cancel_requested = True
-        job.error_code = ErrorCode.JOB_CANCELLED.value
-        job.error_message = None
-        job.finished_at = deleted_at
-        job.attempt_token = None
-        job.attempt_lease_expires_at = None
-    await db.execute(
-        update(File)
-        .where((File.project_id == project_id) & (File.deleted_at.is_(None)))
-        .values(deleted_at=deleted_at)
-    )
-    await db.execute(
-        update(GeneratedArtifact)
-        .where(
-            (GeneratedArtifact.project_id == project_id) & (GeneratedArtifact.deleted_at.is_(None))
+        deleted_at = datetime.now(UTC)
+        project.deleted_at = deleted_at
+        for job in locked_jobs:
+            job.status = "cancelled"
+            job.cancel_requested = True
+            job.error_code = ErrorCode.JOB_CANCELLED.value
+            job.error_message = None
+            job.finished_at = deleted_at
+            job.attempt_token = None
+            job.attempt_lease_expires_at = None
+        await db.execute(
+            update(File)
+            .where((File.project_id == project_id) & (File.deleted_at.is_(None)))
+            .values(deleted_at=deleted_at)
         )
-        .values(deleted_at=deleted_at)
-    )
-    if reservation is not None:
-        response = await complete_idempotency_response(
-            db,
-            reservation,
+        await db.execute(
+            update(GeneratedArtifact)
+            .where(
+                (GeneratedArtifact.project_id == project_id)
+                & (GeneratedArtifact.deleted_at.is_(None))
+            )
+            .values(deleted_at=deleted_at)
+        )
+        return IdempotentMutationSuccess(
+            value=None,
             status_code=status.HTTP_204_NO_CONTENT,
-            response_body=None,
         )
-        await db.commit()
-        return response
-    await db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    def _serialize_deleted(_: None) -> None:
+        return None
+
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="DELETE",
+        path=f"/projects/{project_id}",
+        preclaim=_preclaim,
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=_serialize_deleted,
+        ops=_IDEMPOTENT_MUTATION_OPS,
+    )

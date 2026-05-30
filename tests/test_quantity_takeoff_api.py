@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import IdempotencyReservation
 from app.api.v1 import revisions as revisions_module
+from app.api.v1.revision_routes import estimates as estimates_routes_module
 from app.api.v1.revisions import revisions_router
 from app.db import session as session_module
 from app.db.session import get_db
@@ -810,6 +811,8 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     idempotency_state: dict[str, dict[str, Any]] = {}
     enqueued_job_ids: list[UUID] = []
     pricing_effective_dates: list[date] = []
+    utc_now_calls = 0
+    pricing_contract_calls: list[datetime] = []
 
     class _EstimateJobInputRecord:
         pass
@@ -929,13 +932,22 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
-    class _AppClock(datetime):
-        @classmethod
-        def now(cls, tz: Any = None) -> _AppClock:
-            app_now = job_created_at
-            if tz is None:
-                return cls.fromtimestamp(app_now.timestamp(), UTC)
-            return cls.fromtimestamp(app_now.astimezone(tz).timestamp(), tz)
+    def fake_utc_now() -> datetime:
+        nonlocal utc_now_calls
+        utc_now_calls += 1
+        return job_created_at
+
+    def fake_resolve_estimate_pricing_contract(
+        request_value: Any,
+        *,
+        job_created_at: datetime | None = None,
+    ) -> tuple[str, date]:
+        assert request_value.pricing.currency == request_body["pricing"]["currency"]
+        assert request_value.assumptions == request_body["assumptions"]
+        assert len(request_value.catalog_refs) == len(request_body["catalog_refs"])
+        assert job_created_at is not None
+        pricing_contract_calls.append(job_created_at)
+        return ("derived_from_job_created_at_utc", job_created_at.date())
 
     monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
@@ -974,7 +986,12 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         fake_publish_job_enqueue_intent,
     )
     monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
-    monkeypatch.setattr(revisions_module, "datetime", _AppClock)
+    monkeypatch.setattr(estimates_routes_module, "_utc_now", fake_utc_now)
+    monkeypatch.setattr(
+        estimates_routes_module,
+        "_resolve_estimate_pricing_contract",
+        fake_resolve_estimate_pricing_contract,
+    )
     monkeypatch.setattr(
         revisions_module,
         "_resolve_estimate_job_model_classes",
@@ -1008,6 +1025,8 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     assert estimate_input.pricing_mode == "derived_from_job_created_at_utc"
     assert estimate_input.pricing_effective_date == estimate_job.created_at.date()
     assert estimate_input.assumptions_json == {"crew": "default"}
+    assert utc_now_calls == 1
+    assert pricing_contract_calls == [job_created_at]
     first_ref = session.added[2]
     second_ref = session.added[3]
     assert first_ref.ref_order == 1
@@ -1031,6 +1050,8 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
     assert replay_response.status_code == 202
     assert replay_response.json() == first_body
     assert len(session.added) == 4
+    assert utc_now_calls == 1
+    assert pricing_contract_calls == [job_created_at]
 
 
 def test_create_revision_estimate_version_returns_job_without_idempotency_key(

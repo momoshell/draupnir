@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.idempotency import IdempotencyReservation, get_idempotency_key
+from app.api.idempotency import (
+    IdempotentMutationOps,
+    IdempotentMutationSuccess,
+    get_idempotency_key,
+    run_idempotent_mutation,
+)
 from app.api.idempotency import (
     build_idempotency_fingerprint as _build_idempotency_fingerprint_direct,
 )
@@ -60,6 +65,8 @@ type _JobEnqueuePublisher = Callable[[UUID], None]
 type _PublishJobEnqueueIntent = Callable[..., Awaitable[bool]]
 type _ReplayIdempotencyResponse = Callable[..., Awaitable[Response | None]]
 type _CompleteIdempotencyResponse = Callable[..., Awaitable[Response]]
+type _ExportPreclaimLoader = Callable[[], Awaitable[None]]
+type _ExportJobCreator = Callable[[], Awaitable[Job]]
 
 
 def _compat_attr(*names: str, default: Any = _MISSING) -> Any:
@@ -398,6 +405,112 @@ async def _get_exportable_estimate_or_404(
     return takeoff, estimate_version
 
 
+def _export_create_idempotency_ops() -> IdempotentMutationOps:
+    """Return shared export-route idempotency ops via local compat wrappers."""
+
+    return IdempotentMutationOps(
+        replay=_replay_idempotency_response,
+        claim=_claim_idempotency_response,
+        complete=_complete_idempotency_response,
+    )
+
+
+async def _publish_export_enqueue(job_id: UUID) -> None:
+    """Publish the export job after the enclosing transaction commits."""
+
+    await _publish_job_enqueue_intent(
+        job_id,
+        publisher=_enqueue_export_job,
+        suppress_exceptions=True,
+    )
+
+
+async def _persist_export_job(
+    db: AsyncSession,
+    revision: DrawingRevision,
+    *,
+    parent_job_id: UUID | None,
+    export_kind: ExportKind,
+    options_json: dict[str, Any],
+    quantity_takeoff: QuantityTakeoff | None = None,
+    estimate_version: EstimateVersion | None = None,
+) -> Job:
+    """Create and stage a pending export job plus immutable input row."""
+
+    export_job = _build_export_job(
+        revision,
+        parent_job_id=parent_job_id,
+    )
+    db.add(export_job)
+    _prepare_job_enqueue_intent(export_job)
+    await db.flush()
+    await db.refresh(export_job)
+
+    db.add(
+        _build_export_job_input(
+            export_job,
+            revision,
+            export_kind=export_kind,
+            options_json=options_json,
+            quantity_takeoff=quantity_takeoff,
+            estimate_version=estimate_version,
+        )
+    )
+    return export_job
+
+
+async def _create_export_route_job(
+    db: AsyncSession,
+    *,
+    idempotency_key: str | None,
+    fingerprint: str | None,
+    path: str,
+    load_before_claim: _ExportPreclaimLoader,
+    create_export_job: _ExportJobCreator,
+) -> Job | Response:
+    """Run the shared export-create flow with optional idempotency helpers."""
+
+    if idempotency_key is None:
+        await load_before_claim()
+        export_job = await create_export_job()
+        await db.commit()
+        await _publish_export_enqueue(export_job.id)
+        return export_job
+
+    assert fingerprint is not None
+
+    async def preclaim() -> Response | None:
+        await load_before_claim()
+        return None
+
+    async def mutate() -> IdempotentMutationSuccess[Job]:
+        export_job = await create_export_job()
+
+        async def after_commit() -> None:
+            await _publish_export_enqueue(export_job.id)
+
+        return IdempotentMutationSuccess(
+            value=export_job,
+            status_code=status.HTTP_202_ACCEPTED,
+            after_commit=after_commit,
+        )
+
+    return await run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=fingerprint,
+        method="POST",
+        path=path,
+        mutate=mutate,
+        serialize_result=lambda export_job: JobRead.model_validate(export_job).model_dump(
+            mode="json"
+        ),
+        preclaim=preclaim,
+        reload_after_claim=load_before_claim,
+        ops=_export_create_idempotency_ops(),
+    )
+
+
 @exports_router.post(
     "/revisions/{revision_id}/exports/revision-json",
     response_model=JobRead,
@@ -412,11 +525,11 @@ async def create_revision_json_export(
     """Create a pending revision JSON export job for an active drawing revision."""
 
     export_kind = ExportKind.REVISION_JSON
+    path = f"/revisions/{revision_id}/exports/revision-json"
     normalized_body = _build_export_request_body(
         export_kind,
         options=request.options,
     )
-    reservation: IdempotencyReservation | None = None
     fingerprint: str | None = None
     if idempotency_key is not None:
         fingerprint = _build_idempotency_fingerprint(
@@ -426,68 +539,31 @@ async def create_revision_json_export(
                 "body": normalized_body,
             },
         )
-        replay_response = await _replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay_response is not None:
-            return replay_response
 
-    revision = await _get_locked_active_revision_or_404(revision_id, db)
+    revision: DrawingRevision | None = None
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await _claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=f"/revisions/{revision_id}/exports/revision-json",
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
+    async def load_before_claim() -> None:
+        nonlocal revision
         revision = await _get_locked_active_revision_or_404(revision_id, db)
 
-    export_job = _build_export_job(
-        revision,
-        parent_job_id=_parent_job_id_for_revision(revision),
-    )
-    db.add(export_job)
-    _prepare_job_enqueue_intent(export_job)
-    await db.flush()
-    await db.refresh(export_job)
-
-    db.add(
-        _build_export_job_input(
-            export_job,
+    async def create_export_job() -> Job:
+        assert revision is not None
+        return await _persist_export_job(
+            db,
             revision,
+            parent_job_id=_parent_job_id_for_revision(revision),
             export_kind=export_kind,
             options_json=request.options,
         )
+
+    return await _create_export_route_job(
+        db,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        path=path,
+        load_before_claim=load_before_claim,
+        create_export_job=create_export_job,
     )
-
-    success_response: Response | None = None
-    if reservation is not None:
-        success_response = await _complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_202_ACCEPTED,
-            response_body=JobRead.model_validate(export_job).model_dump(mode="json"),
-        )
-
-    await db.commit()
-    await _publish_job_enqueue_intent(
-        export_job.id,
-        publisher=_enqueue_export_job,
-        suppress_exceptions=True,
-    )
-
-    if success_response is not None:
-        return success_response
-    return export_job
 
 
 @exports_router.post(
@@ -505,11 +581,11 @@ async def create_revision_quantity_csv_export(
     """Create a pending quantity CSV export job for a trusted revision takeoff."""
 
     export_kind = ExportKind.QUANTITY_CSV
+    path = f"/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/exports/quantity-csv"
     normalized_body = _build_export_request_body(
         export_kind,
         options=request.options,
     )
-    reservation: IdempotencyReservation | None = None
     fingerprint: str | None = None
     if idempotency_key is not None:
         fingerprint = _build_idempotency_fingerprint(
@@ -520,71 +596,35 @@ async def create_revision_quantity_csv_export(
                 "body": normalized_body,
             },
         )
-        replay_response = await _replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay_response is not None:
-            return replay_response
 
-    revision = await _get_locked_active_revision_or_404(revision_id, db)
-    takeoff = await _get_exportable_takeoff_or_404(revision_id, takeoff_id, db)
+    revision: DrawingRevision | None = None
+    takeoff: QuantityTakeoff | None = None
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await _claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=(f"/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/exports/quantity-csv"),
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
+    async def load_before_claim() -> None:
+        nonlocal revision, takeoff
         revision = await _get_locked_active_revision_or_404(revision_id, db)
         takeoff = await _get_exportable_takeoff_or_404(revision_id, takeoff_id, db)
 
-    export_job = _build_export_job(
-        revision,
-        parent_job_id=_parent_job_id_for_takeoff(revision, takeoff),
-    )
-    db.add(export_job)
-    _prepare_job_enqueue_intent(export_job)
-    await db.flush()
-    await db.refresh(export_job)
-
-    db.add(
-        _build_export_job_input(
-            export_job,
+    async def create_export_job() -> Job:
+        assert revision is not None
+        assert takeoff is not None
+        return await _persist_export_job(
+            db,
             revision,
+            parent_job_id=_parent_job_id_for_takeoff(revision, takeoff),
             export_kind=export_kind,
             options_json=request.options,
             quantity_takeoff=takeoff,
         )
+
+    return await _create_export_route_job(
+        db,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        path=path,
+        load_before_claim=load_before_claim,
+        create_export_job=create_export_job,
     )
-
-    success_response: Response | None = None
-    if reservation is not None:
-        success_response = await _complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_202_ACCEPTED,
-            response_body=JobRead.model_validate(export_job).model_dump(mode="json"),
-        )
-
-    await db.commit()
-    await _publish_job_enqueue_intent(
-        export_job.id,
-        publisher=_enqueue_export_job,
-        suppress_exceptions=True,
-    )
-
-    if success_response is not None:
-        return success_response
-    return export_job
 
 
 @exports_router.post(
@@ -603,7 +643,11 @@ async def create_revision_estimate_export(
     """Create a pending estimate CSV/PDF export job for a trusted takeoff."""
 
     normalized_body = request.model_dump(mode="json")
-    reservation: IdempotencyReservation | None = None
+    path = (
+        "/revisions/"
+        f"{revision_id}/quantity-takeoffs/{takeoff_id}/estimates/"
+        f"{estimate_version_id}/exports"
+    )
     fingerprint: str | None = None
     if idempotency_key is not None:
         fingerprint = _build_idempotency_fingerprint(
@@ -618,39 +662,13 @@ async def create_revision_estimate_export(
                 "body": normalized_body,
             },
         )
-        replay_response = await _replay_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-        )
-        if replay_response is not None:
-            return replay_response
 
-    revision = await _get_locked_active_revision_or_404(revision_id, db)
-    takeoff, estimate_version = await _get_exportable_estimate_or_404(
-        revision_id,
-        takeoff_id,
-        estimate_version_id,
-        db,
-    )
+    revision: DrawingRevision | None = None
+    takeoff: QuantityTakeoff | None = None
+    estimate_version: EstimateVersion | None = None
 
-    if idempotency_key is not None:
-        assert fingerprint is not None
-        claim = await _claim_idempotency_response(
-            db,
-            key=idempotency_key,
-            fingerprint=fingerprint,
-            method="POST",
-            path=(
-                "/revisions/"
-                f"{revision_id}/quantity-takeoffs/{takeoff_id}/estimates/"
-                f"{estimate_version_id}/exports"
-            ),
-        )
-        if isinstance(claim, Response):
-            return claim
-        assert claim is not None
-        reservation = claim
+    async def load_before_claim() -> None:
+        nonlocal revision, takeoff, estimate_version
         revision = await _get_locked_active_revision_or_404(revision_id, db)
         takeoff, estimate_version = await _get_exportable_estimate_or_404(
             revision_id,
@@ -659,42 +677,25 @@ async def create_revision_estimate_export(
             db,
         )
 
-    export_job = _build_export_job(
-        revision,
-        parent_job_id=_parent_job_id_for_estimate(revision, estimate_version),
-    )
-    db.add(export_job)
-    _prepare_job_enqueue_intent(export_job)
-    await db.flush()
-    await db.refresh(export_job)
-
-    db.add(
-        _build_export_job_input(
-            export_job,
+    async def create_export_job() -> Job:
+        assert revision is not None
+        assert takeoff is not None
+        assert estimate_version is not None
+        return await _persist_export_job(
+            db,
             revision,
+            parent_job_id=_parent_job_id_for_estimate(revision, estimate_version),
             export_kind=request.export_kind,
             options_json=request.options,
             quantity_takeoff=takeoff,
             estimate_version=estimate_version,
         )
+
+    return await _create_export_route_job(
+        db,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        path=path,
+        load_before_claim=load_before_claim,
+        create_export_job=create_export_job,
     )
-
-    success_response: Response | None = None
-    if reservation is not None:
-        success_response = await _complete_idempotency_response(
-            db,
-            reservation,
-            status_code=status.HTTP_202_ACCEPTED,
-            response_body=JobRead.model_validate(export_job).model_dump(mode="json"),
-        )
-
-    await db.commit()
-    await _publish_job_enqueue_intent(
-        export_job.id,
-        publisher=_enqueue_export_job,
-        suppress_exceptions=True,
-    )
-
-    if success_response is not None:
-        return success_response
-    return export_job
