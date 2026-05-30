@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -15,6 +16,7 @@ DEFAULT_DURATIONS = 50
 DEFAULT_DURATIONS_MIN = 0.2
 BASE_MIGRATION_COMMAND = ("uv", "run", "alembic", "upgrade", "head")
 BASE_PYTEST_COMMAND = ("uv", "run", "pytest")
+XDIST_WORKERS_ENV = "PROFILE_INTEGRATION_XDIST_WORKERS"
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,7 @@ class ProfileConfig:
     marker: str
     durations: int
     durations_min: float
+    xdist_workers: int | None
     pytest_args: tuple[str, ...]
 
 
@@ -41,11 +44,17 @@ def parse_args(argv: Sequence[str] | None = None) -> ProfileConfig:
     parser.add_argument("--marker", required=True)
     parser.add_argument("--durations", type=int, default=DEFAULT_DURATIONS)
     parser.add_argument("--durations-min", type=float, default=DEFAULT_DURATIONS_MIN)
+    parser.add_argument(
+        "--xdist-workers",
+        type=parse_positive_int,
+        default=default_xdist_workers(parser),
+    )
     namespace, pytest_args = parser.parse_known_args(argv)
     return ProfileConfig(
         marker=namespace.marker,
         durations=namespace.durations,
         durations_min=namespace.durations_min,
+        xdist_workers=namespace.xdist_workers,
         pytest_args=tuple(normalize_pytest_args(pytest_args)),
     )
 
@@ -54,6 +63,33 @@ def normalize_pytest_args(args: Sequence[str]) -> list[str]:
     if args and args[0] == "--":
         return list(args[1:])
     return list(args)
+
+
+def parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def default_xdist_workers(parser: argparse.ArgumentParser) -> int | None:
+    raw = os.getenv(XDIST_WORKERS_ENV)
+    if raw is None or raw == "":
+        return None
+    try:
+        return parse_positive_int(raw)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(f"{XDIST_WORKERS_ENV} must be a positive integer: {exc}")
+    return None
+
+
+def build_xdist_command_args(xdist_workers: int | None) -> list[str]:
+    if xdist_workers is None:
+        return []
+    return ["-n", str(xdist_workers), "--dist", "loadfile"]
 
 
 def build_collection_command(config: ProfileConfig) -> list[str]:
@@ -78,6 +114,7 @@ def build_execution_command(config: ProfileConfig) -> list[str]:
         config.marker,
         f"--durations={config.durations}",
         f"--durations-min={config.durations_min:g}",
+        *build_xdist_command_args(config.xdist_workers),
         *config.pytest_args,
     ]
 

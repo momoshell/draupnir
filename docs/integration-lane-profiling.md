@@ -4,10 +4,16 @@
 
 - Use a local PostgreSQL test database only: `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test"`.
 - Keep the existing `_test` guardrails intact when profiling locally: localhost-only Postgres, database name ending in `_test`, and no shared dev/prod database targets.
+- Optional xdist mode is local-only and opt-in: set `PROFILE_INTEGRATION_XDIST_WORKERS=<count>` to pass `-n <count> --dist loadfile` through the profiling runner.
 - Repro commands (local snapshots, not permanent benchmarks):
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_api and not compose_smoke"`
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_worker and not compose_smoke"`
+- Repro commands with xdist enabled (local snapshots, not permanent benchmarks):
+  - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_api and not compose_smoke" PROFILE_INTEGRATION_XDIST_WORKERS=4`
+  - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_worker and not compose_smoke" PROFILE_INTEGRATION_XDIST_WORKERS=4`
 - The profiler owns `uv run alembic upgrade head`, the collect-only preflight, and the full pytest pass; do not pre-run Alembic before `make profile-integration`.
+- Per-worker DB safety constraints: keep the base `DATABASE_URL` local and `_test`-suffixed; worker databases are derived from that base URL and created/migrated per worker, so never point profiling at shared or non-test databases.
+- Trade-off framing: xdist can reduce wall clock when tests parallelize cleanly, but can increase setup/load and contention. Treat any speedup as evidence-to-collect per lane (serial vs xdist snapshots on the same machine), not a guaranteed benchmark claim.
 
 ## CI behavior
 

@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+
 
 def load_profile_integration_lane_module() -> ModuleType:
     module_path = Path(__file__).resolve().parents[1] / "scripts" / "profile_integration_lane.py"
@@ -62,7 +64,35 @@ def test_parse_args_supports_marker_durations_and_passthrough() -> None:
     assert config.marker == "integration and db_api and not compose_smoke"
     assert config.durations == 25
     assert config.durations_min == 0.5
+    assert config.xdist_workers is None
     assert config.pytest_args == ("--maxfail=1", "tests/test_jobs_api.py")
+
+
+def test_parse_args_supports_xdist_workers_flag_and_passthrough() -> None:
+    config = profile_integration_lane.parse_args(
+        [
+            "--marker",
+            "integration and db_api and not compose_smoke",
+            "--xdist-workers",
+            "3",
+            "--",
+            "--maxfail=1",
+            "tests/test_jobs_api.py",
+        ]
+    )
+
+    assert config.xdist_workers == 3
+    assert config.pytest_args == ("--maxfail=1", "tests/test_jobs_api.py")
+
+
+def test_parse_args_supports_xdist_workers_env_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PROFILE_INTEGRATION_XDIST_WORKERS", "4")
+
+    config = profile_integration_lane.parse_args(
+        ["--marker", "integration and db_api and not compose_smoke"]
+    )
+
+    assert config.xdist_workers == 4
 
 
 def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() -> None:
@@ -85,6 +115,8 @@ def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() ->
             "50",
             "--durations-min",
             "0.2",
+            "--xdist-workers",
+            "2",
             "--maxfail=1",
         ],
         runner=runner,
@@ -127,6 +159,10 @@ def test_main_profiles_collect_only_and_full_pytest_run_with_summary_output() ->
                 "integration and db_worker and not compose_smoke",
                 "--durations=50",
                 "--durations-min=0.2",
+                "-n",
+                "2",
+                "--dist",
+                "loadfile",
                 "--maxfail=1",
             ),
             False,

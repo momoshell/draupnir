@@ -26,6 +26,7 @@
 #   PROFILE_INTEGRATION_MARKER      — pytest -m expression (default: integration lane)
 #   PROFILE_INTEGRATION_DURATIONS   — slow test count for --durations output
 #   PROFILE_INTEGRATION_DURATIONS_MIN — minimum seconds for --durations-min
+#   PROFILE_INTEGRATION_XDIST_WORKERS — optional local xdist worker count (default: serial)
 #   PROFILE_INTEGRATION_PYTEST_ARGS — extra pytest args passed through to the runner
 #   make up          — Start Docker Compose stack
 #   make down        — Stop Docker Compose stack
@@ -42,7 +43,9 @@ PRE_PUSH_HOOK_VERSION = v1
 PROFILE_INTEGRATION_MARKER ?= $(PYTEST_INTEGRATION_EXPRESSION)
 PROFILE_INTEGRATION_DURATIONS ?= 50
 PROFILE_INTEGRATION_DURATIONS_MIN ?= 0.2
+PROFILE_INTEGRATION_XDIST_WORKERS ?=
 PROFILE_INTEGRATION_PYTEST_ARGS ?=
+PROFILE_INTEGRATION_XDIST_ARGS = $(if $(strip $(PROFILE_INTEGRATION_XDIST_WORKERS)),--xdist-workers $(PROFILE_INTEGRATION_XDIST_WORKERS),)
 PYTEST_SMOKE_EXPRESSION = smoke and not integration and not compose_smoke
 PYTEST_INTEGRATION_EXPRESSION = integration and not compose_smoke
 PYTEST_DB_API_EXPRESSION = integration and db_api and not compose_smoke
@@ -75,7 +78,7 @@ integration:
 	uv run pytest -m "$(PYTEST_INTEGRATION_EXPRESSION)"
 
 profile-integration:
-	uv run python scripts/profile_integration_lane.py --marker "$(PROFILE_INTEGRATION_MARKER)" --durations $(PROFILE_INTEGRATION_DURATIONS) --durations-min $(PROFILE_INTEGRATION_DURATIONS_MIN) $(PROFILE_INTEGRATION_PYTEST_ARGS)
+	uv run python scripts/profile_integration_lane.py --marker "$(PROFILE_INTEGRATION_MARKER)" --durations $(PROFILE_INTEGRATION_DURATIONS) --durations-min $(PROFILE_INTEGRATION_DURATIONS_MIN) $(PROFILE_INTEGRATION_XDIST_ARGS) $(PROFILE_INTEGRATION_PYTEST_ARGS)
 
 compose-smoke:
 	COMPOSE_SMOKE=1 SMOKE_BASE_URL="$(SMOKE_BASE_URL)" uv run pytest -m "$(PYTEST_COMPOSE_SMOKE_EXPRESSION)"
