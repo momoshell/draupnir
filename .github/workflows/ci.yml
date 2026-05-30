@@ -161,6 +161,6 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
 
       - name: Run pytest integration lane
-        run: uv run pytest --durations=40 --durations-min=0.2 -m "integration and ${{ matrix.marker }} and not compose_smoke"
+        run: uv run python scripts/profile_integration_lane.py --marker "integration and ${{ matrix.marker }} and not compose_smoke" --durations 50 --durations-min 0.2
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
