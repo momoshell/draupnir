@@ -1,9 +1,14 @@
 """Shared fixtures for integration tests."""
 
+import asyncio
 import os
+import re
 import shutil
-from collections.abc import AsyncGenerator, Generator
+import subprocess
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping, MutableMapping
 from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 
 import httpx
 import pytest
@@ -13,12 +18,214 @@ from httpx import ASGITransport
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.api.v1.files as files_api
-import app.jobs.worker as worker_module
-from app.core.config import settings
-from app.db.session import get_db
-from app.main import app as fastapi_app
-from app.storage.dependencies import _get_default_storage
+_LOCAL_DATABASE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_XDIST_WORKER_ID_RE = re.compile(r"^gw[0-9]+$")
+_XDIST_BLOCKED_QUERY_PARAMS = frozenset(
+    {
+        "host",
+        "hostaddr",
+        "port",
+        "database",
+        "dbname",
+        "user",
+        "password",
+        "service",
+    }
+)
+_POSTGRES_IDENTIFIER_MAX_BYTES = 63
+
+
+class XdistDatabaseConfig(NamedTuple):
+    """Derived database URLs for one pytest-xdist worker process."""
+
+    worker_id: str
+    worker_database_name: str
+    worker_database_url: str
+    maintenance_database_url: str
+
+
+def _xdist_worker_id(environ: Mapping[str, str]) -> str | None:
+    """Return the active xdist worker id, excluding serial/master collection."""
+
+    worker_id = environ.get("PYTEST_XDIST_WORKER")
+    if worker_id is None or worker_id == "master":
+        return None
+    return worker_id
+
+
+def _xdist_testrun_uid(environ: Mapping[str, str]) -> str | None:
+    """Return the xdist test-run uid when present."""
+
+    testrun_uid = environ.get("PYTEST_XDIST_TESTRUNUID")
+    if testrun_uid is None:
+        return None
+    normalized = testrun_uid.strip()
+    return normalized or None
+
+
+def _derive_database_identity(database_url: str) -> str:
+    """Return a sanitized host/database identity for error messages."""
+
+    parsed = urlparse(database_url)
+    host = parsed.hostname or "<unknown-host>"
+    database_name = unquote(parsed.path.lstrip("/")) or "<unknown-database>"
+    if parsed.port is None:
+        return f"{host}/{database_name}"
+    return f"{host}:{parsed.port}/{database_name}"
+
+
+def _derive_xdist_database_config(
+    database_url: str,
+    worker_id: str,
+    *,
+    testrun_uid: str | None = None,
+) -> XdistDatabaseConfig:
+    """Derive a safe physical database URL for one xdist worker."""
+
+    parsed = urlparse(database_url)
+    if not parsed.scheme.startswith("postgresql"):
+        raise ValueError("DATABASE_URL must use a PostgreSQL URL for xdist DB isolation.")
+    if parsed.hostname not in _LOCAL_DATABASE_HOSTS:
+        raise ValueError(
+            "DATABASE_URL must point to localhost, 127.0.0.1, or ::1 for xdist DB isolation."
+        )
+
+    unsafe_query_params = sorted(
+        {
+            key.casefold()
+            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.casefold() in _XDIST_BLOCKED_QUERY_PARAMS
+        }
+    )
+    if unsafe_query_params:
+        raise ValueError(
+            "DATABASE_URL contains unsupported query parameter(s) for xdist DB isolation: "
+            + ", ".join(unsafe_query_params)
+        )
+
+    database_name = unquote(parsed.path.lstrip("/"))
+    if not database_name.endswith("_test"):
+        raise ValueError(
+            "DATABASE_URL must use a dedicated test database name ending in '_test' for "
+            "xdist DB isolation."
+        )
+    if _XDIST_WORKER_ID_RE.fullmatch(worker_id) is None:
+        raise ValueError(f"unsupported pytest-xdist worker id for DB isolation: {worker_id!r}")
+
+    worker_suffix = worker_id if testrun_uid is None else f"{testrun_uid}_{worker_id}"
+    worker_database_name = f"{database_name}_{worker_suffix}"
+    if len(worker_database_name.encode("utf-8")) > _POSTGRES_IDENTIFIER_MAX_BYTES:
+        raise ValueError(
+            "Derived worker database name exceeds PostgreSQL identifier limit "
+            f"({_POSTGRES_IDENTIFIER_MAX_BYTES} bytes): {worker_database_name!r}"
+        )
+
+    worker_database_url = urlunparse(parsed._replace(path=f"/{quote(worker_database_name)}"))
+    maintenance_database_url = urlunparse(parsed._replace(path="/postgres"))
+    return XdistDatabaseConfig(
+        worker_id=worker_id,
+        worker_database_name=worker_database_name,
+        worker_database_url=worker_database_url,
+        maintenance_database_url=maintenance_database_url,
+    )
+
+
+def _asyncpg_dsn(database_url: str) -> str:
+    """Return an asyncpg-compatible DSN from the SQLAlchemy async URL."""
+
+    parsed = urlparse(database_url)
+    scheme = parsed.scheme.split("+", maxsplit=1)[0]
+    return urlunparse(parsed._replace(scheme=scheme))
+
+
+def _quote_postgres_identifier(value: str) -> str:
+    """Quote a PostgreSQL identifier for CREATE DATABASE."""
+
+    return '"' + value.replace('"', '""') + '"'
+
+
+async def _create_xdist_worker_database_async(config: XdistDatabaseConfig) -> None:
+    """Create the worker database if it does not already exist."""
+
+    import asyncpg  # type: ignore[import-untyped]
+
+    connection = await asyncpg.connect(_asyncpg_dsn(config.maintenance_database_url))
+    try:
+        exists = await connection.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            config.worker_database_name,
+        )
+        if exists is None:
+            await connection.execute(
+                f"CREATE DATABASE {_quote_postgres_identifier(config.worker_database_name)}"
+            )
+    finally:
+        await connection.close()
+
+
+def _create_xdist_worker_database(config: XdistDatabaseConfig) -> None:
+    """Synchronously ensure the worker database exists before app imports."""
+
+    asyncio.run(_create_xdist_worker_database_async(config))
+
+
+def _run_xdist_worker_migrations(
+    worker_database_url: str,
+    environ: Mapping[str, str],
+) -> None:
+    """Run Alembic migrations against the isolated worker database."""
+
+    migration_env = {**environ, "DATABASE_URL": worker_database_url}
+    result = subprocess.run(
+        ["uv", "run", "alembic", "upgrade", "head"],
+        check=False,
+        env=migration_env,
+    )
+    if result.returncode != 0:
+        worker_database_identity = _derive_database_identity(worker_database_url)
+        raise pytest.UsageError(
+            "pytest-xdist worker database migration failed for "
+            f"{worker_database_identity!r} with exit code {result.returncode}."
+        )
+
+
+def _configure_xdist_worker_database(
+    environ: MutableMapping[str, str] = os.environ,
+    *,
+    create_database: Callable[[XdistDatabaseConfig], None] = _create_xdist_worker_database,
+    run_migrations: Callable[[str, Mapping[str, str]], None] = _run_xdist_worker_migrations,
+) -> str | None:
+    """Configure this xdist worker process to use its own physical database."""
+
+    worker_id = _xdist_worker_id(environ)
+    testrun_uid = _xdist_testrun_uid(environ)
+    base_database_url = environ.get("DATABASE_URL")
+    if worker_id is None or not base_database_url:
+        return None
+
+    try:
+        config = _derive_xdist_database_config(
+            base_database_url,
+            worker_id,
+            testrun_uid=testrun_uid,
+        )
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+    create_database(config)
+    environ["DATABASE_URL"] = config.worker_database_url
+    run_migrations(config.worker_database_url, environ)
+    return config.worker_database_url
+
+
+_configure_xdist_worker_database()
+
+import app.api.v1.files as files_api  # noqa: E402
+import app.jobs.worker as worker_module  # noqa: E402
+from app.core.config import settings  # noqa: E402
+from app.db.session import get_db  # noqa: E402
+from app.main import app as fastapi_app  # noqa: E402
+from app.storage.dependencies import _get_default_storage  # noqa: E402
 
 APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "files",
