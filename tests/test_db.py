@@ -1,7 +1,6 @@
 """Tests for database connectivity and migrations."""
 
 import asyncio
-import os
 import subprocess
 import sys
 from collections.abc import Generator
@@ -13,12 +12,7 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.session import close_db, get_engine, get_session_maker, init_db
-
-# Marker for tests that require a running database
-requires_database = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
-    reason="DATABASE_URL not set - skipping database tests",
-)
+from tests.conftest import requires_database
 
 
 @pytest.fixture(autouse=True)

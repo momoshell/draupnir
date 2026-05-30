@@ -10,7 +10,12 @@
 # Lint and typecheck targets will report "no files found" until then.
 #   make test        — Run full pytest suite
 #   make smoke       — Run fast smoke pytest lane
-#   make integration — Run DB-backed integration pytest lane
+#   make integration — Run full DB-backed integration pytest lane
+#   make integration-db-api — Run DB API integration pytest lane
+#   make integration-db-worker — Run DB worker integration pytest lane
+#   make integration-db-estimation-export — Run DB estimation/export integration pytest lane
+#   make integration-db-lineage — Run DB lineage integration pytest lane
+#   make integration-db-migration — Run DB migration integration pytest lane
 #   make compose-smoke — Run opt-in Docker Compose smoke pytest lane
 #   make format      — Run ruff formatter on app/ and tests/
 #   make check       — Run lint + typecheck + test
@@ -29,10 +34,15 @@ PRE_PUSH_HOOK = .git/hooks/pre-push
 PRE_PUSH_HOOK_VERSION = v1
 PYTEST_SMOKE_EXPRESSION = smoke and not integration and not compose_smoke
 PYTEST_INTEGRATION_EXPRESSION = integration and not compose_smoke
+PYTEST_DB_API_EXPRESSION = integration and db_api and not compose_smoke
+PYTEST_DB_WORKER_EXPRESSION = integration and db_worker and not compose_smoke
+PYTEST_DB_ESTIMATION_EXPORT_EXPRESSION = integration and db_estimation_export and not compose_smoke
+PYTEST_DB_LINEAGE_EXPRESSION = integration and db_lineage and not compose_smoke
+PYTEST_DB_MIGRATION_EXPRESSION = integration and db_migration and not compose_smoke
 PYTEST_COMPOSE_SMOKE_EXPRESSION = compose_smoke
 SMOKE_BASE_URL ?= http://localhost:8000
 
-.PHONY: sync lint typecheck test smoke integration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
+.PHONY: sync lint typecheck test smoke integration integration-db-api integration-db-worker integration-db-estimation-export integration-db-lineage integration-db-migration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
 
 sync:
 	uv sync $(UV_SYNC_ARGS)
@@ -90,3 +100,23 @@ shell-worker:
 
 migrate:
 	docker compose exec api alembic upgrade head
+
+integration-db-api:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_DB_API_EXPRESSION)"
+
+integration-db-worker:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_DB_WORKER_EXPRESSION)"
+
+integration-db-estimation-export:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_DB_ESTIMATION_EXPORT_EXPRESSION)"
+
+integration-db-lineage:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_DB_LINEAGE_EXPRESSION)"
+
+integration-db-migration:
+	uv run alembic upgrade head
+	uv run pytest -m "$(PYTEST_DB_MIGRATION_EXPRESSION)"

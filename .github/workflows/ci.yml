@@ -106,9 +106,23 @@ jobs:
       - name: Run pytest non-integration lane
         run: uv run pytest -m "not integration and not compose_smoke and not smoke"
 
-  test-integration:
-    name: Test integration
+  test-integration-db:
+    name: Test integration (${{ matrix.lane_name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane_name: db_api
+            marker: db_api
+          - lane_name: db_worker
+            marker: db_worker
+          - lane_name: db_estimation_export
+            marker: db_estimation_export
+          - lane_name: db_lineage
+            marker: db_lineage
+          - lane_name: db_migration
+            marker: db_migration
     services:
       postgres:
         image: postgres:18-alpine
@@ -147,6 +161,6 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
 
       - name: Run pytest integration lane
-        run: uv run pytest -m "integration and not compose_smoke"
+        run: uv run pytest --durations=40 --durations-min=0.2 -m "integration and ${{ matrix.marker }} and not compose_smoke"
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
