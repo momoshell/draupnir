@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from itertools import pairwise
 from math import isfinite, sqrt
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterDescriptor,
@@ -509,9 +510,7 @@ def _units_payload(document: Any, units_module: Any) -> dict[str, JSONValue]:
                 conversion_factor_to_meter = candidate
 
     normalized = (
-        "meter"
-        if conversion_factor_to_meter is not None
-        else _normalized_unit_name(source_value)
+        "meter" if conversion_factor_to_meter is not None else _normalized_unit_name(source_value)
     )
 
     payload: dict[str, JSONValue] = {
@@ -667,9 +666,7 @@ def _line_entity_payload(
                 "length": length,
                 "count": 1.0,
             },
-            "adapter_native": {
-                "ezdxf": adapter_native
-            },
+            "adapter_native": {"ezdxf": adapter_native},
         },
         "provenance": _entity_provenance(
             native_type=native_type,
@@ -1056,23 +1053,41 @@ def _entity_provenance(
     notes: tuple[str, ...] = ()
     if geometry is None:
         notes = ("unsupported_or_invalid_geometry",)
-    return {
-        "origin": "adapter_normalized",
-        "adapter": {"key": _DESCRIPTOR.key},
+
+    legacy_aliases: dict[str, JSONValue] = {
         "adapter_key": _DESCRIPTOR.key,
         "source": source_entity_ref,
-        "source_ref": source_entity_ref,
         "source_entity_ref": source_entity_ref,
-        "source_identity": handle or entity_id,
-        "source_hash": source_hash,
+        "normalized_source_hash": source_hash,
+    }
+    native_details: dict[str, JSONValue] = {
         "dxf_handle": handle or None,
         "native_entity_type": native_type,
         "layout_name": layout_name,
         "layer_name": layer_name,
-        "normalized_source_hash": source_hash,
-        "extraction_path": ("modelspace", native_type),
-        "notes": notes,
     }
+    extraction_path = ("modelspace", native_type)
+    provenance = cast(
+        dict[str, JSONValue],
+        build_entity_provenance(
+            origin="adapter_normalized",
+            adapter={"key": _DESCRIPTOR.key},
+            source_ref=source_entity_ref,
+            source_identity=handle or entity_id,
+            source_hash=source_hash,
+            extraction_path=list(extraction_path),
+            notes=list(notes),
+            extra={
+                "native": {"ezdxf": native_details},
+                "legacy_aliases": legacy_aliases,
+            },
+        ),
+    )
+    provenance["extraction_path"] = extraction_path
+    provenance["notes"] = notes
+    provenance.update(legacy_aliases)
+    provenance.update(native_details)
+    return provenance
 
 
 def _entity_id(

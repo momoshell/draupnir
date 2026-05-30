@@ -17,6 +17,7 @@ from time import perf_counter
 from types import ModuleType
 from typing import cast
 
+from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterCapabilities,
@@ -150,8 +151,7 @@ class IfcOpenShellAdapter(IngestionAdapter):
                 observed_status=ProbeStatus.MISSING,
                 adapter_status=AdapterStatus.UNAVAILABLE,
                 detail=(
-                    "Install draupnir[ingestion] or the ifcopenshell wheel to "
-                    "enable IFC parsing."
+                    "Install draupnir[ingestion] or the ifcopenshell wheel to enable IFC parsing."
                 ),
             )
             return AdapterAvailability(
@@ -331,8 +331,7 @@ class IfcOpenShellAdapter(IngestionAdapter):
                 AdapterWarning(
                     code="ifc.units_assumed",
                     message=(
-                        "IFC length units were not explicit; canonical units "
-                        "defaulted to meters."
+                        "IFC length units were not explicit; canonical units defaulted to meters."
                     ),
                 )
             )
@@ -542,9 +541,7 @@ def _schema_warnings(sniff: _SchemaSniff) -> list[AdapterWarning]:
 def _normalize_schema(schema: object) -> str | None:
     if not isinstance(schema, str):
         return None
-    normalized = (
-        schema.strip().upper().replace(" ", "").replace("_", "").replace("-", "")
-    )
+    normalized = schema.strip().upper().replace(" ", "").replace("_", "").replace("-", "")
     if not normalized:
         return None
     if normalized in _SUPPORTED_SCHEMAS:
@@ -636,8 +633,7 @@ def _extract_entity_payload(
             _build_helper_warning(
                 code="ifc.psets_unavailable",
                 message=(
-                    "IfcOpenShell property-set helper failed; continuing without "
-                    "property sets."
+                    "IfcOpenShell property-set helper failed; continuing without property sets."
                 ),
                 ifc_type=ifc_type,
                 step_id_token=step_id_token,
@@ -651,8 +647,7 @@ def _extract_entity_payload(
             _build_helper_warning(
                 code="ifc.qtos_unavailable",
                 message=(
-                    "IfcOpenShell quantity helper failed; continuing without "
-                    "quantity metadata."
+                    "IfcOpenShell quantity helper failed; continuing without quantity metadata."
                 ),
                 ifc_type=ifc_type,
                 step_id_token=step_id_token,
@@ -666,8 +661,7 @@ def _extract_entity_payload(
             _build_helper_warning(
                 code="ifc.material_refs_unavailable",
                 message=(
-                    "IfcOpenShell material helper failed; continuing without "
-                    "material references."
+                    "IfcOpenShell material helper failed; continuing without material references."
                 ),
                 ifc_type=ifc_type,
                 step_id_token=step_id_token,
@@ -826,22 +820,39 @@ def _entity_provenance(
         step_id_token=step_id_token,
         fallback_identity=fallback_identity,
     )
-    return {
-        "origin": "adapter_normalized",
-        "adapter": {"key": _ADAPTER_KEY},
+    legacy_aliases: dict[str, JSONValue] = {
         "adapter_key": _ADAPTER_KEY,
         "source": source_entity_ref,
-        "source_ref": source_entity_ref,
         "source_entity_ref": source_entity_ref,
-        "source_identity": global_id or step_id_token or fallback_identity,
-        "source_hash": source_hash,
         "normalized_source_hash": source_hash,
         "native_entity_type": ifc_type,
         "ifc_global_id": global_id,
         "ifc_step_id": step_id_token,
-        "extraction_path": ("semantic_extract",),
-        "notes": ("semantic_ifc_metadata_only",),
     }
+    provenance = cast(
+        dict[str, JSONValue],
+        build_entity_provenance(
+            origin="adapter_normalized",
+            adapter={"key": _ADAPTER_KEY},
+            source_ref=source_entity_ref,
+            source_identity=global_id or step_id_token or fallback_identity,
+            source_hash=source_hash,
+            extraction_path=["semantic_extract"],
+            notes=["semantic_ifc_metadata_only"],
+            extra={
+                "native": {
+                    _ADAPTER_KEY: {
+                        "ifc_type": ifc_type,
+                        "ifc_global_id": global_id,
+                        "ifc_step_id": step_id_token,
+                    }
+                },
+                "legacy_aliases": legacy_aliases,
+            },
+        ),
+    )
+    provenance.update(legacy_aliases)
+    return provenance
 
 
 def _entity_source_locator(

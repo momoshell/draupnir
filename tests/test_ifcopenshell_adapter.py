@@ -295,6 +295,26 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
         entities[0]["provenance"]["normalized_source_hash"]
         == hashlib.sha256(b"ifc://IfcWall/global-id:DUPLICATE").hexdigest()
     )
+    assert entities[0]["provenance"]["extra"] == {
+        "native": {
+            "ifcopenshell": {
+                "ifc_type": "IfcWall",
+                "ifc_global_id": "DUPLICATE",
+                "ifc_step_id": "#10",
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "ifcopenshell",
+            "source": "ifc://IfcWall/global-id:DUPLICATE/step-id:10",
+            "source_entity_ref": "ifc://IfcWall/global-id:DUPLICATE/step-id:10",
+            "normalized_source_hash": hashlib.sha256(
+                b"ifc://IfcWall/global-id:DUPLICATE"
+            ).hexdigest(),
+            "native_entity_type": "IfcWall",
+            "ifc_global_id": "DUPLICATE",
+            "ifc_step_id": "#10",
+        },
+    }
     assert entities[0]["provenance"]["extraction_path"] == ["semantic_extract"]
     assert entities[0]["provenance"]["notes"] == ["semantic_ifc_metadata_only"]
     assert entities[0]["confidence"] == {
@@ -321,6 +341,24 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
         entities[2]["provenance"]["normalized_source_hash"]
         == hashlib.sha256(b"ifc://IfcDoor/step-id:42").hexdigest()
     )
+    assert entities[2]["provenance"]["extra"] == {
+        "native": {
+            "ifcopenshell": {
+                "ifc_type": "IfcDoor",
+                "ifc_global_id": None,
+                "ifc_step_id": "#42",
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "ifcopenshell",
+            "source": "ifc://IfcDoor/step-id:42",
+            "source_entity_ref": "ifc://IfcDoor/step-id:42",
+            "normalized_source_hash": hashlib.sha256(b"ifc://IfcDoor/step-id:42").hexdigest(),
+            "native_entity_type": "IfcDoor",
+            "ifc_global_id": None,
+            "ifc_step_id": "#42",
+        },
+    }
     assert canonical["layers"] == [{"name": "IfcWall"}, {"name": "IfcDoor"}]
     assert payload.provenance_json["records"][1]["details"]["entity_count"] == 3
     assert {record["source_ref"] for record in payload.provenance_json["records"]} == {

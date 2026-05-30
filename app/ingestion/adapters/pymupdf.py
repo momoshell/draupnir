@@ -17,6 +17,7 @@ from time import perf_counter
 from types import ModuleType
 from typing import Any, cast
 
+from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterDiagnostic,
@@ -764,6 +765,13 @@ def _build_lineish_entity(
         drawing_index=drawing_index,
         entity_index=entity_index,
     )
+    provenance = _entity_provenance(
+        page_number=page_number,
+        drawing_index=drawing_index,
+        drawing=drawing,
+        item_indices=item_indices,
+        operator="re" if rect_like else "l",
+    )
     bbox = _bbox_from_points(normalized_points)
     entity_type = "line" if len(normalized_points) == 2 and not closed else "polyline"
     entity: dict[str, JSONValue] = {
@@ -775,13 +783,8 @@ def _build_lineish_entity(
         "layer": layer_name,
         "bbox": bbox,
         "properties": _entity_properties(drawing, closed=closed, rect_like=rect_like),
-        "provenance": _entity_provenance(
-            page_number=page_number,
-            drawing_index=drawing_index,
-            drawing=drawing,
-            item_indices=item_indices,
-            operator="re" if rect_like else "l",
-        ),
+        **provenance,
+        "provenance": provenance,
         "confidence": {
             "score": _VECTOR_CONFIDENCE_SCORE,
             "basis": "vector_path_segment",
@@ -905,6 +908,7 @@ def _build_unknown_entity(
             **_entity_properties(drawing, closed=False, rect_like=False),
             "unsupported_operator": operator,
         },
+        **provenance,
         "provenance": provenance,
         "confidence": {
             "score": _VECTOR_CONFIDENCE_SCORE,
@@ -995,8 +999,7 @@ def _entity_properties(
         "fill_color_rgb": _color_tuple(drawing.get("fill")),
         "fill_opacity": _optional_float(drawing.get("fill_opacity")),
         "line_cap": tuple(
-            int(value)
-            for value in cast(tuple[int, ...], drawing.get("lineCap", ()))
+            int(value) for value in cast(tuple[int, ...], drawing.get("lineCap", ()))
         ),
         "line_join": _optional_float(drawing.get("lineJoin")),
         "dashes": str(drawing.get("dashes", "")),
@@ -1015,6 +1018,13 @@ def _entity_provenance(
     item_indices: tuple[int, ...] | None = None,
     item_index: int | None = None,
 ) -> dict[str, JSONValue]:
+    extraction_path = (
+        "get_drawings",
+        f"page-{page_number}",
+        f"drawing-{drawing_index}",
+        operator,
+    )
+    notes = ("vector_pdf_unconfirmed_scale",)
     location_payload = _entity_location_payload(
         page_number=page_number,
         drawing_index=drawing_index,
@@ -1032,30 +1042,49 @@ def _entity_provenance(
             item_index=item_index,
         )
     )
-    provenance: dict[str, JSONValue] = {
-        "origin": "adapter_normalized",
-        "adapter": {"key": _DESCRIPTOR.key},
-        "adapter_key": _DESCRIPTOR.key,
-        "source": location_payload["source"],
-        "source_ref": source_ref,
-        "source_entity_ref": source_ref,
-        "source_identity": _entity_source_identity(location_payload),
-        "source_hash": source_hash,
-        "page_number": page_number,
-        "drawing_index": drawing_index,
-        "operator": operator,
-        "normalized_source_hash": source_hash,
-        "extraction_path": (
-            "get_drawings",
-            f"page-{page_number}",
-            f"drawing-{drawing_index}",
-            operator,
+    provenance = cast(
+        dict[str, JSONValue],
+        build_entity_provenance(
+            origin="adapter_normalized",
+            adapter={"key": _DESCRIPTOR.key},
+            source_ref=source_ref,
+            source_identity=_entity_source_identity(location_payload),
+            source_hash=source_hash,
+            extraction_path=list(extraction_path),
+            notes=list(notes),
+            extra={
+                "native": {
+                    "pymupdf": {
+                        "page_number": page_number,
+                        "drawing_index": drawing_index,
+                        "operator": operator,
+                    }
+                },
+                "legacy_aliases": {
+                    "adapter_key": _DESCRIPTOR.key,
+                    "source": location_payload["source"],
+                    "source_entity_ref": source_ref,
+                    "normalized_source_hash": source_hash,
+                },
+            },
         ),
-        "notes": ("vector_pdf_unconfirmed_scale",),
-    }
+    )
+    provenance["extraction_path"] = extraction_path
+    provenance["notes"] = notes
+    provenance["adapter_key"] = _DESCRIPTOR.key
+    provenance["source"] = location_payload["source"]
+    provenance["source_entity_ref"] = source_ref
+    provenance["page_number"] = page_number
+    provenance["drawing_index"] = drawing_index
+    provenance["operator"] = operator
+    provenance["normalized_source_hash"] = source_hash
+    extra = cast(dict[str, JSONValue], provenance["extra"])
+    native = cast(dict[str, JSONValue], cast(dict[str, JSONValue], extra["native"])["pymupdf"])
     if item_indices is not None:
+        native["item_indices"] = item_indices
         provenance["item_indices"] = item_indices
     if item_index is not None:
+        native["item_index"] = item_index
         provenance["item_index"] = item_index
     return provenance
 
@@ -1107,9 +1136,7 @@ def _entity_source_ref(payload: Mapping[str, JSONValue]) -> str:
     drawing_index = int(cast(int, payload["drawing_index"]))
     operator = str(payload["operator"])
     if "item_indices" in payload:
-        indices = ",".join(
-            str(index) for index in cast(tuple[int, ...], payload["item_indices"])
-        )
+        indices = ",".join(str(index) for index in cast(tuple[int, ...], payload["item_indices"]))
         return f"pdf://page-{page_number}/drawing-{drawing_index}/{operator}/items:{indices}"
     item_index = int(cast(int, payload["item_index"]))
     return f"pdf://page-{page_number}/drawing-{drawing_index}/{operator}/item:{item_index}"
@@ -1119,13 +1146,10 @@ def _entity_source_identity(payload: Mapping[str, JSONValue]) -> str:
     page_number = int(cast(int, payload["page_number"]))
     drawing_index = int(cast(int, payload["drawing_index"]))
     if "item_indices" in payload:
-        indices = ",".join(
-            str(index) for index in cast(tuple[int, ...], payload["item_indices"])
-        )
+        indices = ",".join(str(index) for index in cast(tuple[int, ...], payload["item_indices"]))
         return f"page-{page_number}:drawing-{drawing_index}:items-{indices}"
     return (
-        f"page-{page_number}:drawing-{drawing_index}:item-"
-        f"{int(cast(int, payload['item_index']))}"
+        f"page-{page_number}:drawing-{drawing_index}:item-{int(cast(int, payload['item_index']))}"
     )
 
 
@@ -1151,9 +1175,7 @@ def _entity_source_items(
         return ()
     items = tuple(raw_items)
     if item_indices is not None:
-        return tuple(
-            items[index] for index in item_indices if 0 <= index < len(items)
-        )
+        return tuple(items[index] for index in item_indices if 0 <= index < len(items))
     if item_index is not None and 0 <= item_index < len(items):
         return (items[item_index],)
     return ()
@@ -1220,13 +1242,17 @@ def _bbox_points_from_value(value: Any) -> list[tuple[float, float]]:
             (_round_float(float(value.x0)), _round_float(float(value.y0))),
             (_round_float(float(value.x1)), _round_float(float(value.y1))),
         ]
-    if isinstance(value, tuple) and len(value) == 2 and all(
-        isinstance(component, int | float) for component in value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(isinstance(component, int | float) for component in value)
     ):
         x, y = value
         return [(_round_float(float(x)), _round_float(float(y)))]
-    if isinstance(value, tuple) and len(value) == 4 and all(
-        isinstance(component, int | float) for component in value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 4
+        and all(isinstance(component, int | float) for component in value)
     ):
         x0, y0, x1, y1 = value
         return [
@@ -1357,9 +1383,7 @@ async def _wait_for_process_envelope(
     *,
     options: AdapterExecutionOptions,
 ) -> dict[str, Any]:
-    deadline = (
-        perf_counter() + options.timeout.seconds if options.timeout is not None else None
-    )
+    deadline = perf_counter() + options.timeout.seconds if options.timeout is not None else None
     try:
         while True:
             _raise_if_cancelled(options)
@@ -1697,3 +1721,4 @@ def _round_float(value: float) -> float:
 
 
 __all__ = ["PyMuPDFAdapter", "create_adapter"]
+# temp mutation for in-scope execution contract

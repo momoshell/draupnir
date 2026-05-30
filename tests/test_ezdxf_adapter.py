@@ -172,8 +172,7 @@ class _FakeLWPolylineEntity:
             for point, (start_width, end_width) in zip(points, widths_by_vertex, strict=True)
         )
         self.has_width = const_width != 0.0 or any(
-            start_width != 0.0 or end_width != 0.0
-            for start_width, end_width in widths_by_vertex
+            start_width != 0.0 or end_width != 0.0 for start_width, end_width in widths_by_vertex
         )
         self.dxf = types.SimpleNamespace(
             handle=handle,
@@ -309,6 +308,22 @@ def _assert_common_entity_contract(
     assert provenance["extraction_path"] == ("modelspace", str(properties["source_type"]))
     assert isinstance(provenance["notes"], tuple)
     assert provenance["dxf_handle"] == entity["handle"]
+    extra = _mapping(provenance["extra"])
+    native = _mapping(extra["native"])
+    ezdxf_native = _mapping(native["ezdxf"])
+    legacy_aliases = _mapping(extra["legacy_aliases"])
+    assert ezdxf_native == {
+        "dxf_handle": entity["handle"],
+        "native_entity_type": properties["source_type"],
+        "layout_name": layout_ref,
+        "layer_name": layer_ref,
+    }
+    assert legacy_aliases == {
+        "adapter_key": "ezdxf",
+        "source": provenance["source_ref"],
+        "source_entity_ref": provenance["source_ref"],
+        "normalized_source_hash": provenance["source_hash"],
+    }
     assert isinstance(provenance["normalized_source_hash"], str)
     assert len(provenance["normalized_source_hash"]) == 64
 
@@ -571,9 +586,7 @@ async def test_ezdxf_adapter_emits_open_legacy_polyline_length_geometry(
     adapter = _load_ezdxf_adapter()
     source_path = tmp_path / "open-legacy-polyline.dxf"
     document = cast(Any, ezdxf).new(units=6)
-    document.modelspace().add_polyline3d(
-        [(0.0, 0.0, 0.0), (3.0, 0.0, 4.0), (3.0, 4.0, 4.0)]
-    )
+    document.modelspace().add_polyline3d([(0.0, 0.0, 0.0), (3.0, 0.0, 4.0), (3.0, 4.0, 4.0)])
     document.saveas(source_path)
 
     result = await adapter.ingest(
@@ -764,8 +777,7 @@ async def test_ezdxf_adapter_retains_unsupported_polyline_as_unknown_with_warnin
     assert entity["kind"] == "unknown"
     assert _mapping(entity["properties"])["source_type"] == "LWPOLYLINE"
     assert (
-        _mapping(result.warnings[0].details)["reason"]
-        == "Polyline bulge arcs are not supported."
+        _mapping(result.warnings[0].details)["reason"] == "Polyline bulge arcs are not supported."
     )
 
 

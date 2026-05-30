@@ -822,7 +822,7 @@ class TestIngestOutputPersistence:
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Invalid non-empty provenance origins should fail before persisting outputs."""
+        """Invalid non-empty provenance origins should persist blocked validation output."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -835,7 +835,7 @@ class TestIngestOutputPersistence:
             request: IngestionRunRequest,
         ) -> IngestFinalizationPayload:
             payload = _build_fake_ingest_payload(request)
-            return _replace_fake_canonical_payload(
+            payload = _replace_fake_canonical_payload(
                 payload,
                 entities=[
                     {
@@ -861,16 +861,42 @@ class TestIngestOutputPersistence:
                     }
                 ],
             )
+            return replace(
+                payload,
+                validation_status="invalid",
+                review_state="rejected",
+                quantity_gate="blocked",
+                report_json={
+                    **payload.report_json,
+                    "summary": {
+                        **payload.report_json["summary"],
+                        "validation_status": "invalid",
+                        "review_state": "rejected",
+                        "quantity_gate": "blocked",
+                    },
+                    "findings": [
+                        {
+                            "severity": "error",
+                            "code": "entity.provenance.origin.invalid",
+                            "message": (
+                                "entity provenance origin must be one of: "
+                                "adapter_normalized, agent_proposed, generated_export, "
+                                "inferred, source_direct, user_created"
+                            ),
+                            "path": ["entities", 0, "provenance_json", "origin"],
+                        }
+                    ],
+                },
+            )
 
         monkeypatch.setattr(worker_module, "run_ingestion", _run_invalid_origin_ingestion)
 
-        with pytest.raises(ValueError, match="Invalid entity provenance origin 'legacy_adapter'"):
-            await process_ingest_job(job.id)
+        await process_ingest_job(job.id)
 
         updated_job = await _get_job(job.id)
-        assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.INTERNAL_ERROR.value
-        assert updated_job.error_message == worker_module._FINALIZE_INGEST_JOB_ERROR_MESSAGE
+        assert updated_job.status == "succeeded"
+        assert updated_job.error_code is None
+        assert updated_job.error_message is None
 
         (
             adapter_outputs,
@@ -878,19 +904,48 @@ class TestIngestOutputPersistence:
             validation_reports,
             generated_artifacts,
         ) = await _load_project_outputs(project["id"])
-        assert adapter_outputs == []
-        assert drawing_revisions == []
-        assert validation_reports == []
-        assert generated_artifacts == []
+        assert len(adapter_outputs) == 1
+        assert len(drawing_revisions) == 1
+        assert len(validation_reports) == 1
+        assert len(generated_artifacts) == 1
+
+        drawing_revision = drawing_revisions[0]
+        validation_report = validation_reports[0]
+        assert drawing_revision.review_state == "rejected"
+        assert validation_report.validation_status == "invalid"
+        assert validation_report.review_state == "rejected"
+        assert validation_report.quantity_gate == "blocked"
+        _assert_validation_report_json_matches_columns(validation_report)
+        assert validation_report.report_json["findings"] == [
+            {
+                "severity": "error",
+                "code": "entity.provenance.origin.invalid",
+                "message": (
+                    "entity provenance origin must be one of: "
+                    "adapter_normalized, agent_proposed, generated_export, "
+                    "inferred, source_direct, user_created"
+                ),
+                "path": ["entities", 0, "provenance_json", "origin"],
+            }
+        ]
 
         manifests, layouts, layers, blocks, entities = await _load_project_materialization(
             project["id"]
         )
-        assert manifests == []
-        assert layouts == []
-        assert layers == []
+        assert len(manifests) == 1
+        assert len(layouts) == 1
+        assert len(layers) == 1
         assert blocks == []
-        assert entities == []
+        assert len(entities) == 1
+        assert entities[0].provenance_json == {
+            "origin": "legacy_adapter",
+            "adapter": {},
+            "source_ref": None,
+            "source_identity": "entity-source-001",
+            "source_hash": None,
+            "extraction_path": [],
+            "notes": [],
+        }
 
     async def test_revision_materialization_wraps_scalar_adapter_provenance(
         self,

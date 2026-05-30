@@ -30,9 +30,7 @@ from tests.ingestion_contract_harness import (
     exercise_adapter_contract,
 )
 
-_FIXTURE_PATH = (
-    Path(__file__).parent / "fixtures" / "dwg" / "libredwg-wrapper-smoke.txt"
-)
+_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "dwg" / "libredwg-wrapper-smoke.txt"
 
 
 class _FakeProcess:
@@ -155,9 +153,7 @@ def _install_fake_subprocess(
             tempdir=tempdir,
             output=output_path,
         ).encode("utf-8")
-        stdout_handle.write(
-            stdout_payload
-        )
+        stdout_handle.write(stdout_payload)
         stdout_handle.flush()
         stderr_handle.write(stderr_payload)
         stderr_handle.flush()
@@ -353,10 +349,29 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert entity["provenance"]["extraction_path"] == ["OBJECTS", "LINE"]
     assert entity["provenance"]["notes"] == ["units_unconfirmed"]
     assert entity["provenance"]["source_locator"] == "OBJECTS/LINE/1A"
+    assert entity["provenance"]["extra"] == {
+        "native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "LINE",
+                "handle": "1A",
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "libredwg",
+            "source": "OBJECTS/LINE/1A",
+            "source_section": "OBJECTS",
+            "source_entity_ref": "OBJECTS/LINE/1A",
+            "source_locator": "OBJECTS/LINE/1A",
+            "entity_ref": "OBJECTS/LINE/1A",
+            "normalized_source_hash": entity["provenance"]["source_hash"],
+            "native_handle": "1A",
+            "source_entity_handle": "1A",
+            "record_hash": f"sha256:{entity['provenance']['source_hash']}",
+        },
+    }
     assert len(entity["provenance"]["source_hash"]) == 64
-    assert all(
-        character in "0123456789abcdef" for character in entity["provenance"]["source_hash"]
-    )
+    assert all(character in "0123456789abcdef" for character in entity["provenance"]["source_hash"])
     assert entity["provenance"]["record_hash"] == f"sha256:{entity['provenance']['source_hash']}"
     assert entity["confidence"] == {
         "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
@@ -576,10 +591,30 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "units_unconfirmed",
         "unsupported_drawable_record",
     )
+    assert entities[0]["provenance"]["extra"] == {
+        "native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "CIRCLE",
+                "handle": "20",
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "libredwg",
+            "source": "OBJECTS/CIRCLE/20",
+            "source_section": "OBJECTS",
+            "source_entity_ref": "OBJECTS/CIRCLE/20",
+            "source_locator": "OBJECTS/CIRCLE/20",
+            "entity_ref": "OBJECTS/CIRCLE/20",
+            "normalized_source_hash": entities[0]["provenance"]["source_hash"],
+            "native_handle": "20",
+            "source_entity_handle": "20",
+            "record_hash": f"sha256:{entities[0]['provenance']['source_hash']}",
+        },
+    }
     assert len(entities[0]["provenance"]["source_hash"]) == 64
     assert all(
-        character in "0123456789abcdef"
-        for character in entities[0]["provenance"]["source_hash"]
+        character in "0123456789abcdef" for character in entities[0]["provenance"]["source_hash"]
     )
     assert entities[0]["provenance"]["record_hash"] == (
         f"sha256:{entities[0]['provenance']['source_hash']}"
