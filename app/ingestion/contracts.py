@@ -242,6 +242,35 @@ class AdapterResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AdapterExportRequest:
+    """Canonical export request passed into write-capable adapters."""
+
+    canonical: Mapping[str, JSONValue]
+    output_format: str
+
+    def __post_init__(self) -> None:
+        if not self.output_format:
+            raise ValueError("Adapter export output format cannot be empty.")
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterExportResult:
+    """Opaque export payload returned by a write-capable adapter."""
+
+    output_format: str
+    media_type: str
+    content: bytes
+    warnings: tuple[AdapterWarning, ...] = ()
+    diagnostics: tuple[AdapterDiagnostic, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.output_format:
+            raise ValueError("Adapter export output format cannot be empty.")
+        if not self.media_type:
+            raise ValueError("Adapter export media type cannot be empty.")
+
+
+@dataclass(frozen=True, slots=True)
 class AdapterSource:
     """Immutable source reference handed to an adapter implementation."""
 
@@ -411,6 +440,19 @@ class AdapterDescriptor:
             raise ValueError("Adapter key must use stable lowercase slug semantics.")
         if not self.output_formats:
             raise ValueError("Adapter descriptor must declare at least one output format.")
+        seen_output_formats: set[str] = set()
+        for output_format in self.output_formats:
+            canonical_output_format = output_format.strip().lower()
+            if not canonical_output_format:
+                raise ValueError("Adapter output format cannot be empty.")
+            if output_format != canonical_output_format:
+                raise ValueError(
+                    "Adapter output format must use canonical lowercase semantics without"
+                    " surrounding whitespace."
+                )
+            if output_format in seen_output_formats:
+                raise ValueError(f"Duplicate adapter output format '{output_format}'.")
+            seen_output_formats.add(output_format)
         if self.bounded_probe_ms <= 0:
             raise ValueError("Bounded probe time must be greater than zero.")
         if self.confidence_range is not None:
@@ -446,3 +488,19 @@ class IngestionAdapter(Protocol):
         options: AdapterExecutionOptions,
     ) -> AdapterResult:
         """Transform a source file into canonical output."""
+
+
+class ExportAdapter(Protocol):
+    """Protocol that concrete export-capable adapters must implement."""
+
+    descriptor: AdapterDescriptor
+
+    def probe(self) -> AdapterAvailability:
+        """Return current availability without importing optional peers."""
+
+    async def export(
+        self,
+        request: AdapterExportRequest,
+        options: AdapterExecutionOptions,
+    ) -> AdapterExportResult:
+        """Transform canonical payloads into an adapter-owned export artifact."""

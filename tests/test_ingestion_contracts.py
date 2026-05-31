@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +14,7 @@ import pytest
 
 import app.ingestion.adapters.pymupdf as pymupdf_adapter
 import app.ingestion.adapters.vtracer_tesseract as vtracer_tesseract_adapter
+import app.ingestion.registry as registry_module
 from app.core.errors import ErrorCode
 from app.ingestion.contracts import (
     AdapterAvailability,
@@ -45,7 +46,9 @@ from app.ingestion.contracts import (
 from app.ingestion.registry import (
     descriptors_for_upload_format,
     evaluate_availability,
+    get_export_registry,
     get_registry,
+    get_registry_by_key,
     list_descriptors,
 )
 from app.ingestion.validation import build_validation_outcome
@@ -126,6 +129,88 @@ class _FakeDocument:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _clear_registry_caches() -> None:
+    cast(Any, list_descriptors).cache_clear()
+    cast(Any, get_registry_by_key).cache_clear()
+    cast(Any, get_registry).cache_clear()
+    cast(Any, get_export_registry).cache_clear()
+
+
+@pytest.fixture
+def clear_registry_caches() -> Iterator[None]:
+    _clear_registry_caches()
+    try:
+        yield
+    finally:
+        _clear_registry_caches()
+
+
+def _build_descriptor(
+    *,
+    key: str,
+    family: InputFamily,
+    upload_formats: tuple[UploadFormat, ...],
+    can_read: bool,
+    can_write: bool,
+    supports_exports: bool,
+    output_formats: tuple[str, ...] = ("canonical_json",),
+) -> AdapterDescriptor:
+    return AdapterDescriptor(
+        key=key,
+        family=family,
+        upload_formats=upload_formats,
+        output_formats=output_formats,
+        display_name=key,
+        module=f"tests.synthetic.{key}",
+        license_name="MIT",
+        capabilities=AdapterCapabilities(
+            can_read=can_read,
+            can_write=can_write,
+            supports_exports=supports_exports,
+        ),
+        confidence_range=(0.95, 1.0),
+        probes=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "output_formats",
+    [
+        ("",),
+        ("   ",),
+        ("Canonical_JSON",),
+        (" canonical_json",),
+        ("canonical_json ",),
+    ],
+)
+def test_adapter_descriptor_rejects_non_canonical_output_formats(
+    output_formats: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="Adapter output format"):
+        _build_descriptor(
+            key="synthetic-output-format",
+            family=InputFamily.DXF,
+            upload_formats=(UploadFormat.DXF,),
+            can_read=False,
+            can_write=True,
+            supports_exports=True,
+            output_formats=output_formats,
+        )
+
+
+def test_adapter_descriptor_rejects_duplicate_output_formats() -> None:
+    with pytest.raises(ValueError, match="Duplicate adapter output format 'revised_dxf'"):
+        _build_descriptor(
+            key="synthetic-duplicate-output-format",
+            family=InputFamily.DXF,
+            upload_formats=(UploadFormat.DXF,),
+            can_read=False,
+            can_write=True,
+            supports_exports=True,
+            output_formats=("revised_dxf", "revised_dxf"),
+        )
 
 
 def _assert_no_nonfinite_numbers(value: object) -> None:
@@ -286,6 +371,141 @@ def test_registry_is_static_and_covers_every_family() -> None:
     assert dwg_license_probe.failure_status is AdapterStatus.UNAVAILABLE
     assert pdf_vector_license_probe.failure_status is AdapterStatus.UNAVAILABLE
     assert pdf_raster_binary_probe.failure_status is AdapterStatus.DEGRADED
+
+
+def test_registry_by_key_rejects_duplicate_adapter_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    duplicate_key = "synthetic-dxf-export"
+    first = _build_descriptor(
+        key=duplicate_key,
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=True,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+    second = _build_descriptor(
+        key=duplicate_key,
+        family=InputFamily.DWG,
+        upload_formats=(UploadFormat.DWG,),
+        can_read=False,
+        can_write=True,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*list_descriptors(), first, second),
+    )
+    _clear_registry_caches()
+
+    with pytest.raises(ValueError, match="Duplicate adapter key 'synthetic-dxf-export'"):
+        get_registry_by_key()
+
+
+def test_registry_rejects_duplicate_read_families(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    duplicate_reader = _build_descriptor(
+        key="synthetic-dxf-reader",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=True,
+        can_write=False,
+        supports_exports=False,
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*list_descriptors(), duplicate_reader),
+    )
+    _clear_registry_caches()
+
+    with pytest.raises(ValueError, match="Duplicate read adapter family"):
+        get_registry()
+
+
+def test_export_registry_indexes_synthetic_dxf_writers_without_changing_read_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    first = _build_descriptor(
+        key="synthetic-dxf-export-a",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=True,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+    second = _build_descriptor(
+        key="synthetic-dxf-export-b",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=True,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*list_descriptors(), first, second),
+    )
+    _clear_registry_caches()
+
+    assert get_registry()[InputFamily.DXF].key == "ezdxf"
+    assert get_export_registry()["revised_dxf"] == (first, second)
+
+
+def test_export_registry_requires_write_and_export_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    read_only = _build_descriptor(
+        key="synthetic-read-only-export",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=False,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+    write_only = _build_descriptor(
+        key="synthetic-write-only-export",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=True,
+        supports_exports=False,
+        output_formats=("revised_dxf",),
+    )
+    eligible = _build_descriptor(
+        key="synthetic-dxf-export",
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        can_read=False,
+        can_write=True,
+        supports_exports=True,
+        output_formats=("revised_dxf",),
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*list_descriptors(), read_only, write_only, eligible),
+    )
+    _clear_registry_caches()
+
+    assert get_export_registry()["revised_dxf"] == (eligible,)
 
 
 def test_ifc_registry_metadata_stays_semantic_only() -> None:

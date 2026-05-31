@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import importlib.machinery
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, cast
@@ -15,11 +15,14 @@ from uuid import uuid4
 import ezdxf
 import pytest
 
+import app.ingestion.registry as registry_module
 from app.core.errors import ErrorCode
 from app.ingestion.adapters import ifcopenshell as ifcopenshell_adapter_module
 from app.ingestion.adapters import pymupdf as pymupdf_adapter_module
 from app.ingestion.contracts import (
     AdapterAvailability,
+    AdapterCapabilities,
+    AdapterDescriptor,
     AdapterResult,
     AdapterStatus,
     AdapterTimeout,
@@ -31,8 +34,13 @@ from app.ingestion.contracts import (
     ProvenanceRecord,
     UploadFormat,
 )
+from app.ingestion.loader import load_export_adapter
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
-from app.ingestion.selection import select_adapter_candidates
+from app.ingestion.selection import (
+    select_adapter_candidates,
+    select_export_candidates,
+    select_export_descriptor,
+)
 from app.ingestion.source import (
     OriginalSourceMaterialization,
     OriginalSourceReadError,
@@ -47,6 +55,46 @@ _DXF_SMOKE_FIXTURE = Path(__file__).parent / "fixtures" / "dxf" / "simple-line.d
 _IFC_SMOKE_BODY = (
     b"ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
 )
+
+
+def _clear_registry_caches() -> None:
+    cast(Any, registry_module.list_descriptors).cache_clear()
+    cast(Any, registry_module.get_registry_by_key).cache_clear()
+    cast(Any, registry_module.get_registry).cache_clear()
+    cast(Any, registry_module.get_export_registry).cache_clear()
+
+
+@pytest.fixture
+def clear_registry_caches() -> Iterator[None]:
+    _clear_registry_caches()
+    try:
+        yield
+    finally:
+        _clear_registry_caches()
+
+
+def _build_export_descriptor(
+    *,
+    key: str,
+    can_write: bool,
+    supports_exports: bool,
+) -> AdapterDescriptor:
+    return AdapterDescriptor(
+        key=key,
+        family=InputFamily.DXF,
+        upload_formats=(UploadFormat.DXF,),
+        output_formats=("revised_dxf",),
+        display_name=key,
+        module=f"tests.synthetic.{key}",
+        license_name="MIT",
+        capabilities=AdapterCapabilities(
+            can_read=False,
+            can_write=can_write,
+            supports_exports=supports_exports,
+        ),
+        confidence_range=(0.95, 1.0),
+        probes=(),
+    )
 
 
 def _fake_line_entity(*, adapter_key: str, source_ref: str) -> dict[str, Any]:
@@ -346,6 +394,169 @@ def test_select_adapter_candidates_keeps_pdf_vector_then_raster_order() -> None:
         (UploadFormat.PDF, InputFamily.PDF_VECTOR),
         (UploadFormat.PDF, InputFamily.PDF_RASTER),
     ]
+
+
+def test_select_export_candidates_keep_registered_order_and_filter_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    read_only = _build_export_descriptor(
+        key="synthetic-read-only-export",
+        can_write=False,
+        supports_exports=True,
+    )
+    first = _build_export_descriptor(
+        key="synthetic-dxf-export-a",
+        can_write=True,
+        supports_exports=True,
+    )
+    write_only = _build_export_descriptor(
+        key="synthetic-write-only-export",
+        can_write=True,
+        supports_exports=False,
+    )
+    second = _build_export_descriptor(
+        key="synthetic-dxf-export-b",
+        can_write=True,
+        supports_exports=True,
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*registry_module.list_descriptors(), read_only, first, write_only, second),
+    )
+    _clear_registry_caches()
+
+    assert select_export_candidates("revised_dxf") == (first, second)
+
+
+def test_select_export_descriptor_returns_single_registered_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    descriptor = _build_export_descriptor(
+        key="synthetic-dxf-export",
+        can_write=True,
+        supports_exports=True,
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*registry_module.list_descriptors(), descriptor),
+    )
+    _clear_registry_caches()
+
+    assert select_export_descriptor("revised_dxf") is descriptor
+
+
+def test_select_export_descriptor_rejects_ambiguous_registered_writers(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_registry_caches: None,
+) -> None:
+    first = _build_export_descriptor(
+        key="synthetic-dxf-export-a",
+        can_write=True,
+        supports_exports=True,
+    )
+    second = _build_export_descriptor(
+        key="synthetic-dxf-export-b",
+        can_write=True,
+        supports_exports=True,
+    )
+
+    monkeypatch.setattr(
+        registry_module,
+        "_ADAPTER_DESCRIPTORS",
+        (*registry_module.list_descriptors(), first, second),
+    )
+    _clear_registry_caches()
+
+    with pytest.raises(
+        ValueError,
+        match="Multiple export adapters registered for 'revised_dxf'",
+    ):
+        select_export_descriptor("revised_dxf")
+
+
+def test_select_export_helpers_reject_unsupported_export_formats() -> None:
+    with pytest.raises(ValueError, match=r"Unsupported export format for ingestion\."):
+        select_export_candidates("revised_svg")
+
+    with pytest.raises(ValueError, match=r"Unsupported export format for ingestion\."):
+        select_export_descriptor("revised_svg")
+
+
+def test_load_export_adapter_uses_create_export_adapter_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _build_export_descriptor(
+        key="synthetic-export-factory",
+        can_write=True,
+        supports_exports=True,
+    )
+    sentinel = object()
+    module = types.ModuleType("synthetic_export_factory_module")
+    module.create_export_adapter = lambda: sentinel  # type: ignore[attr-defined]
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        assert module_name == descriptor.module
+        return module
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    assert load_export_adapter(descriptor) is sentinel
+
+
+def test_load_export_adapter_rejects_missing_export_capabilities() -> None:
+    descriptor = _build_export_descriptor(
+        key="synthetic-export-disabled",
+        can_write=True,
+        supports_exports=False,
+    )
+
+    with pytest.raises(ValueError, match="does not support exports"):
+        load_export_adapter(descriptor)
+
+
+def test_load_export_adapter_rejects_missing_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    descriptor = _build_export_descriptor(
+        key="synthetic-export-missing-factory",
+        can_write=True,
+        supports_exports=True,
+    )
+    module = types.ModuleType("synthetic_export_missing_factory_module")
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        assert module_name == descriptor.module
+        return module
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    with pytest.raises(AttributeError, match="does not define 'create_export_adapter'"):
+        load_export_adapter(descriptor)
+
+
+def test_load_export_adapter_rejects_non_callable_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _build_export_descriptor(
+        key="synthetic-export-non-callable-factory",
+        can_write=True,
+        supports_exports=True,
+    )
+    module = types.ModuleType("synthetic_export_non_callable_factory_module")
+    module.create_export_adapter = object()  # type: ignore[attr-defined]
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        assert module_name == descriptor.module
+        return module
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    with pytest.raises(TypeError, match="exposes non-callable 'create_export_adapter'"):
+        load_export_adapter(descriptor)
 
 
 @pytest.mark.asyncio
