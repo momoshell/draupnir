@@ -222,12 +222,15 @@ async def _seed_quantity_lineage(async_client: httpx.AsyncClient) -> _QuantityPe
         )
         await session.commit()
 
+    extraction_profile_id = drawing_revisions[0].extraction_profile_id
+    assert extraction_profile_id is not None
+
     return _QuantityPersistenceSeed(
         project_id=uuid.UUID(project["id"]),
         file_id=uuid.UUID(str(uploaded["id"])),
         ingest_job_id=ingest_job.id,
         drawing_revision_id=drawing_revision_id,
-        extraction_profile_id=drawing_revisions[0].extraction_profile_id,
+        extraction_profile_id=extraction_profile_id,
         source_entity_id=source_entity_id,
         quantity_job_id=quantity_job_id,
         quantity_takeoff_id=quantity_takeoff_id,

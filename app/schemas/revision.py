@@ -15,9 +15,19 @@ class DrawingRevisionRead(BaseModel):
     id: UUID = Field(..., description="Unique drawing revision identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source ingest or reprocess job identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
+    changeset_id: UUID | None = Field(
+        None,
+        description="Associated changeset identifier",
+    )
     predecessor_revision_id: UUID | None = Field(
         None,
         description="Previous revision identifier when this revision descends from another",
@@ -140,10 +150,16 @@ class RevisionEntityManifestRead(BaseModel):
     id: UUID = Field(..., description="Unique revision entity materialization manifest identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source materialization job identifier")
     drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version used by the materialized revision",
@@ -163,10 +179,16 @@ class RevisionLayoutRead(BaseModel):
     id: UUID = Field(..., description="Unique materialized layout row identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source materialization job identifier")
     drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version for this layout row",
@@ -188,10 +210,16 @@ class RevisionLayerRead(BaseModel):
     id: UUID = Field(..., description="Unique materialized layer row identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source materialization job identifier")
     drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version for this layer row",
@@ -213,10 +241,16 @@ class RevisionBlockRead(BaseModel):
     id: UUID = Field(..., description="Unique materialized block row identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source materialization job identifier")
     drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version for this block row",
@@ -238,10 +272,16 @@ class RevisionEntityRead(BaseModel):
     id: UUID = Field(..., description="Unique materialized entity row identifier")
     project_id: UUID = Field(..., description="Owning project identifier")
     source_file_id: UUID = Field(..., description="Source file identifier")
-    extraction_profile_id: UUID = Field(..., description="Extraction profile identifier")
+    extraction_profile_id: UUID | None = Field(
+        None,
+        description="Extraction profile identifier",
+    )
     source_job_id: UUID = Field(..., description="Source materialization job identifier")
     drawing_revision_id: UUID = Field(..., description="Drawing revision identifier")
-    adapter_run_output_id: UUID = Field(..., description="Associated adapter output identifier")
+    adapter_run_output_id: UUID | None = Field(
+        None,
+        description="Associated adapter output identifier",
+    )
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version for this entity row",

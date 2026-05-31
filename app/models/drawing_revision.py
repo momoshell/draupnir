@@ -60,6 +60,10 @@ class DrawingRevision(Base):
             name="uq_drawing_revisions_adapter_run_output_id",
         ),
         UniqueConstraint(
+            "changeset_id",
+            name="uq_drawing_revisions_changeset_id",
+        ),
+        UniqueConstraint(
             "source_job_id",
             name="uq_drawing_revisions_source_job_id",
         ),
@@ -74,8 +78,16 @@ class DrawingRevision(Base):
             name="ck_drawing_revisions_seq_ge_1",
         ),
         CheckConstraint(
-            "revision_kind IN ('ingest', 'reprocess')",
+            "revision_kind IN ('ingest', 'reprocess', 'changeset')",
             name="ck_drawing_revisions_kind",
+        ),
+        CheckConstraint(
+            "(revision_kind = 'changeset' AND predecessor_revision_id IS NOT NULL "
+            "AND changeset_id IS NOT NULL "
+            "AND extraction_profile_id IS NULL AND adapter_run_output_id IS NULL) "
+            "OR (revision_kind IN ('ingest', 'reprocess') AND changeset_id IS NULL "
+            "AND extraction_profile_id IS NOT NULL AND adapter_run_output_id IS NOT NULL)",
+            name="ck_drawing_revisions_origin_fields",
         ),
         CheckConstraint(
             "review_state IN "
@@ -108,10 +120,13 @@ class DrawingRevision(Base):
         index=True,
         comment="Immutable source file identifier for this revision",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used to derive this revision",
+        comment=(
+            "Optional extraction profile identifier used to derive this revision "
+            "for ingest and reprocess origins"
+        ),
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -123,9 +138,16 @@ class DrawingRevision(Base):
         index=True,
         comment="Job identifier that committed this drawing revision",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Committed adapter output envelope consumed by this drawing revision",
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment=(
+            "Optional committed adapter output envelope consumed by this drawing "
+            "revision for ingest and reprocess origins"
+        ),
+    )
+    changeset_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment=("Forward-reference changeset identifier for changeset-origin drawing revisions"),
     )
     predecessor_revision_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("drawing_revisions.id", ondelete="RESTRICT"),

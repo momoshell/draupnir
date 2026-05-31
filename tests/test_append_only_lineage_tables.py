@@ -54,9 +54,12 @@ from tests.test_jobs import (
 from tests.test_quantity_takeoff_persistence import _seed_quantity_lineage
 
 _APPEND_ONLY_SQLSTATE = "55000"
+_CHECK_VIOLATION_SQLSTATE = "23514"
+_UNIQUE_VIOLATION_SQLSTATE = "23505"
 _DOWNGRADE_TARGET_REVISION = "2026_05_11_0013"
 _MATERIALIZATION_DOWNGRADE_TARGET_REVISION = "2026_05_12_0014"
 _QUANTITY_DOWNGRADE_TARGET_REVISION = "2026_05_14_0016"
+_CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION = "2026_05_27_0024"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -84,6 +87,15 @@ class _ProtectedRowIds:
     revision_layer_id: uuid.UUID
     revision_block_id: uuid.UUID
     revision_entity_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class _ChangesetMaterializationIds:
+    manifest_id: uuid.UUID
+    layout_id: uuid.UUID
+    layer_id: uuid.UUID
+    block_id: uuid.UUID
+    entity_id: uuid.UUID
 
 
 @pytest.fixture(autouse=True)
@@ -496,6 +508,510 @@ def _run_alembic_command(*args: str, database_url: str) -> subprocess.CompletedP
     )
 
 
+async def _insert_job_row(
+    target: Any,
+    *,
+    job_id: uuid.UUID,
+    project_id: uuid.UUID,
+    file_id: uuid.UUID,
+    extraction_profile_id: uuid.UUID | None,
+    base_revision_id: uuid.UUID | None,
+    job_type: str,
+    status: str,
+    enqueue_status: str,
+    enqueue_attempts: int,
+    parent_job_id: uuid.UUID | None = None,
+) -> None:
+    """Insert a job row for raw SQL lineage setup."""
+
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO jobs (
+                id,
+                project_id,
+                file_id,
+                extraction_profile_id,
+                base_revision_id,
+                parent_job_id,
+                job_type,
+                status,
+                attempts,
+                max_attempts,
+                attempt_token,
+                attempt_lease_expires_at,
+                enqueue_status,
+                enqueue_attempts,
+                enqueue_owner_token,
+                enqueue_lease_expires_at,
+                enqueue_last_attempted_at,
+                enqueue_published_at,
+                cancel_requested,
+                error_code,
+                error_message,
+                started_at,
+                finished_at
+            ) VALUES (
+                :id,
+                :project_id,
+                :file_id,
+                :extraction_profile_id,
+                :base_revision_id,
+                :parent_job_id,
+                :job_type,
+                :status,
+                :attempts,
+                :max_attempts,
+                :attempt_token,
+                :attempt_lease_expires_at,
+                :enqueue_status,
+                :enqueue_attempts,
+                :enqueue_owner_token,
+                :enqueue_lease_expires_at,
+                :enqueue_last_attempted_at,
+                :enqueue_published_at,
+                :cancel_requested,
+                :error_code,
+                :error_message,
+                :started_at,
+                :finished_at
+            )
+            """
+        ),
+        {
+            "id": job_id,
+            "project_id": project_id,
+            "file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "base_revision_id": base_revision_id,
+            "parent_job_id": parent_job_id,
+            "job_type": job_type,
+            "status": status,
+            "attempts": 1,
+            "max_attempts": 3,
+            "attempt_token": None,
+            "attempt_lease_expires_at": None,
+            "enqueue_status": enqueue_status,
+            "enqueue_attempts": enqueue_attempts,
+            "enqueue_owner_token": None,
+            "enqueue_lease_expires_at": None,
+            "enqueue_last_attempted_at": None,
+            "enqueue_published_at": None,
+            "cancel_requested": False,
+            "error_code": None,
+            "error_message": None,
+            "started_at": None,
+            "finished_at": None,
+        },
+    )
+
+
+async def _insert_drawing_revision_row(
+    target: Any,
+    *,
+    revision_id: uuid.UUID,
+    project_id: uuid.UUID,
+    file_id: uuid.UUID,
+    extraction_profile_id: uuid.UUID | None,
+    source_job_id: uuid.UUID,
+    adapter_run_output_id: uuid.UUID | None,
+    predecessor_revision_id: uuid.UUID | None,
+    revision_sequence: int,
+    revision_kind: str,
+    review_state: str,
+    canonical_entity_schema_version: str,
+    confidence_score: float,
+    changeset_id: uuid.UUID | None,
+) -> None:
+    """Insert a drawing revision row for raw SQL lineage setup."""
+
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO drawing_revisions (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                adapter_run_output_id,
+                predecessor_revision_id,
+                revision_sequence,
+                revision_kind,
+                review_state,
+                canonical_entity_schema_version,
+                confidence_score,
+                changeset_id
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :adapter_run_output_id,
+                :predecessor_revision_id,
+                :revision_sequence,
+                :revision_kind,
+                :review_state,
+                :canonical_entity_schema_version,
+                :confidence_score,
+                :changeset_id
+            )
+            """
+        ),
+        {
+            "id": revision_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "predecessor_revision_id": predecessor_revision_id,
+            "revision_sequence": revision_sequence,
+            "revision_kind": revision_kind,
+            "review_state": review_state,
+            "canonical_entity_schema_version": canonical_entity_schema_version,
+            "confidence_score": confidence_score,
+            "changeset_id": changeset_id,
+        },
+    )
+
+
+async def _insert_changeset_materialization_rows(
+    target: Any,
+    *,
+    project_id: uuid.UUID,
+    file_id: uuid.UUID,
+    source_job_id: uuid.UUID,
+    drawing_revision_id: uuid.UUID,
+    extraction_profile_id: uuid.UUID | None,
+    adapter_run_output_id: uuid.UUID | None,
+) -> _ChangesetMaterializationIds:
+    """Insert one null-origin materialization row per protected revision table."""
+
+    manifest_id = uuid.uuid4()
+    layout_id = uuid.uuid4()
+    layer_id = uuid.uuid4()
+    block_id = uuid.uuid4()
+    entity_id = uuid.uuid4()
+
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO revision_entity_manifests (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                drawing_revision_id,
+                adapter_run_output_id,
+                canonical_entity_schema_version,
+                counts_json
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :drawing_revision_id,
+                :adapter_run_output_id,
+                :canonical_entity_schema_version,
+                CAST(:counts_json AS json)
+            )
+            """
+        ),
+        {
+            "id": manifest_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "counts_json": dumps(
+                {"layouts": 1, "layers": 1, "blocks": 1, "entities": 1},
+                separators=(",", ":"),
+            ),
+        },
+    )
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO revision_layouts (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                drawing_revision_id,
+                adapter_run_output_id,
+                canonical_entity_schema_version,
+                sequence_index,
+                payload_json,
+                layout_ref
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :drawing_revision_id,
+                :adapter_run_output_id,
+                :canonical_entity_schema_version,
+                :sequence_index,
+                CAST(:payload_json AS json),
+                :layout_ref
+            )
+            """
+        ),
+        {
+            "id": layout_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "sequence_index": 0,
+            "payload_json": dumps(
+                {"layout_ref": "Changeset", "name": "Changeset"},
+                separators=(",", ":"),
+            ),
+            "layout_ref": "Changeset",
+        },
+    )
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO revision_layers (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                drawing_revision_id,
+                adapter_run_output_id,
+                canonical_entity_schema_version,
+                sequence_index,
+                payload_json,
+                layer_ref
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :drawing_revision_id,
+                :adapter_run_output_id,
+                :canonical_entity_schema_version,
+                :sequence_index,
+                CAST(:payload_json AS json),
+                :layer_ref
+            )
+            """
+        ),
+        {
+            "id": layer_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "sequence_index": 0,
+            "payload_json": dumps(
+                {"layer_ref": "A-CHG", "name": "A-CHG"},
+                separators=(",", ":"),
+            ),
+            "layer_ref": "A-CHG",
+        },
+    )
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO revision_blocks (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                drawing_revision_id,
+                adapter_run_output_id,
+                canonical_entity_schema_version,
+                sequence_index,
+                payload_json,
+                block_ref
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :drawing_revision_id,
+                :adapter_run_output_id,
+                :canonical_entity_schema_version,
+                :sequence_index,
+                CAST(:payload_json AS json),
+                :block_ref
+            )
+            """
+        ),
+        {
+            "id": block_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "sequence_index": 0,
+            "payload_json": dumps(
+                {"block_ref": "CHG-BLOCK", "name": "CHG-BLOCK"},
+                separators=(",", ":"),
+            ),
+            "block_ref": "CHG-BLOCK",
+        },
+    )
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO revision_entities (
+                id,
+                project_id,
+                source_file_id,
+                extraction_profile_id,
+                source_job_id,
+                drawing_revision_id,
+                adapter_run_output_id,
+                canonical_entity_schema_version,
+                sequence_index,
+                entity_id,
+                entity_type,
+                entity_schema_version,
+                parent_entity_ref,
+                confidence_score,
+                confidence_json,
+                geometry_json,
+                properties_json,
+                provenance_json,
+                canonical_entity_json,
+                layout_ref,
+                layer_ref,
+                block_ref,
+                source_identity,
+                source_hash,
+                layout_id,
+                layer_id,
+                block_id,
+                parent_entity_row_id
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :extraction_profile_id,
+                :source_job_id,
+                :drawing_revision_id,
+                :adapter_run_output_id,
+                :canonical_entity_schema_version,
+                :sequence_index,
+                :entity_id,
+                :entity_type,
+                :entity_schema_version,
+                :parent_entity_ref,
+                :confidence_score,
+                CAST(:confidence_json AS json),
+                CAST(:geometry_json AS json),
+                CAST(:properties_json AS json),
+                CAST(:provenance_json AS json),
+                CAST(:canonical_entity_json AS json),
+                :layout_ref,
+                :layer_ref,
+                :block_ref,
+                :source_identity,
+                :source_hash,
+                :layout_id,
+                :layer_id,
+                :block_id,
+                :parent_entity_row_id
+            )
+            """
+        ),
+        {
+            "id": entity_id,
+            "project_id": project_id,
+            "source_file_id": file_id,
+            "extraction_profile_id": extraction_profile_id,
+            "source_job_id": source_job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "sequence_index": 0,
+            "entity_id": "changeset-entity-001",
+            "entity_type": "line",
+            "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "parent_entity_ref": None,
+            "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+            "confidence_json": dumps(
+                {"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
+                separators=(",", ":"),
+            ),
+            "geometry_json": dumps(
+                {"type": "line", "coordinates": [[0.0, 0.0], [1.0, 1.0]]},
+                separators=(",", ":"),
+            ),
+            "properties_json": dumps({"kind": "changeset"}, separators=(",", ":")),
+            "provenance_json": dumps(
+                {"origin": "user_created", "notes": ["changeset"]},
+                separators=(",", ":"),
+            ),
+            "canonical_entity_json": dumps(
+                {
+                    "entity_id": "changeset-entity-001",
+                    "entity_type": "line",
+                    "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    "layout_ref": "Changeset",
+                    "layer_ref": "A-CHG",
+                    "block_ref": "CHG-BLOCK",
+                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                    "confidence_json": {"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
+                    "geometry_json": {
+                        "type": "line",
+                        "coordinates": [[0.0, 0.0], [1.0, 1.0]],
+                    },
+                    "properties_json": {"kind": "changeset"},
+                    "provenance_json": {
+                        "origin": "user_created",
+                        "notes": ["changeset"],
+                    },
+                },
+                separators=(",", ":"),
+            ),
+            "layout_ref": "Changeset",
+            "layer_ref": "A-CHG",
+            "block_ref": "CHG-BLOCK",
+            "source_identity": None,
+            "source_hash": None,
+            "layout_id": layout_id,
+            "layer_id": layer_id,
+            "block_id": block_id,
+            "parent_entity_row_id": None,
+        },
+    )
+
+    return _ChangesetMaterializationIds(
+        manifest_id=manifest_id,
+        layout_id=layout_id,
+        layer_id=layer_id,
+        block_id=block_id,
+        entity_id=entity_id,
+    )
+
+
 async def _create_temp_database() -> tuple[str, str]:
     """Create an isolated PostgreSQL database for downgrade validation."""
 
@@ -533,6 +1049,321 @@ async def _drop_temp_database(database_name: str) -> None:
         await connection.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
     finally:
         await connection.close()
+
+
+async def _insert_changeset_origin_rows(
+    database_url: str,
+    *,
+    include_materialization: bool,
+    keep_drawing_revision_compatible: bool = False,
+) -> None:
+    """Insert #271 origin rows for downgrade validation."""
+
+    engine = create_async_engine(database_url)
+    project_id = uuid.uuid4()
+    file_id = uuid.uuid4()
+    extraction_profile_id = uuid.uuid4()
+    ingest_job_id = uuid.uuid4()
+    adapter_run_output_id = uuid.uuid4()
+    base_revision_id = uuid.uuid4()
+    changeset_job_id = uuid.uuid4()
+    changeset_revision_id = uuid.uuid4()
+    canonical_json = dumps(
+        {
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "layouts": [],
+            "layers": [],
+            "blocks": [],
+            "entities": [],
+            "entity_counts": {
+                "layouts": 0,
+                "layers": 0,
+                "blocks": 0,
+                "entities": 0,
+            },
+        },
+        separators=(",", ":"),
+    )
+    provenance_json = dumps(
+        {
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "adapter": {
+                "key": _FAKE_RUNNER_ADAPTER_KEY,
+                "version": _FAKE_RUNNER_ADAPTER_VERSION,
+            },
+            "source": {
+                "file_id": str(file_id),
+                "job_id": str(ingest_job_id),
+                "extraction_profile_id": str(extraction_profile_id),
+                "input_family": "pdf_vector",
+                "revision_kind": "ingest",
+            },
+            "records": [],
+            "generated_at": "2026-01-02T03:04:05+00:00",
+        },
+        separators=(",", ":"),
+    )
+    confidence_json = dumps({"score": _FAKE_RUNNER_CONFIDENCE_SCORE}, separators=(",", ":"))
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO projects (
+                        id,
+                        name,
+                        description,
+                        default_unit_system,
+                        default_currency
+                    ) VALUES (
+                        :id,
+                        :name,
+                        :description,
+                        :default_unit_system,
+                        :default_currency
+                    )
+                    """
+                ),
+                {
+                    "id": project_id,
+                    "name": "changeset downgrade guard",
+                    "description": None,
+                    "default_unit_system": None,
+                    "default_currency": None,
+                },
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO extraction_profiles (
+                        id,
+                        project_id,
+                        profile_version,
+                        units_override,
+                        layout_mode,
+                        xref_handling,
+                        block_handling,
+                        text_extraction,
+                        dimension_extraction,
+                        pdf_page_range,
+                        raster_calibration,
+                        confidence_threshold
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :profile_version,
+                        :units_override,
+                        :layout_mode,
+                        :xref_handling,
+                        :block_handling,
+                        :text_extraction,
+                        :dimension_extraction,
+                        :pdf_page_range,
+                        CAST(:raster_calibration AS json),
+                        :confidence_threshold
+                    )
+                    """
+                ),
+                {
+                    "id": extraction_profile_id,
+                    "project_id": project_id,
+                    "profile_version": "0.1",
+                    "units_override": None,
+                    "layout_mode": "all",
+                    "xref_handling": "embed",
+                    "block_handling": "expand",
+                    "text_extraction": True,
+                    "dimension_extraction": True,
+                    "pdf_page_range": None,
+                    "raster_calibration": "null",
+                    "confidence_threshold": 0.6,
+                },
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO files (
+                        id,
+                        project_id,
+                        original_filename,
+                        media_type,
+                        detected_format,
+                        storage_uri,
+                        size_bytes,
+                        checksum_sha256,
+                        immutable,
+                        initial_job_id,
+                        initial_extraction_profile_id
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :original_filename,
+                        :media_type,
+                        :detected_format,
+                        :storage_uri,
+                        :size_bytes,
+                        :checksum_sha256,
+                        :immutable,
+                        :initial_job_id,
+                        :initial_extraction_profile_id
+                    )
+                    """
+                ),
+                {
+                    "id": file_id,
+                    "project_id": project_id,
+                    "original_filename": "changeset-plan.pdf",
+                    "media_type": "application/pdf",
+                    "detected_format": "pdf",
+                    "storage_uri": "file:///tmp/changeset-plan.pdf",
+                    "size_bytes": 1,
+                    "checksum_sha256": "a" * 64,
+                    "immutable": True,
+                    "initial_job_id": ingest_job_id,
+                    "initial_extraction_profile_id": extraction_profile_id,
+                },
+            )
+            await _insert_job_row(
+                connection,
+                job_id=ingest_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=extraction_profile_id,
+                base_revision_id=None,
+                job_type="ingest",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO adapter_run_outputs (
+                        id,
+                        project_id,
+                        source_file_id,
+                        extraction_profile_id,
+                        source_job_id,
+                        adapter_key,
+                        adapter_version,
+                        input_family,
+                        canonical_entity_schema_version,
+                        canonical_json,
+                        provenance_json,
+                        confidence_json,
+                        confidence_score,
+                        warnings_json,
+                        diagnostics_json,
+                        result_checksum_sha256
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :source_file_id,
+                        :extraction_profile_id,
+                        :source_job_id,
+                        :adapter_key,
+                        :adapter_version,
+                        :input_family,
+                        :canonical_entity_schema_version,
+                        CAST(:canonical_json AS json),
+                        CAST(:provenance_json AS json),
+                        CAST(:confidence_json AS json),
+                        :confidence_score,
+                        CAST(:warnings_json AS json),
+                        CAST(:diagnostics_json AS json),
+                        :result_checksum_sha256
+                    )
+                    """
+                ),
+                {
+                    "id": adapter_run_output_id,
+                    "project_id": project_id,
+                    "source_file_id": file_id,
+                    "extraction_profile_id": extraction_profile_id,
+                    "source_job_id": ingest_job_id,
+                    "adapter_key": _FAKE_RUNNER_ADAPTER_KEY,
+                    "adapter_version": _FAKE_RUNNER_ADAPTER_VERSION,
+                    "input_family": "pdf_vector",
+                    "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    "canonical_json": canonical_json,
+                    "provenance_json": provenance_json,
+                    "confidence_json": confidence_json,
+                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                    "warnings_json": "[]",
+                    "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
+                    "result_checksum_sha256": "b" * 64,
+                },
+            )
+            await _insert_drawing_revision_row(
+                connection,
+                revision_id=base_revision_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=extraction_profile_id,
+                source_job_id=ingest_job_id,
+                adapter_run_output_id=adapter_run_output_id,
+                predecessor_revision_id=None,
+                revision_sequence=1,
+                revision_kind="ingest",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=None,
+            )
+            if keep_drawing_revision_compatible:
+                if include_materialization:
+                    await _insert_changeset_materialization_rows(
+                        connection,
+                        project_id=project_id,
+                        file_id=file_id,
+                        source_job_id=ingest_job_id,
+                        drawing_revision_id=base_revision_id,
+                        extraction_profile_id=None,
+                        adapter_run_output_id=None,
+                    )
+            else:
+                await _insert_job_row(
+                    connection,
+                    job_id=changeset_job_id,
+                    project_id=project_id,
+                    file_id=file_id,
+                    extraction_profile_id=None,
+                    base_revision_id=base_revision_id,
+                    job_type="export",
+                    status="pending",
+                    enqueue_status="pending",
+                    enqueue_attempts=0,
+                )
+                await _insert_drawing_revision_row(
+                    connection,
+                    revision_id=changeset_revision_id,
+                    project_id=project_id,
+                    file_id=file_id,
+                    extraction_profile_id=None,
+                    source_job_id=changeset_job_id,
+                    adapter_run_output_id=None,
+                    predecessor_revision_id=base_revision_id,
+                    revision_sequence=2,
+                    revision_kind="changeset",
+                    review_state="approved",
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                    changeset_id=uuid.uuid4(),
+                )
+                if include_materialization:
+                    await _insert_changeset_materialization_rows(
+                        connection,
+                        project_id=project_id,
+                        file_id=file_id,
+                        source_job_id=changeset_job_id,
+                        drawing_revision_id=changeset_revision_id,
+                        extraction_profile_id=None,
+                        adapter_run_output_id=None,
+                    )
+    finally:
+        await engine.dispose()
 
 
 async def _insert_protected_file_row(database_url: str) -> None:
@@ -1785,6 +2616,351 @@ class TestAppendOnlyLineageTables:
             operation="TRUNCATE",
             table_name=None,
         )
+
+    async def test_changeset_revisions_accept_null_origin_materialization_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Valid changeset revisions may persist null origin fields across materialization rows."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        source_job_id = uuid.uuid4()
+        revision_id = uuid.uuid4()
+        changeset_id = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await _insert_job_row(
+                session,
+                job_id=source_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+            await _insert_drawing_revision_row(
+                session,
+                revision_id=revision_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                source_job_id=source_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=row_ids.drawing_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=changeset_id,
+            )
+            materialization_ids = await _insert_changeset_materialization_rows(
+                session,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                source_job_id=source_job_id,
+                drawing_revision_id=revision_id,
+                extraction_profile_id=None,
+                adapter_run_output_id=None,
+            )
+            await session.commit()
+
+            revision_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT extraction_profile_id, adapter_run_output_id, changeset_id
+                        FROM drawing_revisions
+                        WHERE id = :revision_id
+                        """
+                    ),
+                    {"revision_id": revision_id},
+                )
+            ).one()
+            assert revision_row.extraction_profile_id is None
+            assert revision_row.adapter_run_output_id is None
+            assert revision_row.changeset_id == changeset_id
+
+            materialization_cases = (
+                ("revision_entity_manifests", "manifest_id"),
+                ("revision_layouts", "layout_id"),
+                ("revision_layers", "layer_id"),
+                ("revision_blocks", "block_id"),
+                ("revision_entities", "entity_id"),
+            )
+            materialization_id_map = {
+                "manifest_id": materialization_ids.manifest_id,
+                "layout_id": materialization_ids.layout_id,
+                "layer_id": materialization_ids.layer_id,
+                "block_id": materialization_ids.block_id,
+                "entity_id": materialization_ids.entity_id,
+            }
+
+            for table_name, id_key in materialization_cases:
+                row = (
+                    await session.execute(
+                        sa.text(
+                            f"""
+                            SELECT extraction_profile_id, adapter_run_output_id, drawing_revision_id
+                            FROM {table_name}
+                            WHERE id = :row_id
+                            """
+                        ),
+                        {"row_id": materialization_id_map[id_key]},
+                    )
+                ).one()
+                assert row.extraction_profile_id is None
+                assert row.adapter_run_output_id is None
+                assert row.drawing_revision_id == revision_id
+
+    async def test_changeset_revision_changeset_id_is_unique_when_non_null(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Changeset revisions should reject duplicate non-null changeset ids."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        duplicate_changeset_id = uuid.uuid4()
+        first_source_job_id = uuid.uuid4()
+        first_revision_id = uuid.uuid4()
+        second_source_job_id = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await _insert_job_row(
+                session,
+                job_id=first_source_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+            await _insert_drawing_revision_row(
+                session,
+                revision_id=first_revision_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                source_job_id=first_source_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=row_ids.drawing_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=duplicate_changeset_id,
+            )
+            await session.commit()
+
+            await _insert_job_row(
+                session,
+                job_id=second_source_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=first_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+
+            with pytest.raises(DBAPIError) as exc_info:
+                await _insert_drawing_revision_row(
+                    session,
+                    revision_id=uuid.uuid4(),
+                    project_id=row_ids.project_id,
+                    file_id=row_ids.file_id,
+                    extraction_profile_id=None,
+                    source_job_id=second_source_job_id,
+                    adapter_run_output_id=None,
+                    predecessor_revision_id=first_revision_id,
+                    revision_sequence=3,
+                    revision_kind="changeset",
+                    review_state="approved",
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                    changeset_id=duplicate_changeset_id,
+                )
+                await session.commit()
+
+            await session.rollback()
+            assert _extract_sqlstate(exc_info.value) == _UNIQUE_VIOLATION_SQLSTATE
+            assert "uq_drawing_revisions_changeset_id" in str(exc_info.value)
+
+    async def test_changeset_revision_origin_constraints_reject_invalid_combinations(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Invalid #271 origin combinations should fail the drawing revision check constraint."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        invalid_cases: tuple[
+            tuple[str, uuid.UUID | None, uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
+            ...,
+        ] = (
+            ("changeset", None, None, None, uuid.uuid4()),
+            (
+                "changeset",
+                row_ids.drawing_revision_id,
+                row_ids.extraction_profile_id,
+                None,
+                uuid.uuid4(),
+            ),
+            (
+                "changeset",
+                row_ids.drawing_revision_id,
+                None,
+                row_ids.adapter_run_output_id,
+                uuid.uuid4(),
+            ),
+            ("changeset", row_ids.drawing_revision_id, None, None, None),
+            ("ingest", None, None, row_ids.adapter_run_output_id, None),
+            ("ingest", None, row_ids.extraction_profile_id, None, None),
+            ("ingest", None, None, None, None),
+            (
+                "reprocess",
+                row_ids.drawing_revision_id,
+                None,
+                row_ids.adapter_run_output_id,
+                None,
+            ),
+            (
+                "reprocess",
+                row_ids.drawing_revision_id,
+                row_ids.extraction_profile_id,
+                None,
+                None,
+            ),
+            ("reprocess", row_ids.drawing_revision_id, None, None, None),
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            for (
+                revision_sequence,
+                (
+                    revision_kind,
+                    predecessor_revision_id,
+                    extraction_profile_id,
+                    adapter_run_output_id,
+                    changeset_id,
+                ),
+            ) in enumerate(invalid_cases, start=2):
+                source_job_id = uuid.uuid4()
+                await _insert_job_row(
+                    session,
+                    job_id=source_job_id,
+                    project_id=row_ids.project_id,
+                    file_id=row_ids.file_id,
+                    extraction_profile_id=None,
+                    base_revision_id=row_ids.drawing_revision_id,
+                    job_type="export",
+                    status="pending",
+                    enqueue_status="pending",
+                    enqueue_attempts=0,
+                )
+
+                with pytest.raises(DBAPIError) as exc_info:
+                    await _insert_drawing_revision_row(
+                        session,
+                        revision_id=uuid.uuid4(),
+                        project_id=row_ids.project_id,
+                        file_id=row_ids.file_id,
+                        extraction_profile_id=extraction_profile_id,
+                        source_job_id=source_job_id,
+                        adapter_run_output_id=adapter_run_output_id,
+                        predecessor_revision_id=predecessor_revision_id,
+                        revision_sequence=revision_sequence,
+                        revision_kind=revision_kind,
+                        review_state="approved",
+                        canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                        changeset_id=changeset_id,
+                    )
+                    await session.commit()
+
+                await session.rollback()
+                assert _extract_sqlstate(exc_info.value) == _CHECK_VIOLATION_SQLSTATE
+                assert "ck_drawing_revisions_origin_fields" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        (
+            "include_materialization",
+            "keep_drawing_revision_compatible",
+            "expected_table_name",
+        ),
+        [
+            (False, False, "drawing_revisions"),
+            (True, True, "revision_entity_manifests"),
+        ],
+    )
+    async def test_changeset_origin_downgrade_fails_closed_on_incompatible_rows(
+        self,
+        include_materialization: bool,
+        keep_drawing_revision_compatible: bool,
+        expected_table_name: str,
+    ) -> None:
+        """Downgrade past #271 should refuse incompatible origin rows introduced at head."""
+
+        _ = self
+        database_name, database_url = await _create_temp_database()
+
+        try:
+            upgrade_result = _run_alembic_command("upgrade", "head", database_url=database_url)
+            assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+
+            await _insert_changeset_origin_rows(
+                database_url,
+                include_materialization=include_materialization,
+                keep_drawing_revision_compatible=keep_drawing_revision_compatible,
+            )
+
+            downgrade_result = _run_alembic_command(
+                "downgrade",
+                _CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION,
+                database_url=database_url,
+            )
+            assert downgrade_result.returncode != 0
+
+            combined_output = downgrade_result.stdout + downgrade_result.stderr
+            assert "Cannot downgrade:" in combined_output
+            assert expected_table_name in combined_output
+        finally:
+            await _drop_temp_database(database_name)
 
     async def test_downgrade_fails_closed_on_populated_protected_tables(self) -> None:
         """Downgrade should refuse to remove append-only guards while protected rows exist."""
