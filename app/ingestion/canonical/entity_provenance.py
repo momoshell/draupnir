@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Final
 
+from app.ingestion.canonical.hashing import normalize_sha256_hex
+
 ENTITY_PROVENANCE_ALLOWED_ORIGINS: Final[frozenset[str]] = frozenset(
     {
         "source_direct",
@@ -252,11 +254,10 @@ def _normalize_source_hash(value: Any, *, field_name: str) -> str | None:
         raise EntityProvenanceError(
             f"entity provenance {field_name} must be a SHA-256 string or null"
         )
-    normalized = value.removeprefix("sha256:").strip().lower()
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
+    normalized = value.strip().lower()
+    try:
+        return normalize_sha256_hex(normalized, allow_prefix=True)
+    except ValueError as exc:
         raise EntityProvenanceError(
             f"entity provenance {field_name} must be a raw 64-character SHA-256 hex string"
-        )
-    return normalized
+        ) from exc

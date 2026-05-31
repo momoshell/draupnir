@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
+from app.estimating.engine._decimal import _decimal_text
 from app.estimating.engine.contracts import (
     EstimateAssumptionEntryInput,
     EstimateEngineInput,
@@ -793,10 +794,3 @@ def _resolve_adjustment_anchor(
         expected_type="assumption",
     )
     return None, assumption_value.snapshot.id
-
-
-def _decimal_text(value: Decimal) -> str:
-    text = format(value.normalize(), "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
