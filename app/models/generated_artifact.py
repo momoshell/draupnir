@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     String,
     UniqueConstraint,
     func,
@@ -45,6 +46,42 @@ class GeneratedArtifact(Base):
             name="fk_generated_artifacts_adapter_run_output_id_project_id_outputs",
         ),
         ForeignKeyConstraint(
+            ["drawing_revision_id", "project_id", "changeset_id"],
+            [
+                "drawing_revisions.id",
+                "drawing_revisions.project_id",
+                "drawing_revisions.changeset_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_generated_artifacts_changeset",
+        ),
+        ForeignKeyConstraint(
+            ["quantity_takeoff_id", "project_id", "drawing_revision_id"],
+            [
+                "quantity_takeoffs.id",
+                "quantity_takeoffs.project_id",
+                "quantity_takeoffs.drawing_revision_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_generated_artifacts_takeoff",
+        ),
+        ForeignKeyConstraint(
+            [
+                "estimate_version_id",
+                "project_id",
+                "drawing_revision_id",
+                "quantity_takeoff_id",
+            ],
+            [
+                "estimate_versions.id",
+                "estimate_versions.project_id",
+                "estimate_versions.drawing_revision_id",
+                "estimate_versions.quantity_takeoff_id",
+            ],
+            ondelete="RESTRICT",
+            name="fk_generated_artifacts_estimate",
+        ),
+        ForeignKeyConstraint(
             ["predecessor_artifact_id"],
             ["generated_artifacts.id"],
             ondelete="RESTRICT",
@@ -67,6 +104,22 @@ class GeneratedArtifact(Base):
             "length(checksum_sha256) = 64 AND checksum_sha256 = lower(checksum_sha256)",
             name="ck_generated_artifacts_checksum",
         ),
+        CheckConstraint(
+            "changeset_id IS NULL OR drawing_revision_id IS NOT NULL",
+            name="ck_generated_artifacts_changeset_revision",
+        ),
+        CheckConstraint(
+            "quantity_takeoff_id IS NULL OR drawing_revision_id IS NOT NULL",
+            name="ck_generated_artifacts_takeoff_revision",
+        ),
+        CheckConstraint(
+            "estimate_version_id IS NULL OR "
+            "(drawing_revision_id IS NOT NULL AND quantity_takeoff_id IS NOT NULL)",
+            name="ck_generated_artifacts_estimate_lineage",
+        ),
+        Index("ix_generated_artifacts_changeset_id", "changeset_id"),
+        Index("ix_generated_artifacts_quantity_takeoff_id", "quantity_takeoff_id"),
+        Index("ix_generated_artifacts_estimate_version_id", "estimate_version_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -103,6 +156,18 @@ class GeneratedArtifact(Base):
         nullable=True,
         index=True,
         comment="Drawing revision identifier used to generate this artifact",
+    )
+    changeset_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Changeset anchor identifier for changeset-derived generated artifacts",
+    )
+    quantity_takeoff_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Quantity takeoff anchor identifier for quantity-derived generated artifacts",
+    )
+    estimate_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        comment="Estimate version anchor identifier for estimate-derived generated artifacts",
     )
     adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
         nullable=True,
