@@ -46,8 +46,7 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
         display_name="LibreDWG",
         module="app.ingestion.adapters.libredwg",
         license_name="GPL-3.0-or-later",
-        capabilities=AdapterCapabilities(
-        ),
+        capabilities=AdapterCapabilities(),
         confidence_range=(0.2, 0.72),
         probes=(
             ProbeRequirement(
@@ -227,13 +226,58 @@ def list_descriptors() -> tuple[AdapterDescriptor, ...]:
     return _ADAPTER_DESCRIPTORS
 
 
+def _register_unique[IndexKey](
+    registry: dict[IndexKey, AdapterDescriptor],
+    index_key: IndexKey,
+    descriptor: AdapterDescriptor,
+    *,
+    index_name: str,
+) -> None:
+    existing = registry.get(index_key)
+    if existing is not None:
+        raise ValueError(
+            f"Duplicate {index_name} '{index_key}' declared by adapters "
+            f"'{existing.key}' and '{descriptor.key}'."
+        )
+    registry[index_key] = descriptor
+
+
+@lru_cache(maxsize=1)
+def get_registry_by_key() -> Mapping[str, AdapterDescriptor]:
+    """Return registry descriptors keyed by stable adapter key."""
+
+    registry: dict[str, AdapterDescriptor] = {}
+    for descriptor in list_descriptors():
+        _register_unique(
+            registry,
+            descriptor.key,
+            descriptor,
+            index_name="adapter key",
+        )
+    return MappingProxyType(registry)
+
+
+def get_descriptor_by_key(key: str) -> AdapterDescriptor:
+    """Return the descriptor registered for a stable adapter key."""
+
+    return get_registry_by_key()[key]
+
+
 @lru_cache(maxsize=1)
 def get_registry() -> Mapping[InputFamily, AdapterDescriptor]:
     """Return registry descriptors keyed by normalized input family."""
 
-    return MappingProxyType(
-        {descriptor.family: descriptor for descriptor in list_descriptors()}
-    )
+    registry: dict[InputFamily, AdapterDescriptor] = {}
+    for descriptor in list_descriptors():
+        if not descriptor.capabilities.can_read:
+            continue
+        _register_unique(
+            registry,
+            descriptor.family,
+            descriptor,
+            index_name="read adapter family",
+        )
+    return MappingProxyType(registry)
 
 
 def get_descriptor(family: InputFamily) -> AdapterDescriptor:
@@ -242,12 +286,44 @@ def get_descriptor(family: InputFamily) -> AdapterDescriptor:
     return get_registry()[family]
 
 
+@lru_cache(maxsize=1)
+def get_export_registry() -> Mapping[str, tuple[AdapterDescriptor, ...]]:
+    """Return export-capable descriptors keyed by declared output format."""
+
+    registry: dict[str, list[AdapterDescriptor]] = {}
+    for descriptor in list_descriptors():
+        if not (descriptor.capabilities.can_write and descriptor.capabilities.supports_exports):
+            continue
+        for output_format in descriptor.output_formats:
+            registry.setdefault(output_format, []).append(descriptor)
+    return MappingProxyType(
+        {output_format: tuple(descriptors) for output_format, descriptors in registry.items()}
+    )
+
+
+def get_export_descriptors(output_format: str) -> tuple[AdapterDescriptor, ...]:
+    """Return ordered export-capable descriptors for a requested output format."""
+
+    return get_export_registry()[output_format]
+
+
+def get_export_descriptor(output_format: str) -> AdapterDescriptor:
+    """Return the single export-capable descriptor registered for an output format."""
+
+    descriptors = get_export_descriptors(output_format)
+    if len(descriptors) > 1:
+        descriptor_keys = ", ".join(descriptor.key for descriptor in descriptors)
+        raise ValueError(
+            f"Multiple export adapters registered for '{output_format}': {descriptor_keys}."
+        )
+    return descriptors[0]
+
+
 def descriptors_for_upload_format(upload_format: UploadFormat) -> tuple[AdapterDescriptor, ...]:
     """Return candidate descriptors for a top-level upload format."""
 
     return tuple(
-        get_descriptor(family)
-        for family in input_families_for_upload_format(upload_format)
+        get_descriptor(family) for family in input_families_for_upload_format(upload_format)
     )
 
 
@@ -335,6 +411,10 @@ __all__ = [
     "descriptors_for_upload_format",
     "evaluate_availability",
     "get_descriptor",
+    "get_descriptor_by_key",
+    "get_export_descriptor",
+    "get_export_registry",
     "get_registry",
+    "get_registry_by_key",
     "list_descriptors",
 ]

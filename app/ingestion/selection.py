@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.ingestion.contracts import AdapterDescriptor, InputFamily, UploadFormat
-from app.ingestion.registry import descriptors_for_upload_format, get_descriptor
+from app.ingestion.registry import (
+    descriptors_for_upload_format,
+    get_descriptor,
+    get_export_descriptor,
+    get_export_descriptors,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +42,33 @@ def select_adapter_candidates(
         AdapterCandidate(upload_format, descriptor.family, descriptor)
         for descriptor in descriptors_for_upload_format(upload_format)
     )
+
+
+def _normalize_export_format(output_format: str) -> str:
+    normalized = output_format.strip().lower()
+    if not normalized:
+        raise ValueError("Unsupported export format for ingestion.")
+    return normalized
+
+
+def select_export_candidates(output_format: str) -> tuple[AdapterDescriptor, ...]:
+    """Resolve ordered export-capable adapter descriptors for a requested format."""
+
+    normalized_output_format = _normalize_export_format(output_format)
+    try:
+        return get_export_descriptors(normalized_output_format)
+    except KeyError as exc:
+        raise ValueError("Unsupported export format for ingestion.") from exc
+
+
+def select_export_descriptor(output_format: str) -> AdapterDescriptor:
+    """Resolve a single export-capable adapter descriptor for a requested format."""
+
+    normalized_output_format = _normalize_export_format(output_format)
+    try:
+        return get_export_descriptor(normalized_output_format)
+    except KeyError as exc:
+        raise ValueError("Unsupported export format for ingestion.") from exc
 
 
 def resolve_input_family(
