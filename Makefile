@@ -12,6 +12,8 @@
 #   make smoke       — Run fast smoke pytest lane
 #   make integration — Run full DB-backed integration pytest lane
 #   make profile-integration — Profile DB-backed integration lane timing
+#   make ci-db-pr-fast — Run CI-equivalent PR DB fast gate (db_api only)
+#   make ci-db-extended — Run CI-equivalent extended DB coverage (all DB lanes)
 #   make integration-db-api — Run DB API integration pytest lane
 #   make integration-db-worker — Run DB worker integration pytest lane
 #   make integration-db-estimation-export — Run DB estimation/export integration pytest lane
@@ -56,7 +58,7 @@ PYTEST_DB_MIGRATION_EXPRESSION = integration and db_migration and not compose_sm
 PYTEST_COMPOSE_SMOKE_EXPRESSION = compose_smoke
 SMOKE_BASE_URL ?= http://localhost:8000
 
-.PHONY: sync lint typecheck test smoke integration profile-integration integration-db-api integration-db-worker integration-db-estimation-export integration-db-lineage integration-db-migration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
+.PHONY: sync lint typecheck test smoke integration profile-integration ci-db-pr-fast ci-db-extended integration-db-api integration-db-worker integration-db-estimation-export integration-db-lineage integration-db-migration compose-smoke format check hooks up down logs ps shell-api shell-worker migrate
 
 sync:
 	uv sync $(UV_SYNC_ARGS)
@@ -79,6 +81,18 @@ integration:
 
 profile-integration:
 	uv run python scripts/profile_integration_lane.py --marker "$(PROFILE_INTEGRATION_MARKER)" --durations $(PROFILE_INTEGRATION_DURATIONS) --durations-min $(PROFILE_INTEGRATION_DURATIONS_MIN) $(PROFILE_INTEGRATION_XDIST_ARGS) $(PROFILE_INTEGRATION_PYTEST_ARGS)
+
+ci-db-pr-fast:
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_API_EXPRESSION)"
+
+ci-db-extended:
+	@status=0; \
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_API_EXPRESSION)" || status=$$?; \
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_WORKER_EXPRESSION)" || status=$$?; \
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_ESTIMATION_EXPORT_EXPRESSION)" || status=$$?; \
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_LINEAGE_EXPRESSION)" || status=$$?; \
+	$(MAKE) profile-integration PROFILE_INTEGRATION_MARKER="$(PYTEST_DB_MIGRATION_EXPRESSION)" || status=$$?; \
+	exit $$status
 
 compose-smoke:
 	COMPOSE_SMOKE=1 SMOKE_BASE_URL="$(SMOKE_BASE_URL)" uv run pytest -m "$(PYTEST_COMPOSE_SMOKE_EXPRESSION)"

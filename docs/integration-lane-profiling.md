@@ -8,6 +8,9 @@
 - Repro commands (local snapshots, not permanent benchmarks):
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_api and not compose_smoke"`
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_worker and not compose_smoke"`
+- CI-equivalent helper targets:
+  - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make ci-db-pr-fast`
+  - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make ci-db-extended`
 - Repro commands with xdist enabled (local snapshots, not permanent benchmarks):
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_api and not compose_smoke" PROFILE_INTEGRATION_XDIST_WORKERS=4`
   - `DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test" make profile-integration PROFILE_INTEGRATION_MARKER="integration and db_worker and not compose_smoke" PROFILE_INTEGRATION_XDIST_WORKERS=4`
@@ -17,9 +20,11 @@
 
 ## CI behavior
 
-- CI integration matrix lanes run against a fresh `postgres:18-alpine` service per lane.
-- The profiled lane invokes `scripts/profile_integration_lane.py` directly with `DATABASE_URL` set on that step.
+- Pull requests run only `Test integration (db_api)` as the DB fast gate.
+- Pushes to `main`, the weekly scheduled run, and manual `workflow_dispatch` run the full five-lane DB matrix against a fresh `postgres:18-alpine` service per lane.
+- Each profiled lane invokes `scripts/profile_integration_lane.py` directly with `DATABASE_URL` set on that step.
 - CI does not run a separate pre-profile `uv run alembic upgrade head`; the profiler performs the single migration timing pass so local and CI behavior stay aligned and profiled lanes do not double-run migrations.
+- Branch-protection implication: pull requests no longer publish `Test integration (db_worker)`, `Test integration (db_estimation_export)`, `Test integration (db_lineage)`, or `Test integration (db_migration)`. If any of those are configured as required PR checks, update branch protection to require `Test integration (db_api)` instead.
 
 ## Timing evidence
 
@@ -39,6 +44,6 @@
 
 ## Decision
 
-- No DB lifecycle optimization was adopted.
+- No DB lifecycle optimization was adopted, and pull requests now stay on the `db_api` fast gate while non-PR triggers keep the full DB matrix.
 - Why: Phase 2 showed migration plus collect-only staying under roughly `1.5s` in both `db_api` and `db_worker`, while the meaningful cost remains inside the full pytest run itself.
-- Result: keep the current fresh-database flow for both local profiling and CI, avoid template DB or other lifecycle complexity, and use the retained hotspot evidence for later test-specific optimization work.
+- Result: keep the current fresh-database flow for both local profiling and CI, avoid template DB or other lifecycle complexity, use `db_api` for PR turnaround, and retain the full five-lane matrix on push-to-main/scheduled/manual coverage for later test-specific optimization work.
