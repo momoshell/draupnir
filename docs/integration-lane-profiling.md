@@ -25,6 +25,7 @@
 - Each profiled lane invokes `scripts/profile_integration_lane.py` directly with `DATABASE_URL` set on that step.
 - CI does not run a separate pre-profile `uv run alembic upgrade head`; the profiler performs the single migration timing pass so local and CI behavior stay aligned and profiled lanes do not double-run migrations.
 - Branch-protection implication: pull requests no longer publish `Test integration (db_worker)`, `Test integration (db_estimation_export)`, `Test integration (db_lineage)`, or `Test integration (db_migration)`. If any of those are configured as required PR checks, update branch protection to require `Test integration (db_api)` instead.
+- The local pre-push gate is narrower than CI: clean single-lane source changes run one DB marker, known mapped DB test-file edits can run just those files, and same-lane source+test mixes stay on that lane marker; API schema changes under `app/schemas/` and selector/test-config paths such as `Makefile`, `pyproject.toml`, `scripts/pre_push_check.py`, `tests/conftest.py`, and test helpers still force full fallback to `integration and not compose_smoke`, as do schema/model/migration/new-deleted-renamed/unmapped or mixed-lane changes; every DB pre-push path still runs `uv run alembic upgrade head` first.
 
 ## Timing evidence
 

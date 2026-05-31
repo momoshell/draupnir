@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import io
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -20,6 +22,38 @@ def load_pre_push_check_module() -> ModuleType:
 
 
 pre_push_check = load_pre_push_check_module()
+
+
+def read_repo_text(relative_path: str) -> str:
+    return (Path(__file__).resolve().parents[1] / relative_path).read_text(encoding="utf-8")
+
+
+def extract_makefile_lane_markers() -> set[str]:
+    makefile_text = read_repo_text("Makefile")
+    return set(re.findall(r"integration and db_[a-z_]+ and not compose_smoke", makefile_text))
+
+
+def extract_conftest_db_lane_mapping() -> dict[str, str]:
+    module = ast.parse(read_repo_text("tests/conftest.py"))
+    for statement in module.body:
+        value: ast.expr | None
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+            value = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value = statement.value
+        else:
+            continue
+        if value is None:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "_DB_LANE_BY_TEST_FILE_KEY":
+                parsed = ast.literal_eval(value)
+                if not isinstance(parsed, dict):
+                    raise AssertionError("_DB_LANE_BY_TEST_FILE_KEY must stay a dict literal")
+                return {str(key): str(value) for key, value in parsed.items()}
+    raise AssertionError("failed to find _DB_LANE_BY_TEST_FILE_KEY in tests/conftest.py")
 
 
 class QueryStub:
@@ -56,9 +90,16 @@ class ExecStub:
 
 def test_is_sensitive_path_detects_expected_paths() -> None:
     assert pre_push_check.is_sensitive_path("app/api/v1/revisions.py")
+    assert pre_push_check.is_sensitive_path("app/schemas/file.py")
+    assert pre_push_check.is_sensitive_path("app/jobs/worker.py")
+    assert pre_push_check.is_sensitive_path("app/exports/csv.py")
+    assert pre_push_check.is_sensitive_path("app/estimating/money.py")
     assert pre_push_check.is_sensitive_path("app/models/job.py")
     assert pre_push_check.is_sensitive_path("app/db/session.py")
     assert pre_push_check.is_sensitive_path("alembic/versions/0001_init.py")
+    assert pre_push_check.is_sensitive_path("Makefile")
+    assert pre_push_check.is_sensitive_path("pyproject.toml")
+    assert pre_push_check.is_sensitive_path("scripts/pre_push_check.py")
     assert pre_push_check.is_sensitive_path("tests/api/test_revisions.py")
     assert pre_push_check.is_sensitive_path("tests/test_files.py")
     assert pre_push_check.is_sensitive_path("tests/test_revision_api.py")
@@ -84,9 +125,13 @@ def test_determine_changed_files_uses_merge_base_for_new_branch_push() -> None:
                 "refs/remotes/origin/HEAD",
             ): "origin/main",
             ("git", "merge-base", "abc123", "origin/main"): "base123",
-            ("git", "diff", "--name-only", "base123..abc123"): (
-                "app/api/v1/revisions.py\ntests/test_revision_api.py\n"
-            ),
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "base123..abc123",
+            ): ("M\tapp/api/v1/revisions.py\nM\ttests/test_revision_api.py\n"),
         },
     )
     updates = [
@@ -106,12 +151,41 @@ def test_determine_changed_files_uses_merge_base_for_new_branch_push() -> None:
     ]
 
 
+def test_makefile_lane_markers_match_script_constants() -> None:
+    assert extract_makefile_lane_markers() == {
+        pre_push_check.DB_API_PYTEST_ARGS[4],
+        pre_push_check.DB_WORKER_PYTEST_ARGS[4],
+        pre_push_check.DB_ESTIMATION_EXPORT_PYTEST_ARGS[4],
+        pre_push_check.DB_LINEAGE_PYTEST_ARGS[4],
+        pre_push_check.DB_MIGRATION_PYTEST_ARGS[4],
+    }
+
+
+def test_conftest_db_test_file_lane_keys_match_script_mapping() -> None:
+    lane_name_by_args = {
+        tuple(pre_push_check.DB_API_PYTEST_ARGS): "db_api",
+        tuple(pre_push_check.DB_WORKER_PYTEST_ARGS): "db_worker",
+        tuple(pre_push_check.DB_ESTIMATION_EXPORT_PYTEST_ARGS): "db_estimation_export",
+        tuple(pre_push_check.DB_LINEAGE_PYTEST_ARGS): "db_lineage",
+        tuple(pre_push_check.DB_MIGRATION_PYTEST_ARGS): "db_migration",
+    }
+
+    assert {
+        file_key: lane_name_by_args[tuple(pytest_args)]
+        for file_key, pytest_args in pre_push_check.DB_TEST_FILE_KEY_LANE_ARGS.items()
+    } == extract_conftest_db_lane_mapping()
+
+
 def test_main_runs_pytest_only_for_non_sensitive_changes() -> None:
     query = QueryStub(
         {
-            ("git", "diff", "--name-only", "def456..abc123"): (
-                "docs/runbook.md\nscripts/pre_push_check.py\n"
-            )
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tdocs/runbook.md\n")
         }
     )
     exec_runner = ExecStub()
@@ -136,9 +210,13 @@ def test_main_runs_pytest_only_for_non_sensitive_changes() -> None:
 def test_main_requires_database_url_for_sensitive_changes() -> None:
     query = QueryStub(
         {
-            ("git", "diff", "--name-only", "def456..abc123"): (
-                "app/db/session.py\ntests/test_storage.py\n"
-            )
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tapp/db/session.py\nM\ttests/test_storage.py\n")
         }
     )
     exec_runner = ExecStub()
@@ -165,12 +243,169 @@ def test_main_requires_database_url_for_sensitive_changes() -> None:
     assert "app/db/session.py" in error_output
 
 
-def test_main_runs_migration_before_db_integration_pytest_for_sensitive_changes() -> None:
+def test_main_runs_migration_before_single_source_db_lane() -> None:
     query = QueryStub(
         {
-            ("git", "diff", "--name-only", "def456..abc123"): (
-                "app/models/job.py\ntests/persistence/test_catalog.py\n"
-            )
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tapp/api/v1/revisions.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and db_api and not compose_smoke"),
+    ]
+    error_output = stderr.getvalue()
+    assert "single-source DB lane" in error_output
+    assert 'pytest -m "integration and db_api and not compose_smoke"' in error_output
+
+
+def test_main_runs_migration_before_same_lane_mixed_source_and_test_changes() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tapp/api/v1/revisions.py\nM\ttests/test_files.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and db_api and not compose_smoke"),
+    ]
+    error_output = stderr.getvalue()
+    assert "single-source DB lane" in error_output
+    assert 'pytest -m "integration and db_api and not compose_smoke"' in error_output
+
+
+def test_main_runs_migration_before_focused_db_test_files() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\ttests/test_jobs_worker_ingest.py\nM\ttests/test_jobs_worker_quantity.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        (
+            "uv",
+            "run",
+            "pytest",
+            "tests/test_jobs_worker_ingest.py",
+            "tests/test_jobs_worker_quantity.py",
+        ),
+    ]
+    error_output = stderr.getvalue()
+    assert "focused DB test files" in error_output
+    assert (
+        "uv run pytest tests/test_jobs_worker_ingest.py "
+        "tests/test_jobs_worker_quantity.py" in error_output
+    )
+
+
+def test_main_runs_migration_before_focused_db_api_test_file() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\ttests/test_files.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "tests/test_files.py"),
+    ]
+    error_output = stderr.getvalue()
+    assert "focused DB test files" in error_output
+    assert "uv run pytest tests/test_files.py" in error_output
+
+
+def test_main_falls_back_to_full_integration_for_mixed_sensitive_lanes() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tapp/api/v1/revisions.py\nM\tapp/jobs/worker.py\n")
         }
     )
     exec_runner = ExecStub()
@@ -192,13 +427,191 @@ def test_main_runs_migration_before_db_integration_pytest_for_sensitive_changes(
         ("uv", "run", "alembic", "upgrade", "head"),
         ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
     ]
-    error_output = stderr.getvalue()
-    assert "DB integration lane" in error_output
-    assert 'pytest -m "integration and not compose_smoke"' in error_output
+    assert "DB integration lane" in stderr.getvalue()
+
+
+def test_main_falls_back_to_full_integration_for_selector_changes() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tscripts/pre_push_check.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
+    ]
+    assert "DB integration lane" in stderr.getvalue()
+
+
+def test_main_falls_back_to_full_integration_for_makefile_and_pyproject_changes() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tMakefile\nM\tpyproject.toml\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
+    ]
+    assert "DB integration lane" in stderr.getvalue()
+
+
+def test_main_falls_back_to_full_integration_for_added_db_test_files() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("A\ttests/test_jobs_worker_ingest.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
+    ]
+    assert "DB integration lane" in stderr.getvalue()
+
+
+def test_main_falls_back_to_full_integration_for_schema_changes() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\tapp/schemas/files.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
+    ]
+    assert "DB integration lane" in stderr.getvalue()
+
+
+def test_main_falls_back_to_full_integration_for_deleted_mapped_db_test_files() -> None:
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("D\ttests/test_files.py\n")
+        }
+    )
+    exec_runner = ExecStub()
+    stderr = io.StringIO()
+
+    exit_code = pre_push_check.main(
+        ["origin", "git@github.com:momoshell/draupnir.git"],
+        stdin=io.StringIO(
+            "refs/heads/feature/pre-push abc123 refs/heads/feature/pre-push def456\n"
+        ),
+        env={"DATABASE_URL": pre_push_check.EXAMPLE_DATABASE_URL},
+        query_runner=query,
+        exec_runner=exec_runner,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert exec_runner.calls == [
+        ("uv", "run", "alembic", "upgrade", "head"),
+        ("uv", "run", "pytest", "-m", "integration and not compose_smoke"),
+    ]
+    assert "DB integration lane" in stderr.getvalue()
 
 
 def test_main_rejects_non_local_or_non_test_database_url() -> None:
-    query = QueryStub({("git", "diff", "--name-only", "def456..abc123"): ("tests/test_files.py\n")})
+    query = QueryStub(
+        {
+            (
+                "git",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "def456..abc123",
+            ): ("M\ttests/test_files.py\n")
+        }
+    )
     exec_runner = ExecStub()
     stderr = io.StringIO()
 
