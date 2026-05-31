@@ -109,65 +109,13 @@ jobs:
       - name: Run pytest non-integration lane
         run: uv run pytest -m "not integration and not compose_smoke and not smoke"
 
-  test-integration-db-pr:
-    if: github.event_name == 'pull_request'
-    name: Test integration (db_api)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: draupnir_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          version: "0.11.8"
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
-
-      - name: Run pytest integration lane
-        run: uv run python scripts/profile_integration_lane.py --marker "integration and db_api and not compose_smoke" --durations 50 --durations-min 0.2
-        env:
-          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/draupnir_test
-
-  test-integration-db-extended:
-    if: github.event_name != 'pull_request'
+  test-integration-db:
     name: Test integration (${{ matrix.lane_name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - lane_name: db_api
-            marker: db_api
-          - lane_name: db_worker
-            marker: db_worker
-          - lane_name: db_estimation_export
-            marker: db_estimation_export
-          - lane_name: db_lineage
-            marker: db_lineage
-          - lane_name: db_migration
-            marker: db_migration
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"lane_name":"db_api","marker":"db_api"}]' || '[{"lane_name":"db_api","marker":"db_api"},{"lane_name":"db_worker","marker":"db_worker"},{"lane_name":"db_estimation_export","marker":"db_estimation_export"},{"lane_name":"db_lineage","marker":"db_lineage"},{"lane_name":"db_migration","marker":"db_migration"}]') }}
     services:
       postgres:
         image: postgres:18-alpine
