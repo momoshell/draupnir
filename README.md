@@ -104,11 +104,32 @@ make down -v        # Stop and remove volumes (destructive)
 
 ### Pytest Lanes
 
-The repository keeps three explicit pytest lanes with non-overlapping marker expressions:
+The repository keeps three top-level pytest lanes with non-overlapping marker expressions:
 
 - `make smoke` runs the fast smoke lane: `smoke and not integration and not compose_smoke`
 - `make integration` runs the database-backed integration lane: `integration and not compose_smoke`
 - `make compose-smoke` runs the opt-in Docker Compose lane: `compose_smoke`
+
+The database-backed integration lane is also split into five non-overlapping DB sub-lanes for targeted local runs and CI policy:
+
+- `make integration-db-api` runs `integration and db_api and not compose_smoke`
+- `make integration-db-worker` runs `integration and db_worker and not compose_smoke`
+- `make integration-db-estimation-export` runs `integration and db_estimation_export and not compose_smoke`
+- `make integration-db-lineage` runs `integration and db_lineage and not compose_smoke`
+- `make integration-db-migration` runs `integration and db_migration and not compose_smoke`
+
+CI now uses two DB coverage modes:
+
+- Pull requests run only the fast DB API gate: `Test integration (db_api)`
+- Pushes to `main`, the weekly scheduled run, and manual `workflow_dispatch` run the full five-lane DB matrix
+
+For local CI-equivalent runs, use:
+
+- `make ci-db-pr-fast` to mirror the pull-request DB fast gate via the profiling runner
+- `make ci-db-extended` to mirror the extended DB matrix via the profiling runner
+
+> [!IMPORTANT]
+> If GitHub branch protection still requires `Test integration (db_worker)`, `Test integration (db_estimation_export)`, `Test integration (db_lineage)`, or `Test integration (db_migration)` on pull requests, update the required checks. Pull requests now publish only `Test integration (db_api)` for DB-backed CI.
 
 #### Smoke
 
@@ -142,7 +163,9 @@ make integration
 # or: uv run alembic upgrade head && uv run pytest -m "integration and not compose_smoke"
 ```
 
-CI keeps this lane separate from smoke and preserves the PostgreSQL service plus Alembic migration step before pytest.
+CI keeps this lane separate from smoke and preserves the PostgreSQL service. CI-parity DB targets route through `scripts/profile_integration_lane.py`, which owns the migration timing pass plus pytest execution.
+
+For CI-parity runs, prefer `make ci-db-pr-fast` for the pull-request fast gate and `make ci-db-extended` for the extended non-PR coverage, because those targets route through `scripts/profile_integration_lane.py` just like GitHub Actions.
 
 #### Compose smoke
 
