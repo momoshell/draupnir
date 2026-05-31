@@ -1,7 +1,7 @@
 """Integration tests for revision-scoped materialization read APIs."""
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -59,6 +59,14 @@ def _item_ids(items: list[dict[str, Any]]) -> list[str]:
     """Return identifiers from a JSON list response."""
 
     return [item["id"] for item in items]
+
+
+def _clone_model(instance: Any, **overrides: Any) -> Any:
+    """Clone a persisted SQLAlchemy model instance with selected overrides."""
+
+    data = {column.name: getattr(instance, column.name) for column in instance.__table__.columns}
+    data.update(overrides)
+    return instance.__class__(**data)
 
 
 @requires_database
@@ -251,6 +259,130 @@ class TestRevisionMaterializationApi:
         assert paper_item["entity_id"] == paper_entity.entity_id
         assert paper_item["layout_ref"] == "Paper"
         assert paper_item["source_identity"] == "entity-source-paper"
+
+    async def test_materialization_manifest_serializes_null_origin_ids(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Materialization reads should serialize nullable manifest and row origin identifiers."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_materialized_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[
+                    {"layout_ref": "Model", "name": "Model"},
+                    {"layout_ref": "Paper", "name": "Paper"},
+                ],
+                layers=[],
+                blocks=[],
+                entities=[],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_materialized_ingestion)
+
+        await process_ingest_job(job.id)
+
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        manifests, layouts, _layers, _blocks, _entities = await _load_project_materialization(
+            project["id"]
+        )
+        drawing_revision = drawing_revisions[0]
+        manifest = manifests[0]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        null_origin_job = _clone_model(
+            job,
+            id=uuid.uuid4(),
+            base_revision_id=drawing_revision.id,
+            job_type="reprocess",
+            status="succeeded",
+            started_at=drawing_revision.created_at + timedelta(seconds=1),
+            finished_at=drawing_revision.created_at + timedelta(seconds=1),
+            created_at=drawing_revision.created_at + timedelta(seconds=1),
+        )
+        null_origin_revision = _clone_model(
+            drawing_revision,
+            id=uuid.uuid4(),
+            extraction_profile_id=None,
+            source_job_id=null_origin_job.id,
+            adapter_run_output_id=None,
+            changeset_id=uuid.uuid4(),
+            predecessor_revision_id=drawing_revision.id,
+            revision_sequence=drawing_revision.revision_sequence + 1,
+            revision_kind="changeset",
+            created_at=drawing_revision.created_at + timedelta(seconds=1),
+        )
+        null_origin_manifest = _clone_model(
+            manifest,
+            id=uuid.uuid4(),
+            drawing_revision_id=null_origin_revision.id,
+            extraction_profile_id=None,
+            source_job_id=null_origin_job.id,
+            adapter_run_output_id=None,
+            counts_json={
+                "layouts": len(layouts),
+                "layers": 0,
+                "blocks": 0,
+                "entities": 0,
+            },
+        )
+        null_origin_layouts = [
+            _clone_model(
+                layout,
+                id=uuid.uuid4(),
+                drawing_revision_id=null_origin_revision.id,
+                extraction_profile_id=None,
+                source_job_id=null_origin_job.id,
+                adapter_run_output_id=None,
+            )
+            for layout in layouts
+        ]
+
+        async with session_maker() as session:
+            session.add(null_origin_job)
+            await session.commit()
+
+        async with session_maker() as session:
+            session.add(null_origin_revision)
+            session.add(null_origin_manifest)
+            session.add_all(null_origin_layouts)
+            await session.commit()
+
+        response = await async_client.get(f"/v1/revisions/{null_origin_revision.id}/layouts")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["manifest"]["extraction_profile_id"] is None
+        assert body["manifest"]["adapter_run_output_id"] is None
+        assert body["counts"] == {
+            "layouts": len(layouts),
+            "layers": 0,
+            "blocks": 0,
+            "entities": 0,
+        }
+        assert _item_ids(body["items"]) == [str(layout.id) for layout in null_origin_layouts]
+        assert all(item["extraction_profile_id"] is None for item in body["items"])
+        assert all(item["adapter_run_output_id"] is None for item in body["items"])
 
     async def test_revision_entities_support_filters_and_shared_cursor_validation(
         self,

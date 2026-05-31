@@ -421,6 +421,7 @@ class TestValidationReportApi:
         assert item["extraction_profile_id"] == str(drawing_revision.extraction_profile_id)
         assert item["source_job_id"] == str(drawing_revision.source_job_id)
         assert item["adapter_run_output_id"] == str(drawing_revision.adapter_run_output_id)
+        assert item["changeset_id"] is None
         assert item["predecessor_revision_id"] is None
         assert item["revision_sequence"] == drawing_revision.revision_sequence
         assert item["revision_kind"] == drawing_revision.revision_kind
@@ -431,6 +432,96 @@ class TestValidationReportApi:
         )
         assert item["confidence_score"] == drawing_revision.confidence_score
         assert _parse_timestamp(item["created_at"]) == drawing_revision.created_at.astimezone(UTC)
+
+    async def test_list_file_revisions_serializes_changeset_origin_null_origins(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Changeset-origin revisions should serialize nullable origin identifiers."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await process_ingest_job(job.id)
+
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        drawing_revision = drawing_revisions[0]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        changeset_id = uuid.uuid4()
+        changeset_created_at = drawing_revision.created_at + timedelta(seconds=1)
+        changeset_job = _clone_model(
+            job,
+            id=uuid.uuid4(),
+            base_revision_id=drawing_revision.id,
+            job_type="reprocess",
+            status="succeeded",
+            started_at=changeset_created_at,
+            finished_at=changeset_created_at,
+            created_at=changeset_created_at,
+        )
+        changeset_revision = _clone_model(
+            drawing_revision,
+            id=uuid.uuid4(),
+            extraction_profile_id=None,
+            source_job_id=changeset_job.id,
+            adapter_run_output_id=None,
+            changeset_id=changeset_id,
+            predecessor_revision_id=drawing_revision.id,
+            revision_sequence=drawing_revision.revision_sequence + 1,
+            revision_kind="changeset",
+            created_at=changeset_created_at,
+        )
+
+        async with session_maker() as session:
+            session.add(changeset_job)
+            await session.commit()
+
+        async with session_maker() as session:
+            session.add(changeset_revision)
+            await session.commit()
+
+        response = await async_client.get(f"/v1/files/{uploaded['id']}/revisions")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["id"] for item in body["items"]] == [
+            str(drawing_revision.id),
+            str(changeset_revision.id),
+        ]
+
+        changeset_item = body["items"][1]
+        assert changeset_item["project_id"] == str(changeset_revision.project_id)
+        assert changeset_item["source_file_id"] == str(changeset_revision.source_file_id)
+        assert changeset_item["extraction_profile_id"] is None
+        assert changeset_item["source_job_id"] == str(changeset_revision.source_job_id)
+        assert changeset_item["adapter_run_output_id"] is None
+        assert changeset_item["changeset_id"] == str(changeset_id)
+        assert changeset_item["predecessor_revision_id"] == str(drawing_revision.id)
+        assert changeset_item["revision_sequence"] == changeset_revision.revision_sequence
+        assert changeset_item["revision_kind"] == changeset_revision.revision_kind
+        assert changeset_item["review_state"] == changeset_revision.review_state
+        assert (
+            changeset_item["canonical_entity_schema_version"]
+            == changeset_revision.canonical_entity_schema_version
+        )
+        assert changeset_item["confidence_score"] == changeset_revision.confidence_score
+        assert _parse_timestamp(changeset_item["created_at"]) == changeset_created_at.astimezone(
+            UTC
+        )
 
     async def test_list_file_revisions_supports_limit_cursor_and_invalid_cursor(
         self,

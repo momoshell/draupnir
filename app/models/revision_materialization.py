@@ -91,10 +91,10 @@ class RevisionEntityManifest(Base):
         index=True,
         comment="Immutable source file identifier for the materialized revision",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used for materialization",
+        comment="Optional extraction profile identifier used for materialization",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -110,10 +110,12 @@ class RevisionEntityManifest(Base):
         nullable=False,
         comment="Drawing revision identifier whose normalized entities were materialized",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Adapter run output identifier materialized into revision-scoped entity tables",
+        comment=(
+            "Optional adapter run output identifier materialized into revision-scoped entity tables"
+        ),
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
@@ -201,10 +203,10 @@ class RevisionLayout(Base):
         index=True,
         comment="Immutable source file identifier for this materialized layout row",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used for this layout row",
+        comment="Optional extraction profile identifier used for this layout row",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -220,10 +222,10 @@ class RevisionLayout(Base):
         nullable=False,
         comment="Drawing revision identifier that owns this layout row",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Adapter run output identifier that produced this layout row",
+        comment="Optional adapter run output identifier that produced this layout row",
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
@@ -322,10 +324,10 @@ class RevisionLayer(Base):
         index=True,
         comment="Immutable source file identifier for this materialized layer row",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used for this layer row",
+        comment="Optional extraction profile identifier used for this layer row",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -341,10 +343,10 @@ class RevisionLayer(Base):
         nullable=False,
         comment="Drawing revision identifier that owns this layer row",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Adapter run output identifier that produced this layer row",
+        comment="Optional adapter run output identifier that produced this layer row",
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
@@ -443,10 +445,10 @@ class RevisionBlock(Base):
         index=True,
         comment="Immutable source file identifier for this materialized block row",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used for this block row",
+        comment="Optional extraction profile identifier used for this block row",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -462,10 +464,10 @@ class RevisionBlock(Base):
         nullable=False,
         comment="Drawing revision identifier that owns this block row",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Adapter run output identifier that produced this block row",
+        comment="Optional adapter run output identifier that produced this block row",
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
@@ -625,10 +627,10 @@ class RevisionEntity(Base):
         index=True,
         comment="Immutable source file identifier for this materialized entity row",
     )
-    extraction_profile_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Immutable extraction profile identifier used for this entity row",
+        comment="Optional extraction profile identifier used for this entity row",
     )
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(
@@ -644,10 +646,10 @@ class RevisionEntity(Base):
         nullable=False,
         comment="Drawing revision identifier that owns this entity row",
     )
-    adapter_run_output_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
+    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
         index=True,
-        comment="Adapter run output identifier that produced this entity row",
+        comment="Optional adapter run output identifier that produced this entity row",
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
