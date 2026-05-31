@@ -7,7 +7,7 @@ import subprocess
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from json import dumps
 from pathlib import Path
@@ -55,11 +55,13 @@ from tests.test_quantity_takeoff_persistence import _seed_quantity_lineage
 
 _APPEND_ONLY_SQLSTATE = "55000"
 _CHECK_VIOLATION_SQLSTATE = "23514"
+_FOREIGN_KEY_VIOLATION_SQLSTATE = "23503"
 _UNIQUE_VIOLATION_SQLSTATE = "23505"
 _DOWNGRADE_TARGET_REVISION = "2026_05_11_0013"
 _MATERIALIZATION_DOWNGRADE_TARGET_REVISION = "2026_05_12_0014"
 _QUANTITY_DOWNGRADE_TARGET_REVISION = "2026_05_14_0016"
 _CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION = "2026_05_27_0024"
+_GENERATED_ARTIFACT_LINEAGE_DOWNGRADE_TARGET_REVISION = "2026_05_31_0025"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -673,6 +675,119 @@ async def _insert_drawing_revision_row(
             "canonical_entity_schema_version": canonical_entity_schema_version,
             "confidence_score": confidence_score,
             "changeset_id": changeset_id,
+        },
+    )
+
+
+async def _insert_generated_artifact_row(
+    target: Any,
+    *,
+    artifact_id: uuid.UUID,
+    project_id: uuid.UUID,
+    source_file_id: uuid.UUID,
+    job_id: uuid.UUID,
+    drawing_revision_id: uuid.UUID | None,
+    adapter_run_output_id: uuid.UUID | None,
+    artifact_kind: str,
+    name: str,
+    artifact_format: str,
+    media_type: str,
+    size_bytes: int,
+    checksum_sha256: str,
+    generator_name: str,
+    generator_version: str,
+    generator_config_json: Mapping[str, object],
+    storage_key: str,
+    storage_uri: str,
+    lineage_json: Mapping[str, object],
+    changeset_id: uuid.UUID | None = None,
+    quantity_takeoff_id: uuid.UUID | None = None,
+    estimate_version_id: uuid.UUID | None = None,
+    predecessor_artifact_id: uuid.UUID | None = None,
+) -> None:
+    """Insert a generated artifact row for raw SQL lineage setup."""
+
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO generated_artifacts (
+                id,
+                project_id,
+                source_file_id,
+                job_id,
+                drawing_revision_id,
+                changeset_id,
+                quantity_takeoff_id,
+                estimate_version_id,
+                adapter_run_output_id,
+                artifact_kind,
+                name,
+                format,
+                media_type,
+                size_bytes,
+                checksum_sha256,
+                generator_name,
+                generator_version,
+                generator_config_json,
+                storage_key,
+                storage_uri,
+                lineage_json,
+                predecessor_artifact_id,
+                deleted_at,
+                created_at
+            ) VALUES (
+                :id,
+                :project_id,
+                :source_file_id,
+                :job_id,
+                :drawing_revision_id,
+                :changeset_id,
+                :quantity_takeoff_id,
+                :estimate_version_id,
+                :adapter_run_output_id,
+                :artifact_kind,
+                :name,
+                :format,
+                :media_type,
+                :size_bytes,
+                :checksum_sha256,
+                :generator_name,
+                :generator_version,
+                CAST(:generator_config_json AS json),
+                :storage_key,
+                :storage_uri,
+                CAST(:lineage_json AS json),
+                :predecessor_artifact_id,
+                :deleted_at,
+                :created_at
+            )
+            """
+        ),
+        {
+            "id": artifact_id,
+            "project_id": project_id,
+            "source_file_id": source_file_id,
+            "job_id": job_id,
+            "drawing_revision_id": drawing_revision_id,
+            "changeset_id": changeset_id,
+            "quantity_takeoff_id": quantity_takeoff_id,
+            "estimate_version_id": estimate_version_id,
+            "adapter_run_output_id": adapter_run_output_id,
+            "artifact_kind": artifact_kind,
+            "name": name,
+            "format": artifact_format,
+            "media_type": media_type,
+            "size_bytes": size_bytes,
+            "checksum_sha256": checksum_sha256,
+            "generator_name": generator_name,
+            "generator_version": generator_version,
+            "generator_config_json": dumps(generator_config_json, separators=(",", ":")),
+            "storage_key": storage_key,
+            "storage_uri": storage_uri,
+            "lineage_json": dumps(lineage_json, separators=(",", ":")),
+            "predecessor_artifact_id": predecessor_artifact_id,
+            "deleted_at": None,
+            "created_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
         },
     )
 
@@ -2306,6 +2421,488 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
         await engine.dispose()
 
 
+async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> None:
+    """Insert generated artifacts with populated #273 typed lineage anchors."""
+
+    engine = create_async_engine(database_url)
+    project_id = uuid.uuid4()
+    file_id = uuid.uuid4()
+    extraction_profile_id = uuid.uuid4()
+    ingest_job_id = uuid.uuid4()
+    adapter_run_output_id = uuid.uuid4()
+    base_revision_id = uuid.uuid4()
+    quantity_job_id = uuid.uuid4()
+    quantity_takeoff_id = uuid.uuid4()
+    estimate_job_id = uuid.uuid4()
+    estimate_version_id = uuid.uuid4()
+    quantity_export_job_id = uuid.uuid4()
+    changeset_job_id = uuid.uuid4()
+    changeset_revision_id = uuid.uuid4()
+    changeset_id = uuid.uuid4()
+    changeset_export_job_id = uuid.uuid4()
+    canonical_json = dumps(
+        {
+            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "layouts": [],
+            "layers": [],
+            "blocks": [],
+            "entities": [],
+            "entity_counts": {
+                "layouts": 0,
+                "layers": 0,
+                "blocks": 0,
+                "entities": 0,
+            },
+        },
+        separators=(",", ":"),
+    )
+    provenance_json = dumps(
+        {
+            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "adapter": {
+                "key": _FAKE_RUNNER_ADAPTER_KEY,
+                "version": _FAKE_RUNNER_ADAPTER_VERSION,
+            },
+            "source": {
+                "file_id": str(file_id),
+                "job_id": str(ingest_job_id),
+                "extraction_profile_id": str(extraction_profile_id),
+                "input_family": "pdf_vector",
+                "revision_kind": "ingest",
+            },
+            "records": [],
+            "generated_at": "2026-01-02T03:04:05+00:00",
+        },
+        separators=(",", ":"),
+    )
+    confidence_json = dumps({"score": _FAKE_RUNNER_CONFIDENCE_SCORE}, separators=(",", ":"))
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO projects (
+                        id,
+                        name,
+                        description,
+                        default_unit_system,
+                        default_currency
+                    ) VALUES (
+                        :id,
+                        :name,
+                        :description,
+                        :default_unit_system,
+                        :default_currency
+                    )
+                    """
+                ),
+                {
+                    "id": project_id,
+                    "name": "generated artifact lineage downgrade guard",
+                    "description": None,
+                    "default_unit_system": None,
+                    "default_currency": None,
+                },
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO extraction_profiles (
+                        id,
+                        project_id,
+                        profile_version,
+                        units_override,
+                        layout_mode,
+                        xref_handling,
+                        block_handling,
+                        text_extraction,
+                        dimension_extraction,
+                        pdf_page_range,
+                        raster_calibration,
+                        confidence_threshold
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :profile_version,
+                        :units_override,
+                        :layout_mode,
+                        :xref_handling,
+                        :block_handling,
+                        :text_extraction,
+                        :dimension_extraction,
+                        :pdf_page_range,
+                        CAST(:raster_calibration AS json),
+                        :confidence_threshold
+                    )
+                    """
+                ),
+                {
+                    "id": extraction_profile_id,
+                    "project_id": project_id,
+                    "profile_version": "0.1",
+                    "units_override": None,
+                    "layout_mode": "all",
+                    "xref_handling": "embed",
+                    "block_handling": "expand",
+                    "text_extraction": True,
+                    "dimension_extraction": True,
+                    "pdf_page_range": None,
+                    "raster_calibration": "null",
+                    "confidence_threshold": 0.6,
+                },
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO files (
+                        id,
+                        project_id,
+                        original_filename,
+                        media_type,
+                        detected_format,
+                        storage_uri,
+                        size_bytes,
+                        checksum_sha256,
+                        immutable,
+                        initial_job_id,
+                        initial_extraction_profile_id
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :original_filename,
+                        :media_type,
+                        :detected_format,
+                        :storage_uri,
+                        :size_bytes,
+                        :checksum_sha256,
+                        :immutable,
+                        :initial_job_id,
+                        :initial_extraction_profile_id
+                    )
+                    """
+                ),
+                {
+                    "id": file_id,
+                    "project_id": project_id,
+                    "original_filename": "generated-artifact-lineage.pdf",
+                    "media_type": "application/pdf",
+                    "detected_format": "pdf",
+                    "storage_uri": "file:///tmp/generated-artifact-lineage.pdf",
+                    "size_bytes": 1,
+                    "checksum_sha256": "a" * 64,
+                    "immutable": True,
+                    "initial_job_id": ingest_job_id,
+                    "initial_extraction_profile_id": extraction_profile_id,
+                },
+            )
+            await _insert_job_row(
+                connection,
+                job_id=ingest_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=extraction_profile_id,
+                base_revision_id=None,
+                job_type="ingest",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO adapter_run_outputs (
+                        id,
+                        project_id,
+                        source_file_id,
+                        extraction_profile_id,
+                        source_job_id,
+                        adapter_key,
+                        adapter_version,
+                        input_family,
+                        canonical_entity_schema_version,
+                        canonical_json,
+                        provenance_json,
+                        confidence_json,
+                        confidence_score,
+                        warnings_json,
+                        diagnostics_json,
+                        result_checksum_sha256
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :source_file_id,
+                        :extraction_profile_id,
+                        :source_job_id,
+                        :adapter_key,
+                        :adapter_version,
+                        :input_family,
+                        :canonical_entity_schema_version,
+                        CAST(:canonical_json AS json),
+                        CAST(:provenance_json AS json),
+                        CAST(:confidence_json AS json),
+                        :confidence_score,
+                        CAST(:warnings_json AS json),
+                        CAST(:diagnostics_json AS json),
+                        :result_checksum_sha256
+                    )
+                    """
+                ),
+                {
+                    "id": adapter_run_output_id,
+                    "project_id": project_id,
+                    "source_file_id": file_id,
+                    "extraction_profile_id": extraction_profile_id,
+                    "source_job_id": ingest_job_id,
+                    "adapter_key": _FAKE_RUNNER_ADAPTER_KEY,
+                    "adapter_version": _FAKE_RUNNER_ADAPTER_VERSION,
+                    "input_family": "pdf_vector",
+                    "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    "canonical_json": canonical_json,
+                    "provenance_json": provenance_json,
+                    "confidence_json": confidence_json,
+                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
+                    "warnings_json": "[]",
+                    "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
+                    "result_checksum_sha256": "b" * 64,
+                },
+            )
+            await _insert_drawing_revision_row(
+                connection,
+                revision_id=base_revision_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=extraction_profile_id,
+                source_job_id=ingest_job_id,
+                adapter_run_output_id=adapter_run_output_id,
+                predecessor_revision_id=None,
+                revision_sequence=1,
+                revision_kind="ingest",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=None,
+            )
+            await _insert_job_row(
+                connection,
+                job_id=quantity_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                base_revision_id=base_revision_id,
+                job_type="quantity_takeoff",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO quantity_takeoffs (
+                        id,
+                        project_id,
+                        source_file_id,
+                        drawing_revision_id,
+                        source_job_id,
+                        source_job_type,
+                        review_state,
+                        validation_status,
+                        quantity_gate,
+                        trusted_totals
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :source_file_id,
+                        :drawing_revision_id,
+                        :source_job_id,
+                        :source_job_type,
+                        :review_state,
+                        :validation_status,
+                        :quantity_gate,
+                        :trusted_totals
+                    )
+                    """
+                ),
+                {
+                    "id": quantity_takeoff_id,
+                    "project_id": project_id,
+                    "source_file_id": file_id,
+                    "drawing_revision_id": base_revision_id,
+                    "source_job_id": quantity_job_id,
+                    "source_job_type": "quantity_takeoff",
+                    "review_state": "approved",
+                    "validation_status": "valid",
+                    "quantity_gate": "allowed",
+                    "trusted_totals": True,
+                },
+            )
+            await _insert_job_row(
+                connection,
+                job_id=estimate_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                base_revision_id=base_revision_id,
+                job_type="estimate",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await connection.execute(
+                sa.text(
+                    """
+                    INSERT INTO estimate_versions (
+                        id,
+                        project_id,
+                        source_file_id,
+                        drawing_revision_id,
+                        quantity_takeoff_id,
+                        source_job_id,
+                        quantity_gate,
+                        trusted_totals,
+                        currency,
+                        subtotal_amount,
+                        tax_amount,
+                        total_amount,
+                        created_at
+                    ) VALUES (
+                        :id,
+                        :project_id,
+                        :source_file_id,
+                        :drawing_revision_id,
+                        :quantity_takeoff_id,
+                        :source_job_id,
+                        :quantity_gate,
+                        :trusted_totals,
+                        :currency,
+                        :subtotal_amount,
+                        :tax_amount,
+                        :total_amount,
+                        :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": estimate_version_id,
+                    "project_id": project_id,
+                    "source_file_id": file_id,
+                    "drawing_revision_id": base_revision_id,
+                    "quantity_takeoff_id": quantity_takeoff_id,
+                    "source_job_id": estimate_job_id,
+                    "quantity_gate": "allowed",
+                    "trusted_totals": True,
+                    "currency": "GBP",
+                    "subtotal_amount": Decimal("10.00"),
+                    "tax_amount": Decimal("0.00"),
+                    "total_amount": Decimal("10.00"),
+                    "created_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+                },
+            )
+            await _insert_job_row(
+                connection,
+                job_id=quantity_export_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                base_revision_id=base_revision_id,
+                job_type="export",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await _insert_generated_artifact_row(
+                connection,
+                artifact_id=uuid.uuid4(),
+                project_id=project_id,
+                source_file_id=file_id,
+                job_id=quantity_export_job_id,
+                drawing_revision_id=base_revision_id,
+                changeset_id=None,
+                quantity_takeoff_id=quantity_takeoff_id,
+                estimate_version_id=estimate_version_id,
+                adapter_run_output_id=None,
+                artifact_kind="estimate_pdf",
+                name="estimate.pdf",
+                artifact_format="pdf",
+                media_type="application/pdf",
+                size_bytes=128,
+                checksum_sha256="c" * 64,
+                generator_name="tests",
+                generator_version="1",
+                generator_config_json={"kind": "estimate_pdf"},
+                storage_key="generated/estimate.pdf",
+                storage_uri="file:///tmp/generated/estimate.pdf",
+                lineage_json={"kind": "estimate_pdf"},
+            )
+            await _insert_job_row(
+                connection,
+                job_id=changeset_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                base_revision_id=base_revision_id,
+                job_type="export",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await _insert_drawing_revision_row(
+                connection,
+                revision_id=changeset_revision_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                source_job_id=changeset_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=base_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=changeset_id,
+            )
+            await _insert_job_row(
+                connection,
+                job_id=changeset_export_job_id,
+                project_id=project_id,
+                file_id=file_id,
+                extraction_profile_id=None,
+                base_revision_id=changeset_revision_id,
+                job_type="export",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await _insert_generated_artifact_row(
+                connection,
+                artifact_id=uuid.uuid4(),
+                project_id=project_id,
+                source_file_id=file_id,
+                job_id=changeset_export_job_id,
+                drawing_revision_id=changeset_revision_id,
+                changeset_id=changeset_id,
+                quantity_takeoff_id=None,
+                estimate_version_id=None,
+                adapter_run_output_id=None,
+                artifact_kind="revised_dxf",
+                name="revised.dxf",
+                artifact_format="dxf",
+                media_type="application/dxf",
+                size_bytes=64,
+                checksum_sha256="d" * 64,
+                generator_name="tests",
+                generator_version="1",
+                generator_config_json={"kind": "revised_dxf"},
+                storage_key="generated/revised.dxf",
+                storage_uri="file:///tmp/generated/revised.dxf",
+                lineage_json={"kind": "revised_dxf"},
+            )
+    finally:
+        await engine.dispose()
+
+
 @requires_database
 class TestAppendOnlyLineageTables:
     """Tests for DB-enforced append-only lineage/history protections."""
@@ -2917,6 +3514,555 @@ class TestAppendOnlyLineageTables:
                 assert _extract_sqlstate(exc_info.value) == _CHECK_VIOLATION_SQLSTATE
                 assert "ck_drawing_revisions_origin_fields" in str(exc_info.value)
 
+    async def test_generated_artifacts_keep_new_anchor_columns_null(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Existing generated artifact rows remain valid with all #273 typed anchors unset."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            artifact_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT changeset_id, quantity_takeoff_id, estimate_version_id
+                        FROM generated_artifacts
+                        WHERE id = :artifact_id
+                        """
+                    ),
+                    {"artifact_id": row_ids.generated_artifact_id},
+                )
+            ).one()
+
+        assert artifact_row.changeset_id is None
+        assert artifact_row.quantity_takeoff_id is None
+        assert artifact_row.estimate_version_id is None
+
+    async def test_generated_artifacts_accept_valid_typed_lineage_anchors(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Generated artifacts should accept valid changeset, takeoff, and estimate anchors."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        changeset_job_id = uuid.uuid4()
+        changeset_revision_id = uuid.uuid4()
+        changeset_id = uuid.uuid4()
+        changeset_artifact_job_id = uuid.uuid4()
+        quantity_artifact_job_id = uuid.uuid4()
+        estimate_artifact_job_id = uuid.uuid4()
+        changeset_artifact_id = uuid.uuid4()
+        quantity_artifact_id = uuid.uuid4()
+        estimate_artifact_id = uuid.uuid4()
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await _insert_job_row(
+                session,
+                job_id=changeset_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="succeeded",
+                enqueue_status="published",
+                enqueue_attempts=1,
+            )
+            await _insert_drawing_revision_row(
+                session,
+                revision_id=changeset_revision_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                source_job_id=changeset_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=row_ids.drawing_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=changeset_id,
+            )
+            for artifact_job_id, base_revision_id in (
+                (changeset_artifact_job_id, changeset_revision_id),
+                (quantity_artifact_job_id, row_ids.drawing_revision_id),
+                (estimate_artifact_job_id, row_ids.drawing_revision_id),
+            ):
+                await _insert_job_row(
+                    session,
+                    job_id=artifact_job_id,
+                    project_id=row_ids.project_id,
+                    file_id=row_ids.file_id,
+                    extraction_profile_id=None,
+                    base_revision_id=base_revision_id,
+                    job_type="export",
+                    status="succeeded",
+                    enqueue_status="published",
+                    enqueue_attempts=1,
+                )
+
+            await _insert_generated_artifact_row(
+                session,
+                artifact_id=changeset_artifact_id,
+                project_id=row_ids.project_id,
+                source_file_id=row_ids.file_id,
+                job_id=changeset_artifact_job_id,
+                drawing_revision_id=changeset_revision_id,
+                changeset_id=changeset_id,
+                quantity_takeoff_id=None,
+                estimate_version_id=None,
+                adapter_run_output_id=None,
+                artifact_kind="revised_dxf",
+                name="changeset-revision.dxf",
+                artifact_format="dxf",
+                media_type="application/dxf",
+                size_bytes=64,
+                checksum_sha256="e" * 64,
+                generator_name="tests",
+                generator_version="1",
+                generator_config_json={"kind": "changeset"},
+                storage_key=f"generated/{changeset_artifact_id}.dxf",
+                storage_uri=f"file:///tmp/{changeset_artifact_id}.dxf",
+                lineage_json={"kind": "changeset"},
+            )
+            await _insert_generated_artifact_row(
+                session,
+                artifact_id=quantity_artifact_id,
+                project_id=row_ids.project_id,
+                source_file_id=row_ids.file_id,
+                job_id=quantity_artifact_job_id,
+                drawing_revision_id=row_ids.drawing_revision_id,
+                changeset_id=None,
+                quantity_takeoff_id=row_ids.quantity_takeoff_id,
+                estimate_version_id=None,
+                adapter_run_output_id=None,
+                artifact_kind="quantity_csv",
+                name="quantities.csv",
+                artifact_format="csv",
+                media_type="text/csv",
+                size_bytes=96,
+                checksum_sha256="f" * 64,
+                generator_name="tests",
+                generator_version="1",
+                generator_config_json={"kind": "quantity"},
+                storage_key=f"generated/{quantity_artifact_id}.csv",
+                storage_uri=f"file:///tmp/{quantity_artifact_id}.csv",
+                lineage_json={"kind": "quantity"},
+            )
+            await _insert_generated_artifact_row(
+                session,
+                artifact_id=estimate_artifact_id,
+                project_id=row_ids.project_id,
+                source_file_id=row_ids.file_id,
+                job_id=estimate_artifact_job_id,
+                drawing_revision_id=row_ids.drawing_revision_id,
+                changeset_id=None,
+                quantity_takeoff_id=row_ids.quantity_takeoff_id,
+                estimate_version_id=row_ids.estimate_version_id,
+                adapter_run_output_id=None,
+                artifact_kind="estimate_pdf",
+                name="estimate.pdf",
+                artifact_format="pdf",
+                media_type="application/pdf",
+                size_bytes=128,
+                checksum_sha256="1" * 64,
+                generator_name="tests",
+                generator_version="1",
+                generator_config_json={"kind": "estimate"},
+                storage_key=f"generated/{estimate_artifact_id}.pdf",
+                storage_uri=f"file:///tmp/{estimate_artifact_id}.pdf",
+                lineage_json={"kind": "estimate"},
+            )
+            await session.commit()
+
+            changeset_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            drawing_revision_id,
+                            changeset_id,
+                            quantity_takeoff_id,
+                            estimate_version_id
+                        FROM generated_artifacts
+                        WHERE id = :artifact_id
+                        """
+                    ),
+                    {"artifact_id": changeset_artifact_id},
+                )
+            ).one()
+            quantity_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            drawing_revision_id,
+                            changeset_id,
+                            quantity_takeoff_id,
+                            estimate_version_id
+                        FROM generated_artifacts
+                        WHERE id = :artifact_id
+                        """
+                    ),
+                    {"artifact_id": quantity_artifact_id},
+                )
+            ).one()
+            estimate_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            drawing_revision_id,
+                            changeset_id,
+                            quantity_takeoff_id,
+                            estimate_version_id
+                        FROM generated_artifacts
+                        WHERE id = :artifact_id
+                        """
+                    ),
+                    {"artifact_id": estimate_artifact_id},
+                )
+            ).one()
+
+        assert changeset_row.drawing_revision_id == changeset_revision_id
+        assert changeset_row.changeset_id == changeset_id
+        assert changeset_row.quantity_takeoff_id is None
+        assert changeset_row.estimate_version_id is None
+
+        assert quantity_row.drawing_revision_id == row_ids.drawing_revision_id
+        assert quantity_row.changeset_id is None
+        assert quantity_row.quantity_takeoff_id == row_ids.quantity_takeoff_id
+        assert quantity_row.estimate_version_id is None
+
+        assert estimate_row.drawing_revision_id == row_ids.drawing_revision_id
+        assert estimate_row.changeset_id is None
+        assert estimate_row.quantity_takeoff_id == row_ids.quantity_takeoff_id
+        assert estimate_row.estimate_version_id == row_ids.estimate_version_id
+
+    async def test_generated_artifacts_reject_mismatched_typed_lineage_anchors(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Generated artifacts should reject mismatched changeset, takeoff, and estimate anchors."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        other_row_ids = await _seed_protected_rows(async_client)
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            changeset_job_id = uuid.uuid4()
+            changeset_revision_id = uuid.uuid4()
+            changeset_id = uuid.uuid4()
+            other_changeset_job_id = uuid.uuid4()
+            other_changeset_revision_id = uuid.uuid4()
+            other_changeset_id = uuid.uuid4()
+            changeset_mismatch_job_id = uuid.uuid4()
+
+            await _insert_job_row(
+                session,
+                job_id=changeset_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+            await _insert_drawing_revision_row(
+                session,
+                revision_id=changeset_revision_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                source_job_id=changeset_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=row_ids.drawing_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=changeset_id,
+            )
+            await _insert_job_row(
+                session,
+                job_id=other_changeset_job_id,
+                project_id=other_row_ids.project_id,
+                file_id=other_row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=other_row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+            await _insert_drawing_revision_row(
+                session,
+                revision_id=other_changeset_revision_id,
+                project_id=other_row_ids.project_id,
+                file_id=other_row_ids.file_id,
+                extraction_profile_id=None,
+                source_job_id=other_changeset_job_id,
+                adapter_run_output_id=None,
+                predecessor_revision_id=other_row_ids.drawing_revision_id,
+                revision_sequence=2,
+                revision_kind="changeset",
+                review_state="approved",
+                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                changeset_id=other_changeset_id,
+            )
+            await _insert_job_row(
+                session,
+                job_id=changeset_mismatch_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=changeset_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+
+            with pytest.raises(DBAPIError) as changeset_exc_info:
+                await _insert_generated_artifact_row(
+                    session,
+                    artifact_id=uuid.uuid4(),
+                    project_id=row_ids.project_id,
+                    source_file_id=row_ids.file_id,
+                    job_id=changeset_mismatch_job_id,
+                    drawing_revision_id=changeset_revision_id,
+                    changeset_id=other_changeset_id,
+                    quantity_takeoff_id=None,
+                    estimate_version_id=None,
+                    adapter_run_output_id=None,
+                    artifact_kind="revised_dxf",
+                    name="mismatched-changeset.dxf",
+                    artifact_format="dxf",
+                    media_type="application/dxf",
+                    size_bytes=32,
+                    checksum_sha256="1" * 64,
+                    generator_name="tests",
+                    generator_version="1",
+                    generator_config_json={"kind": "changeset"},
+                    storage_key="generated/mismatched-changeset.dxf",
+                    storage_uri="file:///tmp/mismatched-changeset.dxf",
+                    lineage_json={"kind": "changeset"},
+                )
+                await session.commit()
+
+            await session.rollback()
+            assert _extract_sqlstate(changeset_exc_info.value) == _FOREIGN_KEY_VIOLATION_SQLSTATE
+            assert "fk_generated_artifacts_changeset" in str(changeset_exc_info.value)
+
+            takeoff_mismatch_job_id = uuid.uuid4()
+            await _insert_job_row(
+                session,
+                job_id=takeoff_mismatch_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+
+            with pytest.raises(DBAPIError) as takeoff_exc_info:
+                await _insert_generated_artifact_row(
+                    session,
+                    artifact_id=uuid.uuid4(),
+                    project_id=row_ids.project_id,
+                    source_file_id=row_ids.file_id,
+                    job_id=takeoff_mismatch_job_id,
+                    drawing_revision_id=row_ids.drawing_revision_id,
+                    changeset_id=None,
+                    quantity_takeoff_id=other_row_ids.quantity_takeoff_id,
+                    estimate_version_id=None,
+                    adapter_run_output_id=None,
+                    artifact_kind="quantity_csv",
+                    name="mismatched-quantity.csv",
+                    artifact_format="csv",
+                    media_type="text/csv",
+                    size_bytes=32,
+                    checksum_sha256="2" * 64,
+                    generator_name="tests",
+                    generator_version="1",
+                    generator_config_json={"kind": "quantity"},
+                    storage_key="generated/mismatched-quantity.csv",
+                    storage_uri="file:///tmp/mismatched-quantity.csv",
+                    lineage_json={"kind": "quantity"},
+                )
+                await session.commit()
+
+            await session.rollback()
+            assert _extract_sqlstate(takeoff_exc_info.value) == _FOREIGN_KEY_VIOLATION_SQLSTATE
+            assert "fk_generated_artifacts_takeoff" in str(takeoff_exc_info.value)
+
+            estimate_mismatch_job_id = uuid.uuid4()
+            await _insert_job_row(
+                session,
+                job_id=estimate_mismatch_job_id,
+                project_id=row_ids.project_id,
+                file_id=row_ids.file_id,
+                extraction_profile_id=None,
+                base_revision_id=row_ids.drawing_revision_id,
+                job_type="export",
+                status="pending",
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+
+            with pytest.raises(DBAPIError) as estimate_exc_info:
+                await _insert_generated_artifact_row(
+                    session,
+                    artifact_id=uuid.uuid4(),
+                    project_id=row_ids.project_id,
+                    source_file_id=row_ids.file_id,
+                    job_id=estimate_mismatch_job_id,
+                    drawing_revision_id=row_ids.drawing_revision_id,
+                    changeset_id=None,
+                    quantity_takeoff_id=row_ids.quantity_takeoff_id,
+                    estimate_version_id=other_row_ids.estimate_version_id,
+                    adapter_run_output_id=None,
+                    artifact_kind="estimate_pdf",
+                    name="mismatched-estimate.pdf",
+                    artifact_format="pdf",
+                    media_type="application/pdf",
+                    size_bytes=32,
+                    checksum_sha256="3" * 64,
+                    generator_name="tests",
+                    generator_version="1",
+                    generator_config_json={"kind": "estimate"},
+                    storage_key="generated/mismatched-estimate.pdf",
+                    storage_uri="file:///tmp/mismatched-estimate.pdf",
+                    lineage_json={"kind": "estimate"},
+                )
+                await session.commit()
+
+            await session.rollback()
+            assert _extract_sqlstate(estimate_exc_info.value) == _FOREIGN_KEY_VIOLATION_SQLSTATE
+            assert "fk_generated_artifacts_estimate" in str(estimate_exc_info.value)
+
+    async def test_generated_artifacts_reject_incomplete_nullable_composite_bypass_attempts(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Generated artifacts should reject nullable composite anchor bypass attempts."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        invalid_cases = (
+            (
+                "quantity_takeoff_id without drawing_revision_id",
+                None,
+                row_ids.quantity_takeoff_id,
+                None,
+                "ck_generated_artifacts_takeoff_revision",
+            ),
+            (
+                "estimate_version_id without quantity_takeoff_id",
+                row_ids.drawing_revision_id,
+                None,
+                row_ids.estimate_version_id,
+                "ck_generated_artifacts_estimate_lineage",
+            ),
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            for (
+                _case_name,
+                drawing_revision_id,
+                quantity_takeoff_id,
+                estimate_version_id,
+                expected_constraint,
+            ) in invalid_cases:
+                artifact_job_id = uuid.uuid4()
+                await _insert_job_row(
+                    session,
+                    job_id=artifact_job_id,
+                    project_id=row_ids.project_id,
+                    file_id=row_ids.file_id,
+                    extraction_profile_id=None,
+                    base_revision_id=row_ids.drawing_revision_id,
+                    job_type="export",
+                    status="pending",
+                    enqueue_status="pending",
+                    enqueue_attempts=0,
+                )
+
+                with pytest.raises(DBAPIError) as exc_info:
+                    await _insert_generated_artifact_row(
+                        session,
+                        artifact_id=uuid.uuid4(),
+                        project_id=row_ids.project_id,
+                        source_file_id=row_ids.file_id,
+                        job_id=artifact_job_id,
+                        drawing_revision_id=drawing_revision_id,
+                        changeset_id=None,
+                        quantity_takeoff_id=quantity_takeoff_id,
+                        estimate_version_id=estimate_version_id,
+                        adapter_run_output_id=None,
+                        artifact_kind="debug_overlay",
+                        name="invalid-anchor.svg",
+                        artifact_format="svg",
+                        media_type="image/svg+xml",
+                        size_bytes=16,
+                        checksum_sha256="4" * 64,
+                        generator_name="tests",
+                        generator_version="1",
+                        generator_config_json={"kind": "invalid"},
+                        storage_key=f"generated/{uuid.uuid4()}.svg",
+                        storage_uri="file:///tmp/invalid-anchor.svg",
+                        lineage_json={"kind": "invalid"},
+                    )
+                    await session.commit()
+
+                await session.rollback()
+                assert _extract_sqlstate(exc_info.value) == _CHECK_VIOLATION_SQLSTATE
+                assert expected_constraint in str(exc_info.value)
+
     @pytest.mark.parametrize(
         (
             "include_materialization",
@@ -2959,6 +4105,35 @@ class TestAppendOnlyLineageTables:
             combined_output = downgrade_result.stdout + downgrade_result.stderr
             assert "Cannot downgrade:" in combined_output
             assert expected_table_name in combined_output
+        finally:
+            await _drop_temp_database(database_name)
+
+    async def test_generated_artifact_lineage_downgrade_fails_closed_on_anchored_rows(
+        self,
+    ) -> None:
+        """Downgrade past #273 should refuse generated artifacts with typed lineage anchors."""
+
+        _ = self
+        database_name, database_url = await _create_temp_database()
+
+        try:
+            upgrade_result = _run_alembic_command("upgrade", "head", database_url=database_url)
+            assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+
+            await _insert_generated_artifact_lineage_anchor_rows(database_url)
+
+            downgrade_result = _run_alembic_command(
+                "downgrade",
+                _GENERATED_ARTIFACT_LINEAGE_DOWNGRADE_TARGET_REVISION,
+                database_url=database_url,
+            )
+            assert downgrade_result.returncode != 0
+
+            combined_output = downgrade_result.stdout + downgrade_result.stderr
+            assert (
+                "Cannot downgrade: generated_artifacts has non-null typed lineage anchors."
+                in combined_output
+            )
         finally:
             await _drop_temp_database(database_name)
 

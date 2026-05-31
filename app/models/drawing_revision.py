@@ -64,6 +64,12 @@ class DrawingRevision(Base):
             name="uq_drawing_revisions_changeset_id",
         ),
         UniqueConstraint(
+            "id",
+            "project_id",
+            "changeset_id",
+            name="uq_drawing_revisions_id_project_changeset",
+        ),
+        UniqueConstraint(
             "source_job_id",
             name="uq_drawing_revisions_source_job_id",
         ),
