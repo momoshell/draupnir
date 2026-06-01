@@ -20,9 +20,12 @@ from app.api.idempotency import (
     run_idempotent_mutation,
 )
 from app.api.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
     decode_cursor_payload,
-    encode_cursor_payload,
-    raise_invalid_cursor,
+    encode_keyset_cursor,
+    read_cursor_datetime,
+    read_cursor_uuid,
 )
 from app.core.errors import ErrorCode
 from app.core.exceptions import raise_not_found
@@ -67,7 +70,7 @@ async def _get_active_project_or_404(
 
 def _encode_cursor(created_at: datetime, project_id: UUID) -> str:
     """Encode cursor from created_at and project_id."""
-    return encode_cursor_payload(
+    return encode_keyset_cursor(
         {
             "created_at": created_at.isoformat(),
             "id": str(project_id),
@@ -77,11 +80,8 @@ def _encode_cursor(created_at: datetime, project_id: UUID) -> str:
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     """Decode cursor to typed created_at and id values."""
-    try:
-        cursor_data = decode_cursor_payload(cursor)
-        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(str(cursor_data["id"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise_invalid_cursor(exc)
+    cursor_data = decode_cursor_payload(cursor)
+    return read_cursor_datetime(cursor_data, "created_at"), read_cursor_uuid(cursor_data, "id")
 
 
 @project_router.post(
@@ -137,7 +137,10 @@ async def create_project(
 async def list_projects(
     db: Annotated[AsyncSession, Depends(get_db)],
     cursor: Annotated[str | None, Query(description="Cursor for pagination")] = None,
-    limit: Annotated[int, Query(ge=1, le=200, description="Number of items to return")] = 50,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Number of items to return"),
+    ] = DEFAULT_PAGE_SIZE,
 ) -> ProjectListResponse:
     """List projects with cursor pagination.
 

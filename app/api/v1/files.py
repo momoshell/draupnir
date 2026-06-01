@@ -23,9 +23,12 @@ from app.api.idempotency import (
     run_idempotent_mutation,
 )
 from app.api.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
     decode_cursor_payload,
-    encode_cursor_payload,
-    raise_invalid_cursor,
+    encode_keyset_cursor,
+    read_cursor_datetime,
+    read_cursor_uuid,
 )
 from app.core.config import settings
 from app.core.errors import ErrorCode
@@ -75,7 +78,7 @@ def enqueue_ingest_job(job_id: UUID) -> None:
 
 def _encode_cursor(created_at: datetime, file_id: UUID) -> str:
     """Encode cursor from created_at and file_id."""
-    return encode_cursor_payload(
+    return encode_keyset_cursor(
         {
             "created_at": created_at.isoformat(),
             "id": str(file_id),
@@ -85,11 +88,8 @@ def _encode_cursor(created_at: datetime, file_id: UUID) -> str:
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     """Decode cursor to typed created_at and id values."""
-    try:
-        cursor_data = decode_cursor_payload(cursor)
-        return datetime.fromisoformat(str(cursor_data["created_at"])), UUID(str(cursor_data["id"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise_invalid_cursor(exc)
+    cursor_data = decode_cursor_payload(cursor)
+    return read_cursor_datetime(cursor_data, "created_at"), read_cursor_uuid(cursor_data, "id")
 
 
 def _sniff_format(initial_bytes: bytes) -> str | None:
@@ -751,7 +751,10 @@ async def list_project_files(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     cursor: Annotated[str | None, Query(description="Cursor for pagination")] = None,
-    limit: Annotated[int, Query(ge=1, le=200, description="Number of items to return")] = 50,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Number of items to return"),
+    ] = DEFAULT_PAGE_SIZE,
 ) -> FileListResponse:
     """List files for a project with cursor pagination."""
     await _get_active_project_or_404(db, project_id)

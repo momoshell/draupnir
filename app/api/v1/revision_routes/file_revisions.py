@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
+from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
 from app.api.v1.revision_compat import _get_active_file
 from app.api.v1.revision_cursors import (
     _decode_revision_cursor,
@@ -21,9 +23,6 @@ from app.models.project import Project
 from app.schemas.revision import DrawingRevisionListResponse, DrawingRevisionRead
 
 file_revisions_router = APIRouter()
-
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
 
 
 @file_revisions_router.get("/files/{file_id}/revisions", response_model=DrawingRevisionListResponse)

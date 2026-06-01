@@ -29,6 +29,8 @@ from app.api.idempotency import (
 from app.api.idempotency import (
     replay_idempotency_response as _replay_idempotency_response_direct,
 )
+from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
+from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
 from app.api.v1.revision_cursors import _decode_timestamp_cursor, _encode_timestamp_cursor
 from app.api.v1.revision_lineage import (
     _get_active_revision as _get_active_revision_direct,
@@ -81,8 +83,6 @@ from app.schemas.quantity_takeoff import (
 quantity_takeoffs_router = APIRouter()
 quantity_takeoff_create_router = APIRouter()
 
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
 _MISSING = object()
 
 type _ActiveRevisionGetter = Callable[..., Awaitable[DrawingRevision | None]]

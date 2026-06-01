@@ -30,6 +30,8 @@ from app.api.idempotency import (
 from app.api.idempotency import (
     replay_idempotency_response as _replay_idempotency_response_direct,
 )
+from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
+from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
 from app.api.v1.revision_cursors import (
     _decode_estimate_item_cursor,
     _decode_estimate_snapshot_entry_cursor,
@@ -127,8 +129,6 @@ from app.schemas.job import JobRead
 
 estimates_router = APIRouter()
 
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
 _MISSING = object()
 
 type _NormalizedEstimateCatalogRef = _NormalizedEstimateCatalogRefDirect
