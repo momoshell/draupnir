@@ -3,28 +3,45 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from sqlalchemy import (
     JSON,
     CheckConstraint,
-    DateTime,
-    ForeignKey,
     ForeignKeyConstraint,
     Index,
     Integer,
     String,
     UniqueConstraint,
-    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.db.mixins import ProjectScopedMixin, RevisionLineageMixin, TimestampMixin, sha256_column
 
 
-class RevisionEntityManifest(Base):
+class RevisionEntityManifest(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Manifest row recording whether revision entities were materialized."""
+
+    __source_file_comment__: ClassVar[str] = (
+        "Immutable source file identifier for the materialized revision"
+    )
+    __extraction_profile_comment__: ClassVar[str] = (
+        "Immutable extraction profile identifier used for materialization"
+    )
+    __source_job_comment__: ClassVar[str] = (
+        "Job identifier that materialized normalized revision entities"
+    )
+    __drawing_revision_comment__: ClassVar[str] = (
+        "Drawing revision identifier whose normalized entities were materialized"
+    )
+    __adapter_run_output_comment__: ClassVar[str] = (
+        "Adapter run output identifier materialized into revision-scoped entity tables"
+    )
+    __canonical_entity_schema_version_comment__: ClassVar[str] = (
+        "Canonical entity schema version for the materialized revision payloads"
+    )
+    __created_at_comment__: ClassVar[str] = "Manifest creation timestamp"
 
     __tablename__ = "revision_entity_manifests"
     __table_args__ = (
@@ -76,67 +93,33 @@ class RevisionEntityManifest(Base):
         default=uuid.uuid4,
         comment="Unique revision entity materialization manifest identifier (UUID v4)",
     )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "projects.id",
-            name="fk_revision_entity_manifests_project_id_projects",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Owning project identifier",
-    )
-    source_file_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        index=True,
-        comment="Immutable source file identifier for the materialized revision",
-    )
-    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional extraction profile identifier used for materialization",
-    )
-    source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "jobs.id",
-            name="fk_revision_entity_manifests_source_job_id_jobs",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Job identifier that materialized normalized revision entities",
-    )
-    drawing_revision_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Drawing revision identifier whose normalized entities were materialized",
-    )
-    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment=(
-            "Optional adapter run output identifier materialized into revision-scoped entity tables"
-        ),
-    )
-    canonical_entity_schema_version: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        comment="Canonical entity schema version for the materialized revision payloads",
-    )
     counts_json: Mapped[dict[str, int]] = mapped_column(
         JSON,
         nullable=False,
         comment="Materialized normalized row counts keyed by layouts, layers, blocks, and entities",
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=func.now(),
-        nullable=False,
-        comment="Manifest creation timestamp",
-    )
 
 
-class RevisionLayout(Base):
+class RevisionLayout(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Materialized layout payload rows scoped to a drawing revision."""
+
+    __source_file_comment__: ClassVar[str] = (
+        "Immutable source file identifier for this materialized layout row"
+    )
+    __extraction_profile_comment__: ClassVar[str] = (
+        "Immutable extraction profile identifier used for this layout row"
+    )
+    __source_job_comment__: ClassVar[str] = "Job identifier that materialized this layout row"
+    __drawing_revision_comment__: ClassVar[str] = (
+        "Drawing revision identifier that owns this layout row"
+    )
+    __adapter_run_output_comment__: ClassVar[str] = (
+        "Adapter run output identifier that produced this layout row"
+    )
+    __canonical_entity_schema_version_comment__: ClassVar[str] = (
+        "Canonical entity schema version for this layout row payload"
+    )
+    __created_at_comment__: ClassVar[str] = "Revision layout materialization timestamp"
 
     __tablename__ = "revision_layouts"
     __table_args__ = (
@@ -188,50 +171,6 @@ class RevisionLayout(Base):
         default=uuid.uuid4,
         comment="Unique materialized revision layout row identifier (UUID v4)",
     )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "projects.id",
-            name="fk_revision_layouts_project_id_projects",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Owning project identifier",
-    )
-    source_file_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        index=True,
-        comment="Immutable source file identifier for this materialized layout row",
-    )
-    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional extraction profile identifier used for this layout row",
-    )
-    source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "jobs.id",
-            name="fk_revision_layouts_source_job_id_jobs",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Job identifier that materialized this layout row",
-    )
-    drawing_revision_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Drawing revision identifier that owns this layout row",
-    )
-    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional adapter run output identifier that produced this layout row",
-    )
-    canonical_entity_schema_version: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        comment="Canonical entity schema version for this layout row payload",
-    )
     sequence_index: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -248,16 +187,28 @@ class RevisionLayout(Base):
         index=True,
         comment="Stable non-null layout reference extracted from the canonical layout payload",
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=func.now(),
-        nullable=False,
-        comment="Revision layout materialization timestamp",
-    )
 
 
-class RevisionLayer(Base):
+class RevisionLayer(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Materialized layer payload rows scoped to a drawing revision."""
+
+    __source_file_comment__: ClassVar[str] = (
+        "Immutable source file identifier for this materialized layer row"
+    )
+    __extraction_profile_comment__: ClassVar[str] = (
+        "Immutable extraction profile identifier used for this layer row"
+    )
+    __source_job_comment__: ClassVar[str] = "Job identifier that materialized this layer row"
+    __drawing_revision_comment__: ClassVar[str] = (
+        "Drawing revision identifier that owns this layer row"
+    )
+    __adapter_run_output_comment__: ClassVar[str] = (
+        "Adapter run output identifier that produced this layer row"
+    )
+    __canonical_entity_schema_version_comment__: ClassVar[str] = (
+        "Canonical entity schema version for this layer row payload"
+    )
+    __created_at_comment__: ClassVar[str] = "Revision layer materialization timestamp"
 
     __tablename__ = "revision_layers"
     __table_args__ = (
@@ -309,50 +260,6 @@ class RevisionLayer(Base):
         default=uuid.uuid4,
         comment="Unique materialized revision layer row identifier (UUID v4)",
     )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "projects.id",
-            name="fk_revision_layers_project_id_projects",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Owning project identifier",
-    )
-    source_file_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        index=True,
-        comment="Immutable source file identifier for this materialized layer row",
-    )
-    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional extraction profile identifier used for this layer row",
-    )
-    source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "jobs.id",
-            name="fk_revision_layers_source_job_id_jobs",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Job identifier that materialized this layer row",
-    )
-    drawing_revision_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Drawing revision identifier that owns this layer row",
-    )
-    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional adapter run output identifier that produced this layer row",
-    )
-    canonical_entity_schema_version: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        comment="Canonical entity schema version for this layer row payload",
-    )
     sequence_index: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -369,16 +276,28 @@ class RevisionLayer(Base):
         index=True,
         comment="Stable non-null layer reference extracted from the canonical layer payload",
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=func.now(),
-        nullable=False,
-        comment="Revision layer materialization timestamp",
-    )
 
 
-class RevisionBlock(Base):
+class RevisionBlock(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Materialized block payload rows scoped to a drawing revision."""
+
+    __source_file_comment__: ClassVar[str] = (
+        "Immutable source file identifier for this materialized block row"
+    )
+    __extraction_profile_comment__: ClassVar[str] = (
+        "Immutable extraction profile identifier used for this block row"
+    )
+    __source_job_comment__: ClassVar[str] = "Job identifier that materialized this block row"
+    __drawing_revision_comment__: ClassVar[str] = (
+        "Drawing revision identifier that owns this block row"
+    )
+    __adapter_run_output_comment__: ClassVar[str] = (
+        "Adapter run output identifier that produced this block row"
+    )
+    __canonical_entity_schema_version_comment__: ClassVar[str] = (
+        "Canonical entity schema version for this block row payload"
+    )
+    __created_at_comment__: ClassVar[str] = "Revision block materialization timestamp"
 
     __tablename__ = "revision_blocks"
     __table_args__ = (
@@ -430,50 +349,6 @@ class RevisionBlock(Base):
         default=uuid.uuid4,
         comment="Unique materialized revision block row identifier (UUID v4)",
     )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "projects.id",
-            name="fk_revision_blocks_project_id_projects",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Owning project identifier",
-    )
-    source_file_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        index=True,
-        comment="Immutable source file identifier for this materialized block row",
-    )
-    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional extraction profile identifier used for this block row",
-    )
-    source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "jobs.id",
-            name="fk_revision_blocks_source_job_id_jobs",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Job identifier that materialized this block row",
-    )
-    drawing_revision_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Drawing revision identifier that owns this block row",
-    )
-    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional adapter run output identifier that produced this block row",
-    )
-    canonical_entity_schema_version: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        comment="Canonical entity schema version for this block row payload",
-    )
     sequence_index: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -490,16 +365,28 @@ class RevisionBlock(Base):
         index=True,
         comment="Stable non-null block reference extracted from the canonical block payload",
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=func.now(),
-        nullable=False,
-        comment="Revision block materialization timestamp",
-    )
 
 
-class RevisionEntity(Base):
+class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Materialized entity payload rows scoped to a drawing revision."""
+
+    __source_file_comment__: ClassVar[str] = (
+        "Immutable source file identifier for this materialized entity row"
+    )
+    __extraction_profile_comment__: ClassVar[str] = (
+        "Immutable extraction profile identifier used for this entity row"
+    )
+    __source_job_comment__: ClassVar[str] = "Job identifier that materialized this entity row"
+    __drawing_revision_comment__: ClassVar[str] = (
+        "Drawing revision identifier that owns this entity row"
+    )
+    __adapter_run_output_comment__: ClassVar[str] = (
+        "Adapter run output identifier that produced this entity row"
+    )
+    __canonical_entity_schema_version_comment__: ClassVar[str] = (
+        "Canonical entity schema version for this entity row payload"
+    )
+    __created_at_comment__: ClassVar[str] = "Revision entity materialization timestamp"
 
     __tablename__ = "revision_entities"
     __table_args__ = (
@@ -612,50 +499,6 @@ class RevisionEntity(Base):
         default=uuid.uuid4,
         comment="Unique materialized revision entity row identifier (UUID v4)",
     )
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "projects.id",
-            name="fk_revision_entities_project_id_projects",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Owning project identifier",
-    )
-    source_file_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        index=True,
-        comment="Immutable source file identifier for this materialized entity row",
-    )
-    extraction_profile_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional extraction profile identifier used for this entity row",
-    )
-    source_job_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "jobs.id",
-            name="fk_revision_entities_source_job_id_jobs",
-            ondelete="RESTRICT",
-        ),
-        nullable=False,
-        index=True,
-        comment="Job identifier that materialized this entity row",
-    )
-    drawing_revision_id: Mapped[uuid.UUID] = mapped_column(
-        nullable=False,
-        comment="Drawing revision identifier that owns this entity row",
-    )
-    adapter_run_output_id: Mapped[uuid.UUID | None] = mapped_column(
-        nullable=True,
-        index=True,
-        comment="Optional adapter run output identifier that produced this entity row",
-    )
-    canonical_entity_schema_version: Mapped[str] = mapped_column(
-        String(16),
-        nullable=False,
-        comment="Canonical entity schema version for this entity row payload",
-    )
     sequence_index: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -740,8 +583,7 @@ class RevisionEntity(Base):
         index=True,
         comment="Stable source identity derived from canonical entity top-level or provenance refs",
     )
-    source_hash: Mapped[str | None] = mapped_column(
-        String(64),
+    source_hash: Mapped[str | None] = sha256_column(
         nullable=True,
         index=True,
         comment="Stable source hash derived from canonical entity top-level or provenance refs",
@@ -777,10 +619,4 @@ class RevisionEntity(Base):
             "Best-effort resolved materialized parent entity row for "
             "parent_entity_ref within the same drawing revision"
         ),
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=func.now(),
-        nullable=False,
-        comment="Revision entity materialization timestamp",
     )
