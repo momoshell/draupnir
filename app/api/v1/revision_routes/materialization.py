@@ -9,13 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
-from app.api.v1.revision_compat import (
-    _get_active_revision_manifest_or_409,
-    _manifest_counts,
-)
 from app.api.v1.revision_cursors import (
     _decode_materialization_cursor,
     _encode_materialization_cursor,
+)
+from app.api.v1.revision_lineage import (
+    _get_active_revision_manifest_or_409,
+    _manifest_counts,
 )
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db

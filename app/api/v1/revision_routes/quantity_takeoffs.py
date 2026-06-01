@@ -1,7 +1,7 @@
 """Revision quantity takeoff routes."""
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -83,42 +83,13 @@ from app.schemas.quantity_takeoff import (
 quantity_takeoffs_router = APIRouter()
 quantity_takeoff_create_router = APIRouter()
 
-_MISSING = object()
-
 type _ActiveRevisionGetter = Callable[..., Awaitable[DrawingRevision | None]]
-type _ValidationReportGetter = Callable[[UUID, AsyncSession], Awaitable[ValidationReport]]
-type _RevisionManifestGetter = Callable[[UUID, AsyncSession], Awaitable[RevisionEntityManifest]]
-type _RevisionTakeoffGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[QuantityTakeoff]]
-type _FingerprintBuilder = Callable[..., str]
-type _ReplayIdempotencyResponse = Callable[..., Awaitable[Response | None]]
-type _CompleteIdempotencyResponse = Callable[..., Awaitable[Response]]
-
-
-def _compat_attr(*names: str, default: Any = _MISSING) -> Any:
-    """Return the first matching revision_compat attribute."""
-
-    from app.api.v1 import revision_compat
-
-    for name in names:
-        if hasattr(revision_compat, name):
-            return getattr(revision_compat, name)
-    if default is not _MISSING:
-        return default
-    joined = ", ".join(names)
-    raise AttributeError(f"revision_compat is missing expected helper: {joined}")
 
 
 async def _get_active_revision(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for active revision lookup."""
+    """Route-local active revision seam for tests."""
 
-    helper = cast(
-        _ActiveRevisionGetter,
-        _compat_attr(
-            "_get_active_revision",
-            "get_active_revision",
-            default=_get_active_revision_direct,
-        ),
-    )
+    helper: _ActiveRevisionGetter = _get_active_revision_direct
     return await helper(*args, **kwargs)
 
 
@@ -128,22 +99,11 @@ async def _get_active_validation_report_or_404(
 ) -> ValidationReport:
     """Return an active revision validation report or raise not found."""
 
-    helper = cast(
-        _ValidationReportGetter | None,
-        _compat_attr(
-            "_get_active_validation_report_or_404",
-            "get_active_validation_report_or_404",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return await helper(revision_id, db)
-
     return await _lineage_get_active_validation_report_or_404_direct(
         revision_id,
         db,
         get_active_validation_report=_get_active_validation_report_direct,
-        get_active_revision=_get_active_revision_direct,
+        get_active_revision=_get_active_revision,
     )
 
 
@@ -153,21 +113,10 @@ async def _get_active_revision_manifest_or_409(
 ) -> RevisionEntityManifest:
     """Return an active revision manifest or raise the standard missing errors."""
 
-    helper = cast(
-        _RevisionManifestGetter | None,
-        _compat_attr(
-            "_get_active_revision_manifest_or_409",
-            "get_active_revision_manifest_or_409",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return await helper(revision_id, db)
-
     return await _lineage_get_active_revision_manifest_or_409_direct(
         revision_id,
         db,
-        get_active_revision=_get_active_revision_direct,
+        get_active_revision=_get_active_revision,
         get_revision_manifest=_get_revision_manifest_direct,
         raise_entities_not_materialized=_raise_entities_not_materialized_direct,
     )
@@ -178,66 +127,33 @@ async def _get_revision_quantity_takeoff_or_404(
     takeoff_id: UUID,
     db: AsyncSession,
 ) -> QuantityTakeoff:
-    """Compatibility wrapper for revision quantity takeoff lookup."""
+    """Route-local quantity takeoff lookup seam for tests."""
 
-    helper = cast(
-        _RevisionTakeoffGetter,
-        _compat_attr(
-            "_get_revision_quantity_takeoff_or_404",
-            "get_revision_quantity_takeoff_or_404",
-            default=_get_revision_quantity_takeoff_or_404_direct,
-        ),
-    )
-    return await helper(revision_id, takeoff_id, db)
+    return await _get_revision_quantity_takeoff_or_404_direct(revision_id, takeoff_id, db)
 
 
 def _build_idempotency_fingerprint(*args: Any, **kwargs: Any) -> str:
-    """Compatibility wrapper for fingerprint construction."""
+    """Route-local fingerprint seam for tests."""
 
-    helper = cast(
-        _FingerprintBuilder,
-        _compat_attr(
-            "build_idempotency_fingerprint",
-            default=_build_idempotency_fingerprint_direct,
-        ),
-    )
-    return helper(*args, **kwargs)
+    return _build_idempotency_fingerprint_direct(*args, **kwargs)
 
 
 async def _replay_idempotency_response(*args: Any, **kwargs: Any) -> Response | None:
-    """Compatibility wrapper for idempotency replay."""
+    """Route-local idempotency replay seam for tests."""
 
-    helper = cast(
-        _ReplayIdempotencyResponse,
-        _compat_attr(
-            "replay_idempotency_response",
-            default=_replay_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _replay_idempotency_response_direct(*args, **kwargs)
 
 
 async def _claim_idempotency_response(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for idempotency claim."""
+    """Route-local idempotency claim seam for tests."""
 
-    helper = _compat_attr(
-        "claim_idempotency_response",
-        default=_claim_idempotency_response_direct,
-    )
-    return await helper(*args, **kwargs)
+    return await _claim_idempotency_response_direct(*args, **kwargs)
 
 
 async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
-    """Compatibility wrapper for idempotency completion."""
+    """Route-local idempotency completion seam for tests."""
 
-    helper = cast(
-        _CompleteIdempotencyResponse,
-        _compat_attr(
-            "complete_idempotency_response",
-            default=_complete_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _complete_idempotency_response_direct(*args, **kwargs)
 
 
 async def _complete_mutation_response(
@@ -261,7 +177,7 @@ async def _complete_mutation_response(
 
 
 def _idempotent_mutation_ops() -> IdempotentMutationOps:
-    """Return compatibility-aware idempotency operations for mutation helpers."""
+    """Return route-local idempotency operations for mutation helpers."""
 
     return IdempotentMutationOps(
         replay=_replay_idempotency_response,
@@ -271,54 +187,25 @@ def _idempotent_mutation_ops() -> IdempotentMutationOps:
 
 
 def _prepare_job_enqueue_intent(job: Job) -> None:
-    """Compatibility wrapper for enqueue intent staging."""
+    """Route-local enqueue intent staging seam for tests."""
 
-    helper = _compat_attr(
-        "prepare_job_enqueue_intent",
-        default=_prepare_job_enqueue_intent_direct,
-    )
-    helper(job)
+    _prepare_job_enqueue_intent_direct(job)
 
 
 async def _publish_job_enqueue_intent(*args: Any, **kwargs: Any) -> None:
-    """Compatibility wrapper for enqueue publication."""
+    """Route-local enqueue publication seam for tests."""
 
-    helper = _compat_attr(
-        "publish_job_enqueue_intent",
-        default=_publish_job_enqueue_intent_direct,
-    )
-    await helper(*args, **kwargs)
+    await _publish_job_enqueue_intent_direct(*args, **kwargs)
 
 
 def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
-    """Compatibility wrapper kept for test fixture patching."""
+    """Route-local quantity enqueue seam for tests."""
 
-    publisher = _compat_attr(
-        "enqueue_quantity_takeoff_job",
-        default=_enqueue_quantity_takeoff_job_direct,
-    )
-    publisher(job_id)
-
-
-def _revisions_module() -> Any:
-    """Return the revisions module for compatibility-sensitive callbacks."""
-
-    from app.api.v1 import revisions
-
-    return revisions
+    _enqueue_quantity_takeoff_job_direct(job_id)
 
 
 def _raise_quantity_takeoff_gate_invalid(report: ValidationReport) -> None:
     """Raise the standard pre-enqueue error for non-runnable quantity gates."""
-
-    helper = _compat_attr(
-        "_raise_quantity_takeoff_gate_invalid",
-        "raise_quantity_takeoff_gate_invalid",
-        default=None,
-    )
-    if helper is not None:
-        helper(report)
-        return
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -535,7 +422,7 @@ async def create_revision_quantity_takeoff(
         async def _after_commit() -> None:
             await _publish_job_enqueue_intent(
                 quantity_job.id,
-                publisher=_revisions_module().enqueue_quantity_takeoff_job,
+                publisher=enqueue_quantity_takeoff_job,
                 suppress_exceptions=True,
             )
 

@@ -18,7 +18,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import decode_cursor_payload
-from app.api.v1 import revisions as revisions_module
+from app.api.v1.revision_routes import estimates as estimates_routes_module
 from app.api.v1.revisions import revisions_router
 from app.db import session as session_module
 from app.db.session import get_db
@@ -433,7 +433,7 @@ def test_list_and_get_revision_estimates(monkeypatch: Any) -> None:
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     list_response = client.get(f"/v1/revisions/{revision.id}/estimates?limit=1")
 
@@ -515,7 +515,7 @@ def test_list_revision_estimate_items(monkeypatch: Any) -> None:
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(
         f"/v1/revisions/{revision.id}/estimates/{estimate_version.id}/items?limit=1"
@@ -641,7 +641,7 @@ def test_list_revision_estimate_snapshot_entries(monkeypatch: Any) -> None:
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(
         f"/v1/revisions/{revision.id}/estimates/{estimate_version.id}/snapshot-entries?limit=1"
@@ -721,7 +721,7 @@ def test_revision_estimate_routes_return_404_for_unknown_revision(monkeypatch: A
         _ = (revision_id, db, for_update)
         return None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     responses = (
         client.get(f"/v1/revisions/{unknown_revision_id}/estimates"),
@@ -751,7 +751,7 @@ def test_list_revision_estimates_rejects_invalid_cursor(monkeypatch: Any) -> Non
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(f"/v1/revisions/{revision.id}/estimates?cursor=not-base64")
 
@@ -775,7 +775,7 @@ def test_list_revision_estimate_items_rejects_invalid_cursor(monkeypatch: Any) -
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(
         f"/v1/revisions/{revision.id}/estimates/{estimate_version.id}/items?cursor=not-base64"
@@ -803,7 +803,7 @@ def test_list_revision_estimate_snapshot_entries_rejects_invalid_cursor(
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(
         f"/v1/revisions/{revision.id}/estimates/{estimate_version.id}/snapshot-entries?cursor=not-base64"
@@ -829,7 +829,7 @@ def test_revision_estimate_read_returns_404_for_revision_mismatch(monkeypatch: A
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = client.get(f"/v1/revisions/{revision.id}/estimates/{other_estimate_version_id}")
 
@@ -854,7 +854,7 @@ def test_revision_estimate_nested_routes_return_404_for_revision_mismatch(
         _ = (db, for_update)
         return revision if revision_id == revision.id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     responses = (
         client.get(f"/v1/revisions/{revision.id}/estimates/{other_estimate_version_id}/items"),
@@ -890,7 +890,7 @@ async def test_list_revision_estimates_hides_soft_deleted_lineage_after_stale_ch
         _ = (db, for_update)
         return stale_revision if revision_id == seed.revision_id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = await async_client.get(f"/v1/revisions/{seed.revision_id}/estimates")
 
@@ -921,7 +921,7 @@ async def test_get_revision_estimate_hides_soft_deleted_lineage_after_stale_chec
         _ = (db, for_update)
         return stale_revision if revision_id == seed.revision_id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
 
     response = await async_client.get(
         f"/v1/revisions/{seed.revision_id}/estimates/{seed.estimate_version_id}"
@@ -964,9 +964,9 @@ async def test_list_revision_estimate_items_hides_soft_deleted_lineage_after_sta
         assert estimate_version_id == seed.estimate_version_id
         return stale_estimate_version
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_get_revision_estimate_version_or_404",
         fake_get_revision_estimate_version_or_404,
     )
@@ -1013,9 +1013,9 @@ async def test_list_revision_estimate_snapshot_entries_hide_soft_deleted_lineage
         assert estimate_version_id == seed.estimate_version_id
         return stale_estimate_version
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(estimates_routes_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_get_revision_estimate_version_or_404",
         fake_get_revision_estimate_version_or_404,
     )

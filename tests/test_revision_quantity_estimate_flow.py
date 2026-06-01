@@ -9,8 +9,9 @@ from uuid import UUID
 import httpx
 import pytest
 
-import app.api.v1.revisions as revisions_module
 import app.jobs.worker as worker_module
+from app.api.v1.revision_routes import estimates as estimates_routes_module
+from app.api.v1.revision_routes import quantity_takeoffs as quantity_takeoffs_routes_module
 from app.db import session as session_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
@@ -123,8 +124,13 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
 
     monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_publish_job_enqueue_intent",
+        _capture_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         _capture_publish_job_enqueue_intent,
     )
 
@@ -326,8 +332,8 @@ async def test_revision_estimate_create_api_rejects_review_gated_takeoff_without
         published_job_ids.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         _capture_publish_job_enqueue_intent,
     )
 

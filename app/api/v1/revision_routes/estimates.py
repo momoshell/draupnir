@@ -1,8 +1,7 @@
 """Revision estimate routes."""
 
-from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, status
@@ -102,7 +101,7 @@ from app.api.v1.revision_lineage import (
 )
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
-from app.jobs import worker as jobs_worker_module
+from app.jobs.worker import enqueue_estimate_job as _enqueue_estimate_job_direct
 from app.jobs.worker import (
     prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct,
 )
@@ -129,53 +128,13 @@ from app.schemas.job import JobRead
 
 estimates_router = APIRouter()
 
-_MISSING = object()
-
-type _NormalizedEstimateCatalogRef = _NormalizedEstimateCatalogRefDirect
-
-type _ActiveRevisionGetter = Callable[..., Awaitable[DrawingRevision | None]]
-type _RevisionTakeoffGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[QuantityTakeoff]]
-type _EstimateVersionGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[EstimateVersion]]
-type _FingerprintBuilder = Callable[..., str]
-type _ReplayIdempotencyResponse = Callable[..., Awaitable[Response | None]]
-type _CompleteIdempotencyResponse = Callable[..., Awaitable[Response]]
-type _Clock = Callable[[], datetime]
-type _EstimateRequestNormalizer = Callable[[EstimateVersionCreateRequest], dict[str, Any]]
-type _EstimateJobModelResolver = Callable[[], tuple[type[Any], type[Any]]]
-type _EstimatePricingContractResolver = Callable[..., tuple[str, date]]
-type _EstimateCatalogRefResolver = Callable[
-    [DrawingRevision, QuantityTakeoff, list[EstimateVersionCreateCatalogRef], date, AsyncSession],
-    Awaitable[list[_NormalizedEstimateCatalogRef]],
-]
-type _EstimateJobInputPayloadBuilder = Callable[..., tuple[dict[str, Any], list[dict[str, Any]]]]
+_NormalizedEstimateCatalogRef = _NormalizedEstimateCatalogRefDirect
 
 
-def _compat_attr(*names: str, default: Any = _MISSING) -> Any:
-    """Return the first matching revision_compat attribute."""
+async def _get_active_revision(*args: Any, **kwargs: Any) -> DrawingRevision | None:
+    """Route-local seam for active revision lookup."""
 
-    from app.api.v1 import revision_compat
-
-    for name in names:
-        if hasattr(revision_compat, name):
-            return getattr(revision_compat, name)
-    if default is not _MISSING:
-        return default
-    joined = ", ".join(names)
-    raise AttributeError(f"revision_compat is missing expected helper: {joined}")
-
-
-async def _get_active_revision(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for active revision lookup."""
-
-    helper = cast(
-        _ActiveRevisionGetter,
-        _compat_attr(
-            "_get_active_revision",
-            "get_active_revision",
-            default=_get_active_revision_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _get_active_revision_direct(*args, **kwargs)
 
 
 async def _get_revision_quantity_takeoff_or_404(
@@ -183,17 +142,9 @@ async def _get_revision_quantity_takeoff_or_404(
     takeoff_id: UUID,
     db: AsyncSession,
 ) -> QuantityTakeoff:
-    """Compatibility wrapper for revision quantity takeoff lookup."""
+    """Route-local seam for revision takeoff lookup."""
 
-    helper = cast(
-        _RevisionTakeoffGetter,
-        _compat_attr(
-            "_get_revision_quantity_takeoff_or_404",
-            "get_revision_quantity_takeoff_or_404",
-            default=_get_revision_quantity_takeoff_or_404_direct,
-        ),
-    )
-    return await helper(revision_id, takeoff_id, db)
+    return await _get_revision_quantity_takeoff_or_404_direct(revision_id, takeoff_id, db)
 
 
 async def _get_revision_estimate_version_or_404(
@@ -201,66 +152,23 @@ async def _get_revision_estimate_version_or_404(
     estimate_version_id: UUID,
     db: AsyncSession,
 ) -> EstimateVersion:
-    """Compatibility wrapper for revision estimate lookup."""
+    """Route-local seam for revision estimate lookup."""
 
-    helper = cast(
-        _EstimateVersionGetter,
-        _compat_attr(
-            "_get_revision_estimate_version_or_404",
-            "get_revision_estimate_version_or_404",
-            default=_get_revision_estimate_version_or_404_direct,
-        ),
+    return await _get_revision_estimate_version_or_404_direct(
+        revision_id,
+        estimate_version_id,
+        db,
     )
-    return await helper(revision_id, estimate_version_id, db)
 
 
-def _build_idempotency_fingerprint(*args: Any, **kwargs: Any) -> str:
-    """Compatibility wrapper for fingerprint construction."""
-
-    helper = cast(
-        _FingerprintBuilder,
-        _compat_attr(
-            "build_idempotency_fingerprint",
-            default=_build_idempotency_fingerprint_direct,
-        ),
-    )
-    return helper(*args, **kwargs)
-
-
-async def _replay_idempotency_response(*args: Any, **kwargs: Any) -> Response | None:
-    """Compatibility wrapper for idempotency replay."""
-
-    helper = cast(
-        _ReplayIdempotencyResponse,
-        _compat_attr(
-            "replay_idempotency_response",
-            default=_replay_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
-
-
-async def _claim_idempotency_response(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for idempotency claim."""
-
-    helper = _compat_attr(
-        "claim_idempotency_response",
-        default=_claim_idempotency_response_direct,
-    )
-    return await helper(*args, **kwargs)
-
-
-async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
-    """Compatibility wrapper for idempotency completion."""
-
-    helper = cast(
-        _CompleteIdempotencyResponse,
-        _compat_attr(
-            "complete_idempotency_response",
-            default=_complete_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+_build_idempotency_fingerprint = _build_idempotency_fingerprint_direct
+_replay_idempotency_response = _replay_idempotency_response_direct
+_claim_idempotency_response = _claim_idempotency_response_direct
+_complete_idempotency_response = _complete_idempotency_response_direct
+_prepare_job_enqueue_intent = _prepare_job_enqueue_intent_direct
+_publish_job_enqueue_intent = _publish_job_enqueue_intent_direct
+_raise_estimate_input_invalid = _raise_estimate_input_invalid_direct
+_normalize_estimate_request_body = _normalize_estimate_request_body_direct
 
 
 async def _complete_mutation_response(
@@ -293,102 +201,25 @@ def _idempotent_mutation_ops() -> IdempotentMutationOps:
     )
 
 
-def _prepare_job_enqueue_intent(job: Job) -> None:
-    """Compatibility wrapper for enqueue intent staging."""
-
-    helper = _compat_attr(
-        "prepare_job_enqueue_intent",
-        default=_prepare_job_enqueue_intent_direct,
-    )
-    helper(job)
-
-
-async def _publish_job_enqueue_intent(*args: Any, **kwargs: Any) -> None:
-    """Compatibility wrapper for enqueue publication."""
-
-    helper = _compat_attr(
-        "publish_job_enqueue_intent",
-        default=_publish_job_enqueue_intent_direct,
-    )
-    await helper(*args, **kwargs)
-
-
 def enqueue_estimate_job(job_id: UUID) -> None:
-    """Compatibility wrapper kept for test fixture patching."""
+    """Route-local estimate enqueue seam for test patching."""
 
-    publisher = _compat_attr(
-        "enqueue_estimate_job",
-        default=jobs_worker_module.enqueue_estimate_job,
-    )
-    publisher(job_id)
-
-
-def _revisions_module() -> Any:
-    """Return the revisions module for compatibility-sensitive callbacks."""
-
-    from app.api.v1 import revisions
-
-    return revisions
+    _enqueue_estimate_job_direct(job_id)
 
 
 def _utc_now() -> datetime:
-    """Compatibility wrapper for the facade clock."""
+    """Route-local clock seam for estimate create flows."""
 
-    helper = cast(
-        _Clock,
-        _compat_attr(
-            "utc_now",
-            default=lambda: datetime.now(UTC),
-        ),
-    )
-    return helper()
-
-
-def _raise_estimate_input_invalid(
-    message: str,
-    *,
-    details: dict[str, Any] | None = None,
-) -> None:
-    """Raise the standard estimate input validation error."""
-
-    helper = _compat_attr(
-        "_raise_estimate_input_invalid",
-        "raise_estimate_input_invalid",
-        default=_raise_estimate_input_invalid_direct,
-    )
-    helper(message, details=details)
+    return datetime.now(UTC)
 
 
 def _raise_estimate_takeoff_gate_invalid(takeoff: QuantityTakeoff) -> None:
     """Raise the standard pre-enqueue error for non-runnable estimate inputs."""
 
-    helper = _compat_attr(
-        "_raise_estimate_takeoff_gate_invalid",
-        "raise_estimate_takeoff_gate_invalid",
-        default=None,
-    )
-    if helper is not None:
-        helper(takeoff)
-        return
-
     _raise_estimate_takeoff_gate_invalid_direct(
         takeoff,
         raise_estimate_input_invalid=_raise_estimate_input_invalid,
     )
-
-
-def _normalize_estimate_request_body(payload: EstimateVersionCreateRequest) -> dict[str, Any]:
-    """Return the normalized create-request body used for idempotency fingerprints."""
-
-    helper = cast(
-        _EstimateRequestNormalizer,
-        _compat_attr(
-            "_normalize_estimate_request_body",
-            "normalize_estimate_request_body",
-            default=_normalize_estimate_request_body_direct,
-        ),
-    )
-    return helper(payload)
 
 
 def _mapped_attribute_keys(model_class: type[Any]) -> set[str]:
@@ -399,14 +230,6 @@ def _mapped_attribute_keys(model_class: type[Any]) -> set[str]:
 
 def _build_mapped_instance(model_class: type[Any], values: dict[str, Any]) -> Any:
     """Instantiate a mapped object while ignoring unknown compatibility fields."""
-
-    helper = _compat_attr(
-        "_build_mapped_instance",
-        "build_mapped_instance",
-        default=None,
-    )
-    if helper is not None:
-        return helper(model_class, values)
 
     return _build_mapped_instance_direct(
         model_class,
@@ -429,17 +252,6 @@ def _load_app_model_modules() -> None:
 
 def _resolve_estimate_job_model_classes() -> tuple[type[Any], type[Any]]:
     """Resolve mapped model classes used to persist estimate job inputs."""
-
-    helper = cast(
-        _EstimateJobModelResolver | None,
-        _compat_attr(
-            "_resolve_estimate_job_model_classes",
-            "resolve_estimate_job_model_classes",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return helper()
 
     return _resolve_estimate_job_model_classes_direct(
         load_app_model_modules=_load_app_model_modules,
@@ -486,17 +298,6 @@ def _resolve_estimate_pricing_contract(
 ) -> tuple[str, date]:
     """Resolve the persisted pricing contract for an estimate request."""
 
-    helper = cast(
-        _EstimatePricingContractResolver | None,
-        _compat_attr(
-            "_resolve_estimate_pricing_contract",
-            "resolve_estimate_pricing_contract",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return helper(request, job_created_at=job_created_at)
-
     return _resolve_estimate_pricing_contract_direct(
         request,
         job_created_at=job_created_at,
@@ -533,23 +334,6 @@ async def _resolve_estimate_catalog_refs(
 ) -> list[_NormalizedEstimateCatalogRef]:
     """Validate request refs and normalize worker mapping inputs."""
 
-    helper = cast(
-        _EstimateCatalogRefResolver | None,
-        _compat_attr(
-            "_resolve_estimate_catalog_refs",
-            "resolve_estimate_catalog_refs",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return await helper(
-            revision,
-            takeoff,
-            request_refs,
-            pricing_effective_date,
-            db,
-        )
-
     return await _resolve_estimate_catalog_refs_direct(
         revision,
         takeoff,
@@ -575,25 +359,6 @@ def _build_estimate_job_input_payload(
     pricing_effective_date: date,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build persistence payloads for estimate job input rows."""
-
-    helper = cast(
-        _EstimateJobInputPayloadBuilder | None,
-        _compat_attr(
-            "_build_estimate_job_input_payload",
-            "build_estimate_job_input_payload",
-            default=None,
-        ),
-    )
-    if helper is not None:
-        return helper(
-            estimate_job,
-            revision,
-            takeoff,
-            request,
-            normalized_refs,
-            pricing_mode=pricing_mode,
-            pricing_effective_date=pricing_effective_date,
-        )
 
     return _build_estimate_job_input_payload_direct(
         estimate_job,
@@ -700,6 +465,7 @@ async def create_revision_estimate_version(
         revision = await _get_active_revision(revision_id, db)
         if revision is None:
             raise_not_found("Drawing revision", str(revision_id))
+        assert revision is not None
 
         takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
         if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
@@ -723,6 +489,7 @@ async def create_revision_estimate_version(
         revision = await _get_active_revision(revision_id, db, for_update=True)
         if revision is None:
             raise_not_found("Drawing revision", str(revision_id))
+        assert revision is not None
 
         takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
         if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
@@ -781,7 +548,7 @@ async def create_revision_estimate_version(
         async def _after_commit() -> None:
             await _publish_job_enqueue_intent(
                 estimate_job.id,
-                publisher=_revisions_module().enqueue_estimate_job,
+                publisher=enqueue_estimate_job,
                 suppress_exceptions=True,
             )
 

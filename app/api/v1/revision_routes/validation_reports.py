@@ -6,7 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.revision_compat import _get_active_validation_report_or_404
+from app.api.v1.revision_lineage import _get_active_validation_report_or_404
 from app.db.session import get_db
 from app.schemas.validation_report import (
     ValidationReportResponse,

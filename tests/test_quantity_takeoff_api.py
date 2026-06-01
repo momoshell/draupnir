@@ -20,8 +20,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import IdempotencyReservation
-from app.api.v1 import revisions as revisions_module
 from app.api.v1.revision_routes import estimates as estimates_routes_module
+from app.api.v1.revision_routes import quantity_takeoffs as quantity_takeoffs_routes_module
 from app.api.v1.revisions import revisions_router
 from app.db import session as session_module
 from app.db.session import get_db
@@ -620,58 +620,64 @@ def test_create_revision_quantity_takeoff_replays_idempotent_response(monkeypatc
         suppress_exceptions: bool = False,
     ) -> None:
         _ = suppress_exceptions
-        assert publisher is revisions_module.enqueue_quantity_takeoff_job
+        assert publisher is quantity_takeoffs_routes_module.enqueue_quantity_takeoff_job
         publisher(job_id)
 
     def fake_enqueue_quantity_takeoff_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
-    def fail_enqueue_ingest_job(job_id: UUID) -> None:
-        raise AssertionError(f"unexpected ingest enqueue for {job_id}")
+    async def fake_get_active_revision_manifest_or_409(
+        revision_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        manifest_result = await fake_get_revision_manifest(revision_id, db)
+        assert manifest_result is not None
+        return manifest_result
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-    monkeypatch.setattr(revisions_module, "_get_revision_manifest", fake_get_revision_manifest)
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision_manifest_or_409",
+        fake_get_active_revision_manifest_or_409,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
         "_get_active_validation_report_or_404",
         fake_get_validation_report,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "replay_idempotency_response",
+        quantity_takeoffs_routes_module,
+        "_replay_idempotency_response",
         fake_replay_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "claim_idempotency_response",
+        quantity_takeoffs_routes_module,
+        "_claim_idempotency_response",
         fake_claim_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        quantity_takeoffs_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "_enqueue_quantity_takeoff_job",
+        quantity_takeoffs_routes_module,
+        "enqueue_quantity_takeoff_job",
         fake_enqueue_quantity_takeoff_job,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        revisions_module,
-        "_enqueue_ingest_job",
-        fail_enqueue_ingest_job,
-        raising=False,
     )
 
     response = client.post(
@@ -754,36 +760,52 @@ def test_create_revision_quantity_takeoff_returns_job_without_idempotency_key(
         suppress_exceptions: bool = False,
     ) -> None:
         _ = suppress_exceptions
-        assert publisher is revisions_module.enqueue_quantity_takeoff_job
+        assert publisher is quantity_takeoffs_routes_module.enqueue_quantity_takeoff_job
         publisher(job_id)
 
     def fake_enqueue_quantity_takeoff_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-    monkeypatch.setattr(revisions_module, "_get_revision_manifest", fake_get_revision_manifest)
+    async def fake_get_active_revision_manifest_or_409(
+        revision_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        manifest_result = await fake_get_revision_manifest(revision_id, db)
+        assert manifest_result is not None
+        return manifest_result
+
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision_manifest_or_409",
+        fake_get_active_revision_manifest_or_409,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
         "_get_active_validation_report_or_404",
         fake_get_validation_report,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        quantity_takeoffs_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
         "enqueue_quantity_takeoff_job",
         fake_enqueue_quantity_takeoff_job,
     )
@@ -849,7 +871,7 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         _ = (revision_value, takeoff_value, db)
         pricing_effective_dates.append(pricing_effective_date)
         return [
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[0].ref_type,
                 selection_id=request_refs[0].selection_id,
                 selection_key=request_refs[0].selection_key,
@@ -859,7 +881,7 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
                 quantity_item_id=request_refs[0].quantity_item_id,
                 formula_inputs=request_refs[0].formula_inputs,
             ),
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[1].ref_type,
                 selection_id=request_refs[1].selection_id,
                 selection_key=request_refs[1].selection_key,
@@ -926,7 +948,7 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         suppress_exceptions: bool = False,
     ) -> None:
         _ = suppress_exceptions
-        assert publisher is revisions_module.enqueue_estimate_job
+        assert publisher is estimates_routes_module.enqueue_estimate_job
         publisher(job_id)
 
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
@@ -949,43 +971,47 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         pricing_contract_calls.append(job_created_at)
         return ("derived_from_job_created_at_utc", job_created_at.date())
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "replay_idempotency_response",
+        estimates_routes_module,
+        "_replay_idempotency_response",
         fake_replay_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "claim_idempotency_response",
+        estimates_routes_module,
+        "_claim_idempotency_response",
         fake_claim_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        estimates_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        estimates_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
     monkeypatch.setattr(estimates_routes_module, "_utc_now", fake_utc_now)
     monkeypatch.setattr(
         estimates_routes_module,
@@ -993,12 +1019,12 @@ def test_create_revision_estimate_version_replays_idempotent_response(monkeypatc
         fake_resolve_estimate_pricing_contract,
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_job_model_classes",
         lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_build_mapped_instance",
         lambda _model_class, values: type("StubRecord", (), values.copy())(),
     )
@@ -1101,7 +1127,7 @@ def test_create_revision_estimate_version_returns_job_without_idempotency_key(
     ) -> list[Any]:
         _ = (revision_value, takeoff_value, pricing_effective_date, db)
         return [
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[0].ref_type,
                 selection_id=request_refs[0].selection_id,
                 selection_key=request_refs[0].selection_key,
@@ -1111,7 +1137,7 @@ def test_create_revision_estimate_version_returns_job_without_idempotency_key(
                 quantity_item_id=request_refs[0].quantity_item_id,
                 formula_inputs=request_refs[0].formula_inputs,
             ),
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[1].ref_type,
                 selection_id=request_refs[1].selection_id,
                 selection_key=request_refs[1].selection_key,
@@ -1145,46 +1171,50 @@ def test_create_revision_estimate_version_returns_job_without_idempotency_key(
         suppress_exceptions: bool = False,
     ) -> None:
         _ = suppress_exceptions
-        assert publisher is revisions_module.enqueue_estimate_job
+        assert publisher is estimates_routes_module.enqueue_estimate_job
         publisher(job_id)
 
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        estimates_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        estimates_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_job_model_classes",
         lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_build_mapped_instance",
         lambda _model_class, values: type("StubRecord", (), values.copy())(),
     )
@@ -1253,7 +1283,7 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
     ) -> list[Any]:
         _ = (revision_value, takeoff_value, pricing_effective_date, db)
         return [
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[0].ref_type,
                 selection_id=request_refs[0].selection_id,
                 selection_key=request_refs[0].selection_key,
@@ -1263,7 +1293,7 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
                 quantity_item_id=request_refs[0].quantity_item_id,
                 formula_inputs=request_refs[0].formula_inputs,
             ),
-            revisions_module._NormalizedEstimateCatalogRef(
+            estimates_routes_module._NormalizedEstimateCatalogRef(
                 ref_type=request_refs[1].ref_type,
                 selection_id=request_refs[1].selection_id,
                 selection_key=request_refs[1].selection_key,
@@ -1345,56 +1375,60 @@ def test_create_revision_estimate_version_rejects_idempotency_reuse_with_differe
         suppress_exceptions: bool = False,
     ) -> None:
         _ = suppress_exceptions
-        assert publisher is revisions_module.enqueue_estimate_job
+        assert publisher is estimates_routes_module.enqueue_estimate_job
         publisher(job_id)
 
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
         enqueued_job_ids.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "replay_idempotency_response",
+        estimates_routes_module,
+        "_replay_idempotency_response",
         fake_replay_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "claim_idempotency_response",
+        estimates_routes_module,
+        "_claim_idempotency_response",
         fake_claim_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        estimates_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        estimates_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_job_model_classes",
         lambda: (_EstimateJobInputRecord, _EstimateJobInputCatalogRefRecord),
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_build_mapped_instance",
         lambda _model_class, values: type("StubRecord", (), values.copy())(),
     )
@@ -1460,15 +1494,19 @@ def test_create_revision_estimate_version_rejects_non_gbp(monkeypatch: Any) -> N
         _ = (publisher, suppress_exceptions)
         publish_calls.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -1526,18 +1564,22 @@ def test_create_revision_estimate_version_rejects_non_allowed_quantity_gate_befo
     def fake_enqueue_estimate_job(job_id: UUID) -> None:
         enqueue_calls.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
 
     response = client.post(
         f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
@@ -1588,15 +1630,19 @@ def test_create_revision_estimate_version_rejects_untrusted_takeoff(monkeypatch:
         _ = (publisher, suppress_exceptions)
         publish_calls.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -1652,7 +1698,7 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
         db: AsyncSession,
     ) -> list[Any]:
         _ = (revision_value, takeoff_value, request_refs, pricing_effective_date, db)
-        revisions_module._raise_estimate_input_invalid(
+        estimates_routes_module._raise_estimate_input_invalid(
             "Estimate refs must use the current catalog selection checksum.",
             details={"selection_checksum_sha256": "mismatch"},
         )
@@ -1701,35 +1747,39 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
         _ = (publisher, suppress_exceptions)
         publish_calls.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        estimates_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "replay_idempotency_response",
+        estimates_routes_module,
+        "_replay_idempotency_response",
         fake_replay_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "claim_idempotency_response",
+        estimates_routes_module,
+        "_claim_idempotency_response",
         fake_claim_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "complete_idempotency_response",
+        estimates_routes_module,
+        "_complete_idempotency_response",
         fake_complete_idempotency_response,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -1799,13 +1849,13 @@ async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_befor
         return []
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(revisions_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
+    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
     monkeypatch.setattr(
-        revisions_module,
+        estimates_routes_module,
         "_resolve_estimate_catalog_refs",
         fake_resolve_estimate_catalog_refs,
     )
@@ -1835,18 +1885,20 @@ async def test_create_revision_estimate_version_persists_mapped_input_fields_and
     publish_calls: list[UUID] = []
     session_factory = session_module.AsyncSessionLocal
     assert session_factory is not None
+    rate_key = f"labour:install:{seed.project_id}"
+    formula_id = f"formula:waste:{seed.project_id}"
 
     rate = _build_rate_catalog_entry(
         scope_type="global",
         project_id=None,
-        rate_key="labour:install",
+        rate_key=rate_key,
         checksum_sha256="a" * 64,
         effective_from=date(2026, 1, 1),
     )
     formula = _build_formula_definition(
         scope_type="global",
         project_id=None,
-        formula_id="formula:waste",
+        formula_id=formula_id,
         checksum_sha256="b" * 64,
     )
 
@@ -1856,7 +1908,9 @@ async def test_create_revision_estimate_version_persists_mapped_input_fields_and
         await db.commit()
 
     request_body["catalog_refs"][0]["selection_id"] = str(rate.id)
+    request_body["catalog_refs"][0]["selection_key"] = rate_key
     request_body["catalog_refs"][1]["selection_id"] = str(formula.id)
+    request_body["catalog_refs"][1]["selection_key"] = formula_id
 
     async def fake_publish_job_enqueue_intent(
         job_id: UUID,
@@ -1868,8 +1922,8 @@ async def test_create_revision_estimate_version_persists_mapped_input_fields_and
         publish_calls.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -1910,7 +1964,7 @@ async def test_create_revision_estimate_version_persists_mapped_input_fields_and
 
     assert len(ref_rows) == 2
     assert ref_rows[0].ref_type == "rate"
-    assert ref_rows[0].selection_key == "labour:install"
+    assert ref_rows[0].selection_key == rate_key
     assert ref_rows[0].rate_catalog_entry_id == rate.id
     assert ref_rows[0].material_catalog_entry_id is None
     assert ref_rows[0].formula_definition_id is None
@@ -1918,7 +1972,7 @@ async def test_create_revision_estimate_version_persists_mapped_input_fields_and
     assert ref_rows[0].selection_context_json["line_key"] == "line-rate-1"
     assert ref_rows[0].selection_context_json["quantity_item_id"] == str(seed.quantity_item_id)
     assert ref_rows[1].ref_type == "formula"
-    assert ref_rows[1].selection_key == "formula:waste"
+    assert ref_rows[1].selection_key == formula_id
     assert ref_rows[1].rate_catalog_entry_id is None
     assert ref_rows[1].formula_definition_id == formula.id
     assert ref_rows[1].catalog_checksum_sha256 == "b" * 64
@@ -1991,8 +2045,8 @@ async def test_create_revision_estimate_version_rejects_stale_or_superseded_rate
         publish_calls.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -2058,6 +2112,7 @@ async def test_create_revision_estimate_version_invalid_catalog_retry_reuses_ide
     publish_calls: list[UUID] = []
     session_factory = session_module.AsyncSessionLocal
     assert session_factory is not None
+    idempotency_key = f"estimate-{seed.project_id}"
 
     stale_rate = _build_rate_catalog_entry(
         scope_type="project",
@@ -2100,14 +2155,14 @@ async def test_create_revision_estimate_version_invalid_catalog_retry_reuses_ide
         publish_calls.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
     first_response = await async_client.post(
         f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
-        headers={"Idempotency-Key": "estimate-1"},
+        headers={"Idempotency-Key": idempotency_key},
         json=request_body,
     )
 
@@ -2121,7 +2176,7 @@ async def test_create_revision_estimate_version_invalid_catalog_retry_reuses_ide
 
     second_response = await async_client.post(
         f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
-        headers={"Idempotency-Key": "estimate-1"},
+        headers={"Idempotency-Key": idempotency_key},
         json=request_body,
     )
 
@@ -2177,8 +2232,8 @@ async def test_create_revision_estimate_version_rejects_cross_project_project_re
         publish_calls.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -2308,8 +2363,8 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
         publish_calls.append(job_id)
 
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        estimates_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
 
@@ -2477,7 +2532,11 @@ async def test_list_revision_quantity_takeoffs_hides_soft_deleted_lineage_after_
         _ = (db, for_update)
         return stale_revision if revision_id == seed.revision_id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
 
     response = await async_client.get(f"/v1/revisions/{seed.revision_id}/quantity-takeoffs")
 
@@ -2508,7 +2567,11 @@ async def test_get_revision_quantity_takeoff_hides_soft_deleted_lineage_after_st
         _ = (db, for_update)
         return stale_revision if revision_id == seed.revision_id else None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
 
     response = await async_client.get(
         f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}"
@@ -2551,9 +2614,13 @@ async def test_list_revision_quantity_takeoff_items_hides_soft_deleted_lineage_a
         assert takeoff_id == seed.takeoff_id
         return stale_takeoff
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
         "_get_revision_quantity_takeoff_or_404",
         fake_get_revision_quantity_takeoff_or_404,
     )
@@ -2580,7 +2647,7 @@ async def test_create_revision_quantity_takeoff_rechecks_locked_lineage_before_i
     stale_revision = _build_revision(revision_id=seed.revision_id)
     stale_revision.project_id = seed.project_id
     stale_revision.source_file_id = seed.file_id
-    original_get_active_revision = revisions_module._get_active_revision
+    original_get_active_revision = quantity_takeoffs_routes_module._get_active_revision
 
     async def fake_get_active_revision(
         revision_id: UUID,
@@ -2610,14 +2677,18 @@ async def test_create_revision_quantity_takeoff_rechecks_locked_lineage_before_i
         assert revision_id == seed.revision_id
         return _build_validation_report()
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
         "_get_active_revision_manifest_or_409",
         fake_get_active_revision_manifest_or_409,
     )
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
         "_get_active_validation_report_or_404",
         fake_get_active_validation_report_or_404,
     )
@@ -2684,25 +2755,41 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
     def fake_enqueue_quantity_takeoff_job(job_id: UUID) -> None:
         enqueue_calls.append(job_id)
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
-    monkeypatch.setattr(revisions_module, "_get_revision_manifest", fake_get_revision_manifest)
+    async def fake_get_active_revision_manifest_or_409(
+        revision_id: UUID,
+        db: AsyncSession,
+    ) -> SimpleNamespace:
+        manifest_result = await fake_get_revision_manifest(revision_id, db)
+        assert manifest_result is not None
+        return manifest_result
+
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision_manifest_or_409",
+        fake_get_active_revision_manifest_or_409,
+    )
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
         "_get_active_validation_report_or_404",
         fake_get_validation_report,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "prepare_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_prepare_job_enqueue_intent",
         fake_prepare_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
-        "publish_job_enqueue_intent",
+        quantity_takeoffs_routes_module,
+        "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
     monkeypatch.setattr(
-        revisions_module,
+        quantity_takeoffs_routes_module,
         "enqueue_quantity_takeoff_job",
         fake_enqueue_quantity_takeoff_job,
     )
@@ -2735,7 +2822,11 @@ def test_revision_quantity_takeoff_routes_return_404_for_unknown_revision(
         _ = (revision_id, db, for_update)
         return None
 
-    monkeypatch.setattr(revisions_module, "_get_active_revision", fake_get_active_revision)
+    monkeypatch.setattr(
+        quantity_takeoffs_routes_module,
+        "_get_active_revision",
+        fake_get_active_revision,
+    )
 
     create_response = client.post(f"/v1/revisions/{unknown_revision_id}/quantity-takeoffs")
     list_response = client.get(f"/v1/revisions/{unknown_revision_id}/quantity-takeoffs")
