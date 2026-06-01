@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
+from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
 from app.api.v1.revision_compat import (
     _get_active_revision_manifest_or_409,
     _manifest_counts,
@@ -36,9 +38,6 @@ from app.schemas.revision import (
 )
 
 materialization_router = APIRouter()
-
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
 
 
 @materialization_router.get(

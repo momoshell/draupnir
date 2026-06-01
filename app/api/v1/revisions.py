@@ -17,6 +17,7 @@ from app.api.idempotency import (
 from app.api.idempotency import (
     replay_idempotency_response as _replay_idempotency_response,
 )
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from app.api.v1.revision_estimate_inputs import (
     _build_estimate_job_input_payload as _estimate_inputs_build_estimate_job_input_payload,
 )
@@ -146,8 +147,8 @@ from app.schemas.estimate import (
 
 revisions_router = APIRouter()
 
-_DEFAULT_PAGE_SIZE = 50
-_MAX_PAGE_SIZE = 200
+_DEFAULT_PAGE_SIZE = DEFAULT_PAGE_SIZE
+_MAX_PAGE_SIZE = MAX_PAGE_SIZE
 
 
 _get_active_file = _lineage_get_active_file

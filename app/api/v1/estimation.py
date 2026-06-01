@@ -26,7 +26,12 @@ from app.api.idempotency import (
     replay_idempotency_response,
     run_idempotent_mutation,
 )
-from app.api.pagination import decode_cursor_payload, encode_cursor_payload, raise_invalid_cursor
+from app.api.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
+    decode_keyset_cursor,
+    encode_keyset_cursor,
+)
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
@@ -73,7 +78,7 @@ class _TimestampCursor(BaseModel):
 
 
 def _encode_timestamp_cursor(created_at: datetime, row_id: UUID) -> str:
-    return encode_cursor_payload(
+    return encode_keyset_cursor(
         {
             "created_at": created_at.isoformat(),
             "id": str(row_id),
@@ -82,10 +87,7 @@ def _encode_timestamp_cursor(created_at: datetime, row_id: UUID) -> str:
 
 
 def _decode_timestamp_cursor(cursor: str) -> tuple[datetime, UUID]:
-    try:
-        payload = _TimestampCursor.model_validate(decode_cursor_payload(cursor))
-    except Exception as exc:  # pragma: no cover - normalized by helper
-        raise_invalid_cursor(exc)
+    payload = decode_keyset_cursor(cursor, _TimestampCursor)
     return payload.created_at, payload.id
 
 
@@ -724,7 +726,10 @@ async def get_rate(
 async def list_rates(
     db: Annotated[AsyncSession, Depends(get_db)],
     cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
-    limit: Annotated[int, Query(ge=1, le=200, description="Page size")] = 50,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Page size"),
+    ] = DEFAULT_PAGE_SIZE,
     scope_type: Annotated[
         CatalogScopeType | None,
         Query(description="Filter by scope type"),
@@ -850,7 +855,10 @@ async def get_material(
 async def list_materials(
     db: Annotated[AsyncSession, Depends(get_db)],
     cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
-    limit: Annotated[int, Query(ge=1, le=200, description="Page size")] = 50,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Page size"),
+    ] = DEFAULT_PAGE_SIZE,
     scope_type: Annotated[
         CatalogScopeType | None,
         Query(description="Filter by scope type"),
@@ -976,7 +984,10 @@ async def get_formula(
 async def list_formulas(
     db: Annotated[AsyncSession, Depends(get_db)],
     cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
-    limit: Annotated[int, Query(ge=1, le=200, description="Page size")] = 50,
+    limit: Annotated[
+        int,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Page size"),
+    ] = DEFAULT_PAGE_SIZE,
     scope_type: Annotated[
         CatalogScopeType | None,
         Query(description="Filter by scope type"),

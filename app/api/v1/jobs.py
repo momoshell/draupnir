@@ -20,9 +20,14 @@ from app.api.idempotency import (
     run_idempotent_mutation,
 )
 from app.api.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE,
     decode_cursor_payload,
-    encode_cursor_payload,
+    encode_keyset_cursor,
     raise_invalid_cursor,
+    read_cursor_datetime,
+    read_cursor_int,
+    read_cursor_uuid,
 )
 from app.core.errors import ErrorCode
 from app.core.exceptions import raise_not_found
@@ -40,8 +45,6 @@ from app.schemas.job import JobEventPage, JobEventRead, JobRead
 
 jobs_router = APIRouter()
 
-_DEFAULT_EVENTS_LIMIT = 50
-_MAX_EVENTS_LIMIT = 200
 _TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
 
 _IDEMPOTENT_MUTATION_OPS = IdempotentMutationOps(
@@ -175,7 +178,7 @@ def _encode_job_events_cursor(event: JobEvent) -> str:
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
 
-    return encode_cursor_payload(
+    return encode_keyset_cursor(
         {
             "created_at": created_at.astimezone(UTC).isoformat(),
             "sequence_id": event.sequence_id,
@@ -187,16 +190,16 @@ def _encode_job_events_cursor(event: JobEvent) -> str:
 
 def _decode_job_events_cursor(cursor: str) -> tuple[datetime, int | None, UUID]:
     """Decode a pagination cursor into its sort key values."""
-    try:
-        payload = decode_cursor_payload(cursor)
-        created_at = datetime.fromisoformat(str(payload["created_at"]))
-        sequence_id_raw = payload.get("sequence_id")
-        sequence_id = int(sequence_id_raw) if sequence_id_raw is not None else None
-        if sequence_id is not None and sequence_id < 0:
-            raise ValueError("sequence_id must be non-negative")
-        cursor_id = UUID(str(payload["id"]))
-    except (ValueError, TypeError, KeyError) as exc:
-        raise_invalid_cursor(exc)
+    payload = decode_cursor_payload(cursor)
+    created_at = read_cursor_datetime(payload, "created_at")
+    sequence_id = (
+        read_cursor_int(payload, "sequence_id")
+        if "sequence_id" in payload and payload["sequence_id"] is not None
+        else None
+    )
+    if sequence_id is not None and sequence_id < 0:
+        raise_invalid_cursor(ValueError("sequence_id must be non-negative"))
+    cursor_id = read_cursor_uuid(payload, "id")
 
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
@@ -231,8 +234,8 @@ async def list_job_events(
     cursor: Annotated[str | None, Query(description="Opaque pagination cursor")] = None,
     limit: Annotated[
         int,
-        Query(ge=1, le=_MAX_EVENTS_LIMIT, description="Page size"),
-    ] = _DEFAULT_EVENTS_LIMIT,
+        Query(ge=1, le=MAX_PAGE_SIZE, description="Page size"),
+    ] = DEFAULT_PAGE_SIZE,
 ) -> JobEventPage:
     """Return cursor-paginated lifecycle events for a single job."""
     await _get_job_or_404(db, job_id)
