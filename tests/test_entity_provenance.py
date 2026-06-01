@@ -293,3 +293,23 @@ def test_validate_entity_provenance_rejects_invalid_hash() -> None:
                 "notes": "note",
             }
         )
+
+
+def test_validate_entity_provenance_normalizes_prefixed_hash_with_whitespace() -> None:
+    canonical = validate_entity_provenance(
+        {
+            "origin": "source_direct",
+            "adapter": "dxf",
+            "source_ref": None,
+            "source_identity": None,
+            "source_hash": (
+                "  sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789\n"
+            ),
+            "extraction_path": "entities[0]",
+            "notes": "note",
+        }
+    )
+
+    assert canonical["source_hash"] == (
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    )

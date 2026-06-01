@@ -20,6 +20,7 @@ from app.estimating.engine import (
     formula_definition_from_json,
     formula_definition_from_selected_formula,
 )
+from app.estimating.engine._decimal import _decimal_text
 from app.estimating.formulas import (
     FormulaDefinition,
     FormulaInputDefinition,
@@ -32,6 +33,22 @@ SCALAR = ValueContract(kind="scalar")
 MONEY_GBP = ValueContract(kind="money", currency="GBP")
 QUANTITY_M = ValueContract(kind="quantity", unit="m")
 RATE_GBP_PER_M = ValueContract(kind="rate", currency="GBP", per_unit="m")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("12.3400"), "12.34"),
+        (Decimal("1.2000"), "1.2"),
+        (Decimal("5.000"), "5"),
+        (Decimal("0.000"), "0"),
+    ],
+)
+def test_decimal_text_normalizes_estimate_engine_decimal_strings(
+    value: Decimal,
+    expected: str,
+) -> None:
+    assert _decimal_text(value) == expected
 
 
 def test_engine_contracts_expose_deterministic_ids_and_frozen_specs() -> None:

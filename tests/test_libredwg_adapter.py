@@ -1105,3 +1105,23 @@ async def test_libredwg_adapter_terminates_and_kills_process_on_cancellation(
 
     assert process.terminate_calls == 1
     assert process.kill_calls == 1
+
+
+def test_libredwg_hash_helpers_preserve_raw_and_prefixed_forms() -> None:
+    value = {
+        "record_type": "LINE",
+        "handle": "1A",
+        "layer_name": "Walls",
+        "layout_name": "Model",
+        "block_name": None,
+        "geometry": {
+            "start": {"x": 1.0, "y": 2.0, "z": 0.0},
+            "end": {"x": 4.0, "y": 6.0, "z": 0.0},
+        },
+    }
+    canonical_payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    expected_raw_hash = adapter_module._hash_text(canonical_payload)
+
+    assert adapter_module._canonical_hash_json_value(value) == expected_raw_hash
+    assert adapter_module._hash_json_value(value) == f"sha256:{expected_raw_hash}"
+    assert adapter_module._hash_json_value(value) != expected_raw_hash

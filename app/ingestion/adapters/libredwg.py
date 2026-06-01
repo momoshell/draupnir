@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import resource
@@ -16,7 +15,12 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
-from app.ingestion.canonical import build_entity_provenance
+from app.ingestion.canonical.entity_provenance import build_entity_provenance
+from app.ingestion.canonical.hashing import (
+    sha256_canonical_json_hex,
+    sha256_canonical_json_prefixed,
+    sha256_text_hex,
+)
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterDiagnostic,
@@ -1143,16 +1147,15 @@ def _safe_record_projection(
 
 
 def _hash_json_value(value: JSONValue) -> str:
-    return f"sha256:{_canonical_hash_json_value(value)}"
+    return sha256_canonical_json_prefixed(value)
 
 
 def _canonical_hash_json_value(value: JSONValue) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return _hash_text(payload)
+    return sha256_canonical_json_hex(value)
 
 
 def _hash_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return sha256_text_hex(value)
 
 
 def _source_ref(source: AdapterSource) -> str:

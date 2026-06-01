@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from app.ingestion.canonical import build_entity_provenance
+from app.ingestion.canonical.geometry import canonical_bbox_from_points
 from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterDescriptor,
@@ -982,21 +983,17 @@ def _scaled_points_payload(
 
 
 def _points_bbox_payload(points: tuple[dict[str, JSONValue], ...]) -> dict[str, JSONValue]:
-    x_values = tuple(_point_component(point, "x") for point in points)
-    y_values = tuple(_point_component(point, "y") for point in points)
-    z_values = tuple(_point_component(point, "z") for point in points)
-    return {
-        "min": {
-            "x": min(x_values),
-            "y": min(y_values),
-            "z": min(z_values),
-        },
-        "max": {
-            "x": max(x_values),
-            "y": max(y_values),
-            "z": max(z_values),
-        },
-    }
+    return cast(
+        dict[str, JSONValue],
+        canonical_bbox_from_points(
+            {
+                "x": _point_component(point, "x"),
+                "y": _point_component(point, "y"),
+                "z": _point_component(point, "z"),
+            }
+            for point in points
+        ),
+    )
 
 
 def _polyline_measure(
@@ -1133,18 +1130,23 @@ def _bbox_payload(
     start: dict[str, JSONValue],
     end: dict[str, JSONValue],
 ) -> dict[str, JSONValue]:
-    return {
-        "min": {
-            "x": min(_point_component(start, "x"), _point_component(end, "x")),
-            "y": min(_point_component(start, "y"), _point_component(end, "y")),
-            "z": min(_point_component(start, "z"), _point_component(end, "z")),
-        },
-        "max": {
-            "x": max(_point_component(start, "x"), _point_component(end, "x")),
-            "y": max(_point_component(start, "y"), _point_component(end, "y")),
-            "z": max(_point_component(start, "z"), _point_component(end, "z")),
-        },
-    }
+    return cast(
+        dict[str, JSONValue],
+        canonical_bbox_from_points(
+            (
+                {
+                    "x": _point_component(start, "x"),
+                    "y": _point_component(start, "y"),
+                    "z": _point_component(start, "z"),
+                },
+                {
+                    "x": _point_component(end, "x"),
+                    "y": _point_component(end, "y"),
+                    "z": _point_component(end, "z"),
+                },
+            )
+        ),
+    )
 
 
 def _line_length(start: dict[str, JSONValue], end: dict[str, JSONValue]) -> float:

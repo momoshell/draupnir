@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import types
 from collections.abc import Iterator
 from math import isfinite
@@ -12,12 +14,15 @@ from typing import Any, NoReturn, cast
 import ezdxf
 import pytest
 
+from app.ingestion.adapters import ezdxf as ezdxf_adapter_module
 from app.ingestion.adapters.ezdxf import EzdxfAdapter
+from app.ingestion.canonical.geometry import canonical_bbox_from_points
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
     AdapterTimeout,
     IngestionAdapter,
     InputFamily,
+    JSONValue,
     ProgressUpdate,
 )
 from app.ingestion.loader import load_adapter
@@ -334,6 +339,84 @@ def _load_ezdxf_adapter() -> IngestionAdapter:
 
 def input_family() -> InputFamily:
     return InputFamily.DXF
+
+
+def test_ezdxf_entity_fingerprint_hashes_canonical_json_payload() -> None:
+    geometry: dict[str, JSONValue] = {
+        "end": {"z": 4.0, "y": -3.0, "x": 7.5},
+        "start": {"z": 1.0, "y": 2.5, "x": -1.25},
+    }
+    expected_geometry: dict[str, JSONValue] = {
+        "start": {"x": -1.25, "y": 2.5, "z": 1.0},
+        "end": {"x": 7.5, "y": -3.0, "z": 4.0},
+    }
+    expected_payload: dict[str, JSONValue] = {
+        "native_type": "LINE",
+        "handle": "",
+        "layout_name": "Model",
+        "layer_name": "Walls",
+        "geometry": expected_geometry,
+    }
+    expected_hash = hashlib.sha256(
+        json.dumps(expected_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    assert (
+        ezdxf_adapter_module._entity_fingerprint(
+            native_type="LINE",
+            handle="",
+            layout_name="Model",
+            layer_name="Walls",
+            geometry=geometry,
+        )
+        == expected_hash
+    )
+    assert (
+        ezdxf_adapter_module._entity_fingerprint(
+            native_type="LINE",
+            handle="",
+            layout_name="Model",
+            layer_name="Walls",
+            geometry=expected_geometry,
+        )
+        == expected_hash
+    )
+
+
+def test_ezdxf_line_bbox_payload_uses_coordinate_min_max() -> None:
+    start: dict[str, JSONValue] = {"x": 7.5, "y": 2.5, "z": 4.0}
+    end: dict[str, JSONValue] = {"x": -1.25, "y": -3.0, "z": 1.0}
+
+    assert ezdxf_adapter_module._bbox_payload(start, end) == {
+        "min": {"x": -1.25, "y": -3.0, "z": 1.0},
+        "max": {"x": 7.5, "y": 2.5, "z": 4.0},
+    }
+
+
+def test_canonical_bbox_from_points_uses_coordinate_min_max() -> None:
+    points = (
+        {"x": 7.5, "y": 2.5, "z": 4.0},
+        {"x": -1.25, "y": -3.0, "z": 1.0},
+        {"x": 0.0, "y": 9.0, "z": -2.0},
+    )
+
+    assert canonical_bbox_from_points(points) == {
+        "min": {"x": -1.25, "y": -3.0, "z": -2.0},
+        "max": {"x": 7.5, "y": 9.0, "z": 4.0},
+    }
+
+
+def test_ezdxf_polyline_bbox_payload_uses_pointwise_coordinate_min_max() -> None:
+    points: tuple[dict[str, JSONValue], ...] = (
+        {"x": 7.5, "y": 2.5, "z": 4.0},
+        {"x": -1.25, "y": -3.0, "z": 1.0},
+        {"x": 0.0, "y": 9.0, "z": -2.0},
+    )
+
+    assert ezdxf_adapter_module._points_bbox_payload(points) == {
+        "min": {"x": -1.25, "y": -3.0, "z": -2.0},
+        "max": {"x": 7.5, "y": 9.0, "z": 4.0},
+    }
 
 
 @pytest.mark.asyncio
