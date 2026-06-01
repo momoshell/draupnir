@@ -235,6 +235,39 @@ class EstimationFormulaCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255, description="Human-readable formula name")
     dsl_version: str = Field(..., min_length=1, max_length=32, description="Formula DSL version")
     output_key: str = Field(..., min_length=1, max_length=255, description="Output field key")
+    output_contract_json: object = Field(..., description="Formula output contract JSON")
+    declared_inputs_json: object = Field(
+        ...,
+        description="Formula declared input JSON array",
+    )
+    expression_json: object = Field(..., description="Formula expression JSON object")
+    rounding_json: object | None = Field(
+        None,
+        description="Optional formula-level rounding JSON object",
+    )
+    supersedes_formula_id: UUID | None = Field(
+        None,
+        description="Optional predecessor formula definition to supersede atomically",
+    )
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> EstimationFormulaCreate:
+        _validate_scope(self.scope_type, self.project_id)
+        return self
+
+
+class ValidatedEstimationFormulaCreate(BaseModel):
+    """Internally validated formula definition payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scope_type: CatalogScopeType = Field(..., description="Formula scope type")
+    project_id: UUID | None = Field(None, description="Owning project for project-scoped formulas")
+    formula_id: str = Field(..., min_length=1, max_length=255, description="Stable formula id")
+    version: int = Field(..., ge=1, description="Positive formula version")
+    name: str = Field(..., min_length=1, max_length=255, description="Human-readable formula name")
+    dsl_version: str = Field(..., min_length=1, max_length=32, description="Formula DSL version")
+    output_key: str = Field(..., min_length=1, max_length=255, description="Output field key")
     output_contract_json: dict[str, object] = Field(..., description="Formula output contract JSON")
     declared_inputs_json: list[dict[str, object]] = Field(
         ...,
@@ -250,45 +283,62 @@ class EstimationFormulaCreate(BaseModel):
         description="Optional predecessor formula definition to supersede atomically",
     )
 
-    @field_validator("output_contract_json", mode="before")
-    @classmethod
-    def validate_output_contract_json(cls, value: object) -> dict[str, object]:
-        return _require_json_object(value, field_name="output_contract_json")
-
-    @field_validator("declared_inputs_json", mode="before")
-    @classmethod
-    def validate_declared_inputs_json(cls, value: object) -> list[dict[str, object]]:
-        return _require_json_object_array(value, field_name="declared_inputs_json")
-
-    @field_validator("expression_json", mode="before")
-    @classmethod
-    def validate_expression_json(cls, value: object) -> dict[str, object]:
-        return _require_json_object(value, field_name="expression_json")
-
-    @field_validator("rounding_json", mode="before")
-    @classmethod
-    def validate_rounding_json(cls, value: object) -> dict[str, object] | None:
-        if value is None:
-            return None
-        return _require_json_object(value, field_name="rounding_json")
-
     @model_validator(mode="after")
-    def validate_scope_and_definition(self) -> EstimationFormulaCreate:
+    def validate_scope(self) -> ValidatedEstimationFormulaCreate:
         _validate_scope(self.scope_type, self.project_id)
-        formula_checksum_sha256(
-            scope_type=self.scope_type,
-            project_id=self.project_id,
-            formula_id=self.formula_id,
-            version=self.version,
-            name=self.name,
-            dsl_version=self.dsl_version,
-            output_key=self.output_key,
-            output_contract_json=self.output_contract_json,
-            declared_inputs_json=self.declared_inputs_json,
-            expression_json=self.expression_json,
-            rounding_json=self.rounding_json,
-        )
         return self
+
+
+def validate_formula_create(
+    payload: EstimationFormulaCreate,
+) -> ValidatedEstimationFormulaCreate:
+    output_contract_json = _require_json_object(
+        payload.output_contract_json,
+        field_name="output_contract_json",
+    )
+    declared_inputs_json = _require_json_object_array(
+        payload.declared_inputs_json,
+        field_name="declared_inputs_json",
+    )
+    expression_json = _require_json_object(
+        payload.expression_json,
+        field_name="expression_json",
+    )
+    rounding_json = None
+    if payload.rounding_json is not None:
+        rounding_json = _require_json_object(
+            payload.rounding_json,
+            field_name="rounding_json",
+        )
+
+    formula_checksum_sha256(
+        scope_type=payload.scope_type,
+        project_id=payload.project_id,
+        formula_id=payload.formula_id,
+        version=payload.version,
+        name=payload.name,
+        dsl_version=payload.dsl_version,
+        output_key=payload.output_key,
+        output_contract_json=output_contract_json,
+        declared_inputs_json=declared_inputs_json,
+        expression_json=expression_json,
+        rounding_json=rounding_json,
+    )
+
+    return ValidatedEstimationFormulaCreate(
+        scope_type=payload.scope_type,
+        project_id=payload.project_id,
+        formula_id=payload.formula_id,
+        version=payload.version,
+        name=payload.name,
+        dsl_version=payload.dsl_version,
+        output_key=payload.output_key,
+        output_contract_json=output_contract_json,
+        declared_inputs_json=declared_inputs_json,
+        expression_json=expression_json,
+        rounding_json=rounding_json,
+        supersedes_formula_id=payload.supersedes_formula_id,
+    )
 
 
 class EstimationFormulaRead(BaseModel):

@@ -586,11 +586,77 @@ class TestEstimationCatalogApiErrorPaths:
         create_response = await async_client.post("/v1/estimation/formulas", json=payload)
 
         assert create_response.status_code == 422
-        assert create_response.json()["error"]["code"] == "VALIDATION_ERROR"
+        assert create_response.json()["error"]["code"] == "INPUT_INVALID"
 
         list_response = await async_client.get("/v1/estimation/formulas")
         assert list_response.status_code == 200
         assert list_response.json()["items"] == []
+
+    async def test_create_formula_rejects_subdocument_shape_with_input_invalid(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(async_client, name="Formula Shape Validation Project")
+        payload = _valid_formula_payload(project_id=project_id)
+        payload["rounding_json"] = []
+
+        create_response = await async_client.post("/v1/estimation/formulas", json=payload)
+
+        assert create_response.status_code == 422
+        assert create_response.json()["error"]["code"] == "INPUT_INVALID"
+
+        list_response = await async_client.get("/v1/estimation/formulas")
+        assert list_response.status_code == 200
+        assert list_response.json()["items"] == []
+
+    async def test_create_formula_invalid_dsl_does_not_poison_idempotency_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+
+        project_id = await _create_project(
+            async_client,
+            name="Formula Idempotency Validation Project",
+        )
+        invalid_payload = _valid_formula_payload(project_id=project_id)
+        invalid_payload["expression_json"] = {
+            "op": "multiply",
+            "args": [
+                {"kind": "input", "name": "rate"},
+                {"kind": "input", "name": "quantity"},
+            ],
+        }
+        valid_payload = _valid_formula_payload(project_id=project_id)
+        headers = {"Idempotency-Key": "formula-invalid-then-valid-key"}
+
+        invalid_response = await async_client.post(
+            "/v1/estimation/formulas",
+            json=invalid_payload,
+            headers=headers,
+        )
+        first_valid_response = await async_client.post(
+            "/v1/estimation/formulas",
+            json=valid_payload,
+            headers=headers,
+        )
+        replayed_valid_response = await async_client.post(
+            "/v1/estimation/formulas",
+            json=valid_payload,
+            headers=headers,
+        )
+
+        assert invalid_response.status_code == 422
+        assert invalid_response.json()["error"]["code"] == "INPUT_INVALID"
+        assert first_valid_response.status_code == 201
+        assert replayed_valid_response.status_code == 201
+        assert first_valid_response.json() == replayed_valid_response.json()
 
 
 @requires_database
