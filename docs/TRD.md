@@ -978,8 +978,10 @@ Standard error behavior:
 - Errors use the standard envelope `{error:{code,message,details}}`.
 - Return `404` when the addressed project is missing or soft-deleted, or when
   the requested catalog/formula resource does not exist.
-- Return `422` with `INPUT_INVALID` for invalid Formula DSL payloads or invalid
-  request shape.
+- Return `422` with `VALIDATION_ERROR` for generic request body, path, or query
+  parsing/validation failures.
+- Return `422` with `INPUT_INVALID` for invalid Formula DSL subdocument shape or
+  Formula DSL semantic failures.
 - Return `409` with `DB_CONFLICT` for uniqueness conflicts, effective-date
   overlap conflicts, or invalid supersession/conflict cases.
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, NoReturn, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -61,6 +61,8 @@ from app.schemas.estimation_catalog import (
     EstimationRateCreate,
     EstimationRateListResponse,
     EstimationRateRead,
+    ValidatedEstimationFormulaCreate,
+    validate_formula_create,
 )
 
 estimation_router = APIRouter()
@@ -129,9 +131,20 @@ def _catalog_conflict_result(kind: str) -> IdempotentMutationKnownError:
     )
 
 
-def _raise_input_invalid(message: str) -> None:
+def _raise_input_invalid(message: str) -> NoReturn:
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
+        detail=create_error_response(
+            code=ErrorCode.INPUT_INVALID,
+            message=message,
+            details=None,
+        ),
+    )
+
+
+def _raise_unprocessable_input_invalid(message: str) -> NoReturn:
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=create_error_response(
             code=ErrorCode.INPUT_INVALID,
             message=message,
@@ -496,7 +509,7 @@ def _validate_material_supersession(
 
 
 def _validate_formula_supersession(
-    payload: EstimationFormulaCreate,
+    payload: EstimationFormulaCreate | ValidatedEstimationFormulaCreate,
     predecessor: EstimationFormula,
 ) -> None:
     if (
@@ -605,7 +618,7 @@ def _build_material(material_in: EstimationMaterialCreate) -> EstimationMaterial
     )
 
 
-def _build_formula(formula_in: EstimationFormulaCreate) -> EstimationFormula:
+def _build_formula(formula_in: ValidatedEstimationFormulaCreate) -> EstimationFormula:
     return EstimationFormula(
         scope_type=formula_in.scope_type,
         project_id=formula_in.project_id,
@@ -932,15 +945,20 @@ async def create_formula(
     db: Annotated[AsyncSession, Depends(get_db)],
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> EstimationFormulaRead | Response:
+    try:
+        validated_formula_in = validate_formula_create(formula_in)
+    except ValueError as exc:
+        _raise_unprocessable_input_invalid(str(exc))
+
     return await _create_catalog_entry(
-        payload=formula_in,
+        payload=validated_formula_in,
         db=db,
         idempotency_key=idempotency_key,
         fingerprint_namespace="estimation.formulas.create",
         path="/estimation/formulas",
         conflict_kind="Formula definition",
-        project_id=formula_in.project_id,
-        supersedes_id=formula_in.supersedes_formula_id,
+        project_id=validated_formula_in.project_id,
+        supersedes_id=validated_formula_in.supersedes_formula_id,
         get_predecessor=_get_formula_predecessor_or_404,
         validate_predecessor=_validate_formula_supersession,
         validate_effective_window=None,
