@@ -221,6 +221,9 @@ trustworthy without explicit scale context.
 Agents and users do not directly mutate CAD files. They create proposed
 changesets.
 
+Detailed Phase 9 changeset operation, lifecycle, validation, and revised-DXF
+contract lives in `docs/changesets.md`.
+
 Each changeset must declare the `base_revision_id` it was prepared against.
 Apply-time execution must re-check the current revision for the drawing. If the
 current revision no longer matches the declared base, the system must reject the

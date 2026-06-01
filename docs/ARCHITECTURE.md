@@ -149,6 +149,8 @@ stdout/stderr and exit status remain untrusted inputs.
 ### CAD Revision Engine
 
 Applies approved changesets to normalized data and exports revised CAD artifacts.
+The detailed Phase 9 operation contract, lifecycle, validation gates, and DXF
+support matrix live in `docs/changesets.md`.
 Changesets are prepared against a `base_revision_id` and applied with an
 optimistic current-revision check. If the addressed drawing has advanced since
 that base, the apply request fails with `REVISION_CONFLICT` rather than
