@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.revision_compat import _get_active_revision
+from app.api.v1.revision_lineage import _get_active_revision
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
 from app.models.adapter_run_output import AdapterRunOutput

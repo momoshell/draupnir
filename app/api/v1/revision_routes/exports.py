@@ -1,7 +1,7 @@
 """Revision export creation routes."""
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, status
@@ -25,6 +25,9 @@ from app.api.idempotency import (
 )
 from app.api.idempotency import (
     replay_idempotency_response as _replay_idempotency_response_direct,
+)
+from app.api.v1.revision_estimate_inputs import (
+    _raise_estimate_takeoff_gate_invalid as _raise_estimate_takeoff_gate_invalid_direct,
 )
 from app.api.v1.revision_lineage import _get_active_revision as _get_active_revision_direct
 from app.api.v1.revision_lineage import (
@@ -55,46 +58,19 @@ from app.schemas.job import JobRead
 
 exports_router = APIRouter()
 
-_MISSING = object()
-
-type _ActiveRevisionGetter = Callable[..., Awaitable[DrawingRevision | None]]
-type _RevisionTakeoffGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[QuantityTakeoff]]
-type _EstimateVersionGetter = Callable[[UUID, UUID, AsyncSession], Awaitable[EstimateVersion]]
-type _FingerprintBuilder = Callable[..., str]
-type _JobEnqueuePublisher = Callable[[UUID], None]
-type _PublishJobEnqueueIntent = Callable[..., Awaitable[bool]]
-type _ReplayIdempotencyResponse = Callable[..., Awaitable[Response | None]]
-type _CompleteIdempotencyResponse = Callable[..., Awaitable[Response]]
 type _ExportPreclaimLoader = Callable[[], Awaitable[None]]
 type _ExportJobCreator = Callable[[], Awaitable[Job]]
 
 
-def _compat_attr(*names: str, default: Any = _MISSING) -> Any:
-    """Return the first matching revision_compat attribute."""
+async def _get_active_revision(
+    revision_id: UUID,
+    db: AsyncSession,
+    *,
+    for_update: bool = False,
+) -> DrawingRevision | None:
+    """Route-local seam for active revision lookup."""
 
-    from app.api.v1 import revision_compat
-
-    for name in names:
-        if hasattr(revision_compat, name):
-            return getattr(revision_compat, name)
-    if default is not _MISSING:
-        return default
-    joined = ", ".join(names)
-    raise AttributeError(f"revision_compat is missing expected helper: {joined}")
-
-
-async def _get_active_revision(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for active revision lookup."""
-
-    helper = cast(
-        _ActiveRevisionGetter,
-        _compat_attr(
-            "_get_active_revision",
-            "get_active_revision",
-            default=_get_active_revision_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _get_active_revision_direct(revision_id, db, for_update=for_update)
 
 
 async def _get_locked_active_revision_or_404(
@@ -106,7 +82,8 @@ async def _get_locked_active_revision_or_404(
     revision = await _get_active_revision(revision_id, db, for_update=True)
     if revision is None:
         raise_not_found("Drawing revision", str(revision_id))
-    return cast(DrawingRevision, revision)
+    assert revision is not None
+    return revision
 
 
 async def _get_revision_quantity_takeoff_or_404(
@@ -114,17 +91,9 @@ async def _get_revision_quantity_takeoff_or_404(
     takeoff_id: UUID,
     db: AsyncSession,
 ) -> QuantityTakeoff:
-    """Compatibility wrapper for revision quantity takeoff lookup."""
+    """Route-local seam for revision quantity takeoff lookup."""
 
-    helper = cast(
-        _RevisionTakeoffGetter,
-        _compat_attr(
-            "_get_revision_quantity_takeoff_or_404",
-            "get_revision_quantity_takeoff_or_404",
-            default=_get_revision_quantity_takeoff_or_404_direct,
-        ),
-    )
-    return await helper(revision_id, takeoff_id, db)
+    return await _get_revision_quantity_takeoff_or_404_direct(revision_id, takeoff_id, db)
 
 
 async def _get_revision_estimate_version_or_404(
@@ -132,112 +101,61 @@ async def _get_revision_estimate_version_or_404(
     estimate_version_id: UUID,
     db: AsyncSession,
 ) -> EstimateVersion:
-    """Compatibility wrapper for revision estimate lookup."""
+    """Route-local seam for revision estimate lookup."""
 
-    helper = cast(
-        _EstimateVersionGetter,
-        _compat_attr(
-            "_get_revision_estimate_version_or_404",
-            "get_revision_estimate_version_or_404",
-            default=_get_revision_estimate_version_or_404_direct,
-        ),
+    return await _get_revision_estimate_version_or_404_direct(
+        revision_id,
+        estimate_version_id,
+        db,
     )
-    return await helper(revision_id, estimate_version_id, db)
 
 
 def _build_idempotency_fingerprint(*args: Any, **kwargs: Any) -> str:
-    """Compatibility wrapper for fingerprint construction."""
+    """Route-local seam for fingerprint construction."""
 
-    helper = cast(
-        _FingerprintBuilder,
-        _compat_attr(
-            "build_idempotency_fingerprint",
-            default=_build_idempotency_fingerprint_direct,
-        ),
-    )
-    return helper(*args, **kwargs)
+    return _build_idempotency_fingerprint_direct(*args, **kwargs)
 
 
 async def _replay_idempotency_response(*args: Any, **kwargs: Any) -> Response | None:
-    """Compatibility wrapper for idempotency replay."""
+    """Route-local seam for idempotency replay."""
 
-    helper = cast(
-        _ReplayIdempotencyResponse,
-        _compat_attr(
-            "replay_idempotency_response",
-            default=_replay_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _replay_idempotency_response_direct(*args, **kwargs)
 
 
 async def _claim_idempotency_response(*args: Any, **kwargs: Any) -> Any:
-    """Compatibility wrapper for idempotency claim."""
+    """Route-local seam for idempotency claim."""
 
-    helper = _compat_attr(
-        "claim_idempotency_response",
-        default=_claim_idempotency_response_direct,
-    )
-    return await helper(*args, **kwargs)
+    return await _claim_idempotency_response_direct(*args, **kwargs)
 
 
 async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
-    """Compatibility wrapper for idempotency completion."""
+    """Route-local seam for idempotency completion."""
 
-    helper = cast(
-        _CompleteIdempotencyResponse,
-        _compat_attr(
-            "complete_idempotency_response",
-            default=_complete_idempotency_response_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _complete_idempotency_response_direct(*args, **kwargs)
 
 
 def _prepare_job_enqueue_intent(job: Job) -> None:
-    """Compatibility wrapper for enqueue intent staging."""
+    """Route-local seam for enqueue intent staging."""
 
-    helper = _compat_attr(
-        "prepare_job_enqueue_intent",
-        default=_prepare_job_enqueue_intent_direct,
-    )
-    helper(job)
+    _prepare_job_enqueue_intent_direct(job)
 
 
 async def _publish_job_enqueue_intent(*args: Any, **kwargs: Any) -> bool:
-    """Compatibility wrapper for durable enqueue publication."""
+    """Route-local seam for durable enqueue publication."""
 
-    helper = cast(
-        _PublishJobEnqueueIntent,
-        _compat_attr(
-            "publish_job_enqueue_intent",
-            default=_publish_job_enqueue_intent_direct,
-        ),
-    )
-    return await helper(*args, **kwargs)
+    return await _publish_job_enqueue_intent_direct(*args, **kwargs)
 
 
 def _enqueue_export_job(job_id: UUID) -> None:
-    """Compatibility wrapper for export job queue publication."""
+    """Route-local seam for export job queue publication."""
 
-    helper = cast(
-        _JobEnqueuePublisher,
-        _compat_attr(
-            "enqueue_export_job",
-            default=_enqueue_export_job_direct,
-        ),
-    )
-    helper(job_id)
+    _enqueue_export_job_direct(job_id)
 
 
 def _raise_estimate_takeoff_gate_invalid(takeoff: QuantityTakeoff) -> None:
-    """Raise the standard invalid-takeoff export error."""
+    """Route-local seam for the standard invalid-takeoff export error."""
 
-    helper = _compat_attr(
-        "_raise_estimate_takeoff_gate_invalid",
-        "raise_estimate_takeoff_gate_invalid",
-    )
-    helper(takeoff)
+    _raise_estimate_takeoff_gate_invalid_direct(takeoff)
 
 
 def _build_export_request_body(

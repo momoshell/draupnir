@@ -786,3 +786,39 @@ async def test_create_export_revalidates_active_revision_after_idempotency_claim
     assert response.status_code == 404
     assert await _count_export_side_effects(lineage) == (0, 0, 0)
     assert await _count_idempotency_rows(idempotency_key) == 1
+
+
+async def test_publish_export_enqueue_uses_route_local_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = uuid4()
+    published: dict[str, object] = {}
+
+    async def fake_publish_job_enqueue_intent(
+        published_job_id: UUID,
+        *,
+        publisher: object,
+        suppress_exceptions: bool,
+    ) -> bool:
+        published["job_id"] = published_job_id
+        published["publisher"] = publisher
+        published["suppress_exceptions"] = suppress_exceptions
+        return True
+
+    def fake_enqueue_export_job(enqueued_job_id: UUID) -> None:
+        published["enqueued_job_id"] = enqueued_job_id
+
+    monkeypatch.setattr(
+        export_routes,
+        "_publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
+    monkeypatch.setattr(export_routes, "_enqueue_export_job", fake_enqueue_export_job)
+
+    await export_routes._publish_export_enqueue(job_id)
+
+    assert published == {
+        "job_id": job_id,
+        "publisher": fake_enqueue_export_job,
+        "suppress_exceptions": True,
+    }
