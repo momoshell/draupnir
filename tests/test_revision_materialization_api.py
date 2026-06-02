@@ -15,6 +15,7 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
+from app.models.cad_changeset import CadChangeSet
 from app.models.drawing_revision import DrawingRevision
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
@@ -310,6 +311,14 @@ class TestRevisionMaterializationApi:
         session_maker = session_module.AsyncSessionLocal
         assert session_maker is not None
 
+        changeset_id = uuid.uuid4()
+        null_origin_changeset = CadChangeSet(
+            id=changeset_id,
+            project_id=drawing_revision.project_id,
+            base_revision_id=drawing_revision.id,
+            status="applied",
+            created_by="test",
+        )
         null_origin_job = _clone_model(
             job,
             id=uuid.uuid4(),
@@ -326,7 +335,7 @@ class TestRevisionMaterializationApi:
             extraction_profile_id=None,
             source_job_id=null_origin_job.id,
             adapter_run_output_id=None,
-            changeset_id=uuid.uuid4(),
+            changeset_id=changeset_id,
             predecessor_revision_id=drawing_revision.id,
             revision_sequence=drawing_revision.revision_sequence + 1,
             revision_kind="changeset",
@@ -357,6 +366,10 @@ class TestRevisionMaterializationApi:
             )
             for layout in layouts
         ]
+
+        async with session_maker() as session:
+            session.add(null_origin_changeset)
+            await session.commit()
 
         async with session_maker() as session:
             session.add(null_origin_job)
