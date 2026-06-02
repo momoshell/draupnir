@@ -8,6 +8,7 @@ for Alembic autogenerate support. Example:
 """
 
 from . import adapter_run_output as adapter_run_output
+from . import cad_changeset as cad_changeset
 from . import drawing_revision as drawing_revision
 from . import estimate_job_input as estimate_job_input
 from . import estimate_version as estimate_version
