@@ -292,6 +292,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "quantity_takeoff_api": "db_api",
     "estimate_read_api": "db_api",
     "export_create_api": "db_api",
+    "changeset_api": "db_api",
     "revision_materialization_api": "db_api",
     "validation_report_api": "db_api",
     "revision_quantity_estimate_flow": "db_api",
