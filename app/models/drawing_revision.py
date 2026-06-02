@@ -44,6 +44,11 @@ class DrawingRevision(Base):
             ondelete="RESTRICT",
             name="fk_drawing_revisions_adapter_run_output_id_project_id_outputs",
         ),
+        ForeignKeyConstraint(
+            ["project_id", "changeset_id"],
+            ["cad_change_sets.project_id", "cad_change_sets.id"],
+            name="fk_drawing_revisions_project_id_changeset_id_change_sets",
+        ),
         UniqueConstraint(
             "id",
             "project_id",

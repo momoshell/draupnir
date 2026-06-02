@@ -14,6 +14,7 @@ from app.core.errors import ErrorCode
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
+from app.models.cad_changeset import CadChangeSet
 from app.models.generated_artifact import GeneratedArtifact
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
@@ -463,6 +464,13 @@ class TestValidationReportApi:
 
         changeset_id = uuid.uuid4()
         changeset_created_at = drawing_revision.created_at + timedelta(seconds=1)
+        changeset = CadChangeSet(
+            id=changeset_id,
+            project_id=drawing_revision.project_id,
+            base_revision_id=drawing_revision.id,
+            status="applied",
+            created_by="test",
+        )
         changeset_job = _clone_model(
             job,
             id=uuid.uuid4(),
@@ -485,6 +493,10 @@ class TestValidationReportApi:
             revision_kind="changeset",
             created_at=changeset_created_at,
         )
+
+        async with session_maker() as session:
+            session.add(changeset)
+            await session.commit()
 
         async with session_maker() as session:
             session.add(changeset_job)

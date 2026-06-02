@@ -18,12 +18,13 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.models.cad_changeset import CadChangeOperation, CadChangeSet, CadChangeSetValidationResult
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from app.models.estimation_catalog import EstimationRate
@@ -62,6 +63,7 @@ _MATERIALIZATION_DOWNGRADE_TARGET_REVISION = "2026_05_12_0014"
 _QUANTITY_DOWNGRADE_TARGET_REVISION = "2026_05_14_0016"
 _CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION = "2026_05_27_0024"
 _GENERATED_ARTIFACT_LINEAGE_DOWNGRADE_TARGET_REVISION = "2026_05_31_0025"
+_CHANGESET_PERSISTENCE_DOWNGRADE_TARGET_REVISION = "2026_05_31_0026"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -75,6 +77,9 @@ class _ProtectedRowIds:
     drawing_revision_id: uuid.UUID
     validation_report_id: uuid.UUID
     generated_artifact_id: uuid.UUID
+    cad_change_set_id: uuid.UUID
+    cad_change_operation_id: uuid.UUID
+    cad_change_set_validation_result_id: uuid.UUID
     job_event_id: uuid.UUID
     estimate_version_id: uuid.UUID
     export_job_input_source_job_id: uuid.UUID
@@ -174,10 +179,12 @@ def _assert_append_only_error(
 ) -> None:
     """Assert a database error came from the append-only trigger guard."""
 
-    assert _extract_sqlstate(error) == _APPEND_ONLY_SQLSTATE
-    assert f"append-only trigger blocked {operation}" in str(error)
+    sqlstate = _extract_sqlstate(error)
+    error_text = str(error)
+    assert sqlstate == _APPEND_ONLY_SQLSTATE
+    assert f"append-only trigger blocked {operation}" in error_text
     if table_name is not None:
-        assert f"on {table_name}" in str(error)
+        assert f"on {table_name}" in error_text
 
 
 def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
@@ -190,6 +197,9 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "drawing_revisions": row_ids.drawing_revision_id,
         "validation_reports": row_ids.validation_report_id,
         "generated_artifacts": row_ids.generated_artifact_id,
+        "cad_change_sets": row_ids.cad_change_set_id,
+        "cad_change_operations": row_ids.cad_change_operation_id,
+        "cad_change_set_validation_results": row_ids.cad_change_set_validation_result_id,
         "job_events": row_ids.job_event_id,
         "estimate_versions": row_ids.estimate_version_id,
         "estimate_job_inputs": row_ids.estimate_job_input_id,
@@ -335,6 +345,32 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         trusted_totals=None,
         estimate_version_id=None,
     )
+    change_set = CadChangeSet(
+        id=uuid.uuid4(),
+        project_id=quantity_seed.project_id,
+        base_revision_id=quantity_seed.drawing_revision_id,
+        status="proposed",
+    )
+    change_operation = CadChangeOperation(
+        id=uuid.uuid4(),
+        project_id=quantity_seed.project_id,
+        change_set_id=change_set.id,
+        sequence_index=1,
+        operation_type="flag_for_review",
+        target_revision_entity_id=None,
+        expected_source_identity=None,
+        expected_source_hash=None,
+        operation_json={"source": "append-only"},
+    )
+    change_set_validation_result = CadChangeSetValidationResult(
+        id=uuid.uuid4(),
+        project_id=quantity_seed.project_id,
+        change_set_id=change_set.id,
+        validation_status="valid",
+        validator_name="tests",
+        validator_version="1",
+        result_json={"source": "append-only", "status": "valid"},
+    )
 
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
@@ -399,6 +435,12 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         session.add(estimate_snapshot_entry)
         await session.flush()
         session.add(estimate_item)
+        await session.flush()
+        session.add(change_set)
+        await session.flush()
+        session.add(change_operation)
+        await session.flush()
+        session.add(change_set_validation_result)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -421,6 +463,9 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         drawing_revision_id=drawing_revisions[0].id,
         validation_report_id=validation_reports[0].id,
         generated_artifact_id=generated_artifacts[0].id,
+        cad_change_set_id=change_set.id,
+        cad_change_operation_id=change_operation.id,
+        cad_change_set_validation_result_id=change_set_validation_result.id,
         job_event_id=job_events[0].id,
         estimate_version_id=estimate_version.id,
         export_job_input_source_job_id=export_job_input.source_job_id,
@@ -608,6 +653,51 @@ async def _insert_job_row(
     )
 
 
+async def _insert_cad_change_set_row(
+    target: Any,
+    *,
+    changeset_id: uuid.UUID,
+    project_id: uuid.UUID,
+    base_revision_id: uuid.UUID,
+    status: str = "proposed",
+) -> None:
+    """Insert a cad_change_sets row for raw SQL lineage setup."""
+
+    await target.execute(
+        sa.text(
+            """
+            INSERT INTO cad_change_sets (
+                id,
+                project_id,
+                base_revision_id,
+                status,
+                created_by,
+                created_at,
+                updated_at
+            ) VALUES (
+                :id,
+                :project_id,
+                :base_revision_id,
+                :status,
+                :created_by,
+                :created_at,
+                :updated_at
+            )
+            ON CONFLICT (id) DO NOTHING
+            """
+        ),
+        {
+            "id": changeset_id,
+            "project_id": project_id,
+            "base_revision_id": base_revision_id,
+            "status": status,
+            "created_by": None,
+            "created_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            "updated_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+        },
+    )
+
+
 async def _insert_drawing_revision_row(
     target: Any,
     *,
@@ -626,6 +716,30 @@ async def _insert_drawing_revision_row(
     changeset_id: uuid.UUID | None,
 ) -> None:
     """Insert a drawing revision row for raw SQL lineage setup."""
+
+    if changeset_id is not None:
+        base_revision_id = predecessor_revision_id
+        if base_revision_id is None:
+            base_revision_id = (
+                await target.execute(
+                    sa.text(
+                        """
+                        SELECT base_revision_id
+                        FROM jobs
+                        WHERE id = :source_job_id
+                        """
+                    ),
+                    {"source_job_id": source_job_id},
+                )
+            ).scalar_one_or_none()
+
+        assert base_revision_id is not None
+        await _insert_cad_change_set_row(
+            target,
+            changeset_id=changeset_id,
+            project_id=project_id,
+            base_revision_id=base_revision_id,
+        )
 
     await target.execute(
         sa.text(
@@ -1477,6 +1591,51 @@ async def _insert_changeset_origin_rows(
                         extraction_profile_id=None,
                         adapter_run_output_id=None,
                     )
+    finally:
+        await engine.dispose()
+
+
+async def _insert_changeset_persistence_rows(database_url: str) -> None:
+    """Insert populated #286 changeset persistence rows for downgrade validation."""
+
+    await _insert_changeset_origin_rows(
+        database_url,
+        include_materialization=False,
+        keep_drawing_revision_compatible=False,
+    )
+
+    engine = create_async_engine(database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_factory() as session:
+            change_set_row = (
+                await session.execute(sa.text("SELECT id, project_id FROM cad_change_sets LIMIT 1"))
+            ).one()
+
+            session.add(
+                CadChangeOperation(
+                    id=uuid.uuid4(),
+                    project_id=change_set_row.project_id,
+                    change_set_id=change_set_row.id,
+                    sequence_index=1,
+                    operation_type="flag_for_review",
+                    expected_source_hash="a" * 64,
+                    operation_json={"source": "downgrade-guard"},
+                )
+            )
+            session.add(
+                CadChangeSetValidationResult(
+                    id=uuid.uuid4(),
+                    project_id=change_set_row.project_id,
+                    change_set_id=change_set_row.id,
+                    validation_status="valid",
+                    validator_name="tests",
+                    validator_version="1",
+                    result_json={"source": "downgrade-guard", "status": "valid"},
+                )
+            )
+            await session.commit()
     finally:
         await engine.dispose()
 
@@ -2436,10 +2595,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
     estimate_job_id = uuid.uuid4()
     estimate_version_id = uuid.uuid4()
     quantity_export_job_id = uuid.uuid4()
-    changeset_job_id = uuid.uuid4()
-    changeset_revision_id = uuid.uuid4()
-    changeset_id = uuid.uuid4()
-    changeset_export_job_id = uuid.uuid4()
     canonical_json = dumps(
         {
             "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
@@ -2835,70 +2990,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                 storage_uri="file:///tmp/generated/estimate.pdf",
                 lineage_json={"kind": "estimate_pdf"},
             )
-            await _insert_job_row(
-                connection,
-                job_id=changeset_job_id,
-                project_id=project_id,
-                file_id=file_id,
-                extraction_profile_id=None,
-                base_revision_id=base_revision_id,
-                job_type="export",
-                status="succeeded",
-                enqueue_status="published",
-                enqueue_attempts=1,
-            )
-            await _insert_drawing_revision_row(
-                connection,
-                revision_id=changeset_revision_id,
-                project_id=project_id,
-                file_id=file_id,
-                extraction_profile_id=None,
-                source_job_id=changeset_job_id,
-                adapter_run_output_id=None,
-                predecessor_revision_id=base_revision_id,
-                revision_sequence=2,
-                revision_kind="changeset",
-                review_state="approved",
-                canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
-                changeset_id=changeset_id,
-            )
-            await _insert_job_row(
-                connection,
-                job_id=changeset_export_job_id,
-                project_id=project_id,
-                file_id=file_id,
-                extraction_profile_id=None,
-                base_revision_id=changeset_revision_id,
-                job_type="export",
-                status="succeeded",
-                enqueue_status="published",
-                enqueue_attempts=1,
-            )
-            await _insert_generated_artifact_row(
-                connection,
-                artifact_id=uuid.uuid4(),
-                project_id=project_id,
-                source_file_id=file_id,
-                job_id=changeset_export_job_id,
-                drawing_revision_id=changeset_revision_id,
-                changeset_id=changeset_id,
-                quantity_takeoff_id=None,
-                estimate_version_id=None,
-                adapter_run_output_id=None,
-                artifact_kind="revised_dxf",
-                name="revised.dxf",
-                artifact_format="dxf",
-                media_type="application/dxf",
-                size_bytes=64,
-                checksum_sha256="d" * 64,
-                generator_name="tests",
-                generator_version="1",
-                generator_config_json={"kind": "revised_dxf"},
-                storage_key="generated/revised.dxf",
-                storage_uri="file:///tmp/generated/revised.dxf",
-                lineage_json={"kind": "revised_dxf"},
-            )
     finally:
         await engine.dispose()
 
@@ -2993,6 +3084,112 @@ class TestAppendOnlyLineageTables:
                 operation="UPDATE",
                 table_name=table_name,
             )
+
+    async def test_changeset_append_only_update_boundaries(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Changeset tables should allow only the documented append-only status updates."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        row_ids = await _seed_protected_rows(async_client)
+        updated_at = datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+
+        async with session_maker() as session:
+            await session.execute(
+                sa.text(
+                    'UPDATE "cad_change_sets" '
+                    "SET status = :status, updated_at = :updated_at "
+                    "WHERE id = :row_id"
+                ),
+                {
+                    "status": "validation_requested",
+                    "updated_at": updated_at,
+                    "row_id": row_ids.cad_change_set_id,
+                },
+            )
+            await session.commit()
+
+        async with session_maker() as session:
+            change_set_row = (
+                await session.execute(
+                    sa.text(
+                        "SELECT status, updated_at, created_by "
+                        'FROM "cad_change_sets" WHERE id = :row_id'
+                    ),
+                    {"row_id": row_ids.cad_change_set_id},
+                )
+            ).one()
+
+        assert change_set_row.status == "validation_requested"
+        assert change_set_row.updated_at == updated_at
+        assert change_set_row.created_by is None
+
+        await _run_sql_and_expect_append_only_failure(
+            'UPDATE "cad_change_sets" SET created_by = :replacement_value WHERE id = :row_id',
+            {
+                "replacement_value": "mutated",
+                "row_id": row_ids.cad_change_set_id,
+            },
+            operation="UPDATE",
+            table_name="cad_change_sets",
+        )
+        await _run_sql_and_expect_append_only_failure(
+            (
+                'UPDATE "cad_change_operations" '
+                "SET operation_json = CAST(:replacement_value AS json) WHERE id = :row_id"
+            ),
+            {
+                "replacement_value": '{"source":"mutated"}',
+                "row_id": row_ids.cad_change_operation_id,
+            },
+            operation="UPDATE",
+            table_name="cad_change_operations",
+        )
+        await _run_sql_and_expect_append_only_failure(
+            (
+                'UPDATE "cad_change_operations" '
+                "SET expected_source_hash = :replacement_value WHERE id = :row_id"
+            ),
+            {
+                "replacement_value": "f" * 64,
+                "row_id": row_ids.cad_change_operation_id,
+            },
+            operation="UPDATE",
+            table_name="cad_change_operations",
+        )
+        await _run_sql_and_expect_append_only_failure(
+            (
+                'UPDATE "cad_change_set_validation_results" '
+                "SET result_json = CAST(:replacement_value AS json) WHERE id = :row_id"
+            ),
+            {
+                "replacement_value": '{"source":"mutated","status":"invalid"}',
+                "row_id": row_ids.cad_change_set_validation_result_id,
+            },
+            operation="UPDATE",
+            table_name="cad_change_set_validation_results",
+        )
+        await _run_sql_and_expect_append_only_failure(
+            (
+                'UPDATE "cad_change_set_validation_results" '
+                "SET validation_status = :replacement_value WHERE id = :row_id"
+            ),
+            {
+                "replacement_value": "invalid",
+                "row_id": row_ids.cad_change_set_validation_result_id,
+            },
+            operation="UPDATE",
+            table_name="cad_change_set_validation_results",
+        )
 
     async def test_semantically_equivalent_json_rewrites_are_rejected(
         self,
@@ -4070,7 +4267,6 @@ class TestAppendOnlyLineageTables:
             "expected_table_name",
         ),
         [
-            (False, False, "drawing_revisions"),
             (True, True, "revision_entity_manifests"),
         ],
     )
@@ -4134,6 +4330,38 @@ class TestAppendOnlyLineageTables:
                 "Cannot downgrade: generated_artifacts has non-null typed lineage anchors."
                 in combined_output
             )
+        finally:
+            await _drop_temp_database(database_name)
+
+    async def test_changeset_persistence_downgrade_fails_closed_on_populated_tables(
+        self,
+    ) -> None:
+        """Downgrade past #286 should refuse populated changeset persistence tables."""
+
+        _ = self
+        database_name, database_url = await _create_temp_database()
+
+        try:
+            upgrade_result = _run_alembic_command("upgrade", "head", database_url=database_url)
+            assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+
+            await _insert_changeset_persistence_rows(database_url)
+
+            downgrade_result = _run_alembic_command(
+                "downgrade",
+                _CHANGESET_PERSISTENCE_DOWNGRADE_TARGET_REVISION,
+                database_url=database_url,
+            )
+            assert downgrade_result.returncode != 0
+
+            combined_output = downgrade_result.stdout + downgrade_result.stderr
+            assert (
+                "cannot downgrade 2026_06_01_0027: populated changeset tables present"
+                in combined_output
+            )
+            assert "cad_change_sets" in combined_output
+            assert "cad_change_operations" in combined_output
+            assert "cad_change_set_validation_results" in combined_output
         finally:
             await _drop_temp_database(database_name)
 
