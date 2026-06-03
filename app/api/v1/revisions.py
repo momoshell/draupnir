@@ -5,6 +5,9 @@ from fastapi import APIRouter
 from app.api.v1.revision_routes.adapter_outputs import (
     adapter_outputs_router,
 )
+from app.api.v1.revision_routes.changesets import (
+    changesets_router,
+)
 from app.api.v1.revision_routes.estimates import (
     estimates_router,
 )
@@ -33,6 +36,7 @@ revisions_router = APIRouter()
 
 revisions_router.include_router(file_revisions_router)
 revisions_router.include_router(adapter_outputs_router)
+revisions_router.include_router(changesets_router)
 revisions_router.include_router(generated_artifacts_router)
 revisions_router.include_router(materialization_router)
 revisions_router.include_router(quantity_takeoffs_router)
