@@ -23,6 +23,8 @@ from app.ingestion.contracts import (
     AdapterAvailability,
     AdapterCapabilities,
     AdapterDescriptor,
+    AdapterExecutionOptions,
+    AdapterExportRequest,
     AdapterResult,
     AdapterStatus,
     AdapterTimeout,
@@ -97,6 +99,14 @@ def _build_export_descriptor(
     )
 
 
+def _base_descriptors_without_production_export_writer() -> tuple[AdapterDescriptor, ...]:
+    return tuple(
+        descriptor
+        for descriptor in registry_module.list_descriptors()
+        if descriptor.key != "ezdxf_writer"
+    )
+
+
 def _fake_line_entity(*, adapter_key: str, source_ref: str) -> dict[str, Any]:
     return {
         "kind": "line",
@@ -111,6 +121,20 @@ def _fake_line_entity(*, adapter_key: str, source_ref: str) -> dict[str, Any]:
             "extraction_path": "$.entities[0]",
             "notes": [],
         },
+    }
+
+
+def _empty_export_canonical() -> dict[str, Any]:
+    return {
+        "canonical_entity_schema_version": "0.1",
+        "schema_version": "0.1",
+        "units": "meter",
+        "coordinate_system": {},
+        "layouts": (),
+        "layers": (),
+        "blocks": (),
+        "entities": (),
+        "xrefs": (),
     }
 
 
@@ -424,7 +448,13 @@ def test_select_export_candidates_keep_registered_order_and_filter_capabilities(
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*registry_module.list_descriptors(), read_only, first, write_only, second),
+        (
+            *_base_descriptors_without_production_export_writer(),
+            read_only,
+            first,
+            write_only,
+            second,
+        ),
     )
     _clear_registry_caches()
 
@@ -444,11 +474,19 @@ def test_select_export_descriptor_returns_single_registered_writer(
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*registry_module.list_descriptors(), descriptor),
+        (*_base_descriptors_without_production_export_writer(), descriptor),
     )
     _clear_registry_caches()
 
     assert select_export_descriptor("revised_dxf") is descriptor
+
+
+def test_select_export_descriptor_returns_production_revised_dxf_writer() -> None:
+    descriptor = select_export_descriptor("revised_dxf")
+
+    assert descriptor.key == "ezdxf_writer"
+    assert descriptor.module == "app.ingestion.adapters.ezdxf_writer"
+    assert registry_module.get_registry()[InputFamily.DXF].key == "ezdxf"
 
 
 def test_select_export_descriptor_rejects_ambiguous_registered_writers(
@@ -469,7 +507,7 @@ def test_select_export_descriptor_rejects_ambiguous_registered_writers(
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*registry_module.list_descriptors(), first, second),
+        (*_base_descriptors_without_production_export_writer(), first, second),
     )
     _clear_registry_caches()
 
@@ -557,6 +595,41 @@ def test_load_export_adapter_rejects_non_callable_factory(
 
     with pytest.raises(TypeError, match="exposes non-callable 'create_export_adapter'"):
         load_export_adapter(descriptor)
+
+
+@pytest.mark.asyncio
+async def test_load_export_adapter_exports_parseable_revised_dxf_bytes(
+    tmp_path: Path,
+) -> None:
+    export_adapter = load_export_adapter(select_export_descriptor("revised_dxf"))
+
+    export_result = await export_adapter.export(
+        AdapterExportRequest(
+            canonical=_empty_export_canonical(),
+            output_format="revised_dxf",
+        ),
+        AdapterExecutionOptions(),
+    )
+    output_path = tmp_path / "revised.dxf"
+    output_path.write_bytes(export_result.content)
+    document = cast(Callable[[Any], ezdxf.document.Drawing], cast(Any, ezdxf).readfile)(output_path)
+
+    assert export_result.output_format == "revised_dxf"
+    assert len(document.modelspace()) == 0
+
+
+@pytest.mark.asyncio
+async def test_load_export_adapter_rejects_wrong_output_format_for_revised_dxf() -> None:
+    export_adapter = load_export_adapter(select_export_descriptor("revised_dxf"))
+
+    with pytest.raises(ValueError, match="Unsupported DXF export format"):
+        await export_adapter.export(
+            AdapterExportRequest(
+                canonical=_empty_export_canonical(),
+                output_format="canonical_json",
+            ),
+            AdapterExecutionOptions(),
+        )
 
 
 @pytest.mark.asyncio
