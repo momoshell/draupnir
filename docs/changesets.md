@@ -180,18 +180,19 @@ The first revised-DXF contract is intentionally narrow.
 | `remove_entity` | valid | supported for revised_dxf | represented through derived revision output |
 | `replace_block` | valid | blocked from revised_dxf | deferred beyond first subset |
 | `replace_profile_material_candidate` | valid | blocked from revised_dxf | non-geometric/internal first |
-| `update_property` | valid | supported for revised_dxf | whitelist-based non-geometric subset only |
+| `update_property` | valid | not directly mapped by revised_dxf writer v1 | metadata-only updates stay internal; later export validation decides revised_dxf eligibility |
 | `flag_for_review` | valid | blocked from revised_dxf | metadata/review operations |
 
 ### simple DXF-native entities
 
-For Phase 9, `add_entity` support is limited to simple DXF-native entities already representable by the initial write path. Broader geometry, complex block rewrites, and arbitrary CAD-visible annotation authoring are deferred.
+For Phase 9, `add_entity` support is limited to modelspace `LINE` and simple 2D polyline payloads already representable by the initial write path. Broader geometry, block rewrites, paper-space content, and arbitrary CAD-visible annotation authoring are deferred.
 
 ## Export And Apply Relationship
 
 - revised-DXF export operates on an applied revision with changeset lineage
 - proposed-only changesets do not produce revised CAD artifacts
-- a changeset may be valid for internal workflow but still be blocked from revised_dxf if one or more operations are outside the supported subset
+- revised_dxf writer v1 fails closed: unsupported entity, geometry, layout, layer, block, unit, or coordinate cases return structured errors and produce no revised-DXF artifact
+- a changeset may be valid for internal workflow but still be blocked from revised_dxf if one or more operations are outside the supported subset or only affect internal metadata
 
 ## Cross-Reference Summary
 

@@ -175,6 +175,12 @@ def _build_descriptor(
     )
 
 
+def _base_descriptors_without_production_export_writer() -> tuple[AdapterDescriptor, ...]:
+    return tuple(
+        descriptor for descriptor in list_descriptors() if descriptor.key != "ezdxf_writer"
+    )
+
+
 @pytest.mark.parametrize(
     "output_formats",
     [
@@ -316,6 +322,7 @@ def test_adapter_result_exposes_required_trd_fields() -> None:
 def test_registry_is_static_and_covers_every_family() -> None:
     descriptors = list_descriptors()
     registry = get_registry()
+    export_descriptor = get_registry_by_key()["ezdxf_writer"]
 
     assert descriptors is list_descriptors()
     assert set(registry) == {
@@ -328,7 +335,8 @@ def test_registry_is_static_and_covers_every_family() -> None:
     assert registry[InputFamily.PDF_VECTOR].module == "app.ingestion.adapters.pymupdf"
     assert all(descriptor.adapter_key == descriptor.key for descriptor in descriptors)
     assert all(descriptor.input_formats == descriptor.upload_formats for descriptor in descriptors)
-    assert all(descriptor.output_formats == ("canonical_json",) for descriptor in descriptors)
+    assert all(descriptor.output_formats == ("canonical_json",) for descriptor in registry.values())
+    assert export_descriptor.output_formats == ("revised_dxf",)
     assert all(descriptor.bounded_probe_ms > 0 for descriptor in descriptors)
     assert all(descriptor.confidence_range is not None for descriptor in descriptors)
     assert registry[InputFamily.PDF_RASTER].experimental is True
@@ -355,6 +363,15 @@ def test_registry_is_static_and_covers_every_family() -> None:
         "quantity hints remain deferred.",
     )
     assert registry[InputFamily.IFC].capabilities.extracts_materials is True
+    assert export_descriptor.capabilities.can_read is False
+    assert export_descriptor.capabilities.can_write is True
+    assert export_descriptor.capabilities.extracts_canonical is False
+    assert export_descriptor.capabilities.extracts_provenance is False
+    assert export_descriptor.capabilities.extracts_confidence is False
+    assert export_descriptor.capabilities.extracts_warnings is False
+    assert export_descriptor.capabilities.extracts_diagnostics is False
+    assert export_descriptor.capabilities.supports_exports is True
+    assert get_export_registry()["revised_dxf"] == (export_descriptor,)
 
     dwg_license_probe = next(
         probe for probe in registry[InputFamily.DWG].probes if probe.kind is ProbeKind.LICENSE
@@ -400,7 +417,7 @@ def test_registry_by_key_rejects_duplicate_adapter_keys(
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*list_descriptors(), first, second),
+        (*_base_descriptors_without_production_export_writer(), first, second),
     )
     _clear_registry_caches()
 
@@ -458,7 +475,7 @@ def test_export_registry_indexes_synthetic_dxf_writers_without_changing_read_reg
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*list_descriptors(), first, second),
+        (*_base_descriptors_without_production_export_writer(), first, second),
     )
     _clear_registry_caches()
 
@@ -501,7 +518,7 @@ def test_export_registry_requires_write_and_export_capabilities(
     monkeypatch.setattr(
         registry_module,
         "_ADAPTER_DESCRIPTORS",
-        (*list_descriptors(), read_only, write_only, eligible),
+        (*_base_descriptors_without_production_export_writer(), read_only, write_only, eligible),
     )
     _clear_registry_caches()
 
