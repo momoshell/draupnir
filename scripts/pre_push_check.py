@@ -129,6 +129,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "quantity_takeoff_persistence": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "append_only_lineage_tables": DB_LINEAGE_PYTEST_ARGS,
     "changeset_persistence": DB_LINEAGE_PYTEST_ARGS,
+    "changeset_validation": DB_LINEAGE_PYTEST_ARGS,
     "lineage_delete_restrictions": DB_LINEAGE_PYTEST_ARGS,
     "db": DB_MIGRATION_PYTEST_ARGS,
     "jobs_base_revision_migration": DB_MIGRATION_PYTEST_ARGS,
