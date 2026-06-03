@@ -234,6 +234,7 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "cad_change_sets",
     "cad_change_operations",
     "cad_change_set_validation_results",
+    "changeset_apply_job_inputs",
     "drawing_revisions",
     "validation_reports",
     "generated_artifacts",

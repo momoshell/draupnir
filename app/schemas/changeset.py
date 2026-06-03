@@ -359,6 +359,26 @@ class CadChangeSetRead(BaseModel):
     operations: list[CadChangeOperationRead]
 
 
+class CadChangeSetValidationResultRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    project_id: UUID
+    change_set_id: UUID
+    validation_status: str
+    validator_name: str | None = None
+    validator_version: str | None = None
+    result_json: dict[str, Any]
+    created_at: datetime
+
+
+class CadChangeSetValidationActionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    change_set: CadChangeSetRead
+    validation_result: CadChangeSetValidationResultRead
+
+
 class CadChangeSetListResponse(BaseModel):
     items: list[CadChangeSetRead]
     next_cursor: str | None = None

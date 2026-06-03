@@ -5,6 +5,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cad.changeset import (
@@ -27,14 +28,24 @@ from app.cad.changeset import (
     load_change_set_apply_input,
 )
 from app.models.adapter_run_output import AdapterRunOutput
-from app.models.cad_changeset import CadChangeOperation, CadChangeSet, CadChangeSetValidationResult
+from app.models.cad_changeset import (
+    CadChangeOperation,
+    CadChangeSet,
+    CadChangeSetValidationResult,
+)
+from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.drawing_revision import DrawingRevision
 from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File
-from app.models.job import Job
+from app.models.job import Job, JobType
 from app.models.project import Project
-from app.models.revision_materialization import RevisionEntity, RevisionEntityManifest
+from app.models.revision_materialization import (
+    RevisionEntity,
+    RevisionEntityManifest,
+)
 from tests.conftest import requires_database
+
+_DEFAULT_CHANGESET_APPLY_JOB_ID = uuid.UUID("90000000-0000-0000-0000-000000000100")
 
 
 def test_build_stale_base_conflict_details_returns_none_for_matching_current_revision() -> None:
@@ -713,6 +724,222 @@ def test_apply_change_set_returns_conflict_for_stale_current_revision() -> None:
 @requires_database
 @pytest.mark.usefixtures("cleanup_projects")
 @pytest.mark.asyncio
+async def test_changeset_apply_job_input_persists_valid_lineage() -> None:
+    session, seeded = await _seed_loader_case()
+    apply_job = _build_changeset_apply_job(seeded=seeded)
+    apply_input = _build_changeset_apply_job_input(seeded=seeded, source_job_id=apply_job.id)
+    try:
+        session.add(apply_job)
+        await session.flush()
+
+        session.add(apply_input)
+        await session.flush()
+        session.expunge_all()
+
+        persisted = await session.get(ChangeSetApplyJobInput, apply_job.id)
+
+        assert persisted is not None
+        assert persisted.source_job_id == apply_job.id
+        assert persisted.source_job_type == JobType.CHANGESET_APPLY.value
+        assert persisted.drawing_revision_id == seeded.base_revision.id
+        assert persisted.change_set_id == seeded.change_set.id
+        assert persisted.latest_validation_result_id == seeded.latest_validation.id
+        assert persisted.latest_validation_status == seeded.latest_validation.validation_status
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_input_rejects_duplicate_changeset_intent() -> None:
+    session, seeded = await _seed_loader_case()
+    first_job = _build_changeset_apply_job(seeded=seeded)
+    second_job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000105"),
+    )
+    try:
+        session.add_all([first_job, second_job])
+        await session.flush()
+
+        session.add(
+            _build_changeset_apply_job_input(
+                seeded=seeded,
+                source_job_id=first_job.id,
+            )
+        )
+        await session.flush()
+
+        session.add(
+            _build_changeset_apply_job_input(
+                seeded=seeded,
+                source_job_id=second_job.id,
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="uq_changeset_apply_job_inputs_project_id_change_set_id",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_requires_base_revision_id() -> None:
+    session, seeded = await _seed_loader_case()
+    try:
+        session.add(
+            Job(
+                id=uuid.UUID("90000000-0000-0000-0000-000000000104"),
+                project_id=seeded.project.id,
+                file_id=seeded.base_revision.source_file_id,
+                job_type=JobType.CHANGESET_APPLY.value,
+                status="pending",
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="ck_jobs_revision_scoped_base_revision_required",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_forbids_extraction_profile_id() -> None:
+    session, seeded = await _seed_loader_case()
+    try:
+        session.add(
+            _build_changeset_apply_job(
+                seeded=seeded,
+                extraction_profile_id=seeded.base_revision.extraction_profile_id,
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="ck_jobs_revision_scoped_extraction_profile_forbidden",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_input_rejects_wrong_job_type() -> None:
+    session, seeded = await _seed_loader_case()
+    wrong_job = Job(
+        id=uuid.UUID("90000000-0000-0000-0000-000000000101"),
+        project_id=seeded.project.id,
+        file_id=seeded.base_revision.source_file_id,
+        extraction_profile_id=seeded.base_revision.extraction_profile_id,
+        base_revision_id=seeded.base_revision.id,
+        job_type=JobType.REPROCESS.value,
+        status="pending",
+    )
+    try:
+        session.add(wrong_job)
+        await session.flush()
+
+        session.add(
+            _build_changeset_apply_job_input(
+                seeded=seeded,
+                source_job_id=wrong_job.id,
+                source_job_type=JobType.REPROCESS.value,
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="ck_changeset_apply_job_inputs_source_job_type",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_input_rejects_wrong_changeset_base_revision() -> None:
+    session, seeded = await _seed_loader_case(include_current_revision=True)
+    apply_job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000102"),
+        base_revision_id=seeded.current_revision.id,
+    )
+    try:
+        session.add(apply_job)
+        await session.flush()
+
+        session.add(
+            _build_changeset_apply_job_input(
+                seeded=seeded,
+                source_job_id=apply_job.id,
+                drawing_revision_id=seeded.current_revision.id,
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="fk_changeset_apply_job_inputs_base_changeset",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_changeset_apply_job_input_rejects_mismatched_latest_validation_status() -> None:
+    session, seeded = await _seed_loader_case(latest_validation_status="valid_with_warnings")
+    apply_job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000103"),
+    )
+    try:
+        session.add(apply_job)
+        await session.flush()
+
+        session.add(
+            _build_changeset_apply_job_input(
+                seeded=seeded,
+                source_job_id=apply_job.id,
+                latest_validation_status="valid",
+            )
+        )
+
+        with pytest.raises(
+            IntegrityError,
+            match="fk_changeset_apply_job_inputs_validation_result",
+        ):
+            await session.flush()
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
 async def test_load_change_set_apply_input_orders_operations_and_entities() -> None:
     session, seeded = await _seed_loader_case()
     try:
@@ -931,6 +1158,7 @@ class _SeededLoaderCase:
         change_set: CadChangeSet,
         base_revision: DrawingRevision,
         current_revision: DrawingRevision,
+        latest_validation: CadChangeSetValidationResult,
         first_operation: CadChangeOperation,
         second_operation: CadChangeOperation,
         first_entity: RevisionEntity,
@@ -940,10 +1168,52 @@ class _SeededLoaderCase:
         self.change_set = change_set
         self.base_revision = base_revision
         self.current_revision = current_revision
+        self.latest_validation = latest_validation
         self.first_operation = first_operation
         self.second_operation = second_operation
         self.first_entity = first_entity
         self.second_entity = second_entity
+
+
+def _build_changeset_apply_job(
+    *,
+    seeded: _SeededLoaderCase,
+    job_id: uuid.UUID = _DEFAULT_CHANGESET_APPLY_JOB_ID,
+    base_revision_id: uuid.UUID | None = None,
+    extraction_profile_id: uuid.UUID | None = None,
+) -> Job:
+    return Job(
+        id=job_id,
+        project_id=seeded.project.id,
+        file_id=seeded.base_revision.source_file_id,
+        extraction_profile_id=extraction_profile_id,
+        base_revision_id=base_revision_id or seeded.base_revision.id,
+        job_type=JobType.CHANGESET_APPLY.value,
+        status="pending",
+    )
+
+
+def _build_changeset_apply_job_input(
+    *,
+    seeded: _SeededLoaderCase,
+    source_job_id: uuid.UUID,
+    drawing_revision_id: uuid.UUID | None = None,
+    change_set_id: uuid.UUID | None = None,
+    source_job_type: str = JobType.CHANGESET_APPLY.value,
+    latest_validation_result_id: uuid.UUID | None = None,
+    latest_validation_status: str | None = None,
+) -> ChangeSetApplyJobInput:
+    return ChangeSetApplyJobInput(
+        source_job_id=source_job_id,
+        project_id=seeded.project.id,
+        source_file_id=seeded.base_revision.source_file_id,
+        drawing_revision_id=drawing_revision_id or seeded.base_revision.id,
+        change_set_id=change_set_id or seeded.change_set.id,
+        source_job_type=source_job_type,
+        latest_validation_result_id=latest_validation_result_id or seeded.latest_validation.id,
+        latest_validation_status=latest_validation_status
+        or seeded.latest_validation.validation_status,
+    )
 
 
 async def _seed_loader_case(
@@ -1252,6 +1522,7 @@ async def _seed_loader_case(
             change_set=change_set,
             base_revision=base_revision,
             current_revision=current_revision,
+            latest_validation=validations[-1],
             first_operation=first_operation,
             second_operation=second_operation,
             first_entity=first_entity,

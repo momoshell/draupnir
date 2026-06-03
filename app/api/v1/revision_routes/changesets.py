@@ -22,18 +22,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api import idempotency, pagination
 from app.api.v1 import revision_lineage
 from app.cad import changesets as changeset_service
+from app.cad.changeset import ChangeSetApplyConflict
+from app.cad.changeset import loading as changeset_loading
+from app.cad.changeset_validation import (
+    ChangeSetValidationServiceError,
+    validate_change_set,
+)
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
-from app.models.cad_changeset import CadChangeOperation, CadChangeSet
+from app.models.cad_changeset import (
+    CadChangeOperation,
+    CadChangeSet,
+    CadChangeSetValidationResult,
+)
+from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.drawing_revision import DrawingRevision
+from app.models.job import Job, JobStatus, JobType
 from app.schemas.changeset import (
     CadChangeOperationRead,
     CadChangeSetCreateRequest,
     CadChangeSetCursor,
     CadChangeSetListResponse,
     CadChangeSetRead,
+    CadChangeSetValidationActionRead,
+    CadChangeSetValidationResultRead,
 )
+from app.schemas.job import JobRead
 
 changesets_router = APIRouter()
 
@@ -49,6 +64,10 @@ _run_idempotent_mutation = idempotency.run_idempotent_mutation
 _IdempotentMutationSuccess = idempotency.IdempotentMutationSuccess
 _encode_keyset_cursor = pagination.encode_keyset_cursor
 _decode_keyset_cursor = pagination.decode_keyset_cursor
+_load_change_set_apply_input = changeset_loading.load_change_set_apply_input
+_validate_change_set = validate_change_set
+
+_CHANGESET_APPLY_VALIDATION_STATUSES = ("valid", "valid_with_warnings")
 
 
 def _get_active_revision(*args: Any, **kwargs: Any) -> Any:
@@ -59,6 +78,17 @@ def _raise_input_invalid(message: str, *, details: Any | None = None) -> None:
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=create_error_response(ErrorCode.INPUT_INVALID, message, details),
+    )
+
+
+def _build_input_invalid_known_error(
+    message: str,
+    *,
+    details: Any | None = None,
+) -> idempotency.IdempotentMutationKnownError:
+    return idempotency.IdempotentMutationKnownError(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        response_body=create_error_response(ErrorCode.INPUT_INVALID, message, details),
     )
 
 
@@ -143,6 +173,30 @@ async def _require_active_revision(
     return revision
 
 
+async def _require_active_revision_changeset(
+    db: AsyncSession,
+    revision_id: UUID,
+    change_set_id: UUID,
+    *,
+    for_update: bool = False,
+) -> tuple[DrawingRevision, CadChangeSet]:
+    revision = await _require_active_revision(db, revision_id, for_update=for_update)
+
+    query = select(CadChangeSet).where(
+        CadChangeSet.id == change_set_id,
+        CadChangeSet.project_id == revision.project_id,
+        CadChangeSet.base_revision_id == revision.id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    change_set = result.scalar_one_or_none()
+    if change_set is None:
+        raise_not_found("change_set", str(change_set_id))
+    assert change_set is not None
+    return revision, change_set
+
+
 async def _load_change_set_operations(
     db: AsyncSession,
     *,
@@ -219,6 +273,128 @@ def _apply_after_cursor(query: Any, cursor: CadChangeSetCursor) -> Any:
                 CadChangeSet.id > cursor.id,
             ),
         )
+    )
+
+
+def _build_validate_fingerprint(revision_id: UUID, change_set_id: UUID) -> str:
+    return idempotency.build_idempotency_fingerprint(
+        "revision_changeset_validate",
+        {
+            "revision_id": str(revision_id),
+            "change_set_id": str(change_set_id),
+        },
+    )
+
+
+def _build_apply_fingerprint(revision_id: UUID, change_set_id: UUID) -> str:
+    return idempotency.build_idempotency_fingerprint(
+        "revision_changeset_apply",
+        {
+            "revision_id": str(revision_id),
+            "change_set_id": str(change_set_id),
+        },
+    )
+
+
+def _serialize_validation_action(
+    change_set: CadChangeSet,
+    *,
+    operations: list[CadChangeOperation],
+    validation_result: CadChangeSetValidationResult,
+) -> CadChangeSetValidationActionRead:
+    return CadChangeSetValidationActionRead(
+        change_set=_serialize_change_set(change_set, operations=operations),
+        validation_result=CadChangeSetValidationResultRead.model_validate(validation_result),
+    )
+
+
+def _serialize_job(job: Job) -> JobRead:
+    return JobRead.model_validate(job)
+
+
+def _build_validation_service_known_error(
+    exc: ChangeSetValidationServiceError,
+) -> idempotency.IdempotentMutationKnownError:
+    code = getattr(exc.code, "value", str(exc.code))
+    return _build_input_invalid_known_error(
+        "Changeset validation prerequisites are not satisfied.",
+        details={"code": code},
+    )
+
+
+def _build_http_exception_known_error(
+    exc: HTTPException,
+) -> idempotency.IdempotentMutationKnownError:
+    if not isinstance(exc.detail, Mapping):
+        raise exc
+    return idempotency.IdempotentMutationKnownError(
+        status_code=exc.status_code,
+        response_body=dict(exc.detail),
+    )
+
+
+async def _load_latest_valid_validation_result(
+    db: AsyncSession,
+    *,
+    project_id: UUID,
+    change_set_id: UUID,
+) -> CadChangeSetValidationResult | None:
+    result = await db.execute(
+        select(CadChangeSetValidationResult)
+        .where(
+            CadChangeSetValidationResult.project_id == project_id,
+            CadChangeSetValidationResult.change_set_id == change_set_id,
+            CadChangeSetValidationResult.validation_status.in_(
+                _CHANGESET_APPLY_VALIDATION_STATUSES
+            ),
+        )
+        .order_by(
+            CadChangeSetValidationResult.created_at.desc(),
+            CadChangeSetValidationResult.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _load_existing_changeset_apply_job(
+    db: AsyncSession,
+    *,
+    project_id: UUID,
+    change_set_id: UUID,
+) -> Job | None:
+    result = await db.execute(
+        select(Job)
+        .join(
+            ChangeSetApplyJobInput,
+            ChangeSetApplyJobInput.source_job_id == Job.id,
+        )
+        .where(
+            ChangeSetApplyJobInput.project_id == project_id,
+            ChangeSetApplyJobInput.change_set_id == change_set_id,
+        )
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _build_revision_conflict(
+    conflict: Any,
+) -> idempotency.IdempotentMutationKnownError:
+    return idempotency.IdempotentMutationKnownError(
+        status_code=status.HTTP_409_CONFLICT,
+        response_body=create_error_response(
+            ErrorCode.REVISION_CONFLICT,
+            "Changeset base revision is no longer the current revision.",
+            {
+                "base_revision_id": str(conflict.details.base_revision_id),
+                "base_revision_sequence": conflict.details.base_revision_sequence,
+                "current_revision_id": str(conflict.details.current_revision_id),
+                "current_revision_sequence": conflict.details.current_revision_sequence,
+                "change_set_id": str(conflict.details.change_set_id),
+            },
+        ),
     )
 
 
@@ -351,3 +527,177 @@ async def get_revision_changeset(
         )
     )
     return _serialize_change_set(change_set, operations=operations)
+
+
+@changesets_router.post(
+    "/revisions/{revision_id}/changesets/{change_set_id}/validate",
+    response_model=CadChangeSetValidationActionRead,
+)
+async def validate_revision_changeset(
+    revision_id: UUID,
+    change_set_id: UUID,
+    request: Request,
+    db: DbSession,
+    idempotency_key: IdempotencyKey,
+) -> Response:
+    async def preclaim() -> Response | None:
+        await _require_active_revision_changeset(
+            db,
+            revision_id,
+            change_set_id,
+        )
+        return None
+
+    async def mutate() -> (
+        idempotency.IdempotentMutationSuccess[CadChangeSetValidationActionRead]
+        | idempotency.IdempotentMutationKnownError
+    ):
+        try:
+            revision, change_set = await _require_active_revision_changeset(
+                db,
+                revision_id,
+                change_set_id,
+                for_update=True,
+            )
+        except HTTPException as exc:
+            return _build_http_exception_known_error(exc)
+        try:
+            validation_result = await _validate_change_set(db, change_set.id)
+        except ChangeSetValidationServiceError as exc:
+            return _build_validation_service_known_error(exc)
+
+        await db.refresh(change_set)
+        operations = list(
+            await _list_change_set_operations(
+                db,
+                project_id=revision.project_id,
+                change_set_id=change_set.id,
+            )
+        )
+        return _IdempotentMutationSuccess(
+            value=_serialize_validation_action(
+                change_set,
+                operations=operations,
+                validation_result=validation_result,
+            ),
+            status_code=status.HTTP_200_OK,
+        )
+
+    return await _run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=_build_validate_fingerprint(revision_id, change_set_id),
+        method="POST",
+        path=str(request.url.path),
+        mutate=mutate,
+        serialize_result=lambda result: result.model_dump(mode="json"),
+        preclaim=preclaim,
+    )
+
+
+@changesets_router.post(
+    "/revisions/{revision_id}/changesets/{change_set_id}/apply",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def apply_revision_changeset(
+    revision_id: UUID,
+    change_set_id: UUID,
+    request: Request,
+    db: DbSession,
+    idempotency_key: IdempotencyKey,
+) -> Response:
+    async def preclaim() -> Response | None:
+        await _require_active_revision_changeset(
+            db,
+            revision_id,
+            change_set_id,
+        )
+        return None
+
+    async def mutate() -> (
+        idempotency.IdempotentMutationSuccess[JobRead] | idempotency.IdempotentMutationKnownError
+    ):
+        try:
+            revision, change_set = await _require_active_revision_changeset(
+                db,
+                revision_id,
+                change_set_id,
+                for_update=True,
+            )
+        except HTTPException as exc:
+            return _build_http_exception_known_error(exc)
+
+        existing_job = await _load_existing_changeset_apply_job(
+            db,
+            project_id=revision.project_id,
+            change_set_id=change_set.id,
+        )
+        if existing_job is not None:
+            return _IdempotentMutationSuccess(
+                value=_serialize_job(existing_job),
+                status_code=status.HTTP_202_ACCEPTED,
+            )
+
+        try:
+            apply_input = await _load_change_set_apply_input(
+                db,
+                project_id=revision.project_id,
+                change_set_id=change_set.id,
+            )
+        except changeset_loading.ChangeSetApplyLoadError as exc:
+            return _build_input_invalid_known_error(
+                "Changeset apply prerequisites are not satisfied.",
+                details={"code": exc.__class__.__name__},
+            )
+
+        if isinstance(apply_input, ChangeSetApplyConflict):
+            return _build_revision_conflict(apply_input)
+
+        validation_result = await _load_latest_valid_validation_result(
+            db,
+            project_id=revision.project_id,
+            change_set_id=change_set.id,
+        )
+        if validation_result is None:
+            return _build_input_invalid_known_error(
+                "Changeset apply requires a latest valid validation result.",
+            )
+        job = Job(
+            project_id=revision.project_id,
+            file_id=revision.source_file_id,
+            base_revision_id=revision.id,
+            job_type=JobType.CHANGESET_APPLY,
+            status=JobStatus.PENDING,
+        )
+        db.add(job)
+        await db.flush()
+
+        db.add(
+            ChangeSetApplyJobInput(
+                source_job_id=job.id,
+                project_id=revision.project_id,
+                source_file_id=revision.source_file_id,
+                drawing_revision_id=revision.id,
+                change_set_id=change_set.id,
+                latest_validation_result_id=validation_result.id,
+                latest_validation_status=validation_result.validation_status,
+            )
+        )
+        await db.flush()
+
+        return _IdempotentMutationSuccess(
+            value=_serialize_job(job),
+            status_code=status.HTTP_202_ACCEPTED,
+        )
+
+    return await _run_idempotent_mutation(
+        db,
+        key=idempotency_key,
+        fingerprint=_build_apply_fingerprint(revision_id, change_set_id),
+        method="POST",
+        path=str(request.url.path),
+        mutate=mutate,
+        serialize_result=lambda result: result.model_dump(mode="json"),
+        preclaim=preclaim,
+    )
