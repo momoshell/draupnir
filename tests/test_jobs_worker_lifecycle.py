@@ -45,6 +45,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         JobType.QUANTITY_TAKEOFF.value,
         JobType.ESTIMATE.value,
         JobType.EXPORT.value,
+        JobType.CHANGESET_APPLY.value,
     )
     expected_ingest_worker_job_types = (
         JobType.INGEST.value,
@@ -58,6 +59,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         "process_quantity_takeoff_job": (JobType.QUANTITY_TAKEOFF.value,),
         "process_estimate_job": (JobType.ESTIMATE.value,),
         "process_export_job": (JobType.EXPORT.value,),
+        "process_changeset_apply_job": (JobType.CHANGESET_APPLY.value,),
     }
 
     assert [handler.job_type_name for handler in runner_module.JOB_HANDLERS] == [
@@ -66,6 +68,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         JobType.QUANTITY_TAKEOFF.value,
         JobType.ESTIMATE.value,
         JobType.EXPORT.value,
+        JobType.CHANGESET_APPLY.value,
     ]
     assert expected_recoverable_job_types == runner_module.RECOVERABLE_ENQUEUE_JOB_TYPES
     assert expected_ingest_worker_job_types == runner_module.INGEST_WORKER_JOB_TYPES
@@ -77,14 +80,18 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
     ingest_handler = runner_module.get_job_handler(JobType.INGEST.value)
     reprocess_handler = runner_module.get_job_handler(JobType.REPROCESS.value)
     export_handler = runner_module.get_job_handler(JobType.EXPORT.value)
+    changeset_apply_handler = runner_module.get_job_handler(JobType.CHANGESET_APPLY.value)
     ingest_route = runner_module.get_begin_or_resume_route("process_ingest_job")
     export_route = runner_module.get_begin_or_resume_route("process_export_job")
+    changeset_apply_route = runner_module.get_begin_or_resume_route("process_changeset_apply_job")
 
     assert ingest_handler is not None
     assert reprocess_handler is not None
     assert export_handler is not None
+    assert changeset_apply_handler is not None
     assert ingest_route is not None
     assert export_route is not None
+    assert changeset_apply_route is not None
     assert reprocess_handler.execute_name == ingest_handler.execute_name
     assert ingest_handler.execute_name == "_execute_ingest_job_attempt"
     assert reprocess_handler.finalize_name == ingest_handler.finalize_name == "_finalize_ingest_job"
@@ -108,6 +115,17 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
     assert (
         export_route.log_keys.reclaimed_stale_running == "export_job_reclaimed_stale_running_status"
     )
+    assert changeset_apply_handler.execute_name == "_execute_changeset_apply_job_attempt"
+    assert changeset_apply_handler.finalize_name == "_finalize_changeset_apply_job"
+    assert changeset_apply_handler.process_name == "process_changeset_apply_job"
+    assert changeset_apply_handler.run_task_name == "run_changeset_apply_job"
+    assert changeset_apply_handler.enqueue_publisher_name == "enqueue_changeset_apply_job"
+    assert changeset_apply_handler.enqueue_error_message == "Failed to enqueue changeset apply job"
+    assert changeset_apply_route.supported_job_types == (JobType.CHANGESET_APPLY.value,)
+    assert (
+        changeset_apply_route.log_keys.reclaimed_stale_running
+        == "changeset_apply_job_reclaimed_stale_running_status"
+    )
 
 
 def test_worker_registry_derived_helpers_preserve_public_compatibility(
@@ -116,6 +134,7 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
     """Worker metadata helpers should remain registry-derived and monkeypatch-friendly."""
     published_ingest_job_ids: list[uuid.UUID] = []
     published_export_job_ids: list[uuid.UUID] = []
+    published_changeset_apply_job_ids: list[uuid.UUID] = []
 
     def _fake_recovery_enqueue(job_id: uuid.UUID) -> None:
         published_ingest_job_ids.append(job_id)
@@ -123,8 +142,16 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
     def _fake_export_enqueue(job_id: uuid.UUID) -> None:
         published_export_job_ids.append(job_id)
 
+    def _fake_changeset_apply_enqueue(job_id: uuid.UUID) -> None:
+        published_changeset_apply_job_ids.append(job_id)
+
     monkeypatch.setattr(worker_module, "enqueue_ingest_job", _fake_recovery_enqueue)
     monkeypatch.setattr(worker_module, "enqueue_export_job", _fake_export_enqueue)
+    monkeypatch.setattr(
+        worker_module,
+        "enqueue_changeset_apply_job",
+        _fake_changeset_apply_enqueue,
+    )
 
     assert worker_module.is_ingest_worker_job_type(JobType.INGEST) is True
     assert worker_module.is_ingest_worker_job_type(JobType.REPROCESS.value) is True
@@ -136,6 +163,7 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
         JobType.QUANTITY_TAKEOFF,
         JobType.ESTIMATE,
         JobType.EXPORT,
+        JobType.CHANGESET_APPLY,
     ):
         assert worker_module.is_recoverable_enqueue_job_type(job_type) is True
 
@@ -143,6 +171,8 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
     assert publisher is _fake_recovery_enqueue
     export_publisher = worker_module.get_job_enqueue_publisher(JobType.EXPORT)
     assert export_publisher is _fake_export_enqueue
+    changeset_apply_publisher = worker_module.get_job_enqueue_publisher(JobType.CHANGESET_APPLY)
+    assert changeset_apply_publisher is _fake_changeset_apply_enqueue
 
     sample_job_id = uuid.uuid4()
     assert publisher is not None
@@ -154,11 +184,19 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
     export_publisher(sample_export_job_id)
     assert published_export_job_ids == [sample_export_job_id]
 
+    sample_changeset_apply_job_id = uuid.uuid4()
+    assert changeset_apply_publisher is not None
+    changeset_apply_publisher(sample_changeset_apply_job_id)
+    assert published_changeset_apply_job_ids == [sample_changeset_apply_job_id]
+
     assert worker_module._get_enqueue_job_error_message(JobType.REPROCESS.value) == (
         "Failed to enqueue reprocess job"
     )
     assert worker_module._get_enqueue_job_error_message(JobType.EXPORT.value) == (
         "Failed to enqueue export job"
+    )
+    assert worker_module._get_enqueue_job_error_message(JobType.CHANGESET_APPLY.value) == (
+        "Failed to enqueue changeset apply job"
     )
     assert worker_module._get_enqueue_job_error_message("unknown") == "Failed to enqueue job"
 
@@ -286,18 +324,84 @@ async def test_process_export_job_wrapper_late_binds_registered_callables(
     ]
 
 
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_wrapper_late_binds_registered_callables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changeset apply wrapper should late-bind registered execution/finalization callables."""
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    observed_calls: list[tuple[Any, ...]] = []
+
+    async def _fake_begin_or_resume_registered_job(
+        received_job_id: uuid.UUID,
+        *,
+        process_name: str,
+    ) -> types.SimpleNamespace:
+        observed_calls.append(("begin", received_job_id, process_name))
+        return types.SimpleNamespace(token=attempt_token)
+
+    async def _fake_execute_changeset_apply_job_attempt(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> worker_module._RegisteredJobAttemptResult:
+        observed_calls.append(("execute", received_job_id, attempt_token))
+        return worker_module._RegisteredJobAttemptResult(
+            finalize_kwargs={"apply_result": "apply_result"}
+        )
+
+    async def _fake_finalize_changeset_apply_job(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+        apply_result: str,
+    ) -> bool:
+        observed_calls.append(("finalize", received_job_id, attempt_token, apply_result))
+        return True
+
+    monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "_begin_or_resume_registered_job",
+        _fake_begin_or_resume_registered_job,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_execute_changeset_apply_job_attempt",
+        _fake_execute_changeset_apply_job_attempt,
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_finalize_changeset_apply_job",
+        _fake_finalize_changeset_apply_job,
+    )
+
+    await worker_module.process_changeset_apply_job(job_id)
+
+    assert observed_calls == [
+        ("begin", job_id, "process_changeset_apply_job"),
+        ("execute", job_id, attempt_token),
+        ("finalize", job_id, attempt_token, "apply_result"),
+    ]
+
+
 def test_worker_task_names_preserve_public_compatibility() -> None:
     """Celery task names should stay aligned with the registered public wrappers."""
     assert worker_module.run_ingest_job.name == "app.jobs.worker.run_ingest_job"
     assert worker_module.run_export_job.name == "app.jobs.worker.run_export_job"
+    assert worker_module.run_changeset_apply_job.name == "app.jobs.worker.run_changeset_apply_job"
 
     ingest_handler = runner_module.get_job_handler(JobType.INGEST.value)
     export_handler = runner_module.get_job_handler(JobType.EXPORT.value)
+    changeset_apply_handler = runner_module.get_job_handler(JobType.CHANGESET_APPLY.value)
 
     assert ingest_handler is not None
     assert export_handler is not None
+    assert changeset_apply_handler is not None
     assert ingest_handler.run_task_name == worker_module.run_ingest_job.__name__
     assert export_handler.run_task_name == worker_module.run_export_job.__name__
+    assert changeset_apply_handler.run_task_name == worker_module.run_changeset_apply_job.__name__
 
 
 @pytest.mark.usefixtures(fake_ingestion_runner.__name__)

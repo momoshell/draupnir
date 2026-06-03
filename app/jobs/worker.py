@@ -11,7 +11,7 @@ import json
 import math
 import threading
 import uuid
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -24,6 +24,13 @@ from celery.signals import worker_ready
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cad.changeset import (
+    ChangeSetApplyConflict,
+    ChangeSetApplyError,
+    ChangeSetApplyLoadError,
+    ChangeSetApplySuccess,
+    load_and_apply_change_set,
+)
 from app.core.clock import utcnow as _clock_utcnow
 from app.core.config import settings
 from app.core.errors import ErrorCode
@@ -74,6 +81,8 @@ from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import runner as job_runner
 from app.models.adapter_run_output import AdapterRunOutput
+from app.models.cad_changeset import CadChangeSet
+from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -122,14 +131,19 @@ _ENQUEUE_ESTIMATE_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_T
 _ENQUEUE_EXPORT_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
     JobType.EXPORT.value
 ]
+_ENQUEUE_CHANGESET_APPLY_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.CHANGESET_APPLY.value
+]
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
 _FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to finalize estimate job"
 _FINALIZE_EXPORT_JOB_ERROR_MESSAGE = "Failed to finalize export job"
+_FINALIZE_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Failed to finalize changeset apply job"
 _PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexpectedly."
 _PROCESS_ESTIMATE_JOB_ERROR_MESSAGE = "Estimate job failed unexpectedly."
 _PROCESS_EXPORT_JOB_ERROR_MESSAGE = "Export job failed unexpectedly."
+_PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Changeset apply job failed unexpectedly."
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
 _DEBUG_OVERLAY_ARTIFACT_KIND = "debug_overlay"
@@ -267,8 +281,23 @@ class _ExportJobInputError(Exception):
         return self.message
 
 
+@dataclass(frozen=True, slots=True)
+class _ChangeSetApplyJobError(Exception):
+    """Raised for deterministic changeset apply execution failures."""
+
+    error_code: ErrorCode
+    message: str
+    details: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
 type _RegisteredJobInputError = (
-    _QuantityTakeoffJobError | _EstimateJobInputError | _ExportJobInputError
+    _QuantityTakeoffJobError
+    | _EstimateJobInputError
+    | _ExportJobInputError
+    | _ChangeSetApplyJobError
 )
 
 
@@ -368,6 +397,21 @@ _EXPORT_PROCESS_SPEC = _RegisteredJobProcessSpec(
     succeeded_log_event="export_job_succeeded",
     process_error_message=_PROCESS_EXPORT_JOB_ERROR_MESSAGE,
     finalize_error_message=_FINALIZE_EXPORT_JOB_ERROR_MESSAGE,
+)
+
+_CHANGESET_APPLY_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="changeset_apply",
+    input_error_type=_ChangeSetApplyJobError,
+    input_failure_log_event="changeset_apply_job_input_failed",
+    stale_attempt_log_event="changeset_apply_job_stale_attempt_skipped",
+    revision_conflict_log_event="changeset_apply_job_revision_conflict",
+    cancelled_during_execution_log_event="changeset_apply_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="changeset_apply_job_cancelled_during_finalization",
+    process_failed_log_event="changeset_apply_job_failed",
+    finalization_failed_log_event="changeset_apply_job_finalization_failed",
+    succeeded_log_event="changeset_apply_job_succeeded",
+    process_error_message=_PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_CHANGESET_APPLY_JOB_ERROR_MESSAGE,
 )
 
 
@@ -855,6 +899,18 @@ async def _get_existing_estimate_version(
     return result.scalar_one_or_none()
 
 
+async def _get_existing_drawing_revision(
+    session: AsyncSession,
+    *,
+    source_job_id: UUID,
+) -> DrawingRevision | None:
+    """Load an existing committed drawing revision for a job."""
+    result = await session.execute(
+        select(DrawingRevision).where(DrawingRevision.source_job_id == source_job_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _get_existing_generated_artifact(
     session: AsyncSession,
     *,
@@ -901,6 +957,24 @@ async def _get_drawing_revision(
     return await session.get(DrawingRevision, revision_id)
 
 
+async def _get_drawing_revision_for_changeset(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    change_set_id: UUID,
+) -> DrawingRevision | None:
+    """Load the committed drawing revision anchored to a changeset."""
+    result = await session.execute(
+        select(DrawingRevision)
+        .where(
+            (DrawingRevision.project_id == project_id)
+            & (DrawingRevision.changeset_id == change_set_id)
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _get_validation_report_for_revision(
     session: AsyncSession,
     *,
@@ -915,6 +989,66 @@ async def _get_validation_report_for_revision(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def _get_revision_layouts_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    source_file_id: UUID,
+    drawing_revision_id: UUID,
+) -> list[RevisionLayout]:
+    """Load deterministic layout rows for a drawing revision."""
+    result = await session.execute(
+        select(RevisionLayout)
+        .where(
+            (RevisionLayout.project_id == project_id)
+            & (RevisionLayout.source_file_id == source_file_id)
+            & (RevisionLayout.drawing_revision_id == drawing_revision_id)
+        )
+        .order_by(RevisionLayout.sequence_index.asc(), RevisionLayout.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _get_revision_layers_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    source_file_id: UUID,
+    drawing_revision_id: UUID,
+) -> list[RevisionLayer]:
+    """Load deterministic layer rows for a drawing revision."""
+    result = await session.execute(
+        select(RevisionLayer)
+        .where(
+            (RevisionLayer.project_id == project_id)
+            & (RevisionLayer.source_file_id == source_file_id)
+            & (RevisionLayer.drawing_revision_id == drawing_revision_id)
+        )
+        .order_by(RevisionLayer.sequence_index.asc(), RevisionLayer.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def _get_revision_blocks_for_revision(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    source_file_id: UUID,
+    drawing_revision_id: UUID,
+) -> list[RevisionBlock]:
+    """Load deterministic block rows for a drawing revision."""
+    result = await session.execute(
+        select(RevisionBlock)
+        .where(
+            (RevisionBlock.project_id == project_id)
+            & (RevisionBlock.source_file_id == source_file_id)
+            & (RevisionBlock.drawing_revision_id == drawing_revision_id)
+        )
+        .order_by(RevisionBlock.sequence_index.asc(), RevisionBlock.id.asc())
+    )
+    return list(result.scalars().all())
 
 
 async def _get_revision_entity_manifest_for_revision(
@@ -1153,6 +1287,78 @@ def _build_persisted_validation_report_json(
     report_json["generated_at"] = payload.generated_at.isoformat()
     report_json["summary"] = summary
     report_json["checks"] = checks
+
+    return report_json
+
+
+def _build_changeset_validation_report_json(
+    base_report: ValidationReport,
+    *,
+    change_set_id: UUID,
+    drawing_revision_id: UUID,
+    predecessor_revision_id: UUID,
+    pinned_validation_result_id: UUID | None,
+    pinned_validation_status: str | None,
+    source_job_id: UUID,
+    validation_report_id: UUID,
+    generated_at: datetime,
+) -> dict[str, Any]:
+    """Copy a predecessor validation report onto a changeset-origin revision."""
+    base_json = base_report.report_json
+    report_json = deepcopy(base_json) if isinstance(base_json, dict) else {}
+
+    validator_json = report_json.get("validator")
+    validator = dict(validator_json) if isinstance(validator_json, dict) else {}
+    validator["name"] = base_report.validator_name
+    validator["version"] = base_report.validator_version
+
+    summary_json = report_json.get("summary")
+    summary = dict(summary_json) if isinstance(summary_json, dict) else {}
+    summary["validation_status"] = base_report.validation_status
+    summary["review_state"] = base_report.review_state
+    summary["quantity_gate"] = base_report.quantity_gate
+    summary["effective_confidence"] = base_report.effective_confidence
+
+    checks_json = report_json.get("checks")
+    checks = list(checks_json) if isinstance(checks_json, list) else []
+    if not checks:
+        checks.append(
+            {
+                "code": "changeset_validation_report_persisted",
+                "status": "passed",
+                "message": (
+                    "Changeset-origin revisions inherit the predecessor validation gate "
+                    "for quantity workflow compatibility."
+                ),
+            }
+        )
+
+    provenance_json = report_json.get("provenance")
+    provenance = dict(provenance_json) if isinstance(provenance_json, dict) else {}
+    provenance["source_validation_report_id"] = str(base_report.id)
+    provenance["source_drawing_revision_id"] = str(predecessor_revision_id)
+    provenance["change_set_id"] = str(change_set_id)
+    if pinned_validation_result_id is not None:
+        provenance["pinned_validation_result_id"] = str(pinned_validation_result_id)
+    if pinned_validation_status is not None:
+        provenance["pinned_validation_status"] = pinned_validation_status
+
+    report_json["validation_report_id"] = str(validation_report_id)
+    report_json["drawing_revision_id"] = str(drawing_revision_id)
+    report_json["source_job_id"] = str(source_job_id)
+    report_json["validation_report_schema_version"] = base_report.validation_report_schema_version
+    report_json["canonical_entity_schema_version"] = base_report.canonical_entity_schema_version
+    report_json["validation_status"] = base_report.validation_status
+    report_json["review_state"] = base_report.review_state
+    report_json["quantity_gate"] = base_report.quantity_gate
+    report_json["effective_confidence"] = base_report.effective_confidence
+    report_json["validator"] = validator
+    report_json["summary"] = summary
+    report_json["checks"] = checks
+    report_json["provenance"] = provenance
+    report_json["generated_at"] = generated_at.isoformat()
+    report_json["change_set_id"] = str(change_set_id)
+    report_json["predecessor_revision_id"] = str(predecessor_revision_id)
 
     return report_json
 
@@ -2524,6 +2730,117 @@ def _build_revision_materialization_rows(
     )
 
 
+def _copy_revision_collection_rows(
+    rows: Sequence[RevisionLayout | RevisionLayer | RevisionBlock],
+    *,
+    ref_key: str,
+) -> list[dict[str, Any]]:
+    """Copy persisted collection rows into a new in-memory materialization plan."""
+    copied_rows: list[dict[str, Any]] = []
+    for row in sorted(
+        rows,
+        key=lambda item: (int(item.sequence_index), str(getattr(item, ref_key)), str(item.id)),
+    ):
+        copied_rows.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": row.sequence_index,
+                "payload_json": _materialized_payload_json(row.payload_json),
+                ref_key: cast(str, getattr(row, ref_key)),
+            }
+        )
+    return copied_rows
+
+
+def _copy_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Deep-copy mapping-backed JSON contract fields into plain dicts."""
+    if value is None:
+        return {}
+    return deepcopy(dict(value))
+
+
+def _build_changeset_revision_materialization_rows(
+    apply_result: ChangeSetApplySuccess,
+    *,
+    base_manifest: RevisionEntityManifest,
+    base_layouts: Sequence[RevisionLayout],
+    base_layers: Sequence[RevisionLayer],
+    base_blocks: Sequence[RevisionBlock],
+) -> _RevisionMaterializationRows:
+    """Map applied changeset entities plus base collections into insert-ready rows."""
+    layouts = _copy_revision_collection_rows(base_layouts, ref_key="layout_ref")
+    layers = _copy_revision_collection_rows(base_layers, ref_key="layer_ref")
+    blocks = _copy_revision_collection_rows(base_blocks, ref_key="block_ref")
+
+    layout_ids_by_ref = {row["layout_ref"]: row["id"] for row in layouts}
+    layer_ids_by_ref = {row["layer_ref"]: row["id"] for row in layers}
+    block_ids_by_ref = {row["block_ref"]: row["id"] for row in blocks}
+
+    entities: list[dict[str, Any]] = []
+    for entity in sorted(
+        apply_result.entities,
+        key=lambda item: (item.sequence_index, item.entity_id, str(item.id)),
+    ):
+        layout_ref = _string_ref(entity.layout_ref)
+        layer_ref = _string_ref(entity.layer_ref)
+        block_ref = _string_ref(entity.block_ref)
+        parent_entity_ref = _string_ref(entity.parent_entity_ref)
+        entities.append(
+            {
+                "id": uuid.uuid4(),
+                "sequence_index": entity.sequence_index,
+                "entity_id": entity.entity_id,
+                "entity_type": entity.entity_type,
+                "entity_schema_version": entity.entity_schema_version,
+                "parent_entity_ref": parent_entity_ref,
+                "confidence_score": entity.confidence_score,
+                "confidence_json": _copy_json_mapping(entity.confidence_json),
+                "geometry_json": _copy_json_mapping(entity.geometry_json),
+                "properties_json": _copy_json_mapping(entity.properties_json),
+                "provenance_json": _copy_json_mapping(entity.provenance_json),
+                "canonical_entity_json": (
+                    _copy_json_mapping(entity.canonical_entity_json)
+                    if entity.canonical_entity_json is not None
+                    else None
+                ),
+                "layout_ref": layout_ref,
+                "layer_ref": layer_ref,
+                "block_ref": block_ref,
+                "source_identity": _string_ref(entity.source_identity),
+                "source_hash": _hash_ref(entity.source_hash),
+                "layout_id": layout_ids_by_ref.get(layout_ref) if layout_ref is not None else None,
+                "layer_id": layer_ids_by_ref.get(layer_ref) if layer_ref is not None else None,
+                "block_id": block_ids_by_ref.get(block_ref) if block_ref is not None else None,
+            }
+        )
+
+    entity_row_ids_by_entity_id = {row["entity_id"]: row["id"] for row in entities}
+    for row in entities:
+        parent_entity_ref = row["parent_entity_ref"]
+        row["parent_entity_row_id"] = (
+            entity_row_ids_by_entity_id.get(parent_entity_ref)
+            if parent_entity_ref is not None
+            else None
+        )
+
+    counts_json = _json_object(base_manifest.counts_json)
+    counts_json.update(
+        {
+            "layouts": len(layouts),
+            "layers": len(layers),
+            "blocks": len(blocks),
+            "entities": len(entities),
+        }
+    )
+    return _RevisionMaterializationRows(
+        counts_json=counts_json,
+        layouts=layouts,
+        layers=layers,
+        blocks=blocks,
+        entities=entities,
+    )
+
+
 def _order_revision_entity_insert_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Order entity rows so parent self-FKs insert before children when possible."""
     if len(rows) < 2:
@@ -2671,6 +2988,77 @@ async def _persist_revision_materialization(
                 }
                 for row in materialization_rows.entities
             ]
+        ),
+    )
+
+    return manifest_id
+
+
+async def _persist_changeset_revision_materialization(
+    session: AsyncSession,
+    *,
+    job: Job,
+    source_file: File,
+    drawing_revision_id: UUID,
+    apply_result: ChangeSetApplySuccess,
+    base_manifest: RevisionEntityManifest,
+    base_layouts: Sequence[RevisionLayout],
+    base_layers: Sequence[RevisionLayer],
+    base_blocks: Sequence[RevisionBlock],
+) -> UUID:
+    """Persist changeset-origin revision materialization with null ingest lineage fields."""
+    materialization_rows = _build_changeset_revision_materialization_rows(
+        apply_result,
+        base_manifest=base_manifest,
+        base_layouts=base_layouts,
+        base_layers=base_layers,
+        base_blocks=base_blocks,
+    )
+    manifest_id = uuid.uuid4()
+    base_row = {
+        "project_id": job.project_id,
+        "source_file_id": source_file.id,
+        "extraction_profile_id": None,
+        "source_job_id": job.id,
+        "drawing_revision_id": drawing_revision_id,
+        "adapter_run_output_id": None,
+        "canonical_entity_schema_version": base_manifest.canonical_entity_schema_version,
+    }
+
+    session.add(
+        RevisionEntityManifest(
+            id=manifest_id,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            extraction_profile_id=None,
+            source_job_id=job.id,
+            drawing_revision_id=drawing_revision_id,
+            adapter_run_output_id=None,
+            canonical_entity_schema_version=base_manifest.canonical_entity_schema_version,
+            counts_json=materialization_rows.counts_json,
+        )
+    )
+
+    await _bulk_insert_model_rows(
+        session,
+        RevisionLayout,
+        [{**base_row, **row} for row in materialization_rows.layouts],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionLayer,
+        [{**base_row, **row} for row in materialization_rows.layers],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionBlock,
+        [{**base_row, **row} for row in materialization_rows.blocks],
+    )
+    await _bulk_insert_model_rows(
+        session,
+        RevisionEntity,
+        _order_revision_entity_insert_rows(
+            [{**base_row, **row} for row in materialization_rows.entities]
         ),
     )
 
@@ -4830,6 +5218,14 @@ async def _begin_or_resume_export_job(job_id: UUID) -> _JobAttemptLease | None:
     return await _begin_or_resume_registered_job(job_id, process_name="process_export_job")
 
 
+async def _begin_or_resume_changeset_apply_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted changeset apply job under a row lock."""
+    return await _begin_or_resume_registered_job(
+        job_id,
+        process_name="process_changeset_apply_job",
+    )
+
+
 async def _execute_ingest_job_attempt(
     job_id: UUID,
     *,
@@ -4943,12 +5339,20 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
         logger.info(spec.stale_attempt_log_event, job_id=str(job_id))
         return
     except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event=spec.revision_conflict_log_event,
-            exc=exc,
-        )
+        if spec.job_type_name == "changeset_apply":
+            await _mark_changeset_apply_job_failed_for_revision_conflict(
+                job_id,
+                attempt_token=lease.token,
+                log_event=spec.revision_conflict_log_event,
+                exc=exc,
+            )
+        else:
+            await _mark_job_failed_for_revision_conflict(
+                job_id,
+                attempt_token=lease.token,
+                log_event=spec.revision_conflict_log_event,
+                exc=exc,
+            )
         if spec.reraise_revision_conflict:
             raise
         return
@@ -4963,23 +5367,32 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
         if spec.input_error_type is not None and isinstance(exc, spec.input_error_type):
             input_error = cast(_RegisteredJobInputError, exc)
             failure_details = input_error.details
-            await _mark_job_failed(
-                job_id,
-                error_message=input_error.message,
-                error_code=input_error.error_code,
-                attempt_token=lease.token,
-                error_details=failure_details,
-            )
             if spec.input_failure_log_event is None:
                 raise AssertionError(
                     f"Registered job '{spec.job_type_name}' is missing input_failure_log_event"
                 ) from exc
-            logger.warning(
-                spec.input_failure_log_event,
-                job_id=str(job_id),
-                error_code=input_error.error_code.value,
-                **(failure_details or {}),
-            )
+            if spec.job_type_name == "changeset_apply":
+                assert isinstance(input_error, _ChangeSetApplyJobError)
+                await _mark_changeset_apply_job_failed_for_input_error(
+                    job_id,
+                    attempt_token=lease.token,
+                    log_event=spec.input_failure_log_event,
+                    exc=input_error,
+                )
+            else:
+                await _mark_job_failed(
+                    job_id,
+                    error_message=input_error.message,
+                    error_code=input_error.error_code,
+                    attempt_token=lease.token,
+                    error_details=failure_details,
+                )
+                logger.warning(
+                    spec.input_failure_log_event,
+                    job_id=str(job_id),
+                    error_code=input_error.error_code.value,
+                    **(failure_details or {}),
+                )
             return
 
         if spec.execution_error_type is not None and isinstance(exc, spec.execution_error_type):
@@ -5030,12 +5443,20 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
         )
         raise
     except _RevisionConflictError as exc:
-        await _mark_job_failed_for_revision_conflict(
-            job_id,
-            attempt_token=lease.token,
-            log_event=spec.revision_conflict_log_event,
-            exc=exc,
-        )
+        if spec.job_type_name == "changeset_apply":
+            await _mark_changeset_apply_job_failed_for_revision_conflict(
+                job_id,
+                attempt_token=lease.token,
+                log_event=spec.revision_conflict_log_event,
+                exc=exc,
+            )
+        else:
+            await _mark_job_failed_for_revision_conflict(
+                job_id,
+                attempt_token=lease.token,
+                log_event=spec.revision_conflict_log_event,
+                exc=exc,
+            )
         if spec.reraise_revision_conflict:
             raise
         return
@@ -5160,6 +5581,576 @@ async def _execute_export_job(
     return _RegisteredJobAttemptResult(
         finalize_kwargs={"execution": execution, "rendered": rendered}
     )
+
+
+async def _query_changeset_apply_job_inputs(
+    session: AsyncSession,
+    *,
+    job_id: UUID,
+) -> list[ChangeSetApplyJobInput]:
+    """Load persisted immutable inputs for one changeset-apply job."""
+    with session.no_autoflush:
+        result = await session.execute(
+            select(ChangeSetApplyJobInput)
+            .where(ChangeSetApplyJobInput.source_job_id == job_id)
+            .order_by(
+                ChangeSetApplyJobInput.created_at.asc(),
+                ChangeSetApplyJobInput.source_job_id.asc(),
+            )
+        )
+    return list(result.scalars().all())
+
+
+async def _load_changeset_apply_job_input(
+    session: AsyncSession,
+    *,
+    job: Job,
+) -> ChangeSetApplyJobInput:
+    """Validate that one immutable apply input exists and matches the persisted job."""
+    apply_inputs = await _query_changeset_apply_job_inputs(session, job_id=job.id)
+    if not apply_inputs:
+        raise _ChangeSetApplyJobError(
+            error_code=ErrorCode.NOT_FOUND,
+            message="Changeset apply job input is missing.",
+            details=None,
+        )
+    if len(apply_inputs) != 1:
+        raise _ChangeSetApplyJobError(
+            error_code=ErrorCode.INPUT_INVALID,
+            message="Changeset apply job has multiple immutable inputs.",
+            details={"input_count": len(apply_inputs)},
+        )
+
+    apply_input = apply_inputs[0]
+    if (
+        apply_input.project_id != job.project_id
+        or apply_input.source_file_id != job.file_id
+        or apply_input.drawing_revision_id != job.base_revision_id
+        or apply_input.source_job_id != job.id
+        or apply_input.source_job_type != JobType.CHANGESET_APPLY.value
+    ):
+        raise _ChangeSetApplyJobError(
+            error_code=ErrorCode.INPUT_INVALID,
+            message="Changeset apply job input lineage does not match the persisted job.",
+            details={
+                "source_job_type": apply_input.source_job_type,
+                "source_file_id": str(apply_input.source_file_id),
+                "file_id": str(job.file_id),
+                "drawing_revision_id": str(apply_input.drawing_revision_id),
+                "base_revision_id": (
+                    str(job.base_revision_id) if job.base_revision_id is not None else None
+                ),
+            },
+        )
+    return apply_input
+
+
+async def _load_changeset_apply_job_input_if_valid(
+    session: AsyncSession,
+    *,
+    job: Job,
+) -> ChangeSetApplyJobInput | None:
+    """Return the immutable apply input when exactly one lineage-matching row exists."""
+    apply_inputs = await _query_changeset_apply_job_inputs(session, job_id=job.id)
+    if len(apply_inputs) != 1:
+        return None
+
+    apply_input = apply_inputs[0]
+    if (
+        apply_input.project_id != job.project_id
+        or apply_input.source_file_id != job.file_id
+        or apply_input.drawing_revision_id != job.base_revision_id
+        or apply_input.source_job_id != job.id
+        or apply_input.source_job_type != JobType.CHANGESET_APPLY.value
+    ):
+        return None
+    return apply_input
+
+
+def _parse_uuid_value(value: Any) -> UUID | None:
+    """Best-effort UUID parsing for persisted error payloads."""
+    if isinstance(value, UUID):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+async def _resolve_changeset_apply_failure_target(
+    session: AsyncSession,
+    *,
+    job: Job,
+    fallback_change_set_id: UUID | None = None,
+) -> CadChangeSet | None:
+    """Resolve the mutable changeset row for an apply-job terminal failure."""
+    apply_input = await _load_changeset_apply_job_input_if_valid(session, job=job)
+    change_set_id = apply_input.change_set_id if apply_input is not None else fallback_change_set_id
+    if change_set_id is None:
+        return None
+
+    change_set = await session.get(CadChangeSet, change_set_id)
+    if change_set is None or change_set.project_id != job.project_id:
+        return None
+    if job.base_revision_id is not None and change_set.base_revision_id != job.base_revision_id:
+        return None
+    return change_set
+
+
+async def _mark_changeset_apply_job_failed(
+    job_id: UUID,
+    *,
+    error_message: str,
+    error_code: ErrorCode,
+    attempt_token: UUID,
+    error_details: dict[str, Any] | None,
+    change_set_status: str | None,
+) -> bool:
+    """Persist a changeset-apply job failure and matching changeset status atomically."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    fallback_change_set_id = _parse_uuid_value((error_details or {}).get("change_set_id"))
+    async with session_maker() as session:
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            return await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+
+        if change_set_status is not None:
+            change_set = await _resolve_changeset_apply_failure_target(
+                session,
+                job=job,
+                fallback_change_set_id=fallback_change_set_id,
+            )
+            if change_set is not None and change_set.status != "applied":
+                change_set.status = change_set_status
+
+        await _persist_job_failed(
+            session,
+            job,
+            error_message=error_message,
+            error_code=error_code,
+            error_details=error_details,
+        )
+        await session.commit()
+
+    return True
+
+
+async def _mark_changeset_apply_job_failed_for_revision_conflict(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    log_event: str,
+    exc: _RevisionConflictError,
+) -> None:
+    """Persist and log a changeset-apply revision conflict atomically."""
+    await _mark_changeset_apply_job_failed(
+        job_id,
+        error_message=exc.message,
+        error_code=ErrorCode.REVISION_CONFLICT,
+        attempt_token=attempt_token,
+        error_details=exc.details,
+        change_set_status="revision_conflict",
+    )
+    logger.warning(
+        log_event,
+        job_id=str(job_id),
+        error_code=ErrorCode.REVISION_CONFLICT.value,
+        **exc.details,
+    )
+
+
+async def _mark_changeset_apply_job_failed_for_input_error(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    log_event: str,
+    exc: _ChangeSetApplyJobError,
+) -> None:
+    """Persist and log a deterministic changeset-apply failure atomically."""
+    failure_details = exc.details
+    await _mark_changeset_apply_job_failed(
+        job_id,
+        error_message=exc.message,
+        error_code=exc.error_code,
+        attempt_token=attempt_token,
+        error_details=failure_details,
+        change_set_status="apply_failed",
+    )
+    logger.warning(
+        log_event,
+        job_id=str(job_id),
+        error_code=exc.error_code.value,
+        **(failure_details or {}),
+    )
+
+
+def _build_changeset_apply_conflict_details(
+    result: ChangeSetApplyConflict,
+) -> dict[str, Any]:
+    """Convert a stale apply conflict into the shared job failure detail shape."""
+    return {
+        "change_set_id": str(result.details.change_set_id),
+        "base_revision_id": str(result.details.base_revision_id),
+        "base_revision_sequence": result.details.base_revision_sequence,
+        "current_revision_id": str(result.details.current_revision_id),
+        "current_revision_sequence": result.details.current_revision_sequence,
+        "conflicting_targets": [
+            {
+                "operation_id": str(target.operation_id),
+                "sequence_index": target.sequence_index,
+                "operation_type": target.operation_type,
+                "target_revision_entity_id": (
+                    str(target.target_revision_entity_id)
+                    if target.target_revision_entity_id is not None
+                    else None
+                ),
+                "entity_id": target.entity_id,
+                "expected_source_identity": target.expected_source_identity,
+                "expected_source_hash": target.expected_source_hash,
+            }
+            for target in result.details.conflicting_targets
+        ],
+    }
+
+
+def _build_changeset_apply_error_details(result: ChangeSetApplyError) -> dict[str, Any]:
+    """Convert a deterministic apply-engine failure into worker job failure details."""
+    details: dict[str, Any] = {
+        "change_set_id": str(result.change_set_id),
+        "apply_error_code": result.error_code,
+    }
+    if result.details:
+        details.update(dict(result.details))
+    return details
+
+
+async def _execute_changeset_apply_job_attempt(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+) -> _RegisteredJobAttemptResult | None:
+    """Load immutable apply input, re-run apply loading, and defer success finalization."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await session.get(Job, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+        if job.job_type != JobType.CHANGESET_APPLY.value:
+            raise ValueError(f"Unsupported changeset apply job type '{job.job_type}'")
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Changeset apply job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "current_revision_id": None,
+                },
+            )
+
+        apply_input = await _load_changeset_apply_job_input(session, job=job)
+        try:
+            apply_result = await load_and_apply_change_set(
+                session,
+                project_id=job.project_id,
+                change_set_id=apply_input.change_set_id,
+            )
+        except ChangeSetApplyLoadError as exc:
+            raise _ChangeSetApplyJobError(
+                error_code=ErrorCode.INPUT_INVALID,
+                message=str(exc),
+                details={
+                    "change_set_id": str(apply_input.change_set_id),
+                },
+            ) from exc
+
+    if isinstance(apply_result, ChangeSetApplyConflict):
+        raise _RevisionConflictError(
+            message="Changeset apply base revision is stale relative to the current revision.",
+            details=_build_changeset_apply_conflict_details(apply_result),
+        )
+    if isinstance(apply_result, ChangeSetApplyError):
+        raise _ChangeSetApplyJobError(
+            error_code=ErrorCode.INPUT_INVALID,
+            message=apply_result.message,
+            details=_build_changeset_apply_error_details(apply_result),
+        )
+
+    assert isinstance(apply_result, ChangeSetApplySuccess)
+    return _RegisteredJobAttemptResult(finalize_kwargs={"apply_result": apply_result})
+
+
+async def _finalize_changeset_apply_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    apply_result: ChangeSetApplySuccess,
+) -> bool:
+    """Atomically publish a changeset-origin revision and terminal job success."""
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
+        job = locked_source.job
+        source_file = locked_source.source_file
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "changeset_apply_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "changeset_apply_job_completion_skipped_stale_attempt",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if job.cancel_requested:
+            _finalize_job_cancelled(job)
+            await emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info("changeset_apply_job_cancelled", job_id=str(job_id))
+            return False
+
+        if job.status != "running":
+            logger.info(
+                "changeset_apply_job_completion_skipped_non_running_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or source_file is None
+            or source_file.deleted_at is not None
+        ):
+            await _cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("changeset_apply_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
+        if job.base_revision_id != apply_result.base_revision.revision_id:
+            raise _RevisionConflictError(
+                message="Changeset apply base revision changed before finalization.",
+                details={
+                    "base_revision_id": (
+                        str(job.base_revision_id) if job.base_revision_id is not None else None
+                    ),
+                    "apply_result_base_revision_id": str(apply_result.base_revision.revision_id),
+                },
+            )
+
+        existing_revision = await _get_existing_drawing_revision(session, source_job_id=job.id)
+        if existing_revision is not None:
+            logger.info(
+                "changeset_apply_job_completion_skipped_existing_revision",
+                job_id=str(job_id),
+                drawing_revision_id=str(existing_revision.id),
+            )
+            return False
+
+        current_revision = await _get_latest_drawing_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+        )
+        if (
+            current_revision is None
+            or current_revision.id != apply_result.current_revision.revision_id
+        ):
+            base_revision = await _get_drawing_revision(
+                session,
+                revision_id=apply_result.base_revision.revision_id,
+            )
+            raise _RevisionConflictError(
+                message="Changeset apply base revision became stale before finalization.",
+                details={
+                    **_build_revision_conflict_details(
+                        base_revision=base_revision,
+                        current_revision=current_revision,
+                    ),
+                    "change_set_id": str(apply_result.change_set_id),
+                },
+            )
+
+        validation_report = await _get_validation_report_for_revision(
+            session,
+            project_id=job.project_id,
+            drawing_revision_id=current_revision.id,
+        )
+        if validation_report is None:
+            raise RuntimeError("Changeset apply base revision is missing its validation report.")
+
+        apply_input = await _load_changeset_apply_job_input_if_valid(session, job=job)
+
+        base_manifest = await _get_revision_entity_manifest_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            drawing_revision_id=current_revision.id,
+        )
+        if base_manifest is None:
+            raise RuntimeError("Changeset apply base revision is missing normalized entities.")
+
+        base_layouts = await _get_revision_layouts_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            drawing_revision_id=current_revision.id,
+        )
+        base_layers = await _get_revision_layers_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            drawing_revision_id=current_revision.id,
+        )
+        base_blocks = await _get_revision_blocks_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            drawing_revision_id=current_revision.id,
+        )
+
+        change_set = await session.get(CadChangeSet, apply_result.change_set_id)
+        if change_set is None:
+            raise RuntimeError("Changeset apply change set no longer exists.")
+        if (
+            change_set.project_id != job.project_id
+            or change_set.base_revision_id != apply_result.base_revision.revision_id
+        ):
+            raise ValueError("Changeset apply change set lineage does not match the source job")
+
+        drawing_revision_id = uuid.uuid4()
+        validation_report_id = uuid.uuid4()
+        finished_at = _utcnow()
+        drawing_revision = DrawingRevision(
+            id=drawing_revision_id,
+            project_id=job.project_id,
+            source_file_id=source_file.id,
+            extraction_profile_id=None,
+            source_job_id=job.id,
+            adapter_run_output_id=None,
+            changeset_id=apply_result.change_set_id,
+            predecessor_revision_id=current_revision.id,
+            revision_sequence=current_revision.revision_sequence + 1,
+            revision_kind="changeset",
+            review_state=validation_report.review_state,
+            canonical_entity_schema_version=base_manifest.canonical_entity_schema_version,
+            confidence_score=validation_report.effective_confidence,
+        )
+
+        session.add(drawing_revision)
+        await session.flush()
+
+        session.add(
+            ValidationReport(
+                id=validation_report_id,
+                project_id=job.project_id,
+                drawing_revision_id=drawing_revision_id,
+                source_job_id=job.id,
+                validation_report_schema_version=validation_report.validation_report_schema_version,
+                canonical_entity_schema_version=validation_report.canonical_entity_schema_version,
+                validation_status=validation_report.validation_status,
+                review_state=validation_report.review_state,
+                quantity_gate=validation_report.quantity_gate,
+                effective_confidence=validation_report.effective_confidence,
+                validator_name=validation_report.validator_name,
+                validator_version=validation_report.validator_version,
+                report_json=_build_changeset_validation_report_json(
+                    validation_report,
+                    change_set_id=apply_result.change_set_id,
+                    drawing_revision_id=drawing_revision_id,
+                    predecessor_revision_id=current_revision.id,
+                    pinned_validation_result_id=(
+                        apply_input.latest_validation_result_id if apply_input is not None else None
+                    ),
+                    pinned_validation_status=(
+                        apply_input.latest_validation_status if apply_input is not None else None
+                    ),
+                    source_job_id=job.id,
+                    validation_report_id=validation_report_id,
+                    generated_at=finished_at,
+                ),
+                generated_at=finished_at,
+            )
+        )
+        await _persist_changeset_revision_materialization(
+            session,
+            job=job,
+            source_file=source_file,
+            drawing_revision_id=drawing_revision_id,
+            apply_result=apply_result,
+            base_manifest=base_manifest,
+            base_layouts=base_layouts,
+            base_layers=base_layers,
+            base_blocks=base_blocks,
+        )
+
+        change_set.status = "applied"
+        job.status = "succeeded"
+        job.finished_at = finished_at
+        job.error_code = None
+        job.error_message = None
+        _clear_job_attempt_lease(job)
+        await emit_job_event(
+            job.id,
+            level="info",
+            message="Job succeeded",
+            data_json={
+                "status": "succeeded",
+                "attempts": job.attempts,
+                "drawing_revision_id": str(drawing_revision_id),
+                "validation_report_id": str(validation_report_id),
+                "change_set_id": str(apply_result.change_set_id),
+            },
+            session=session,
+        )
+        await session.commit()
+
+    return True
 
 
 async def process_ingest_job(job_id: UUID) -> None:
@@ -5323,6 +6314,11 @@ async def process_export_job(job_id: UUID) -> None:
     await _process_registered_job(job_id, spec=_EXPORT_PROCESS_SPEC)
 
 
+async def process_changeset_apply_job(job_id: UUID) -> None:
+    """Load a persisted changeset apply job through the shared worker shell."""
+    await _process_registered_job(job_id, spec=_CHANGESET_APPLY_PROCESS_SPEC)
+
+
 @celery_app.task(
     name="app.jobs.worker.run_export_job",
     ignore_result=True,
@@ -5338,3 +6334,19 @@ def enqueue_export_job(job_id: UUID) -> None:
     """Publish a persisted export job to Celery."""
 
     run_export_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+
+
+@celery_app.task(
+    name="app.jobs.worker.run_changeset_apply_job",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def run_changeset_apply_job(job_id: str) -> None:
+    """Celery task wrapper for persisted changeset apply jobs."""
+    _run_worker_loop(lambda: process_changeset_apply_job(UUID(job_id)))
+
+
+def enqueue_changeset_apply_job(job_id: UUID) -> None:
+    """Publish a persisted changeset apply job to Celery."""
+    run_changeset_apply_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)

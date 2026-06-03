@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal
 
-type JobTypeName = Literal["ingest", "reprocess", "quantity_takeoff", "estimate", "export"]
+type JobTypeName = Literal[
+    "ingest",
+    "reprocess",
+    "quantity_takeoff",
+    "estimate",
+    "export",
+    "changeset_apply",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +91,15 @@ JOB_HANDLERS: Final[tuple[JobHandler, ...]] = (
         enqueue_publisher_name="enqueue_export_job",
         enqueue_error_message="Failed to enqueue export job",
     ),
+    JobHandler(
+        job_type_name="changeset_apply",
+        execute_name="_execute_changeset_apply_job_attempt",
+        finalize_name="_finalize_changeset_apply_job",
+        process_name="process_changeset_apply_job",
+        run_task_name="run_changeset_apply_job",
+        enqueue_publisher_name="enqueue_changeset_apply_job",
+        enqueue_error_message="Failed to enqueue changeset apply job",
+    ),
 )
 
 _JOB_HANDLERS_BY_TYPE: Final[dict[str, JobHandler]] = {
@@ -146,6 +162,18 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             reclaimed_stale_running="export_job_reclaimed_stale_running_status",
             duplicate_delivery="export_job_duplicate_delivery_skipped_running_attempt",
             cancelled="export_job_cancelled",
+        ),
+    ),
+    BeginOrResumeRoute(
+        process_name="process_changeset_apply_job",
+        supported_job_types=_job_types_for_process("process_changeset_apply_job"),
+        log_keys=BeginOrResumeLogKeys(
+            unsupported_type="changeset_apply_job_unsupported_type_skipped",
+            terminal_status="changeset_apply_job_skipped_terminal_status",
+            inactive_source="changeset_apply_job_cancelled_inactive_source",
+            reclaimed_stale_running="changeset_apply_job_reclaimed_stale_running_status",
+            duplicate_delivery="changeset_apply_job_duplicate_delivery_skipped_running_attempt",
+            cancelled="changeset_apply_job_cancelled",
         ),
     ),
 )

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +29,8 @@ from app.cad.changeset import (
     load_and_apply_change_set,
     load_change_set_apply_input,
 )
+from app.core.errors import ErrorCode
+from app.jobs import worker as worker_module
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import (
     CadChangeOperation,
@@ -40,9 +44,13 @@ from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.project import Project
 from app.models.revision_materialization import (
+    RevisionBlock,
     RevisionEntity,
     RevisionEntityManifest,
+    RevisionLayer,
+    RevisionLayout,
 )
+from app.models.validation_report import ValidationReport
 from tests.conftest import requires_database
 
 _DEFAULT_CHANGESET_APPLY_JOB_ID = uuid.UUID("90000000-0000-0000-0000-000000000100")
@@ -721,6 +729,224 @@ def test_apply_change_set_returns_conflict_for_stale_current_revision() -> None:
     )
 
 
+def test_build_changeset_revision_materialization_rows_copies_base_rows_and_remaps_ids() -> None:
+    project_id = uuid.UUID("30000000-0000-0000-0000-000000000001")
+    file_id = uuid.UUID("30000000-0000-0000-0000-000000000002")
+    profile_id = uuid.UUID("30000000-0000-0000-0000-000000000003")
+    job_id = uuid.UUID("30000000-0000-0000-0000-000000000004")
+    revision_id = uuid.UUID("30000000-0000-0000-0000-000000000005")
+    adapter_id = uuid.UUID("30000000-0000-0000-0000-000000000006")
+    change_set_id = uuid.UUID("30000000-0000-0000-0000-000000000007")
+
+    base_manifest = RevisionEntityManifest(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000008"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        counts_json={"layouts": 99, "layers": 99, "blocks": 99, "entities": 2},
+    )
+    base_layout = RevisionLayout(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000009"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=0,
+        payload_json={"name": "Model"},
+        layout_ref="model",
+    )
+    wall_layer = RevisionLayer(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000010"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=0,
+        payload_json={"name": "A-WALL"},
+        layer_ref="A-WALL",
+    )
+    updated_wall_layer = RevisionLayer(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000011"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=1,
+        payload_json={"name": "A-WALL-UPDATED"},
+        layer_ref="A-WALL-UPDATED",
+    )
+    door_layer = RevisionLayer(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000012"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=2,
+        payload_json={"name": "A-DOOR"},
+        layer_ref="A-DOOR",
+    )
+    note_layer = RevisionLayer(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000013"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=3,
+        payload_json={"name": "A-NOTE"},
+        layer_ref="A-NOTE",
+    )
+    base_block = RevisionBlock(
+        id=uuid.UUID("30000000-0000-0000-0000-000000000014"),
+        project_id=project_id,
+        source_file_id=file_id,
+        extraction_profile_id=profile_id,
+        source_job_id=job_id,
+        drawing_revision_id=revision_id,
+        adapter_run_output_id=adapter_id,
+        canonical_entity_schema_version="1",
+        sequence_index=0,
+        payload_json={"name": "door-block"},
+        block_ref="door-block",
+    )
+
+    apply_result = ChangeSetApplySuccess(
+        change_set_id=change_set_id,
+        base_revision=RevisionRef(revision_id=revision_id, revision_sequence=1),
+        current_revision=RevisionRef(revision_id=revision_id, revision_sequence=1),
+        operations=(),
+        entities=(
+            _entity_snapshot(
+                revision_entity_id=uuid.UUID("30000000-0000-0000-0000-000000000015"),
+                sequence_index=0,
+                entity_id="wall-1",
+                layout_ref="model",
+                layer_ref="A-WALL-UPDATED",
+                properties_json={"description": "Wall"},
+                canonical_entity_json={"properties": {"description": "Wall"}},
+                source_identity="wall:1",
+                source_hash="a" * 64,
+            ),
+            _entity_snapshot(
+                revision_entity_id=uuid.UUID("30000000-0000-0000-0000-000000000016"),
+                sequence_index=1,
+                entity_id="door-1",
+                layout_ref="model",
+                layer_ref="A-DOOR",
+                block_ref="door-block",
+                parent_entity_ref="wall-1",
+                properties_json={"label": "Door"},
+                canonical_entity_json={"properties": {"label": "Door"}},
+                source_identity="door:1",
+                source_hash="b" * 64,
+            ),
+            _entity_snapshot(
+                revision_entity_id=uuid.UUID("30000000-0000-0000-0000-000000000017"),
+                sequence_index=2,
+                entity_id="note-1",
+                layout_ref="model",
+                layer_ref="A-NOTE",
+                properties_json={"label": "N-1"},
+                canonical_entity_json={"properties": {"label": "N-1"}},
+                source_identity="note:1",
+                source_hash="c" * 64,
+            ),
+        ),
+    )
+
+    rows = worker_module._build_changeset_revision_materialization_rows(
+        apply_result,
+        base_manifest=base_manifest,
+        base_layouts=(base_layout,),
+        base_layers=(wall_layer, updated_wall_layer, door_layer, note_layer),
+        base_blocks=(base_block,),
+    )
+
+    assert rows.counts_json == {"layouts": 1, "layers": 4, "blocks": 1, "entities": 3}
+    assert len(rows.layouts) == 1
+    assert len(rows.layers) == 4
+    assert len(rows.blocks) == 1
+    assert len(rows.entities) == 3
+
+    copied_layout = rows.layouts[0]
+    copied_block = rows.blocks[0]
+    layer_ids_by_ref = {row["layer_ref"]: row["id"] for row in rows.layers}
+    entity_rows_by_entity_id = {row["entity_id"]: row for row in rows.entities}
+
+    assert copied_layout["id"] != base_layout.id
+    assert copied_layout["sequence_index"] == base_layout.sequence_index
+    assert copied_layout["payload_json"] == base_layout.payload_json
+    assert copied_layout["layout_ref"] == base_layout.layout_ref
+
+    assert copied_block["id"] != base_block.id
+    assert copied_block["sequence_index"] == base_block.sequence_index
+    assert copied_block["payload_json"] == base_block.payload_json
+    assert copied_block["block_ref"] == base_block.block_ref
+
+    assert layer_ids_by_ref["A-WALL-UPDATED"] != updated_wall_layer.id
+    assert layer_ids_by_ref["A-DOOR"] != door_layer.id
+    assert layer_ids_by_ref["A-NOTE"] != note_layer.id
+
+    wall_row = entity_rows_by_entity_id["wall-1"]
+    door_row = entity_rows_by_entity_id["door-1"]
+    note_row = entity_rows_by_entity_id["note-1"]
+
+    assert wall_row["sequence_index"] == 0
+    assert wall_row["layout_ref"] == "model"
+    assert wall_row["layout_id"] == copied_layout["id"]
+    assert wall_row["layer_ref"] == "A-WALL-UPDATED"
+    assert wall_row["layer_id"] == layer_ids_by_ref["A-WALL-UPDATED"]
+    assert wall_row["block_id"] is None
+    assert wall_row["parent_entity_row_id"] is None
+    assert wall_row["canonical_entity_json"] == {"properties": {"description": "Wall"}}
+
+    assert door_row["sequence_index"] == 1
+    assert door_row["layout_id"] == copied_layout["id"]
+    assert door_row["layer_id"] == layer_ids_by_ref["A-DOOR"]
+    assert door_row["block_ref"] == "door-block"
+    assert door_row["block_id"] == copied_block["id"]
+    assert door_row["parent_entity_ref"] == "wall-1"
+    assert door_row["parent_entity_row_id"] == wall_row["id"]
+    assert door_row["canonical_entity_json"] == {"properties": {"label": "Door"}}
+
+    assert note_row["sequence_index"] == 2
+    assert note_row["layout_id"] == copied_layout["id"]
+    assert note_row["layer_id"] == layer_ids_by_ref["A-NOTE"]
+    assert note_row["block_id"] is None
+    assert note_row["parent_entity_row_id"] is None
+    assert note_row["canonical_entity_json"] == {"properties": {"label": "N-1"}}
+
+    leaked_origin_keys = {
+        "project_id",
+        "source_file_id",
+        "source_job_id",
+        "drawing_revision_id",
+        "extraction_profile_id",
+        "adapter_run_output_id",
+        "canonical_entity_schema_version",
+    }
+    for row in [*rows.layouts, *rows.layers, *rows.blocks, *rows.entities]:
+        assert leaked_origin_keys.isdisjoint(row)
+
+
 @requires_database
 @pytest.mark.usefixtures("cleanup_projects")
 @pytest.mark.asyncio
@@ -1089,12 +1315,705 @@ async def test_load_and_apply_change_set_short_circuits_stale_current_before_ent
     )
 
 
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_execute_changeset_apply_job_attempt_returns_success_for_finalization() -> None:
+    session, seeded = await _seed_loader_case()
+    attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000120")
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000121"),
+    )
+    job.status = "running"
+    job.attempts = 1
+    job.attempt_token = attempt_token
+    job.started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+
+        result = await worker_module._execute_changeset_apply_job_attempt(
+            job.id,
+            attempt_token=attempt_token,
+        )
+    finally:
+        await session.close()
+
+    assert isinstance(result, worker_module._RegisteredJobAttemptResult)
+    apply_result = result.finalize_kwargs["apply_result"]
+    assert isinstance(apply_result, ChangeSetApplySuccess)
+    assert apply_result.change_set_id == seeded.change_set.id
+    assert apply_result.base_revision == RevisionRef(
+        revision_id=seeded.base_revision.id,
+        revision_sequence=seeded.base_revision.revision_sequence,
+    )
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_missing_input_fails_deterministically() -> None:
+    session, seeded = await _seed_loader_case()
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000122"),
+    )
+    try:
+        session.add(job)
+        await session.commit()
+    finally:
+        await session.close()
+
+    await worker_module.process_changeset_apply_job(job.id)
+
+    persisted = await _get_job(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == ErrorCode.NOT_FOUND.value
+    assert persisted.error_message == "Changeset apply job input is missing."
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_multiple_inputs_fail_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, seeded = await _seed_loader_case()
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000123"),
+    )
+    apply_input = _build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(apply_input)
+        await session.commit()
+    finally:
+        await session.close()
+
+    async def _duplicate_inputs(*args: object, **kwargs: object) -> list[ChangeSetApplyJobInput]:
+        _ = (args, kwargs)
+        return [apply_input, apply_input]
+
+    monkeypatch.setattr(worker_module, "_query_changeset_apply_job_inputs", _duplicate_inputs)
+
+    await worker_module.process_changeset_apply_job(job.id)
+
+    persisted = await _get_job(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == ErrorCode.INPUT_INVALID.value
+    assert persisted.error_message == "Changeset apply job has multiple immutable inputs."
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_input_mismatch_fails_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, seeded = await _seed_loader_case()
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000124"),
+    )
+    apply_input = _build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id)
+    mismatched_input = _build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id)
+    mismatched_input.drawing_revision_id = uuid.UUID("90000000-0000-0000-0000-000000000199")
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(apply_input)
+        await session.commit()
+    finally:
+        await session.close()
+
+    async def _mismatched_inputs(*args: object, **kwargs: object) -> list[ChangeSetApplyJobInput]:
+        _ = (args, kwargs)
+        return [mismatched_input]
+
+    monkeypatch.setattr(worker_module, "_query_changeset_apply_job_inputs", _mismatched_inputs)
+
+    await worker_module.process_changeset_apply_job(job.id)
+
+    persisted = await _get_job(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == ErrorCode.INPUT_INVALID.value
+    assert (
+        persisted.error_message
+        == "Changeset apply job input lineage does not match the persisted job."
+    )
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_stale_base_maps_to_revision_conflict() -> None:
+    session, seeded = await _seed_loader_case(include_current_revision=True)
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000125"),
+    )
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+    finally:
+        await session.close()
+
+    await worker_module.process_changeset_apply_job(job.id)
+
+    persisted = await _get_job(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == ErrorCode.REVISION_CONFLICT.value
+    assert (
+        persisted.error_message
+        == "Changeset apply base revision is stale relative to the current revision."
+    )
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "revision_conflict"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_apply_error_fails_deterministically() -> None:
+    session, seeded = await _seed_loader_case()
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000126"),
+    )
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+    finally:
+        await session.close()
+
+    async def _return_apply_error(*args: object, **kwargs: object) -> ChangeSetApplyError:
+        _ = (args, kwargs)
+        return ChangeSetApplyError(
+            change_set_id=seeded.change_set.id,
+            error_code="UNSUPPORTED_OPERATION",
+            message="Unsupported changeset operation 'explode_block'.",
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(worker_module, "load_and_apply_change_set", _return_apply_error)
+    try:
+        await worker_module.process_changeset_apply_job(job.id)
+    finally:
+        monkeypatch.undo()
+
+    persisted = await _get_job(job.id)
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.error_code == ErrorCode.INPUT_INVALID.value
+    assert persisted.error_message == "Unsupported changeset operation 'explode_block'."
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "apply_failed"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_persists_changeset_revision_and_validation_report() -> (
+    None
+):
+    session, seeded = await _seed_loader_case()
+    attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000127")
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000128"),
+    )
+    job.status = "running"
+    job.attempts = 1
+    job.attempt_token = attempt_token
+    job.started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+    finally:
+        await session.close()
+
+    await worker_module.process_changeset_apply_job(job.id)
+
+    persisted_job = await _get_job(job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "succeeded"
+    assert persisted_job.error_code is None
+    assert persisted_job.error_message is None
+
+    persisted_revision = await _get_drawing_revision_by_source_job(job.id)
+    assert persisted_revision is not None
+    assert persisted_revision.project_id == seeded.project.id
+    assert persisted_revision.source_file_id == seeded.base_revision.source_file_id
+    assert persisted_revision.source_job_id == job.id
+    assert persisted_revision.revision_kind == "changeset"
+    assert persisted_revision.predecessor_revision_id == seeded.base_revision.id
+    assert persisted_revision.changeset_id == seeded.change_set.id
+    assert persisted_revision.revision_sequence == seeded.base_revision.revision_sequence + 1
+    assert persisted_revision.extraction_profile_id is None
+    assert persisted_revision.adapter_run_output_id is None
+
+    persisted_report = await _get_validation_report_by_source_job(job.id)
+    assert persisted_report is not None
+    assert persisted_report.drawing_revision_id == persisted_revision.id
+    assert persisted_report.project_id == seeded.project.id
+    assert persisted_report.validation_status == "valid"
+    assert persisted_report.review_state == "approved"
+    assert persisted_report.quantity_gate == "allowed"
+    assert persisted_report.report_json["change_set_id"] == str(seeded.change_set.id)
+    assert persisted_report.report_json["predecessor_revision_id"] == str(seeded.base_revision.id)
+    assert persisted_report.report_json["provenance"]["pinned_validation_result_id"] == str(
+        seeded.latest_validation.id
+    )
+    assert (
+        persisted_report.report_json["provenance"]["pinned_validation_status"]
+        == seeded.latest_validation.validation_status
+    )
+
+    persisted_entities = await _get_revision_entities_for_revision(persisted_revision.id)
+    assert [entity.entity_id for entity in persisted_entities] == ["wall-1", "door-1"]
+    assert persisted_entities[0].layer_ref == "A-WALL-UPDATED"
+    assert persisted_entities[0].source_job_id == job.id
+    assert persisted_entities[0].extraction_profile_id is None
+    assert persisted_entities[0].adapter_run_output_id is None
+    assert persisted_entities[1].properties_json == {"label": "Door", "notes": "review"}
+
+    persisted_manifest = await _get_revision_entity_manifest_for_revision(persisted_revision.id)
+    assert persisted_manifest is not None
+    assert persisted_manifest.source_job_id == job.id
+    assert persisted_manifest.extraction_profile_id is None
+    assert persisted_manifest.adapter_run_output_id is None
+    assert persisted_manifest.counts_json["entities"] == 2
+
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "applied"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_finalize_changeset_apply_job_revision_conflict() -> None:
+    session, seeded = await _seed_loader_case()
+    attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000129")
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000130"),
+    )
+    job.status = "running"
+    job.attempts = 1
+    job.attempt_token = attempt_token
+    job.started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+
+        result = await worker_module._execute_changeset_apply_job_attempt(
+            job.id,
+            attempt_token=attempt_token,
+        )
+    finally:
+        await session.close()
+
+    assert result is not None
+    apply_result = result.finalize_kwargs["apply_result"]
+    assert isinstance(apply_result, ChangeSetApplySuccess)
+
+    await _append_competing_revision(seeded=seeded)
+
+    with pytest.raises(
+        worker_module._RevisionConflictError,
+        match=r"Changeset apply base revision became stale before finalization\.",
+    ):
+        await worker_module._finalize_changeset_apply_job(
+            job.id,
+            attempt_token=attempt_token,
+            apply_result=apply_result,
+        )
+
+    persisted_revision = await _get_drawing_revision_by_source_job(job.id)
+    assert persisted_revision is None
+    persisted_report = await _get_validation_report_by_source_job(job.id)
+    assert persisted_report is None
+
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "approved"
+    persisted_job = await _get_job(job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "running"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_process_changeset_apply_job_finalization_conflict() -> None:
+    session, seeded = await _seed_loader_case()
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000136"),
+    )
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+    finally:
+        await session.close()
+
+    real_execute = worker_module._execute_changeset_apply_job_attempt
+
+    async def _execute_with_competing_revision(
+        job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> worker_module._RegisteredJobAttemptResult | None:
+        result = await real_execute(job_id, attempt_token=attempt_token)
+        assert result is not None
+        await _append_competing_revision(seeded=seeded)
+        return result
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        worker_module,
+        "_execute_changeset_apply_job_attempt",
+        _execute_with_competing_revision,
+    )
+    try:
+        await worker_module.process_changeset_apply_job(job.id)
+    finally:
+        monkeypatch.undo()
+
+    persisted_job = await _get_job(job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "failed"
+    assert persisted_job.error_code == ErrorCode.REVISION_CONFLICT.value
+    assert (
+        persisted_job.error_message
+        == "Changeset apply base revision became stale before finalization."
+    )
+
+    persisted_revision = await _get_drawing_revision_by_source_job(job.id)
+    assert persisted_revision is None
+    persisted_report = await _get_validation_report_by_source_job(job.id)
+    assert persisted_report is None
+
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "revision_conflict"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_finalize_changeset_apply_job_cancellation_before_output_creates_no_revision() -> (
+    None
+):
+    session, seeded = await _seed_loader_case()
+    attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000134")
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000135"),
+    )
+    job.status = "running"
+    job.attempts = 1
+    job.attempt_token = attempt_token
+    job.started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+
+        result = await worker_module._execute_changeset_apply_job_attempt(
+            job.id,
+            attempt_token=attempt_token,
+        )
+    finally:
+        await session.close()
+
+    assert result is not None
+    apply_result = result.finalize_kwargs["apply_result"]
+    assert isinstance(apply_result, ChangeSetApplySuccess)
+
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    async with session_maker() as update_session:
+        persisted_job = await update_session.get(Job, job.id)
+        assert persisted_job is not None
+        persisted_job.cancel_requested = True
+        await update_session.commit()
+
+    finalized = await worker_module._finalize_changeset_apply_job(
+        job.id,
+        attempt_token=attempt_token,
+        apply_result=apply_result,
+    )
+
+    assert finalized is False
+    persisted_job = await _get_job(job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "cancelled"
+    assert persisted_job.finished_at is not None
+    assert await _get_drawing_revision_by_source_job(job.id) is None
+    assert await _get_validation_report_by_source_job(job.id) is None
+
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "approved"
+
+
+@requires_database
+@pytest.mark.usefixtures("cleanup_projects")
+@pytest.mark.asyncio
+async def test_finalize_changeset_apply_job_stale_attempt_creates_no_revision() -> None:
+    session, seeded = await _seed_loader_case()
+    stale_attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000136")
+    current_attempt_token = uuid.UUID("90000000-0000-0000-0000-000000000137")
+    job = _build_changeset_apply_job(
+        seeded=seeded,
+        job_id=uuid.UUID("90000000-0000-0000-0000-000000000138"),
+    )
+    job.status = "running"
+    job.attempts = 1
+    job.attempt_token = stale_attempt_token
+    job.started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    try:
+        session.add(job)
+        await session.flush()
+        session.add(_build_changeset_apply_job_input(seeded=seeded, source_job_id=job.id))
+        await session.commit()
+
+        result = await worker_module._execute_changeset_apply_job_attempt(
+            job.id,
+            attempt_token=stale_attempt_token,
+        )
+    finally:
+        await session.close()
+
+    assert result is not None
+    apply_result = result.finalize_kwargs["apply_result"]
+    assert isinstance(apply_result, ChangeSetApplySuccess)
+
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+    async with session_maker() as update_session:
+        persisted_job = await update_session.get(Job, job.id)
+        assert persisted_job is not None
+        persisted_job.attempt_token = current_attempt_token
+        persisted_job.attempts = 2
+        await update_session.commit()
+
+    finalized = await worker_module._finalize_changeset_apply_job(
+        job.id,
+        attempt_token=stale_attempt_token,
+        apply_result=apply_result,
+    )
+
+    assert finalized is False
+    persisted_job = await _get_job(job.id)
+    assert persisted_job is not None
+    assert persisted_job.status == "running"
+    assert persisted_job.attempt_token == current_attempt_token
+    assert persisted_job.finished_at is None
+    assert await _get_drawing_revision_by_source_job(job.id) is None
+    assert await _get_validation_report_by_source_job(job.id) is None
+
+    persisted_change_set = await _get_change_set(seeded.change_set.id)
+    assert persisted_change_set is not None
+    assert persisted_change_set.status == "approved"
+
+
+async def _get_job(job_id: uuid.UUID) -> Job | None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        return await session.get(Job, job_id)
+
+
+async def _get_change_set(change_set_id: uuid.UUID) -> CadChangeSet | None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        return await session.get(CadChangeSet, change_set_id)
+
+
+async def _get_drawing_revision_by_source_job(source_job_id: uuid.UUID) -> DrawingRevision | None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        return cast(
+            DrawingRevision | None,
+            await session.scalar(
+                select(DrawingRevision).where(DrawingRevision.source_job_id == source_job_id)
+            ),
+        )
+
+
+async def _get_validation_report_by_source_job(source_job_id: uuid.UUID) -> ValidationReport | None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        return cast(
+            ValidationReport | None,
+            await session.scalar(
+                select(ValidationReport).where(ValidationReport.source_job_id == source_job_id)
+            ),
+        )
+
+
+async def _get_revision_entities_for_revision(
+    drawing_revision_id: uuid.UUID,
+) -> list[RevisionEntity]:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        result = await session.execute(
+            select(RevisionEntity)
+            .where(RevisionEntity.drawing_revision_id == drawing_revision_id)
+            .order_by(RevisionEntity.sequence_index.asc(), RevisionEntity.id.asc())
+        )
+        return list(result.scalars().all())
+
+
+async def _get_revision_entity_manifest_for_revision(
+    drawing_revision_id: uuid.UUID,
+) -> RevisionEntityManifest | None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        return cast(
+            RevisionEntityManifest | None,
+            await session.scalar(
+                select(RevisionEntityManifest).where(
+                    RevisionEntityManifest.drawing_revision_id == drawing_revision_id
+                )
+            ),
+        )
+
+
+async def _append_competing_revision(*, seeded: _SeededLoaderCase) -> None:
+    import app.db.session as session_module
+
+    session_maker = session_module.AsyncSessionLocal
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        conflict_job_id = uuid.UUID("90000000-0000-0000-0000-000000000131")
+        conflict_adapter_id = uuid.UUID("90000000-0000-0000-0000-000000000132")
+        conflict_revision_id = uuid.UUID("90000000-0000-0000-0000-000000000133")
+        session.add(
+            Job(
+                id=conflict_job_id,
+                project_id=seeded.project.id,
+                file_id=seeded.base_revision.source_file_id,
+                extraction_profile_id=uuid.UUID("90000000-0000-0000-0000-000000000003"),
+                base_revision_id=seeded.base_revision.id,
+                job_type=JobType.REPROCESS.value,
+                status="succeeded",
+            )
+        )
+        await session.flush()
+        session.add(
+            AdapterRunOutput(
+                id=conflict_adapter_id,
+                project_id=seeded.project.id,
+                source_file_id=seeded.base_revision.source_file_id,
+                extraction_profile_id=uuid.UUID("90000000-0000-0000-0000-000000000003"),
+                source_job_id=conflict_job_id,
+                adapter_key="test_adapter",
+                adapter_version="1",
+                input_family="dxf",
+                canonical_entity_schema_version="1",
+                canonical_json={"entities": []},
+                provenance_json={"adapter": "test_adapter"},
+                confidence_json={},
+                confidence_score=1.0,
+                warnings_json=[],
+                diagnostics_json=[],
+                result_checksum_sha256="8" * 64,
+            )
+        )
+        await session.flush()
+        session.add(
+            DrawingRevision(
+                id=conflict_revision_id,
+                project_id=seeded.project.id,
+                source_file_id=seeded.base_revision.source_file_id,
+                extraction_profile_id=uuid.UUID("90000000-0000-0000-0000-000000000003"),
+                source_job_id=conflict_job_id,
+                adapter_run_output_id=conflict_adapter_id,
+                predecessor_revision_id=seeded.base_revision.id,
+                revision_sequence=seeded.base_revision.revision_sequence + 1,
+                revision_kind="reprocess",
+                review_state="approved",
+                canonical_entity_schema_version="1",
+                confidence_score=1.0,
+            )
+        )
+        await session.commit()
+
+
 def _entity_snapshot(
     *,
     revision_entity_id: uuid.UUID,
     sequence_index: int,
     entity_id: str,
+    entity_type: str = "polyline",
+    parent_entity_ref: str | None = None,
+    layout_ref: str | None = None,
     layer_ref: str | None = None,
+    block_ref: str | None = None,
+    geometry_json: dict[str, object] | None = None,
     properties_json: dict[str, object] | None = None,
     canonical_entity_json: dict[str, object] | None = None,
     source_identity: str | None = None,
@@ -1104,15 +2023,18 @@ def _entity_snapshot(
         id=revision_entity_id,
         sequence_index=sequence_index,
         entity_id=entity_id,
-        entity_type="polyline",
+        entity_type=entity_type,
         entity_schema_version="1",
         confidence_score=1.0,
         confidence_json={},
-        geometry_json={"kind": "polyline", "vertices": [{"x": 0.0, "y": 0.0}]},
+        geometry_json=geometry_json or {"kind": "polyline", "vertices": [{"x": 0.0, "y": 0.0}]},
         properties_json=properties_json or {},
         provenance_json={"origin": "source_direct"},
+        parent_entity_ref=parent_entity_ref,
         canonical_entity_json=canonical_entity_json,
+        layout_ref=layout_ref,
         layer_ref=layer_ref,
+        block_ref=block_ref,
         source_identity=source_identity,
         source_hash=source_hash,
     )
@@ -1471,6 +2393,35 @@ async def _seed_loader_case(
         canonical_entity_schema_version="1",
         counts_json={"entities": 2},
     )
+    base_validation_report = ValidationReport(
+        id=uuid.UUID("90000000-0000-0000-0000-000000000019"),
+        project_id=project_id,
+        drawing_revision_id=base_revision_id,
+        source_job_id=ingest_job_id,
+        validation_report_schema_version="0.1",
+        canonical_entity_schema_version="1",
+        validation_status="valid",
+        review_state="approved",
+        quantity_gate="allowed",
+        effective_confidence=1.0,
+        validator_name="test_validation_service",
+        validator_version="1",
+        report_json={
+            "summary": {
+                "validation_status": "valid",
+                "review_state": "approved",
+                "quantity_gate": "allowed",
+            },
+            "checks": [
+                {
+                    "code": "seeded_validation",
+                    "status": "passed",
+                    "message": "Seeded base validation report.",
+                }
+            ],
+        },
+        generated_at=first_validation_at,
+    )
 
     try:
         session.add(project)
@@ -1485,7 +2436,7 @@ async def _seed_loader_case(
         session.add(base_adapter)
         await session.flush()
 
-        session.add_all([base_revision, base_manifest])
+        session.add_all([base_revision, base_manifest, base_validation_report])
         await session.flush()
 
         session.add_all([first_entity, second_entity])

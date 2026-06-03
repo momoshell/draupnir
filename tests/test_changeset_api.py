@@ -565,6 +565,28 @@ async def test_apply_changeset_creates_pending_job_and_immutable_input(
         "_load_change_set_apply_input",
         fake_load_change_set_apply_input,
     )
+    published_job_ids: list[UUID] = []
+
+    async def fake_publish_job_enqueue_intent(
+        job_id: UUID,
+        *,
+        publisher: object | None = None,
+        suppress_exceptions: bool = False,
+    ) -> bool:
+        published_job_ids.append(job_id)
+        assert publisher is changeset_routes._enqueue_changeset_apply_job
+        assert suppress_exceptions is True
+        assert session_module.AsyncSessionLocal is not None
+        async with session_module.AsyncSessionLocal() as session:
+            persisted_job = await session.get(Job, job_id)
+            assert persisted_job is not None
+        return True
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_publish_job_enqueue_intent",
+        fake_publish_job_enqueue_intent,
+    )
 
     response = await async_client.post(_action_route_path(lineage, change_set_id, "apply"))
 
@@ -590,10 +612,11 @@ async def test_apply_changeset_creates_pending_job_and_immutable_input(
     assert session_module.AsyncSessionLocal is not None
     async with session_module.AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
-        assert job is not None
-        assert job.enqueue_status == "pending"
-        assert job.enqueue_attempts == 0
-        assert job.enqueue_published_at is None
+    assert job is not None
+    assert job.enqueue_status == "pending"
+    assert job.enqueue_attempts == 0
+    assert job.enqueue_published_at is None
+    assert published_job_ids == [job_id]
 
 
 async def test_apply_changeset_reuses_existing_pending_job_without_duplicate_input(
