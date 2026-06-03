@@ -31,6 +31,11 @@ from app.cad.changeset_validation import (
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
+from app.jobs.worker import (
+    enqueue_changeset_apply_job,
+    prepare_job_enqueue_intent,
+    publish_job_enqueue_intent,
+)
 from app.models.cad_changeset import (
     CadChangeOperation,
     CadChangeSet,
@@ -66,6 +71,9 @@ _encode_keyset_cursor = pagination.encode_keyset_cursor
 _decode_keyset_cursor = pagination.decode_keyset_cursor
 _load_change_set_apply_input = changeset_loading.load_change_set_apply_input
 _validate_change_set = validate_change_set
+_prepare_job_enqueue_intent = prepare_job_enqueue_intent
+_publish_job_enqueue_intent = publish_job_enqueue_intent
+_enqueue_changeset_apply_job = enqueue_changeset_apply_job
 
 _CHANGESET_APPLY_VALIDATION_STATUSES = ("valid", "valid_with_warnings")
 
@@ -310,6 +318,17 @@ def _serialize_validation_action(
 
 def _serialize_job(job: Job) -> JobRead:
     return JobRead.model_validate(job)
+
+
+def _extract_job_id_from_response(response: Response) -> UUID | None:
+    body = getattr(response, "body", None)
+    if not body:
+        return None
+
+    try:
+        return JobRead.model_validate_json(body).id
+    except (TypeError, ValueError, ValidationError):
+        return None
 
 
 def _build_validation_service_known_error(
@@ -607,6 +626,8 @@ async def apply_revision_changeset(
     db: DbSession,
     idempotency_key: IdempotencyKey,
 ) -> Response:
+    enqueue_job_id: UUID | None = None
+
     async def preclaim() -> Response | None:
         await _require_active_revision_changeset(
             db,
@@ -618,6 +639,8 @@ async def apply_revision_changeset(
     async def mutate() -> (
         idempotency.IdempotentMutationSuccess[JobRead] | idempotency.IdempotentMutationKnownError
     ):
+        nonlocal enqueue_job_id
+
         try:
             revision, change_set = await _require_active_revision_changeset(
                 db,
@@ -634,6 +657,7 @@ async def apply_revision_changeset(
             change_set_id=change_set.id,
         )
         if existing_job is not None:
+            enqueue_job_id = existing_job.id
             return _IdempotentMutationSuccess(
                 value=_serialize_job(existing_job),
                 status_code=status.HTTP_202_ACCEPTED,
@@ -670,6 +694,7 @@ async def apply_revision_changeset(
             job_type=JobType.CHANGESET_APPLY,
             status=JobStatus.PENDING,
         )
+        _prepare_job_enqueue_intent(job)
         db.add(job)
         await db.flush()
 
@@ -686,12 +711,14 @@ async def apply_revision_changeset(
         )
         await db.flush()
 
+        enqueue_job_id = job.id
+
         return _IdempotentMutationSuccess(
             value=_serialize_job(job),
             status_code=status.HTTP_202_ACCEPTED,
         )
 
-    return await _run_idempotent_mutation(
+    response = await _run_idempotent_mutation(
         db,
         key=idempotency_key,
         fingerprint=_build_apply_fingerprint(revision_id, change_set_id),
@@ -701,3 +728,15 @@ async def apply_revision_changeset(
         serialize_result=lambda result: result.model_dump(mode="json"),
         preclaim=preclaim,
     )
+
+    published_job_id = enqueue_job_id
+    if response.status_code == status.HTTP_202_ACCEPTED and published_job_id is None:
+        published_job_id = _extract_job_id_from_response(response)
+    if published_job_id is not None:
+        await _publish_job_enqueue_intent(
+            published_job_id,
+            publisher=_enqueue_changeset_apply_job,
+            suppress_exceptions=True,
+        )
+
+    return response
