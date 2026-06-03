@@ -25,6 +25,7 @@ import app.jobs.worker as worker_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.models.cad_changeset import CadChangeOperation, CadChangeSet, CadChangeSetValidationResult
+from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from app.models.estimation_catalog import EstimationRate
@@ -64,6 +65,7 @@ _QUANTITY_DOWNGRADE_TARGET_REVISION = "2026_05_14_0016"
 _CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION = "2026_05_27_0024"
 _GENERATED_ARTIFACT_LINEAGE_DOWNGRADE_TARGET_REVISION = "2026_05_31_0025"
 _CHANGESET_PERSISTENCE_DOWNGRADE_TARGET_REVISION = "2026_05_31_0026"
+_CHANGESET_APPLY_JOB_INPUT_DOWNGRADE_TARGET_REVISION = "2026_06_01_0027"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -80,6 +82,7 @@ class _ProtectedRowIds:
     cad_change_set_id: uuid.UUID
     cad_change_operation_id: uuid.UUID
     cad_change_set_validation_result_id: uuid.UUID
+    changeset_apply_job_input_source_job_id: uuid.UUID
     job_event_id: uuid.UUID
     estimate_version_id: uuid.UUID
     export_job_input_source_job_id: uuid.UUID
@@ -239,6 +242,11 @@ def _row_filter_for_table(
             "estimate_job_id = :estimate_job_id",
             {"estimate_job_id": row_ids.estimate_job_input_id},
         )
+    if table_name == "changeset_apply_job_inputs":
+        return (
+            "source_job_id = :source_job_id",
+            {"source_job_id": row_ids.changeset_apply_job_input_source_job_id},
+        )
     if table_name == "export_job_inputs":
         return (
             "source_job_id = :source_job_id",
@@ -304,6 +312,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         assumption_snapshot_entry_type="assumption",
     )
     estimate_job_id = uuid.uuid4()
+    changeset_apply_job_id = uuid.uuid4()
     export_job_id = uuid.uuid4()
     rate_id = uuid.uuid4()
     rate_checksum = "d" * 64
@@ -371,6 +380,16 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         validator_version="1",
         result_json={"source": "append-only", "status": "valid"},
     )
+    changeset_apply_job_input = ChangeSetApplyJobInput(
+        source_job_id=changeset_apply_job_id,
+        project_id=quantity_seed.project_id,
+        source_file_id=quantity_seed.file_id,
+        drawing_revision_id=quantity_seed.drawing_revision_id,
+        change_set_id=change_set.id,
+        source_job_type=JobType.CHANGESET_APPLY.value,
+        latest_validation_result_id=change_set_validation_result.id,
+        latest_validation_status=change_set_validation_result.validation_status,
+    )
 
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
@@ -424,6 +443,21 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
             )
         )
         await session.flush()
+        session.add(
+            Job(
+                id=changeset_apply_job_id,
+                project_id=quantity_seed.project_id,
+                file_id=quantity_seed.file_id,
+                extraction_profile_id=None,
+                base_revision_id=quantity_seed.drawing_revision_id,
+                job_type=JobType.CHANGESET_APPLY.value,
+                status=JobStatus.PENDING.value,
+                enqueue_status="pending",
+                enqueue_attempts=0,
+                cancel_requested=False,
+            )
+        )
+        await session.flush()
         session.add(estimate_job_input)
         await session.flush()
         session.add(export_job_input)
@@ -441,6 +475,8 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         session.add(change_operation)
         await session.flush()
         session.add(change_set_validation_result)
+        await session.flush()
+        session.add(changeset_apply_job_input)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -466,6 +502,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         cad_change_set_id=change_set.id,
         cad_change_operation_id=change_operation.id,
         cad_change_set_validation_result_id=change_set_validation_result.id,
+        changeset_apply_job_input_source_job_id=changeset_apply_job_input.source_job_id,
         job_event_id=job_events[0].id,
         estimate_version_id=estimate_version.id,
         export_job_input_source_job_id=export_job_input.source_job_id,
@@ -1633,6 +1670,81 @@ async def _insert_changeset_persistence_rows(database_url: str) -> None:
                     validator_name="tests",
                     validator_version="1",
                     result_json={"source": "downgrade-guard", "status": "valid"},
+                )
+            )
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
+async def _insert_changeset_apply_contract_rows(database_url: str) -> None:
+    """Insert populated #290 changeset-apply contract rows for downgrade validation."""
+
+    await _insert_changeset_origin_rows(
+        database_url,
+        include_materialization=False,
+        keep_drawing_revision_compatible=False,
+    )
+
+    engine = create_async_engine(database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    try:
+        async with session_factory() as session:
+            change_set_row = (
+                await session.execute(
+                    sa.text(
+                        """
+                        SELECT
+                            c.id AS change_set_id,
+                            c.project_id AS project_id,
+                            c.base_revision_id AS base_revision_id,
+                            r.source_file_id AS source_file_id
+                        FROM cad_change_sets AS c
+                        JOIN drawing_revisions AS r
+                          ON r.id = c.base_revision_id
+                         AND r.project_id = c.project_id
+                        LIMIT 1
+                        """
+                    )
+                )
+            ).one()
+
+            validation_result = CadChangeSetValidationResult(
+                id=uuid.uuid4(),
+                project_id=change_set_row.project_id,
+                change_set_id=change_set_row.change_set_id,
+                validation_status="valid",
+                validator_name="tests",
+                validator_version="1",
+                result_json={"source": "downgrade-guard", "status": "valid"},
+            )
+            session.add(validation_result)
+            await session.flush()
+
+            changeset_apply_job_id = uuid.uuid4()
+            await _insert_job_row(
+                session,
+                job_id=changeset_apply_job_id,
+                project_id=change_set_row.project_id,
+                file_id=change_set_row.source_file_id,
+                extraction_profile_id=None,
+                base_revision_id=change_set_row.base_revision_id,
+                job_type=JobType.CHANGESET_APPLY.value,
+                status=JobStatus.PENDING.value,
+                enqueue_status="pending",
+                enqueue_attempts=0,
+            )
+            session.add(
+                ChangeSetApplyJobInput(
+                    source_job_id=changeset_apply_job_id,
+                    project_id=change_set_row.project_id,
+                    source_file_id=change_set_row.source_file_id,
+                    drawing_revision_id=change_set_row.base_revision_id,
+                    change_set_id=change_set_row.change_set_id,
+                    source_job_type=JobType.CHANGESET_APPLY.value,
+                    latest_validation_result_id=validation_result.id,
+                    latest_validation_status=validation_result.validation_status,
                 )
             )
             await session.commit()
@@ -3043,6 +3155,7 @@ class TestAppendOnlyLineageTables:
             ("files", "original_filename", "mutated-plan.pdf"),
             ("extraction_profiles", "layout_mode", "manual"),
             ("adapter_run_outputs", "adapter_version", "mutated"),
+            ("changeset_apply_job_inputs", "source_job_type", "export"),
             ("drawing_revisions", "review_state", "superseded"),
             ("validation_reports", "validator_version", "mutated"),
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
@@ -4362,6 +4475,37 @@ class TestAppendOnlyLineageTables:
             assert "cad_change_sets" in combined_output
             assert "cad_change_operations" in combined_output
             assert "cad_change_set_validation_results" in combined_output
+        finally:
+            await _drop_temp_database(database_name)
+
+    async def test_changeset_apply_job_input_downgrade_fails_closed_on_populated_contract(
+        self,
+    ) -> None:
+        """Downgrade past #290 should refuse populated changeset-apply contract rows."""
+
+        _ = self
+        database_name, database_url = await _create_temp_database()
+
+        try:
+            upgrade_result = _run_alembic_command("upgrade", "head", database_url=database_url)
+            assert upgrade_result.returncode == 0, upgrade_result.stdout + upgrade_result.stderr
+
+            await _insert_changeset_apply_contract_rows(database_url)
+
+            downgrade_result = _run_alembic_command(
+                "downgrade",
+                _CHANGESET_APPLY_JOB_INPUT_DOWNGRADE_TARGET_REVISION,
+                database_url=database_url,
+            )
+            assert downgrade_result.returncode != 0
+
+            combined_output = downgrade_result.stdout + downgrade_result.stderr
+            assert (
+                "cannot downgrade 2026_06_03_0028: populated changeset apply contract present"
+                in combined_output
+            )
+            assert "jobs=1" in combined_output
+            assert "changeset_apply_job_inputs=1" in combined_output
         finally:
             await _drop_temp_database(database_name)
 

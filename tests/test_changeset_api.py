@@ -7,11 +7,22 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.session as session_module
 from app.api.idempotency import hash_idempotency_key
+from app.api.v1.revision_routes import changesets as changeset_routes
+from app.cad.changeset.conflicts import build_stale_base_conflict
+from app.cad.changeset.contracts import RevisionRef
+from app.cad.changeset.loading import ChangeSetApplyLoadError
+from app.core.exceptions import raise_not_found
 from app.models.adapter_run_output import AdapterRunOutput
-from app.models.cad_changeset import CadChangeOperation, CadChangeSet
+from app.models.cad_changeset import (
+    CadChangeOperation,
+    CadChangeSet,
+    CadChangeSetValidationResult,
+)
+from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.drawing_revision import DrawingRevision
 from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File
@@ -133,6 +144,10 @@ def _route_path(lineage: ChangesetLineage) -> str:
     return f"/v1/revisions/{lineage.revision_id}/changesets"
 
 
+def _action_route_path(lineage: ChangesetLineage, change_set_id: UUID, action: str) -> str:
+    return f"{_route_path(lineage)}/{change_set_id}/{action}"
+
+
 def _valid_create_body(*, created_by: str = " api-user ") -> dict[str, object]:
     target_entity_id = uuid4()
     return {
@@ -205,6 +220,72 @@ async def _set_source_file_deleted(lineage: ChangesetLineage) -> None:
         assert source_file is not None
         source_file.deleted_at = datetime.now(UTC)
         await session.commit()
+
+
+async def _approve_changeset_with_valid_validation_result(
+    lineage: ChangesetLineage,
+    change_set_id: UUID,
+) -> UUID:
+    assert session_module.AsyncSessionLocal is not None
+
+    async with session_module.AsyncSessionLocal() as session:
+        change_set = await session.get(CadChangeSet, change_set_id)
+        assert change_set is not None
+        change_set.status = "approved"
+        validation_result = CadChangeSetValidationResult(
+            project_id=lineage.project_id,
+            change_set_id=change_set_id,
+            validation_status="valid",
+            validator_name="api-test",
+            validator_version="1",
+            result_json={"status": "valid"},
+        )
+        session.add(validation_result)
+        await session.flush()
+        validation_result_id = validation_result.id
+        await session.commit()
+
+    return validation_result_id
+
+
+async def _get_changeset_apply_job_input(job_id: UUID) -> ChangeSetApplyJobInput | None:
+    assert session_module.AsyncSessionLocal is not None
+
+    async with session_module.AsyncSessionLocal() as session:
+        return await session.get(ChangeSetApplyJobInput, job_id)
+
+
+async def _count_changeset_apply_contract_rows(
+    lineage: ChangesetLineage,
+    change_set_id: UUID,
+) -> tuple[int, int]:
+    assert session_module.AsyncSessionLocal is not None
+
+    async with session_module.AsyncSessionLocal() as session:
+        job_count = await session.scalar(
+            select(func.count())
+            .select_from(Job)
+            .where(
+                Job.project_id == lineage.project_id,
+                Job.file_id == lineage.file_id,
+                Job.base_revision_id == lineage.revision_id,
+                Job.job_type == JobType.CHANGESET_APPLY.value,
+            )
+        )
+        input_count = await session.scalar(
+            select(func.count())
+            .select_from(ChangeSetApplyJobInput)
+            .where(
+                ChangeSetApplyJobInput.project_id == lineage.project_id,
+                ChangeSetApplyJobInput.source_file_id == lineage.file_id,
+                ChangeSetApplyJobInput.drawing_revision_id == lineage.revision_id,
+                ChangeSetApplyJobInput.change_set_id == change_set_id,
+            )
+        )
+
+    assert job_count is not None
+    assert input_count is not None
+    return job_count, input_count
 
 
 async def test_create_changeset_persists_proposed_changeset_and_operations(
@@ -416,6 +497,340 @@ async def test_changeset_routes_hide_deleted_lineage(async_client: AsyncClient) 
     assert list_after_delete.status_code == 404
     assert get_after_delete.status_code == 404
     assert await _count_changeset_rows(lineage) == (1, 2)
+
+
+async def test_validate_changeset_returns_change_set_and_validation_result(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+
+    async def fake_validate_change_set(
+        db: AsyncSession,
+        validated_change_set_id: UUID,
+    ) -> CadChangeSetValidationResult:
+        validation_result = CadChangeSetValidationResult(
+            project_id=lineage.project_id,
+            change_set_id=validated_change_set_id,
+            validation_status="valid",
+            validator_name="api-test",
+            validator_version="1",
+            result_json={"status": "valid"},
+        )
+        db.add(validation_result)
+        await db.flush()
+        return validation_result
+
+    monkeypatch.setattr(changeset_routes, "_validate_change_set", fake_validate_change_set)
+
+    response = await async_client.post(_action_route_path(lineage, change_set_id, "validate"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["change_set"]["id"] == str(change_set_id)
+    assert body["change_set"]["base_revision_id"] == str(lineage.revision_id)
+    assert body["validation_result"]["change_set_id"] == str(change_set_id)
+    assert body["validation_result"]["validation_status"] == "valid"
+    assert body["validation_result"]["result_json"] == {"status": "valid"}
+
+
+async def test_apply_changeset_creates_pending_job_and_immutable_input(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+    validation_result_id = await _approve_changeset_with_valid_validation_result(
+        lineage,
+        change_set_id,
+    )
+    load_calls: list[tuple[UUID, UUID]] = []
+
+    async def fake_load_change_set_apply_input(
+        _db: AsyncSession,
+        *,
+        project_id: UUID,
+        change_set_id: UUID,
+    ) -> object:
+        load_calls.append((project_id, change_set_id))
+        return object()
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_load_change_set_apply_input",
+        fake_load_change_set_apply_input,
+    )
+
+    response = await async_client.post(_action_route_path(lineage, change_set_id, "apply"))
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["project_id"] == str(lineage.project_id)
+    assert body["file_id"] == str(lineage.file_id)
+    assert body["base_revision_id"] == str(lineage.revision_id)
+    assert body["job_type"] == JobType.CHANGESET_APPLY.value
+    assert body["status"] == "pending"
+    assert load_calls == [(lineage.project_id, change_set_id)]
+
+    job_id = UUID(body["id"])
+    apply_input = await _get_changeset_apply_job_input(job_id)
+    assert apply_input is not None
+    assert apply_input.project_id == lineage.project_id
+    assert apply_input.source_file_id == lineage.file_id
+    assert apply_input.drawing_revision_id == lineage.revision_id
+    assert apply_input.change_set_id == change_set_id
+    assert apply_input.latest_validation_result_id == validation_result_id
+    assert apply_input.latest_validation_status == "valid"
+
+    assert session_module.AsyncSessionLocal is not None
+    async with session_module.AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+        assert job is not None
+        assert job.enqueue_status == "pending"
+        assert job.enqueue_attempts == 0
+        assert job.enqueue_published_at is None
+
+
+async def test_apply_changeset_reuses_existing_pending_job_without_duplicate_input(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+    await _approve_changeset_with_valid_validation_result(lineage, change_set_id)
+    load_calls: list[tuple[UUID, UUID]] = []
+
+    async def fake_load_change_set_apply_input(
+        _db: AsyncSession,
+        *,
+        project_id: UUID,
+        change_set_id: UUID,
+    ) -> object:
+        load_calls.append((project_id, change_set_id))
+        return object()
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_load_change_set_apply_input",
+        fake_load_change_set_apply_input,
+    )
+
+    first_response = await async_client.post(_action_route_path(lineage, change_set_id, "apply"))
+    second_response = await async_client.post(
+        _action_route_path(lineage, change_set_id, "apply"),
+        headers={"Idempotency-Key": f"changeset-apply-second-{uuid4().hex}"},
+    )
+    third_response = await async_client.post(_action_route_path(lineage, change_set_id, "apply"))
+
+    assert first_response.status_code == 202
+    assert second_response.status_code == 202
+    assert third_response.status_code == 202
+    assert second_response.json() == first_response.json()
+    assert third_response.json() == first_response.json()
+    assert load_calls == [(lineage.project_id, change_set_id)]
+    assert await _count_changeset_apply_contract_rows(lineage, change_set_id) == (1, 1)
+
+
+async def test_apply_changeset_stale_base_returns_replayable_revision_conflict(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+    await _approve_changeset_with_valid_validation_result(lineage, change_set_id)
+    current_revision_id = uuid4()
+    load_calls: list[tuple[UUID, UUID]] = []
+
+    async def fake_load_change_set_apply_input(
+        _db: AsyncSession,
+        *,
+        project_id: UUID,
+        change_set_id: UUID,
+    ) -> object:
+        load_calls.append((project_id, change_set_id))
+        conflict = build_stale_base_conflict(
+            change_set_id=change_set_id,
+            base_revision=RevisionRef(
+                revision_id=lineage.revision_id,
+                revision_sequence=1,
+            ),
+            current_revision=RevisionRef(
+                revision_id=current_revision_id,
+                revision_sequence=2,
+            ),
+        )
+        assert conflict is not None
+        return conflict
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_load_change_set_apply_input",
+        fake_load_change_set_apply_input,
+    )
+    headers = {"Idempotency-Key": f"changeset-apply-stale-{uuid4().hex}"}
+
+    first_response = await async_client.post(
+        _action_route_path(lineage, change_set_id, "apply"),
+        headers=headers,
+    )
+    second_response = await async_client.post(
+        _action_route_path(lineage, change_set_id, "apply"),
+        headers=headers,
+    )
+
+    assert first_response.status_code == 409
+    assert second_response.status_code == 409
+    assert second_response.json() == first_response.json()
+    error = first_response.json()["error"]
+    assert error["code"] == "REVISION_CONFLICT"
+    assert error["details"] == {
+        "base_revision_id": str(lineage.revision_id),
+        "base_revision_sequence": 1,
+        "current_revision_id": str(current_revision_id),
+        "current_revision_sequence": 2,
+        "change_set_id": str(change_set_id),
+    }
+    assert load_calls == [(lineage.project_id, change_set_id)]
+    assert await _count_changeset_apply_contract_rows(lineage, change_set_id) == (0, 0)
+
+
+async def test_apply_changeset_load_error_replays_input_invalid_without_job(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+    await _approve_changeset_with_valid_validation_result(lineage, change_set_id)
+    load_calls: list[tuple[UUID, UUID]] = []
+
+    async def fake_load_change_set_apply_input(
+        _db: AsyncSession,
+        *,
+        project_id: UUID,
+        change_set_id: UUID,
+    ) -> object:
+        load_calls.append((project_id, change_set_id))
+        raise ChangeSetApplyLoadError("not approved")
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_load_change_set_apply_input",
+        fake_load_change_set_apply_input,
+    )
+    headers = {"Idempotency-Key": f"changeset-apply-load-error-{uuid4().hex}"}
+
+    first_response = await async_client.post(
+        _action_route_path(lineage, change_set_id, "apply"),
+        headers=headers,
+    )
+    second_response = await async_client.post(
+        _action_route_path(lineage, change_set_id, "apply"),
+        headers=headers,
+    )
+
+    assert first_response.status_code == 400
+    assert second_response.status_code == 400
+    assert second_response.json() == first_response.json()
+    error = first_response.json()["error"]
+    assert error["code"] == "INPUT_INVALID"
+    assert error["details"] == {"code": "ChangeSetApplyLoadError"}
+    assert load_calls == [(lineage.project_id, change_set_id)]
+    assert await _count_changeset_apply_contract_rows(lineage, change_set_id) == (0, 0)
+
+
+@pytest.mark.parametrize("action", ["validate", "apply"])
+async def test_changeset_action_postclaim_not_found_replays_with_same_idempotency_key(
+    async_client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    lineage = await _seed_changeset_lineage()
+    create_response = await async_client.post(_route_path(lineage), json=_valid_create_body())
+    assert create_response.status_code == 201
+    change_set_id = UUID(create_response.json()["id"])
+    if action == "apply":
+        await _approve_changeset_with_valid_validation_result(lineage, change_set_id)
+
+    require_calls: list[tuple[UUID, UUID, bool]] = []
+
+    async def fake_require_active_revision_changeset(
+        db: AsyncSession,
+        revision_id: UUID,
+        patched_change_set_id: UUID,
+        *,
+        for_update: bool = False,
+    ) -> tuple[DrawingRevision, CadChangeSet]:
+        require_calls.append((revision_id, patched_change_set_id, for_update))
+        if for_update:
+            raise_not_found("change_set", str(patched_change_set_id))
+
+        revision = await db.get(DrawingRevision, revision_id)
+        change_set = await db.get(CadChangeSet, patched_change_set_id)
+        assert revision is not None
+        assert change_set is not None
+        return revision, change_set
+
+    monkeypatch.setattr(
+        changeset_routes,
+        "_require_active_revision_changeset",
+        fake_require_active_revision_changeset,
+    )
+
+    if action == "validate":
+
+        async def unexpected_validate_change_set(
+            _db: AsyncSession,
+            _change_set_id: UUID,
+        ) -> CadChangeSetValidationResult:
+            raise AssertionError("validate should not run after postclaim not found")
+
+        monkeypatch.setattr(
+            changeset_routes,
+            "_validate_change_set",
+            unexpected_validate_change_set,
+        )
+    else:
+
+        async def unexpected_load_change_set_apply_input(
+            _db: AsyncSession,
+            *,
+            project_id: UUID,
+            change_set_id: UUID,
+        ) -> object:
+            raise AssertionError("apply load should not run after postclaim not found")
+
+        monkeypatch.setattr(
+            changeset_routes,
+            "_load_change_set_apply_input",
+            unexpected_load_change_set_apply_input,
+        )
+
+    headers = {"Idempotency-Key": f"changeset-{action}-postclaim-not-found-{uuid4().hex}"}
+    route_path = _action_route_path(lineage, change_set_id, action)
+
+    first_response = await async_client.post(route_path, headers=headers)
+    second_response = await async_client.post(route_path, headers=headers)
+
+    assert first_response.status_code == 404
+    assert second_response.status_code == 404
+    assert second_response.json() == first_response.json()
+    assert first_response.json()["error"]["code"] == "NOT_FOUND"
+    assert require_calls == [
+        (lineage.revision_id, change_set_id, False),
+        (lineage.revision_id, change_set_id, True),
+    ]
+    assert await _count_idempotency_rows(headers["Idempotency-Key"]) == 1
 
 
 async def test_create_changeset_replays_idempotent_request(

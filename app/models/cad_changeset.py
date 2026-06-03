@@ -71,6 +71,12 @@ class CadChangeSet(ProjectScopedMixin, TimestampMixin, Base):
             f"status IN ({_sql_in_list(CAD_CHANGE_SET_STATUSES)})",
             name="ck_cad_change_sets_status",
         ),
+        UniqueConstraint(
+            "project_id",
+            "id",
+            "base_revision_id",
+            name="uq_cad_change_sets_project_id_id_base_revision_id",
+        ),
         UniqueConstraint("project_id", "id", name="uq_cad_change_sets_project_id_id"),
     )
 
@@ -162,6 +168,13 @@ class CadChangeSetValidationResult(ProjectScopedMixin, TimestampMixin, Base):
             "change_set_id",
             "id",
             name="uq_cad_change_validation_project_set_id",
+        ),
+        UniqueConstraint(
+            "project_id",
+            "change_set_id",
+            "id",
+            "validation_status",
+            name="uq_cad_change_validation_project_set_id_status",
         ),
     )
 

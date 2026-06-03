@@ -29,6 +29,7 @@ class JobType(StrEnum):
     QUANTITY_TAKEOFF = "quantity_takeoff"
     ESTIMATE = "estimate"
     EXPORT = "export"
+    CHANGESET_APPLY = "changeset_apply"
 
 
 class JobStatus(StrEnum):
@@ -51,11 +52,13 @@ _BASE_REQUIRED_JOB_TYPE_VALUES = (
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
     JobType.EXPORT.value,
+    JobType.CHANGESET_APPLY.value,
 )
 _EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
     JobType.EXPORT.value,
+    JobType.CHANGESET_APPLY.value,
 )
 
 
@@ -201,7 +204,9 @@ class Job(Base):
     job_type: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment=("Job type (e.g. ingest, reprocess, quantity_takeoff, estimate, export)"),
+        comment=(
+            "Job type (e.g. ingest, reprocess, quantity_takeoff, estimate, export, changeset_apply)"
+        ),
     )
     status: Mapped[str] = mapped_column(
         String(32),
