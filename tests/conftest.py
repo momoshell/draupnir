@@ -320,6 +320,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "append_only_lineage_tables": "db_lineage",
     "changeset_validation": "db_lineage",
     "changeset_persistence": "db_lineage",
+    "changeset_apply": "db_lineage",
     "lineage_delete_restrictions": "db_lineage",
     "db": "db_migration",
     "jobs_base_revision_migration": "db_migration",
