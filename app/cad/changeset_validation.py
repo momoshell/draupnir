@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cad.changeset.apply import ALLOWED_LAYER_KEYS
 from app.cad.changesets import (
     CadChangeSetValidationResultCreate,
     append_change_set_validation_result,
@@ -257,7 +258,7 @@ async def _validate_operation(
         findings.extend(target_findings)
         layer_ref = _extract_text_reference(
             payload,
-            keys=("layer_ref", "layer", "layer_name", "new_layer"),
+            keys=ALLOWED_LAYER_KEYS,
         )
         if layer_ref is None:
             findings.append(
@@ -357,26 +358,11 @@ async def _validate_operation(
                     )
                 )
 
-        for field_name, reference_value, exists_fn in (
-            (
-                "layer_ref",
-                _extract_text_reference(entity or payload, keys=("layer_ref",)),
-                _layer_exists,
-            ),
-            (
-                "layout_ref",
-                _extract_text_reference(entity or payload, keys=("layout_ref",)),
-                _layout_exists,
-            ),
-            (
-                "block_ref",
-                _extract_text_reference(entity or payload, keys=("block_ref",)),
-                _block_exists,
-            ),
+        for field_name, reference_value in _iter_text_references(
+            entity or payload,
+            keys=ALLOWED_LAYER_KEYS,
         ):
-            if reference_value is None:
-                continue
-            if not await exists_fn(
+            if not await _layer_exists(
                 db,
                 change_set.project_id,
                 change_set.base_revision_id,
@@ -392,6 +378,40 @@ async def _validate_operation(
                             "not exist on the base revision."
                         ),
                         details={field_name: reference_value},
+                    )
+                )
+
+        for field_name, scoped_reference_value, exists_fn in (
+            (
+                "layout_ref",
+                _extract_text_reference(entity or payload, keys=("layout_ref",)),
+                _layout_exists,
+            ),
+            (
+                "block_ref",
+                _extract_text_reference(entity or payload, keys=("block_ref",)),
+                _block_exists,
+            ),
+        ):
+            if scoped_reference_value is None:
+                continue
+            if not await exists_fn(
+                db,
+                change_set.project_id,
+                change_set.base_revision_id,
+                scoped_reference_value,
+            ):
+                findings.append(
+                    _finding(
+                        operation,
+                        severity="error",
+                        code=f"{field_name}_not_found",
+                        message=(
+                            "add_entity references "
+                            f"{field_name} {scoped_reference_value!r} that does "
+                            "not exist on the base revision."
+                        ),
+                        details={field_name: scoped_reference_value},
                     )
                 )
 
@@ -998,13 +1018,25 @@ def _extract_text_reference(
     *,
     keys: Sequence[str],
 ) -> str | None:
+    references = _iter_text_references(payload, keys=keys)
+    if references:
+        return references[0][1]
+    return None
+
+
+def _iter_text_references(
+    payload: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> tuple[tuple[str, str], ...]:
+    references: list[tuple[str, str]] = []
     for key in keys:
         value = payload.get(key)
         if isinstance(value, str):
             normalized = value.strip()
             if normalized:
-                return normalized
-    return None
+                references.append((key, normalized))
+    return tuple(references)
 
 
 def _extract_block_reference(payload: Mapping[str, Any]) -> str | None:

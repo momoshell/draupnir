@@ -14,6 +14,7 @@ from sqlalchemy import MetaData, Table
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.session as session_module
+from app.cad.changeset.apply import ALLOWED_LAYER_KEYS
 from app.cad.changeset_validation import (
     ChangeSetValidationErrorCode,
     ChangeSetValidationServiceError,
@@ -902,6 +903,45 @@ async def test_validate_change_set_rejects_invalid_add_entity_geometry_and_refer
 
     assert validation_result.validation_status == "invalid"
     assert expected_code in _result_codes(validation_result.result_json)
+
+
+@pytest.mark.parametrize("layer_key", ALLOWED_LAYER_KEYS)
+async def test_validate_change_set_rejects_missing_add_entity_layer_aliases(
+    db_session: AsyncSession,
+    layer_key: str,
+) -> None:
+    seed = await _seed_revision(db_session)
+    change_set = await create_change_set(
+        db_session,
+        project_id=seed.project_id,
+        base_revision_id=seed.revision_id,
+        status="proposed",
+        created_by="tester",
+        operations=[
+            CadChangeOperationCreate(
+                operation_type="add_entity",
+                operation_json=_operation_envelope(
+                    target={"drawing_revision_scope": "base"},
+                    payload={
+                        "entity": {
+                            "entity_type": "line",
+                            "geometry": {
+                                "type": "line",
+                                "start": {"x": 1.0, "y": 1.0},
+                                "end": {"x": 2.0, "y": 2.0},
+                            },
+                            layer_key: "missing-layer",
+                        }
+                    },
+                ),
+            )
+        ],
+    )
+
+    validation_result = await validate_change_set(db_session, change_set.id)
+
+    assert validation_result.validation_status == "invalid"
+    assert f"{layer_key}_not_found" in _result_codes(validation_result.result_json)
 
 
 async def test_validate_change_set_rejects_invalid_replace_block_reference(
