@@ -536,6 +536,14 @@ async def test_process_export_job_supported_kinds_persist_artifact(
     assert artifact.project_id == lineage.project_id
     assert artifact.source_file_id == lineage.file_id
     assert artifact.drawing_revision_id == lineage.drawing_revision_id
+    assert artifact.quantity_takeoff_id == (
+        lineage.quantity_takeoff_id
+        if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"}
+        else None
+    )
+    assert artifact.estimate_version_id == (
+        lineage.estimate_version_id if export_kind in {"estimate_csv", "estimate_pdf"} else None
+    )
     assert artifact.generator_config_json == options_json
     lineage_json = cast(dict[str, Any], artifact.lineage_json)
     assert lineage_json["drawing_revision"] == {"id": str(lineage.drawing_revision_id)}
