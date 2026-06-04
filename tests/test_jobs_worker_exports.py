@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -23,7 +23,9 @@ from app.core.errors import ErrorCode
 from app.exports._base import ExportArtifact
 from app.exports.csv import CsvExportResult, render_estimate_csv_export, render_quantity_csv_export
 from app.exports.estimate_pdf import EstimatePdfExportResult, render_estimate_pdf_export
+from app.exports.revised_dxf import RevisedDxfExportError
 from app.exports.revision_json import RevisionJsonExportResult, render_revision_json_export
+from app.models.cad_changeset import CadChangeSet
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
 from app.models.export_job_input import ExportJobInput
@@ -54,6 +56,7 @@ class _ExportTestLineage:
     drawing_revision_id: uuid.UUID
     quantity_takeoff_id: uuid.UUID
     estimate_version_id: uuid.UUID
+    changeset_id: uuid.UUID | None = None
 
 
 class _StorageSpy:
@@ -288,6 +291,57 @@ async def _create_export_test_lineage(async_client: httpx.AsyncClient) -> _Expor
     )
 
 
+async def _create_revised_dxf_export_test_lineage(
+    async_client: httpx.AsyncClient,
+) -> _ExportTestLineage:
+    lineage = await _create_export_test_lineage(async_client)
+    base_revision = await _get_latest_revision(lineage.file_id)
+    changeset_id = uuid.uuid4()
+    changeset_revision_id = uuid.uuid4()
+    changeset_job = await _create_completed_job(
+        project_id=lineage.project_id,
+        file_id=lineage.file_id,
+        base_revision_id=base_revision.id,
+        job_type=JobType.CHANGESET_APPLY,
+    )
+    session_maker = _get_session_maker()
+
+    async with session_maker() as session:
+        session.add(
+            CadChangeSet(
+                id=changeset_id,
+                project_id=lineage.project_id,
+                base_revision_id=base_revision.id,
+                status="applied",
+                created_by="test",
+            )
+        )
+        session.add(
+            DrawingRevision(
+                id=changeset_revision_id,
+                project_id=lineage.project_id,
+                source_file_id=lineage.file_id,
+                extraction_profile_id=None,
+                source_job_id=changeset_job.id,
+                adapter_run_output_id=None,
+                changeset_id=changeset_id,
+                predecessor_revision_id=base_revision.id,
+                revision_sequence=base_revision.revision_sequence + 1,
+                revision_kind="changeset",
+                review_state=base_revision.review_state,
+                canonical_entity_schema_version=base_revision.canonical_entity_schema_version,
+                confidence_score=base_revision.confidence_score,
+            )
+        )
+        await session.commit()
+
+    return replace(
+        lineage,
+        drawing_revision_id=changeset_revision_id,
+        changeset_id=changeset_id,
+    )
+
+
 async def _create_export_job(
     *,
     lineage: _ExportTestLineage,
@@ -403,6 +457,30 @@ def _build_export_execution_input(
     )
 
 
+def _build_revised_dxf_execution_input(
+    *,
+    lineage: _ExportTestLineage,
+    changeset_id: uuid.UUID | None = None,
+    options_json: dict[str, object] | None = None,
+) -> worker_module._ExportExecutionInput:
+    resolved_changeset_id = changeset_id or lineage.changeset_id or uuid.uuid4()
+    resolved_options = {} if options_json is None else options_json
+    return worker_module._ExportExecutionInput(
+        drawing_revision_id=lineage.drawing_revision_id,
+        export_kind="revised_dxf",
+        export_format="dxf",
+        media_type="application/dxf",
+        artifact_name=worker_module._build_export_artifact_name(
+            export_kind="revised_dxf",
+            export_format="dxf",
+            drawing_revision_id=lineage.drawing_revision_id,
+            changeset_id=resolved_changeset_id,
+        ),
+        options_json=resolved_options,
+        changeset_id=resolved_changeset_id,
+    )
+
+
 @pytest.mark.parametrize(
     ("export_kind", "export_format", "media_type", "options_json"),
     [
@@ -459,6 +537,9 @@ async def test_process_export_job_supported_kinds_persist_artifact(
     assert artifact.source_file_id == lineage.file_id
     assert artifact.drawing_revision_id == lineage.drawing_revision_id
     assert artifact.generator_config_json == options_json
+    lineage_json = cast(dict[str, Any], artifact.lineage_json)
+    assert lineage_json["drawing_revision"] == {"id": str(lineage.drawing_revision_id)}
+    assert "changeset_id" not in cast(dict[str, Any], lineage_json["export"])
 
     (
         expected_bytes,
@@ -488,6 +569,14 @@ async def test_process_export_job_supported_kinds_persist_artifact(
         "generated_artifact_id": str(artifact.id),
         "export_kind": export_kind,
     }
+
+
+def test_export_kind_spec_revised_dxf_is_registered_with_changeset_anchor() -> None:
+    spec = worker_module._get_export_kind_spec("revised_dxf")
+
+    assert spec.format == "dxf"
+    assert spec.media_type == "application/dxf"
+    assert spec.lineage_anchor == worker_module._EXPORT_LINEAGE_ANCHOR_CHANGESET
 
 
 @pytest.mark.parametrize(
@@ -521,6 +610,170 @@ async def test_render_export_artifact_supported_kinds_return_shared_export_artif
 
     assert isinstance(rendered, ExportArtifact)
     assert rendered.media_type == media_type
+
+
+async def test_process_export_job_revised_dxf_requires_changeset_origin_revision(
+    async_client: httpx.AsyncClient,
+) -> None:
+    lineage = await _create_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revised_dxf",
+        export_format="dxf",
+        media_type="application/dxf",
+        options_json={},
+    )
+
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "failed"
+    assert job.error_code == ErrorCode.INPUT_INVALID.value
+    assert job.error_message == "Revised DXF export requires a changeset-origin drawing revision."
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
+
+
+async def test_process_export_job_revised_dxf_persists_typed_changeset_artifact_and_redelivery_noop(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _create_revised_dxf_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revised_dxf",
+        export_format="dxf",
+        media_type="application/dxf",
+        options_json={"profile": "default"},
+    )
+
+    async def _render_revised_dxf(
+        db: AsyncSession,
+        revision_id: uuid.UUID,
+        options: dict[str, object] | None = None,
+    ) -> ExportArtifact:
+        _ = db
+        assert revision_id == lineage.drawing_revision_id
+        assert options == {"profile": "default"}
+        content_bytes = b"0\nSECTION\n2\nHEADER\n0\nENDSEC\n0\nEOF\n"
+        return ExportArtifact(
+            content_bytes=content_bytes,
+            checksum_sha256=hashlib.sha256(content_bytes).hexdigest(),
+            size_bytes=len(content_bytes),
+            media_type="application/dxf",
+            generator_name="revised_dxf_export",
+            generator_version="1",
+        )
+
+    monkeypatch.setattr(worker_module, "render_revised_dxf_export", _render_revised_dxf)
+
+    await worker_module.process_export_job(export_job_id)
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "succeeded"
+    assert job.error_code is None
+    artifacts = await _get_generated_artifacts_for_job(export_job_id)
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    lineage_json = cast(dict[str, Any], artifact.lineage_json)
+    assert artifact.artifact_kind == "revised_dxf"
+    assert artifact.format == "dxf"
+    assert artifact.media_type == "application/dxf"
+    assert artifact.name == f"changeset-{lineage.changeset_id}.dxf"
+    assert artifact.changeset_id == lineage.changeset_id
+    assert lineage_json["drawing_revision"] == {
+        "id": str(lineage.drawing_revision_id),
+        "changeset_id": str(lineage.changeset_id),
+    }
+    export_lineage = cast(dict[str, Any], lineage_json["export"])
+    assert export_lineage["changeset_id"] == str(lineage.changeset_id)
+
+    success_events = [
+        event for event in await _get_job_events(export_job_id) if event.message == "Job succeeded"
+    ]
+    assert len(success_events) == 1
+
+
+@pytest.mark.parametrize(
+    ("renderer_code", "expected_error_code"),
+    [
+        ("UNSUPPORTED_ENTITY_TYPE", ErrorCode.INPUT_INVALID.value),
+        ("ADAPTER_UNAVAILABLE", ErrorCode.ADAPTER_UNAVAILABLE.value),
+        ("ADAPTER_LOAD_FAILED", ErrorCode.ADAPTER_UNAVAILABLE.value),
+        ("ADAPTER_FAILED", ErrorCode.ADAPTER_FAILED.value),
+        ("EXPORT_FAILED", ErrorCode.ADAPTER_FAILED.value),
+        ("WRITER_CONTRACT_BROKEN", ErrorCode.ADAPTER_FAILED.value),
+    ],
+)
+async def test_process_export_job_revised_dxf_renderer_errors_map_without_artifact(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    renderer_code: str,
+    expected_error_code: str,
+) -> None:
+    lineage = await _create_revised_dxf_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revised_dxf",
+        export_format="dxf",
+        media_type="application/dxf",
+        options_json={},
+    )
+
+    async def _raise_revised_dxf_error(
+        db: AsyncSession,
+        revision_id: uuid.UUID,
+        options: dict[str, object] | None = None,
+    ) -> ExportArtifact:
+        _ = (db, revision_id, options)
+        raise RevisedDxfExportError(
+            code=renderer_code,
+            message=f"renderer failed with {renderer_code}",
+            details={"entity_type": "ARC"},
+        )
+
+    monkeypatch.setattr(worker_module, "render_revised_dxf_export", _raise_revised_dxf_error)
+
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "failed"
+    assert job.error_code == expected_error_code
+    assert job.error_message is not None
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
+
+
+async def test_process_export_job_revised_dxf_unexpected_renderer_failure_is_internal_error(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lineage = await _create_revised_dxf_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revised_dxf",
+        export_format="dxf",
+        media_type="application/dxf",
+        options_json={},
+    )
+
+    async def _raise_runtime_error(
+        db: AsyncSession,
+        revision_id: uuid.UUID,
+        options: dict[str, object] | None = None,
+    ) -> ExportArtifact:
+        _ = (db, revision_id, options)
+        raise RuntimeError("unexpected revised dxf failure")
+
+    monkeypatch.setattr(worker_module, "render_revised_dxf_export", _raise_runtime_error)
+
+    with pytest.raises(RuntimeError, match="unexpected revised dxf failure"):
+        await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "failed"
+    assert job.error_code == ErrorCode.INTERNAL_ERROR.value
+    assert job.error_message == worker_module._PROCESS_EXPORT_JOB_ERROR_MESSAGE
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
 
 
 async def test_process_export_job_duplicate_terminal_redelivery_is_noop(

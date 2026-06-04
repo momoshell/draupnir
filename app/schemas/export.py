@@ -15,6 +15,7 @@ class ExportKind(StrEnum):
     """Export kind string constants."""
 
     REVISION_JSON = "revision_json"
+    REVISED_DXF = "revised_dxf"
     QUANTITY_CSV = "quantity_csv"
     ESTIMATE_CSV = "estimate_csv"
     ESTIMATE_PDF = "estimate_pdf"
@@ -24,17 +25,20 @@ class ExportFormat(StrEnum):
     """Export format string constants."""
 
     JSON = "json"
+    DXF = "dxf"
     CSV = "csv"
     PDF = "pdf"
 
 
 EXPORT_KIND_MATRIX: dict[ExportKind, tuple[ExportFormat, str]] = {
     ExportKind.REVISION_JSON: (ExportFormat.JSON, "application/json"),
+    ExportKind.REVISED_DXF: (ExportFormat.DXF, "application/dxf"),
     ExportKind.QUANTITY_CSV: (ExportFormat.CSV, "text/csv"),
     ExportKind.ESTIMATE_CSV: (ExportFormat.CSV, "text/csv"),
     ExportKind.ESTIMATE_PDF: (ExportFormat.PDF, "application/pdf"),
 }
 ESTIMATE_EXPORT_KINDS = {ExportKind.ESTIMATE_CSV, ExportKind.ESTIMATE_PDF}
+REVISION_SCOPED_EXPORT_KINDS = {ExportKind.REVISION_JSON, ExportKind.REVISED_DXF}
 
 
 def _validate_json_safe_option_value(value: Any, *, path: str) -> None:
@@ -107,10 +111,14 @@ class ExportJobInputBase(BaseModel):
                 raise ValueError(
                     "estimate exports require both quantity_takeoff_id and estimate_version_id"
                 )
+        elif self.export_kind in REVISION_SCOPED_EXPORT_KINDS:
+            if self.quantity_takeoff_id is not None or self.estimate_version_id is not None:
+                raise ValueError(
+                    "revision_json and revised_dxf exports forbid quantity_takeoff_id and "
+                    "estimate_version_id"
+                )
         elif self.quantity_takeoff_id is not None or self.estimate_version_id is not None:
-            raise ValueError(
-                "revision_json exports forbid quantity_takeoff_id and estimate_version_id"
-            )
+            raise ValueError(f"Unsupported export_kind: {self.export_kind}")
 
         return self
 

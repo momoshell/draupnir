@@ -69,6 +69,7 @@ from app.exports.estimate_pdf import (
     EstimatePdfExportError,
     render_estimate_pdf_export,
 )
+from app.exports.revised_dxf import RevisedDxfExportError, render_revised_dxf_export
 from app.exports.revision_json import (
     RevisionJsonExportError,
     render_revision_json_export,
@@ -425,6 +426,7 @@ class _ExportExecutionInput:
     media_type: str
     artifact_name: str
     options_json: dict[str, Any]
+    changeset_id: UUID | None = None
     quantity_takeoff_id: UUID | None = None
     estimate_version_id: UUID | None = None
 
@@ -434,10 +436,24 @@ _ExportRenderFn = Callable[
     Coroutine[Any, Any, ExportArtifact],
 ]
 _ExportErrorDetailsFn = Callable[[_ExportExecutionInput], dict[str, Any]]
+_ExportErrorMapperFn = Callable[[Exception, _ExportExecutionInput], _ExportJobInputError]
 
 _EXPORT_LINEAGE_ANCHOR_REVISION = "revision"
+_EXPORT_LINEAGE_ANCHOR_CHANGESET = "changeset"
 _EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF = "quantity_takeoff"
 _EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION = "estimate_version"
+_REVISED_DXF_INPUT_ERROR_CODES = frozenset(
+    {
+        "INPUT_INVALID",
+        "MANIFEST_NOT_FOUND",
+        "MATERIALIZATION_MISSING",
+        "MISSING_LAYER",
+        "MISSING_LAYOUT",
+        "NONFINITE_COORDINATE",
+        "NONZERO_Z_COORDINATE",
+        "REVISION_NOT_FOUND",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,11 +466,20 @@ class _ExportKindSpec:
     error_type: type[Exception]
     lineage_anchor: str
     error_details_fn: _ExportErrorDetailsFn
+    error_mapper_fn: _ExportErrorMapperFn | None = None
 
 
 def _export_revision_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
     """Build not-found details for revision-scoped exports."""
     return {"drawing_revision_id": str(execution.drawing_revision_id)}
+
+
+def _export_changeset_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
+    """Build details for changeset-scoped exports."""
+    return {
+        "drawing_revision_id": str(execution.drawing_revision_id),
+        "changeset_id": str(execution.changeset_id) if execution.changeset_id is not None else None,
+    }
 
 
 def _export_quantity_error_details(execution: _ExportExecutionInput) -> dict[str, Any]:
@@ -481,6 +506,46 @@ async def _render_revision_json_export_artifact(
 ) -> ExportArtifact:
     """Render a revision JSON export artifact."""
     return await render_revision_json_export(
+        session,
+        execution.drawing_revision_id,
+        options=execution.options_json,
+    )
+
+
+def _map_revised_dxf_export_error(
+    exc: Exception,
+    execution: _ExportExecutionInput,
+) -> _ExportJobInputError:
+    """Map revised-DXF renderer failures to deterministic job errors."""
+    assert isinstance(exc, RevisedDxfExportError)
+    details = _export_changeset_error_details(execution)
+    details.update(deepcopy(exc.details or {}))
+    details["renderer_error_code"] = exc.code
+    return _build_export_job_input_error(
+        str(exc),
+        error_code=(
+            ErrorCode.ADAPTER_UNAVAILABLE
+            if exc.code in {"ADAPTER_UNAVAILABLE", "ADAPTER_LOAD_FAILED"}
+            else (
+                ErrorCode.INPUT_INVALID
+                if _is_revised_dxf_input_error_code(exc.code)
+                else ErrorCode.ADAPTER_FAILED
+            )
+        ),
+        details=details,
+    )
+
+
+def _is_revised_dxf_input_error_code(code: str) -> bool:
+    return code in _REVISED_DXF_INPUT_ERROR_CODES or code.startswith(("INVALID_", "UNSUPPORTED_"))
+
+
+async def _render_revised_dxf_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render a revised DXF export artifact."""
+    return await render_revised_dxf_export(
         session,
         execution.drawing_revision_id,
         options=execution.options_json,
@@ -550,6 +615,15 @@ _EXPORT_KIND_SPECS: dict[str, _ExportKindSpec] = {
         error_type=EstimatePdfExportError,
         lineage_anchor=_EXPORT_LINEAGE_ANCHOR_ESTIMATE_VERSION,
         error_details_fn=_export_estimate_error_details,
+    ),
+    "revised_dxf": _ExportKindSpec(
+        format="dxf",
+        media_type="application/dxf",
+        render_fn=_render_revised_dxf_export_artifact,
+        error_type=RevisedDxfExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_CHANGESET,
+        error_details_fn=_export_changeset_error_details,
+        error_mapper_fn=_map_revised_dxf_export_error,
     ),
 }
 
@@ -3786,6 +3860,7 @@ def _build_export_artifact_name(
     export_kind: str,
     export_format: str,
     drawing_revision_id: UUID,
+    changeset_id: UUID | None = None,
     quantity_takeoff_id: UUID | None = None,
     estimate_version_id: UUID | None = None,
 ) -> str:
@@ -3793,6 +3868,9 @@ def _build_export_artifact_name(
     export_spec = _get_export_kind_spec(export_kind)
     if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_REVISION:
         return f"revision-{drawing_revision_id}.{export_format}"
+    if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_CHANGESET:
+        assert changeset_id is not None
+        return f"changeset-{changeset_id}.{export_format}"
     if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_QUANTITY_TAKEOFF:
         assert quantity_takeoff_id is not None
         return f"quantity-takeoff-{quantity_takeoff_id}.{export_format}"
@@ -3818,6 +3896,29 @@ def _build_export_artifact_lineage_json(
     execution: _ExportExecutionInput,
 ) -> dict[str, Any]:
     """Build lineage metadata for a persisted export artifact."""
+    drawing_revision_lineage: dict[str, Any] = {"id": str(execution.drawing_revision_id)}
+    if execution.changeset_id is not None:
+        drawing_revision_lineage["changeset_id"] = str(execution.changeset_id)
+
+    export_lineage: dict[str, Any] = {
+        "kind": execution.export_kind,
+        "format": execution.export_format,
+        "media_type": execution.media_type,
+        "quantity_takeoff_id": (
+            str(execution.quantity_takeoff_id)
+            if execution.quantity_takeoff_id is not None
+            else None
+        ),
+        "estimate_version_id": (
+            str(execution.estimate_version_id)
+            if execution.estimate_version_id is not None
+            else None
+        ),
+        "options": deepcopy(execution.options_json),
+    }
+    if execution.changeset_id is not None:
+        export_lineage["changeset_id"] = str(execution.changeset_id)
+
     return {
         "source_file": {
             "id": str(source_file.id),
@@ -3833,23 +3934,8 @@ def _build_export_artifact_lineage_json(
                 str(job.base_revision_id) if job.base_revision_id is not None else None
             ),
         },
-        "drawing_revision": {"id": str(execution.drawing_revision_id)},
-        "export": {
-            "kind": execution.export_kind,
-            "format": execution.export_format,
-            "media_type": execution.media_type,
-            "quantity_takeoff_id": (
-                str(execution.quantity_takeoff_id)
-                if execution.quantity_takeoff_id is not None
-                else None
-            ),
-            "estimate_version_id": (
-                str(execution.estimate_version_id)
-                if execution.estimate_version_id is not None
-                else None
-            ),
-            "options": deepcopy(execution.options_json),
-        },
+        "drawing_revision": drawing_revision_lineage,
+        "export": export_lineage,
     }
 
 
@@ -3863,6 +3949,8 @@ async def _render_export_artifact(
         result = await export_spec.render_fn(session, execution)
     except Exception as exc:
         if isinstance(exc, export_spec.error_type):
+            if export_spec.error_mapper_fn is not None:
+                raise export_spec.error_mapper_fn(exc, execution) from exc
             raise _build_export_job_input_error(
                 str(exc),
                 error_code=ErrorCode.NOT_FOUND,
@@ -3963,7 +4051,10 @@ async def _build_export_execution_input(
             )
 
         options_json = deepcopy(export_input.options_json)
-        if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_REVISION:
+        if export_spec.lineage_anchor in {
+            _EXPORT_LINEAGE_ANCHOR_REVISION,
+            _EXPORT_LINEAGE_ANCHOR_CHANGESET,
+        }:
             if (
                 export_input.quantity_takeoff_id is not None
                 or export_input.estimate_version_id is not None
@@ -3971,8 +4062,34 @@ async def _build_export_execution_input(
                 or export_input.trusted_totals is not None
             ):
                 raise _build_export_job_input_error(
-                    "Revision JSON export input contains unexpected quantity or estimate lineage.",
+                    (
+                        "Revision-scoped export input contains unexpected quantity or estimate "
+                        "lineage."
+                    ),
                     details={"export_kind": export_input.export_kind},
+                )
+            if export_spec.lineage_anchor == _EXPORT_LINEAGE_ANCHOR_CHANGESET:
+                if (
+                    drawing_revision.revision_kind != "changeset"
+                    or drawing_revision.changeset_id is None
+                ):
+                    raise _build_export_job_input_error(
+                        "Revised DXF export requires a changeset-origin drawing revision.",
+                        details={"drawing_revision_id": str(drawing_revision.id)},
+                    )
+                return _ExportExecutionInput(
+                    drawing_revision_id=drawing_revision.id,
+                    changeset_id=drawing_revision.changeset_id,
+                    export_kind=export_input.export_kind,
+                    export_format=export_input.export_format,
+                    media_type=export_input.media_type,
+                    artifact_name=_build_export_artifact_name(
+                        export_kind=export_input.export_kind,
+                        export_format=export_input.export_format,
+                        drawing_revision_id=drawing_revision.id,
+                        changeset_id=drawing_revision.changeset_id,
+                    ),
+                    options_json=options_json,
                 )
             return _ExportExecutionInput(
                 drawing_revision_id=drawing_revision.id,
@@ -4223,6 +4340,7 @@ async def _finalize_export_job(
                     source_file_id=source_file.id,
                     job_id=job.id,
                     drawing_revision_id=execution.drawing_revision_id,
+                    changeset_id=execution.changeset_id,
                     artifact_kind=execution.export_kind,
                     name=execution.artifact_name,
                     format=execution.export_format,
