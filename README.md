@@ -11,9 +11,21 @@ The MVP product surface is API-only. Future clients may include a web UI, TUI,
 CLI, or other services, but this repository does not imply that a product CLI
 exists today.
 
+Phase 10 client interface work is deferred; no shipped first-party client is
+documented here.
+
 ## Current Status
 
-Docker Compose development stack is available. See "Local Development" below for setup instructions.
+The Phase 0-9 MVP implementation in this repository is API-only. It supports
+project and file creation/upload, queued ingestion and reprocess jobs, revision
+reads with materialization and validation data, quantity takeoff workflows,
+estimation catalog/formula management and estimate job workflows, export job
+creation plus generated artifact metadata, changeset validate/apply flows, and
+the revised-DXF export path for eligible changeset-origin revisions.
+
+Docker Compose development infrastructure is available for local API and worker
+setup; see "Local Development" below. Phase 10 client interface work remains
+deferred, and no shipped first-party client is documented here.
 
 ## Local Development
 
@@ -58,23 +70,29 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
    # or: docker compose ps
    ```
 
-4. **Check API health**:
+4. **Run database migrations**:
+   ```bash
+   make migrate
+   # or: uv run alembic upgrade head
+   ```
+
+5. **Check API health**:
    ```bash
    curl http://localhost:8000/v1/health
    ```
 
-5. **View RabbitMQ management UI**:
-    - Open http://localhost:15672 in your browser
-    - Login: guest / guest
-    - AMQP is also exposed on localhost:5672 for host-side clients only
+6. **View RabbitMQ management UI**:
+     - Open http://localhost:15672 in your browser
+     - Login: guest / guest
+     - AMQP is also exposed on localhost:5672 for host-side clients only
 
-6. **View logs**:
+7. **View logs**:
    ```bash
    make logs
    # or: docker compose logs -f
    ```
 
-7. **Stop all services**:
+8. **Stop all services**:
    ```bash
    make down
    # or: docker compose down
@@ -213,12 +231,17 @@ The reported version should be PostgreSQL 18.x.
    # Adjust DATABASE_URL and BROKER_URL for local services
    ```
 
-3. **Run the API**:
+3. **Run migrations**:
+   ```bash
+   uv run alembic upgrade head
+   ```
+
+4. **Run the API**:
    ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-4. **Run the worker**:
+5. **Run the worker**:
    ```bash
    uv run celery -A app.jobs.worker worker --loglevel=info
    ```
@@ -252,13 +275,99 @@ Point it at a migrated database. If the tool cannot use your async driver URL, u
 
 The API surface is auto-documented from the running FastAPI application:
 
-- **OpenAPI JSON schema**: `GET /v1/openapi.json`
-- **Swagger UI**: `GET /v1/docs`
-- **ReDoc**: `GET /v1/redoc`
+- **OpenAPI JSON schema**: `GET /openapi.json`
+- **Swagger UI**: `GET /docs`
+- **ReDoc**: `GET /redoc`
+
+The interactive docs are unversioned FastAPI endpoints. The application API
+itself mounts under `/v1`.
 
 The static `docs/API.md` API plan was retired once Phase 1 shipped. The live
 OpenAPI schema is the canonical source of truth for endpoints and request/response
 shapes.
+
+## API Consumer Quick Guide
+
+Use the live OpenAPI docs for exact request and response shapes. The summary
+below is the practical starting point for API consumers.
+
+### Health and capabilities
+
+- `GET /v1/health` is shallow liveness only.
+- `GET /v1/system/health` checks dependencies and adapter availability and can
+  return `503`.
+
+### Core workflow
+
+1. Create a project.
+2. Upload a source file to that project.
+3. Track the background job until terminal state.
+4. Read the resulting revision, validation, quantities, estimates, or exports.
+
+### Projects and files
+
+- Start with project and file endpoints under `/v1`.
+- File upload is multipart and expects the file field name `file`.
+- Upload requests must include `Content-Length`.
+- The API accepts PDF, DWG, DXF, and IFC inputs when the relevant adapters are
+  available.
+
+### Jobs
+
+- Long-running ingestion, quantity, estimate, export, and changeset-apply work
+  is job-backed.
+- Use the jobs API to fetch job status, read job events, cancel work, and retry
+  eligible failures.
+
+### Revisions, materialization, and validation
+
+- Revisions are the durable read model produced by ingestion or changeset apply.
+- Read revision details and materialized entities through revision-scoped `/v1`
+  endpoints.
+- Validation reports are part of the revision workflow and determine whether
+  downstream quantity and export flows are allowed, provisional, or blocked.
+
+### Quantities
+
+- Quantity takeoffs are revision-scoped.
+- Review-gated or blocked validation outcomes are not equivalent to trusted
+  totals; consumers should check returned gate and trust fields before using
+  quantities as a billing or estimating input.
+
+### Estimates
+
+- Estimates are created from eligible quantity takeoffs, not directly from raw
+  files.
+- Estimate reads are also revision-scoped and preserve frozen pricing inputs for
+  reproducibility.
+
+### Exports and artifacts
+
+- Export kinds currently include `revision_json`, `quantity_csv`,
+  `estimate_csv`, `estimate_pdf`, and `revised_dxf`.
+- Generated artifact routes expose metadata and lineage, not raw artifact bytes
+  or presigned download URLs.
+- Consumers should treat artifact metadata as the API contract available today.
+
+### Changesets
+
+- Changesets are revision-scoped proposals for CAD-visible or metadata-only
+  edits.
+- The API supports create, list, validate, and apply workflows under revision
+  routes.
+- Revised DXF export is intended for changeset-origin revisions.
+
+### Adapter caveats
+
+- Adapter availability is environment-dependent; use system health/capabilities
+  checks instead of assuming every format is enabled everywhere.
+- Current registry covers DWG, DXF, IFC, vector PDF, raster PDF, and a
+  `revised_dxf` writer path.
+
+### Idempotency
+
+- Use `Idempotency-Key` on mutation requests that may be retried by clients.
+- This is especially important for uploads and job-creating endpoints.
 
 ## MVP Direction
 
