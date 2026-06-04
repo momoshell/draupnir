@@ -19,6 +19,7 @@ import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.config import settings
 from app.core.exceptions import raise_not_found
+from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File as FileModel
 from app.models.job import Job
 from app.models.project import Project
@@ -127,6 +128,82 @@ def _make_get_db_override_with_commit_error(
             await session.close()
 
     return _override_get_db
+
+
+def _make_get_db_override_with_flush_error(
+    flush_error: BaseException,
+) -> Callable[[], AsyncGenerator[Any, None]]:
+    """Create a request-scoped get_db override with a post-flush failure."""
+
+    async def _override_get_db() -> AsyncGenerator[Any, None]:
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        session = session_maker()
+        original_flush = session.flush
+
+        async def _fail_flush(*args: Any, **kwargs: Any) -> None:
+            await original_flush(*args, **kwargs)
+            raise flush_error
+
+        cast(Any, session).flush = _fail_flush
+
+        try:
+            yield session
+        finally:
+            await session.close()
+
+    return _override_get_db
+
+
+def _make_get_db_override_with_flush_and_rollback_error(
+    flush_error: BaseException,
+    rollback_error: BaseException,
+) -> Callable[[], AsyncGenerator[Any, None]]:
+    """Create a request-scoped get_db override with flush and rollback failures."""
+
+    async def _override_get_db() -> AsyncGenerator[Any, None]:
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        session = session_maker()
+        original_flush = session.flush
+
+        async def _fail_flush(*args: Any, **kwargs: Any) -> None:
+            await original_flush(*args, **kwargs)
+            raise flush_error
+
+        async def _fail_rollback() -> None:
+            raise rollback_error
+
+        cast(Any, session).flush = _fail_flush
+        cast(Any, session).rollback = _fail_rollback
+
+        try:
+            yield session
+        finally:
+            await session.close()
+
+    return _override_get_db
+
+
+async def _assert_upload_lineage_absent(project_id: str) -> None:
+    """Assert failed uploads left no persisted lineage rows for the project."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    project_uuid = uuid.UUID(project_id)
+
+    async with session_maker() as session:
+        file_result = await session.execute(
+            select(FileModel).where(FileModel.project_id == project_uuid)
+        )
+        job_result = await session.execute(select(Job).where(Job.project_id == project_uuid))
+        extraction_profile_result = await session.execute(
+            select(ExtractionProfile).where(ExtractionProfile.project_id == project_uuid)
+        )
+
+    assert file_result.scalars().all() == []
+    assert job_result.scalars().all() == []
+    assert extraction_profile_result.scalars().all() == []
 
 
 class RecordingStorage:
@@ -1060,6 +1137,56 @@ class TestProjectFiles:
 
         assert file_result.scalars().all() == []
         assert job_result.scalars().all() == []
+
+    @pytest.mark.parametrize(
+        "rollback_error",
+        [
+            pytest.param(None, id="rollback-ok"),
+            pytest.param(RuntimeError("forced rollback failure"), id="rollback-fails"),
+            pytest.param(asyncio.CancelledError(), id="rollback-cancelled"),
+        ],
+    )
+    async def test_upload_file_cleans_persisted_upload_when_db_finalization_fails(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+        rollback_error: BaseException | None,
+    ) -> None:
+        """POST should cleanup persisted bytes when upload DB finalization fails pre-commit."""
+        _ = self
+        payload = b"%PDF-1.7\nflush-failure"
+
+        if rollback_error is None:
+            app.dependency_overrides[session_module.get_db] = (
+                _make_get_db_override_with_flush_error(RuntimeError("forced flush failure"))
+            )
+        else:
+            app.dependency_overrides[session_module.get_db] = (
+                _make_get_db_override_with_flush_and_rollback_error(
+                    RuntimeError("forced flush failure"),
+                    rollback_error,
+                )
+            )
+        try:
+            with pytest.raises(RuntimeError, match="forced flush failure"):
+                await async_client.post(
+                    f"/v1/projects/{created_project['id']}/files",
+                    files={"file": ("flush-fail.pdf", payload, "application/pdf")},
+                )
+        finally:
+            app.dependency_overrides.pop(session_module.get_db, None)
+
+        upload_root = Path(settings.upload_storage_root).resolve()
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+
+        originals_root = upload_root / "originals"
+        assert not originals_root.exists() or not any(
+            path.is_file() for path in originals_root.rglob("*")
+        )
+
+        await _assert_upload_lineage_absent(created_project["id"])
 
     async def test_list_project_files_project_not_found(
         self,

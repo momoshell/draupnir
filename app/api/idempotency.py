@@ -383,6 +383,7 @@ async def run_idempotent_mutation[ResultT](
     preclaim: Callable[[], Awaitable[Response | None]] | None = None,
     reload_after_claim: Callable[[], Awaitable[None]] | None = None,
     ops: IdempotentMutationOps | None = None,
+    pre_commit_failure_cleanup: Callable[[], Awaitable[None]] | None = None,
 ) -> Response:
     """Run the shared replay/claim/mutate/complete/commit mutation flow."""
 
@@ -413,23 +414,31 @@ async def run_idempotent_mutation[ResultT](
     if reservation_or_response is not None and reload_after_claim is not None:
         await reload_after_claim()
 
-    mutation_result = await mutate()
-    if isinstance(mutation_result, IdempotentMutationKnownError):
-        response_body = mutation_result.response_body
-        after_commit = mutation_result.after_commit
-        status_code = mutation_result.status_code
-    else:
-        response_body = serialize_result(mutation_result.value)
-        after_commit = mutation_result.after_commit
-        status_code = mutation_result.status_code
+    commit_started = False
+    try:
+        mutation_result = await mutate()
+        if isinstance(mutation_result, IdempotentMutationKnownError):
+            response_body = mutation_result.response_body
+            after_commit = mutation_result.after_commit
+            status_code = mutation_result.status_code
+        else:
+            response_body = serialize_result(mutation_result.value)
+            after_commit = mutation_result.after_commit
+            status_code = mutation_result.status_code
 
-    response = await resolved_ops.complete(
-        db,
-        reservation_or_response,
-        status_code=status_code,
-        response_body=response_body,
-    )
-    await db.commit()
+        response = await resolved_ops.complete(
+            db,
+            reservation_or_response,
+            status_code=status_code,
+            response_body=response_body,
+        )
+        commit_started = True
+        await db.commit()
+    except BaseException:
+        if not commit_started and pre_commit_failure_cleanup is not None:
+            await pre_commit_failure_cleanup()
+        raise
+
     if after_commit is not None:
         await after_commit()
     return response

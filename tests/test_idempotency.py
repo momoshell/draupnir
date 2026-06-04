@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -14,6 +16,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.api.idempotency as idempotency_api
 from app.api.idempotency import (
     IdempotencyReplay,
     IdempotencyReservation,
@@ -38,6 +41,8 @@ from app.db import session as session_module
 from app.jobs import worker as worker_module
 from app.jobs.worker import process_ingest_job
 from app.models.drawing_revision import DrawingRevision
+from app.models.extraction_profile import ExtractionProfile
+from app.models.file import File as FileModel
 from app.models.idempotency_key import IdempotencyKey, IdempotencyStatus
 from app.models.job import Job
 from app.models.project import Project
@@ -246,6 +251,43 @@ class _CommitTrackingSession:
     async def commit(self) -> None:
         self.commit_calls += 1
         self._events.append("commit")
+
+
+async def _upload_lineage_counts(project_id: str) -> tuple[int, int, int]:
+    """Return persisted file/job/extraction-profile counts for a project."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    project_uuid = uuid.UUID(project_id)
+
+    async with session_maker() as session:
+        file_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(FileModel)
+                    .where(FileModel.project_id == project_uuid)
+                )
+            ).scalar_one()
+        )
+        job_count = int(
+            (
+                await session.execute(
+                    select(func.count()).select_from(Job).where(Job.project_id == project_uuid)
+                )
+            ).scalar_one()
+        )
+        extraction_profile_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ExtractionProfile)
+                    .where(ExtractionProfile.project_id == project_uuid)
+                )
+            ).scalar_one()
+        )
+
+    return file_count, job_count, extraction_profile_count
 
 
 @pytest.mark.asyncio
@@ -695,6 +737,78 @@ async def test_run_idempotent_mutation_propagates_arbitrary_exceptions() -> None
 
 
 @pytest.mark.asyncio
+async def test_run_idempotent_mutation_runs_pre_commit_failure_cleanup_before_commit_starts() -> (
+    None
+):
+    """Pre-commit failures should cleanup before any final commit begins."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("cleanup-key-1", "fingerprint-13")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "cleanup-key-1",
+            "fingerprint-13",
+            "POST",
+            "/v1/projects/project-3/files",
+        )
+        return IdempotencyReservation(record_id=uuid.uuid4())
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = (db, reservation, status_code, response_body)
+        events.append("complete")
+        raise RuntimeError("complete failed")
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        return IdempotentMutationSuccess(value="project-3", status_code=201)
+
+    def _serialize(value: str) -> dict[str, Any]:
+        events.append("serialize")
+        return {"id": value}
+
+    async def _cleanup() -> None:
+        events.append("cleanup")
+
+    with pytest.raises(RuntimeError, match="complete failed"):
+        await run_idempotent_mutation(
+            cast(Any, session),
+            key="cleanup-key-1",
+            fingerprint="fingerprint-13",
+            method="POST",
+            path="/v1/projects/project-3/files",
+            mutate=_mutate,
+            serialize_result=_serialize,
+            ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+            pre_commit_failure_cleanup=_cleanup,
+        )
+
+    assert session.commit_calls == 0
+    assert events == ["replay", "claim", "mutate", "serialize", "complete", "cleanup"]
+
+
+@pytest.mark.asyncio
 async def test_complete_idempotency_response_marks_snapshot_and_returns_json() -> None:
     """Completion helper should snapshot success bodies without committing the session."""
 
@@ -816,6 +930,29 @@ def _get_async_client_app(async_client: httpx.AsyncClient) -> Any:
     if app is not None:
         return app
     return cast(Any, async_client)._transport.app
+
+
+def _make_get_db_override_with_rollback_error(
+    rollback_error: BaseException,
+) -> Callable[[], AsyncGenerator[Any, None]]:
+    """Create a request-scoped get_db override with an instance-level rollback failure."""
+
+    async def _override_get_db() -> AsyncGenerator[Any, None]:
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        session = session_maker()
+
+        async def _fail_rollback() -> None:
+            raise rollback_error
+
+        cast(Any, session).rollback = _fail_rollback
+
+        try:
+            yield session
+        finally:
+            await session.close()
+
+    return _override_get_db
 
 
 async def _project_count() -> int:
@@ -1270,6 +1407,71 @@ class TestEndpointIdempotency:
         assert record.response_status_code == 500
         assert record.response_body_json == first.json()
         assert enqueued_job_ids == []
+
+    @pytest.mark.parametrize(
+        "rollback_error",
+        [
+            pytest.param(None, id="rollback-ok"),
+            pytest.param(RuntimeError("forced rollback failure"), id="rollback-fails"),
+            pytest.param(asyncio.CancelledError(), id="rollback-cancelled"),
+        ],
+    )
+    async def test_upload_file_cleans_idempotent_persisted_upload_when_db_finalization_fails(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        monkeypatch: pytest.MonkeyPatch,
+        rollback_error: BaseException | None,
+    ) -> None:
+        """Idempotent uploads should cleanup persisted bytes on pre-commit finalization failure."""
+
+        _ = self
+        _ = cleanup_projects
+        project = cast(dict[str, Any], (await _create_project(async_client)).json())
+        key = "file-upload-complete-failure-1"
+        upload_root = Path(settings.upload_storage_root).resolve()
+        original_ops = idempotency_api.DEFAULT_IDEMPOTENT_MUTATION_OPS
+        app = _get_async_client_app(async_client)
+
+        async def _fail_complete(
+            db: AsyncSession,
+            reservation: IdempotencyReservation | None,
+            *,
+            status_code: int,
+            response_body: dict[str, Any] | None,
+        ) -> Response:
+            _ = (db, reservation, status_code, response_body)
+            raise RuntimeError("forced idempotent finalization failure")
+
+        monkeypatch.setattr(
+            idempotency_api,
+            "DEFAULT_IDEMPOTENT_MUTATION_OPS",
+            IdempotentMutationOps(
+                replay=original_ops.replay,
+                claim=original_ops.claim,
+                complete=_fail_complete,
+            ),
+        )
+
+        if rollback_error is not None:
+            app.dependency_overrides[session_module.get_db] = (
+                _make_get_db_override_with_rollback_error(rollback_error)
+            )
+
+        try:
+            with pytest.raises(RuntimeError, match="forced idempotent finalization failure"):
+                await _upload_pdf(async_client, project_id=project["id"], idempotency_key=key)
+        finally:
+            app.dependency_overrides.pop(session_module.get_db, None)
+
+        staging_root = upload_root / ".staging"
+        assert not staging_root.exists() or not any(staging_root.iterdir())
+
+        originals_root = upload_root / "originals"
+        assert not originals_root.exists() or not any(
+            path.is_file() for path in originals_root.rglob("*")
+        )
+        assert await _upload_lineage_counts(project["id"]) == (0, 0, 0)
 
     async def test_mark_idempotency_completed_does_not_overwrite_completed_snapshot(
         self,
