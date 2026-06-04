@@ -186,6 +186,12 @@ async def _cleanup_persisted_upload(storage: Storage, storage_key: str, storage_
         await storage.delete_failed_put(storage_key, storage_uri=storage_uri)
 
 
+async def _rollback_upload_cleanup_transaction(db: AsyncSession) -> None:
+    """Best-effort rollback before upload cleanup paths."""
+    with suppress(BaseException):
+        await db.rollback()
+
+
 async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: str) -> None:
     """Close upload and raise standardized client validation error envelope."""
     await file.close()
@@ -442,6 +448,7 @@ async def upload_project_file(
     max_upload_bytes = settings.max_upload_mb * 1024 * 1024
     total_bytes = 0
     checksum_builder = hashlib.sha256()
+    persisted_upload_uri: str | None = None
     try:
         with staging_path.open("xb") as stream:
             initial_bytes = await file.read(_UPLOAD_SNIFF_BYTES)
@@ -494,47 +501,49 @@ async def upload_project_file(
         async def _finalize_upload(persisted_storage_uri: str) -> FileModel:
             try:
                 await _get_active_project_or_404(db, project_id, for_update=True)
-            except Exception:
-                await db.rollback()
+                extraction_profile = _build_extraction_profile(project_id)
+                db.add(extraction_profile)
+
+                ingest_job = Job(
+                    id=uuid.uuid4(),
+                    project_id=project_id,
+                    file_id=file_id,
+                    extraction_profile_id=extraction_profile.id,
+                    job_type="ingest",
+                    status="pending",
+                    attempts=0,
+                    max_attempts=3,
+                    cancel_requested=False,
+                )
+
+                file_row = FileModel(
+                    id=file_id,
+                    project_id=project_id,
+                    original_filename=original_filename,
+                    media_type=media_type,
+                    detected_format=detected_format,
+                    storage_uri=persisted_storage_uri,
+                    size_bytes=total_bytes,
+                    checksum_sha256=checksum,
+                    immutable=True,
+                    initial_job_id=ingest_job.id,
+                    initial_extraction_profile_id=extraction_profile.id,
+                )
+                db.add(file_row)
+                db.add(ingest_job)
+                prepare_job_enqueue_intent(ingest_job)
+                await db.flush()
+                await db.refresh(file_row)
+                await db.refresh(ingest_job)
+
+                return _attach_initial_upload_metadata(file_row)
+            except BaseException:
+                nonlocal persisted_upload_uri
+                await _rollback_upload_cleanup_transaction(db)
                 await _cleanup_persisted_upload(storage, storage_key, persisted_storage_uri)
+                if persisted_upload_uri == persisted_storage_uri:
+                    persisted_upload_uri = None
                 raise
-
-            extraction_profile = _build_extraction_profile(project_id)
-            db.add(extraction_profile)
-
-            ingest_job = Job(
-                id=uuid.uuid4(),
-                project_id=project_id,
-                file_id=file_id,
-                extraction_profile_id=extraction_profile.id,
-                job_type="ingest",
-                status="pending",
-                attempts=0,
-                max_attempts=3,
-                cancel_requested=False,
-            )
-
-            file_row = FileModel(
-                id=file_id,
-                project_id=project_id,
-                original_filename=original_filename,
-                media_type=media_type,
-                detected_format=detected_format,
-                storage_uri=persisted_storage_uri,
-                size_bytes=total_bytes,
-                checksum_sha256=checksum,
-                immutable=True,
-                initial_job_id=ingest_job.id,
-                initial_extraction_profile_id=extraction_profile.id,
-            )
-            db.add(file_row)
-            db.add(ingest_job)
-            prepare_job_enqueue_intent(ingest_job)
-            await db.flush()
-            await db.refresh(file_row)
-            await db.refresh(ingest_job)
-
-            return _attach_initial_upload_metadata(file_row)
 
         if idempotency_key is not None:
             fingerprint = build_idempotency_fingerprint(
@@ -553,9 +562,18 @@ async def upload_project_file(
                 await _get_active_project_or_404(db, project_id)
                 return None
 
+            async def _cleanup_pre_commit_failed_upload() -> None:
+                nonlocal persisted_upload_uri
+                if persisted_upload_uri is None:
+                    return
+                await _rollback_upload_cleanup_transaction(db)
+                await _cleanup_persisted_upload(storage, storage_key, persisted_upload_uri)
+                persisted_upload_uri = None
+
             async def _mutate_upload() -> (
                 IdempotentMutationSuccess[FileModel] | IdempotentMutationKnownError
             ):
+                nonlocal persisted_upload_uri
                 try:
                     stored_object = await storage.put(storage_key, staging_path, immutable=True)
                 except FileExistsError:
@@ -569,7 +587,8 @@ async def upload_project_file(
                     await _cleanup_persisted_upload(storage, storage_key, stored_object.storage_uri)
                     return _known_upload_storage_failure("Stored file checksum mismatch detected.")
 
-                file_row = await _finalize_upload(stored_object.storage_uri)
+                persisted_upload_uri = stored_object.storage_uri
+                file_row = await _finalize_upload(persisted_upload_uri)
                 return IdempotentMutationSuccess(
                     value=file_row,
                     status_code=status.HTTP_201_CREATED,
@@ -587,6 +606,7 @@ async def upload_project_file(
                 preclaim=_preclaim_upload,
                 mutate=_mutate_upload,
                 serialize_result=_serialize_uploaded_file,
+                pre_commit_failure_cleanup=_cleanup_pre_commit_failed_upload,
             )
 
         try:
