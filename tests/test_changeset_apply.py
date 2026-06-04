@@ -29,6 +29,7 @@ from app.cad.changeset import (
     load_and_apply_change_set,
     load_change_set_apply_input,
 )
+from app.cad.changeset.apply import ALLOWED_LAYER_KEYS
 from app.core.errors import ErrorCode
 from app.jobs import worker as worker_module
 from app.models.adapter_run_output import AdapterRunOutput
@@ -338,7 +339,8 @@ def test_apply_change_set_marks_no_op_update_as_unchanged() -> None:
     )
 
 
-def test_apply_change_set_accepts_add_entity_alias_payloads() -> None:
+@pytest.mark.parametrize("layer_key", ALLOWED_LAYER_KEYS)
+def test_apply_change_set_accepts_add_entity_alias_payloads(layer_key: str) -> None:
     change_set_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     revision = RevisionRef(
         revision_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
@@ -357,7 +359,7 @@ def test_apply_change_set_accepts_add_entity_alias_payloads() -> None:
                     "properties": {"label": "N-1"},
                 },
                 "properties_json": {"label": "N-1"},
-                "layer_ref": "A-NOTE",
+                layer_key: "A-NOTE",
             }
         },
     )
