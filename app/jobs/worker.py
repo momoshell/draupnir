@@ -4341,6 +4341,8 @@ async def _finalize_export_job(
                     job_id=job.id,
                     drawing_revision_id=execution.drawing_revision_id,
                     changeset_id=execution.changeset_id,
+                    quantity_takeoff_id=execution.quantity_takeoff_id,
+                    estimate_version_id=execution.estimate_version_id,
                     artifact_kind=execution.export_kind,
                     name=execution.artifact_name,
                     format=execution.export_format,
