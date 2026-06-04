@@ -494,6 +494,27 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "POST",
+            "/revisions/{revision_id}/exports/revised-dxf",
+            "create_revised_dxf_export",
+            "create_revised_dxf_export",
+            "JobRead",
+            202,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+                (
+                    "dependency",
+                    "idempotency_key",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "get_idempotency_key",
+                ),
+            ),
+        ),
+        (
+            "POST",
             "/revisions/{revision_id}/quantity-takeoffs/{takeoff_id}/exports/quantity-csv",
             "create_revision_quantity_csv_export",
             "create_revision_quantity_csv_export",

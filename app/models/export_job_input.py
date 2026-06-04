@@ -27,6 +27,7 @@ class ExportKind(StrEnum):
     """Supported export payload kinds."""
 
     REVISION_JSON = "revision_json"
+    REVISED_DXF = "revised_dxf"
     QUANTITY_CSV = "quantity_csv"
     ESTIMATE_CSV = "estimate_csv"
     ESTIMATE_PDF = "estimate_pdf"
@@ -36,6 +37,7 @@ class ExportFormat(StrEnum):
     """Supported export artifact formats."""
 
     JSON = "json"
+    DXF = "dxf"
     CSV = "csv"
     PDF = "pdf"
 
@@ -44,6 +46,7 @@ _EXPORT_KIND_VALUES = tuple(kind.value for kind in ExportKind)
 _EXPORT_FORMAT_VALUES = tuple(export_format.value for export_format in ExportFormat)
 _EXPORT_MEDIA_TYPES = (
     "application/json",
+    "application/dxf",
     "text/csv",
     "application/pdf",
 )
@@ -145,6 +148,8 @@ class ExportJobInput(Base):
         CheckConstraint(
             "(export_kind = 'revision_json' AND export_format = 'json' "
             "AND media_type = 'application/json') OR "
+            "(export_kind = 'revised_dxf' AND export_format = 'dxf' "
+            "AND media_type = 'application/dxf') OR "
             "(export_kind = 'quantity_csv' AND export_format = 'csv' "
             "AND media_type = 'text/csv') OR "
             "(export_kind = 'estimate_csv' AND export_format = 'csv' "
@@ -158,14 +163,14 @@ class ExportJobInput(Base):
             "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
             "(export_kind IN ('estimate_csv', 'estimate_pdf') AND quantity_takeoff_id IS NOT NULL "
             "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
-            "(export_kind = 'revision_json' AND quantity_takeoff_id IS NULL "
+            "(export_kind IN ('revision_json', 'revised_dxf') AND quantity_takeoff_id IS NULL "
             "AND quantity_gate IS NULL AND trusted_totals IS NULL)",
             name="ck_export_job_inputs_quantity_lineage",
         ),
         CheckConstraint(
             "(export_kind IN ('estimate_csv', 'estimate_pdf') "
             "AND quantity_takeoff_id IS NOT NULL AND estimate_version_id IS NOT NULL) OR "
-            "(export_kind IN ('quantity_csv', 'revision_json') "
+            "(export_kind IN ('quantity_csv', 'revision_json', 'revised_dxf') "
             "AND estimate_version_id IS NULL)",
             name="ck_export_job_inputs_estimate_lineage",
         ),
@@ -209,7 +214,10 @@ class ExportJobInput(Base):
     export_kind: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="Export kind selector (revision_json, quantity_csv, estimate_csv, estimate_pdf).",
+        comment=(
+            "Export kind selector (revision_json, revised_dxf, quantity_csv, "
+            "estimate_csv, estimate_pdf)."
+        ),
     )
     export_format: Mapped[str] = mapped_column(
         String(32),
@@ -231,8 +239,8 @@ class ExportJobInput(Base):
         nullable=True,
         index=True,
         comment=(
-            "Trusted quantity takeoff required for quantity_csv, estimate_csv, "
-            "and estimate_pdf exports."
+            "Trusted quantity takeoff required for quantity_csv, estimate_csv, and "
+            "estimate_pdf exports."
         ),
     )
     quantity_gate: Mapped[str | None] = mapped_column(

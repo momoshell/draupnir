@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.idempotency import (
@@ -36,7 +36,8 @@ from app.api.v1.revision_lineage import (
 from app.api.v1.revision_lineage import (
     _get_revision_quantity_takeoff_or_404 as _get_revision_quantity_takeoff_or_404_direct,
 )
-from app.core.exceptions import raise_not_found
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import enqueue_export_job as _enqueue_export_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
@@ -60,6 +61,7 @@ exports_router = APIRouter()
 
 type _ExportPreclaimLoader = Callable[[], Awaitable[None]]
 type _ExportJobCreator = Callable[[], Awaitable[Job]]
+type _ExportPreclaim = Callable[[], Awaitable[Response | None]]
 
 
 async def _get_active_revision(
@@ -175,6 +177,24 @@ def _parent_job_id_for_revision(revision: DrawingRevision) -> UUID | None:
     """Return the source parent job id for revision-scoped exports."""
 
     return revision.source_job_id
+
+
+def _revision_supports_revised_dxf_export(revision: DrawingRevision) -> bool:
+    """Return whether the revision is eligible for revised DXF export."""
+
+    return revision.revision_kind == "changeset" and revision.changeset_id is not None
+
+
+def _revised_dxf_export_revision_invalid_response() -> Response:
+    """Return the standard invalid-route response for non-changeset revisions."""
+
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=create_error_response(
+            ErrorCode.INPUT_INVALID,
+            "Revised DXF export requires an active changeset-origin revision.",
+        ),
+    )
 
 
 def _parent_job_id_for_takeoff(
@@ -385,21 +405,26 @@ async def _create_export_route_job(
     path: str,
     load_before_claim: _ExportPreclaimLoader,
     create_export_job: _ExportJobCreator,
+    preclaim: _ExportPreclaim | None = None,
 ) -> Job | Response:
     """Run the shared export-create flow with optional idempotency helpers."""
 
-    if idempotency_key is None:
+    async def default_preclaim() -> Response | None:
         await load_before_claim()
+        return None
+
+    preclaim_fn = preclaim or default_preclaim
+
+    if idempotency_key is None:
+        preclaim_response = await preclaim_fn()
+        if preclaim_response is not None:
+            return preclaim_response
         export_job = await create_export_job()
         await db.commit()
         await _publish_export_enqueue(export_job.id)
         return export_job
 
     assert fingerprint is not None
-
-    async def preclaim() -> Response | None:
-        await load_before_claim()
-        return None
 
     async def mutate() -> IdempotentMutationSuccess[Job]:
         export_job = await create_export_job()
@@ -423,7 +448,7 @@ async def _create_export_route_job(
         serialize_result=lambda export_job: JobRead.model_validate(export_job).model_dump(
             mode="json"
         ),
-        preclaim=preclaim,
+        preclaim=preclaim_fn,
         reload_after_claim=load_before_claim,
         ops=_export_create_idempotency_ops(),
     )
@@ -481,6 +506,72 @@ async def create_revision_json_export(
         path=path,
         load_before_claim=load_before_claim,
         create_export_job=create_export_job,
+    )
+
+
+@exports_router.post(
+    "/revisions/{revision_id}/exports/revised-dxf",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_revised_dxf_export(
+    revision_id: UUID,
+    request: RevisionJsonExportCreateRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Job | Response:
+    """Create a pending revised DXF export job for an active changeset revision."""
+
+    export_kind = ExportKind.REVISED_DXF
+    path = f"/revisions/{revision_id}/exports/revised-dxf"
+    normalized_body = _build_export_request_body(
+        export_kind,
+        options=request.options,
+    )
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = _build_idempotency_fingerprint(
+            f"revisions.exports.revised_dxf:{revision_id}",
+            {
+                "revision_id": str(revision_id),
+                "body": normalized_body,
+            },
+        )
+
+    revision: DrawingRevision | None = None
+
+    invalid_preclaim_response: Response | None = None
+
+    async def load_before_claim() -> None:
+        nonlocal invalid_preclaim_response
+        nonlocal revision
+        invalid_preclaim_response = None
+        revision = await _get_locked_active_revision_or_404(revision_id, db)
+        if not _revision_supports_revised_dxf_export(revision):
+            invalid_preclaim_response = _revised_dxf_export_revision_invalid_response()
+
+    async def preclaim() -> Response | None:
+        await load_before_claim()
+        return invalid_preclaim_response
+
+    async def create_export_job() -> Job:
+        assert revision is not None
+        return await _persist_export_job(
+            db,
+            revision,
+            parent_job_id=_parent_job_id_for_revision(revision),
+            export_kind=export_kind,
+            options_json=request.options,
+        )
+
+    return await _create_export_route_job(
+        db,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        path=path,
+        load_before_claim=load_before_claim,
+        create_export_job=create_export_job,
+        preclaim=preclaim,
     )
 
 

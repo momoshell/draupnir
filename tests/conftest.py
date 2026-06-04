@@ -307,6 +307,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "jobs_worker_exports": "db_worker",
     "ingest_output_persistence": "db_worker",
     "csv_exports": "db_estimation_export",
+    "revised_dxf_export": "db_estimation_export",
     "revision_json_export": "db_estimation_export",
     "estimate_pdf_export": "db_estimation_export",
     "estimate_engine_persistence_payloads": "db_estimation_export",

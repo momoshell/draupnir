@@ -13,6 +13,7 @@ import app.db.session as session_module
 from app.api.idempotency import hash_idempotency_key
 from app.api.v1.revision_routes import exports as export_routes
 from app.models.adapter_run_output import AdapterRunOutput
+from app.models.cad_changeset import CadChangeSet
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
@@ -39,9 +40,11 @@ class ExportLineage:
     project_id: UUID
     file_id: UUID
     revision_id: UUID
+    changeset_revision_id: UUID
     takeoff_id: UUID
     estimate_version_id: UUID
     revision_source_job_id: UUID
+    changeset_revision_source_job_id: UUID
     takeoff_source_job_id: UUID
     estimate_source_job_id: UUID
 
@@ -168,6 +171,49 @@ async def _seed_export_lineage() -> ExportLineage:
         session.add(revision)
         await session.flush()
 
+        change_set = CadChangeSet(
+            project_id=project.id,
+            base_revision_id=revision.id,
+            status="approved",
+            created_by="test-suite",
+        )
+        session.add(change_set)
+        await session.flush()
+
+        changeset_revision_source_job = Job(
+            project_id=project.id,
+            file_id=source_file.id,
+            extraction_profile_id=None,
+            base_revision_id=revision.id,
+            parent_job_id=revision_source_job.id,
+            job_type=getattr(JobType, "CHANGESET_APPLY", JobType.EXPORT).value,
+            status="succeeded",
+            attempts=1,
+            max_attempts=3,
+            enqueue_status="pending",
+            enqueue_attempts=0,
+            cancel_requested=False,
+        )
+        session.add(changeset_revision_source_job)
+        await session.flush()
+
+        changeset_revision = DrawingRevision(
+            project_id=project.id,
+            source_file_id=source_file.id,
+            extraction_profile_id=None,
+            source_job_id=changeset_revision_source_job.id,
+            adapter_run_output_id=None,
+            predecessor_revision_id=revision.id,
+            revision_sequence=2,
+            revision_kind="changeset",
+            review_state="approved",
+            canonical_entity_schema_version="1.0",
+            confidence_score=0.99,
+            changeset_id=change_set.id,
+        )
+        session.add(changeset_revision)
+        await session.flush()
+
         takeoff_source_job = Job(
             project_id=project.id,
             file_id=source_file.id,
@@ -235,9 +281,11 @@ async def _seed_export_lineage() -> ExportLineage:
             project_id=project.id,
             file_id=source_file.id,
             revision_id=revision.id,
+            changeset_revision_id=changeset_revision.id,
             takeoff_id=takeoff.id,
             estimate_version_id=estimate_version.id,
             revision_source_job_id=revision_source_job.id,
+            changeset_revision_source_job_id=changeset_revision_source_job.id,
             takeoff_source_job_id=takeoff_source_job.id,
             estimate_source_job_id=estimate_source_job.id,
         )
@@ -267,6 +315,13 @@ def _expected_parent_job_id(case: ExportCreateCase, lineage: ExportLineage) -> U
 
 
 async def _count_export_side_effects(lineage: ExportLineage) -> tuple[int, int, int]:
+    return await _count_export_side_effects_for_revision(lineage, lineage.revision_id)
+
+
+async def _count_export_side_effects_for_revision(
+    lineage: ExportLineage,
+    revision_id: UUID,
+) -> tuple[int, int, int]:
     assert session_module.AsyncSessionLocal is not None
 
     async with session_module.AsyncSessionLocal() as session:
@@ -277,7 +332,7 @@ async def _count_export_side_effects(lineage: ExportLineage) -> tuple[int, int, 
                 Job.job_type == JobType.EXPORT.value,
                 Job.project_id == lineage.project_id,
                 Job.file_id == lineage.file_id,
-                Job.base_revision_id == lineage.revision_id,
+                Job.base_revision_id == revision_id,
             )
         )
         export_input_count = await session.scalar(
@@ -286,7 +341,7 @@ async def _count_export_side_effects(lineage: ExportLineage) -> tuple[int, int, 
             .where(
                 ExportJobInput.project_id == lineage.project_id,
                 ExportJobInput.source_file_id == lineage.file_id,
-                ExportJobInput.drawing_revision_id == lineage.revision_id,
+                ExportJobInput.drawing_revision_id == revision_id,
             )
         )
         generated_artifact_count = await session.scalar(
@@ -295,7 +350,7 @@ async def _count_export_side_effects(lineage: ExportLineage) -> tuple[int, int, 
             .where(
                 GeneratedArtifact.project_id == lineage.project_id,
                 GeneratedArtifact.source_file_id == lineage.file_id,
-                GeneratedArtifact.drawing_revision_id == lineage.revision_id,
+                GeneratedArtifact.drawing_revision_id == revision_id,
             )
         )
 
@@ -548,6 +603,93 @@ async def test_create_export_persists_pending_job_and_input(
             )
         )
         assert generated_artifact_count == 0
+
+
+async def test_create_revised_dxf_export_persists_pending_job_and_input(
+    async_client: AsyncClient,
+) -> None:
+    lineage = await _seed_export_lineage()
+
+    response = await async_client.post(
+        f"/v1/revisions/{lineage.changeset_revision_id}/exports/revised-dxf",
+        json={"options": {"target_version": "R2010", "include_review_flags": True}},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    job_id = UUID(body["id"])
+    assert body["project_id"] == str(lineage.project_id)
+    assert body["file_id"] == str(lineage.file_id)
+    assert body["base_revision_id"] == str(lineage.changeset_revision_id)
+    assert body["parent_job_id"] == str(lineage.changeset_revision_source_job_id)
+    assert body["job_type"] == JobType.EXPORT.value
+    assert body["status"] == "pending"
+
+    expected_format, expected_media_type = EXPORT_KIND_MATRIX[ExportKind.REVISED_DXF]
+
+    assert session_module.AsyncSessionLocal is not None
+    async with session_module.AsyncSessionLocal() as session:
+        export_jobs = list(
+            await session.scalars(
+                select(Job).where(
+                    Job.job_type == JobType.EXPORT.value,
+                    Job.project_id == lineage.project_id,
+                    Job.file_id == lineage.file_id,
+                    Job.base_revision_id == lineage.changeset_revision_id,
+                )
+            )
+        )
+        assert len(export_jobs) == 1
+        export_job = export_jobs[0]
+        assert export_job.id == job_id
+        assert export_job.parent_job_id == lineage.changeset_revision_source_job_id
+
+        export_inputs = list(
+            await session.scalars(
+                select(ExportJobInput).where(
+                    ExportJobInput.project_id == lineage.project_id,
+                    ExportJobInput.source_file_id == lineage.file_id,
+                    ExportJobInput.drawing_revision_id == lineage.changeset_revision_id,
+                )
+            )
+        )
+        assert len(export_inputs) == 1
+        export_input = export_inputs[0]
+        assert export_input.source_job_id == export_job.id
+        assert export_input.export_kind == ExportKind.REVISED_DXF.value
+        assert export_input.export_format == expected_format.value
+        assert export_input.media_type == expected_media_type
+        assert export_input.options_json == {
+            "target_version": "R2010",
+            "include_review_flags": True,
+        }
+        assert export_input.quantity_takeoff_id is None
+        assert export_input.quantity_gate is None
+        assert export_input.trusted_totals is None
+        assert export_input.estimate_version_id is None
+
+    assert await _count_export_side_effects_for_revision(
+        lineage,
+        lineage.changeset_revision_id,
+    ) == (1, 1, 0)
+
+
+async def test_create_revised_dxf_export_rejects_non_changeset_revision_before_claim(
+    async_client: AsyncClient,
+) -> None:
+    lineage = await _seed_export_lineage()
+    idempotency_key = f"revised-dxf-ingest-{uuid4().hex}"
+
+    response = await async_client.post(
+        f"/v1/revisions/{lineage.revision_id}/exports/revised-dxf",
+        json={"options": {"target_version": "R2010"}},
+        headers={"Idempotency-Key": idempotency_key},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INPUT_INVALID"
+    assert await _count_export_side_effects(lineage) == (0, 0, 0)
+    assert await _count_idempotency_rows(idempotency_key) == 0
 
 
 @pytest.mark.parametrize(

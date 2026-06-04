@@ -116,6 +116,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "jobs_worker_exports": DB_WORKER_PYTEST_ARGS,
     "ingest_output_persistence": DB_WORKER_PYTEST_ARGS,
     "csv_exports": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
+    "revised_dxf_export": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "revision_json_export": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "estimate_pdf_export": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "estimate_engine_persistence_payloads": DB_ESTIMATION_EXPORT_PYTEST_ARGS,

@@ -33,7 +33,7 @@ _MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "alembic"
     / "versions"
-    / "2026_05_27_0024_add_export_job_input_contract.py"
+    / "2026_06_04_0029_add_revised_dxf_export_kind.py"
 )
 
 
@@ -196,7 +196,7 @@ async def _assert_append_only_sql_mutation_fails(
 
 def _load_migration_module() -> Any:
     spec = importlib.util.spec_from_file_location(
-        "migration_2026_05_27_0024_add_export_job_input_contract",
+        "migration_2026_06_04_0029_add_revised_dxf_export_kind",
         _MIGRATION_PATH,
     )
     assert spec is not None
@@ -375,6 +375,24 @@ async def test_export_job_input_schema_matches_contract() -> None:
         assert constraint_name in check_constraints["export_job_inputs"]
 
     assert (
+        "revised_dxf"
+        in check_constraints["export_job_inputs"]["ck_export_job_inputs_export_kind_valid"]
+    )
+    assert (
+        "dxf" in check_constraints["export_job_inputs"]["ck_export_job_inputs_export_format_valid"]
+    )
+    assert (
+        "application/dxf"
+        in check_constraints["export_job_inputs"]["ck_export_job_inputs_media_type_valid"]
+    )
+    assert (
+        "revised_dxf"
+        in check_constraints["export_job_inputs"][
+            "ck_export_job_inputs_kind_format_media_type_matrix"
+        ]
+    )
+
+    assert (
         (
             "source_job_id",
             "project_id",
@@ -429,6 +447,7 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
     estimate_version_id = await _create_estimate_version(db_session, seed)
 
     revision_job_id = await _create_export_job(db_session, seed)
+    revised_dxf_job_id = await _create_export_job(db_session, seed)
     quantity_job_id = await _create_export_job(db_session, seed)
     estimate_csv_job_id = await _create_export_job(db_session, seed)
     estimate_pdf_job_id = await _create_export_job(db_session, seed)
@@ -441,6 +460,17 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_kind="revision_json",
                 export_format="json",
                 media_type="application/json",
+                quantity_takeoff_id=None,
+                quantity_gate=None,
+                trusted_totals=None,
+                estimate_version_id=None,
+            ),
+            _build_export_input(
+                seed,
+                source_job_id=revised_dxf_job_id,
+                export_kind="revised_dxf",
+                export_format="dxf",
+                media_type="application/dxf",
                 quantity_takeoff_id=None,
                 quantity_gate=None,
                 trusted_totals=None,
@@ -492,7 +522,7 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
         .scalars()
         .all()
     )
-    assert len(persisted) == 4
+    assert len(persisted) == 5
     by_job_id = {row.source_job_id: row for row in persisted}
 
     assert by_job_id[revision_job_id].export_kind == "revision_json"
@@ -500,6 +530,12 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
     assert by_job_id[revision_job_id].media_type == "application/json"
     assert by_job_id[revision_job_id].quantity_takeoff_id is None
     assert by_job_id[revision_job_id].estimate_version_id is None
+
+    assert by_job_id[revised_dxf_job_id].export_kind == "revised_dxf"
+    assert by_job_id[revised_dxf_job_id].export_format == "dxf"
+    assert by_job_id[revised_dxf_job_id].media_type == "application/dxf"
+    assert by_job_id[revised_dxf_job_id].quantity_takeoff_id is None
+    assert by_job_id[revised_dxf_job_id].estimate_version_id is None
 
     assert by_job_id[quantity_job_id].export_kind == "quantity_csv"
     assert by_job_id[quantity_job_id].export_format == "csv"
@@ -555,7 +591,7 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
         "ck_jobs_revision_scoped_extraction_profile_forbidden",
     )
 
-    bad_job_ids = [await _create_export_job(db_session, seed) for _ in range(9)]
+    bad_job_ids = [await _create_export_job(db_session, seed) for _ in range(11)]
     await db_session.commit()
 
     invalid_cases: list[tuple[dict[str, object], str | tuple[str, ...]]] = [
@@ -574,6 +610,18 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
         ),
         (
             {
+                "export_kind": "revised_dxf",
+                "export_format": "json",
+                "media_type": "application/json",
+                "quantity_takeoff_id": None,
+                "quantity_gate": None,
+                "trusted_totals": None,
+                "estimate_version_id": None,
+            },
+            "ck_export_job_inputs_kind_format_media_type_matrix",
+        ),
+        (
+            {
                 "export_kind": "quantity_csv",
                 "export_format": "pdf",
                 "media_type": "application/pdf",
@@ -583,6 +631,18 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_kind_format_media_type_matrix",
+        ),
+        (
+            {
+                "export_kind": "revised_dxf",
+                "export_format": "dxf",
+                "media_type": "application/dxf",
+                "quantity_takeoff_id": seed.quantity_takeoff_id,
+                "quantity_gate": "allowed",
+                "trusted_totals": True,
+                "estimate_version_id": None,
+            },
+            "ck_export_job_inputs_quantity_lineage",
         ),
         (
             {
@@ -710,7 +770,7 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
         )
 
 
-async def test_export_job_inputs_are_append_only_and_downgrade_guarded(
+async def test_export_job_inputs_are_append_only_and_revised_dxf_downgrade_guarded(
     async_client: httpx.AsyncClient,
     db_session: AsyncSession,
 ) -> None:
@@ -720,8 +780,7 @@ async def test_export_job_inputs_are_append_only_and_downgrade_guarded(
     export_job_without_rows = await _create_export_job(db_session, seed)
     await db_session.commit()
 
-    with pytest.raises(RuntimeError, match="persisted export jobs present"):
-        await _run_downgrade_guard(db_session)
+    await _run_downgrade_guard(db_session)
 
     estimate_version_id = await _create_estimate_version(db_session, seed)
     row_job_id = await _create_export_job(db_session, seed)
@@ -739,6 +798,8 @@ async def test_export_job_inputs_are_append_only_and_downgrade_guarded(
         )
     )
     await db_session.commit()
+
+    await _run_downgrade_guard(db_session)
 
     await _assert_append_only_sql_mutation_fails(
         db_session,
@@ -762,5 +823,21 @@ async def test_export_job_inputs_are_append_only_and_downgrade_guarded(
     )
 
     _ = export_job_without_rows
-    with pytest.raises(RuntimeError, match="persisted export_job_inputs rows present"):
+    revised_dxf_job_id = await _create_export_job(db_session, seed)
+    db_session.add(
+        _build_export_input(
+            seed,
+            source_job_id=revised_dxf_job_id,
+            export_kind="revised_dxf",
+            export_format="dxf",
+            media_type="application/dxf",
+            quantity_takeoff_id=None,
+            quantity_gate=None,
+            trusted_totals=None,
+            estimate_version_id=None,
+        )
+    )
+    await db_session.commit()
+
+    with pytest.raises(RuntimeError, match="persisted revised_dxf export_job_inputs rows present"):
         await _run_downgrade_guard(db_session)
