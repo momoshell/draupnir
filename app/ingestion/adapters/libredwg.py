@@ -916,27 +916,7 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
     }
 
 
-def _extract_record_type(record: Mapping[str, Any]) -> str | None:
-    raw_type = _first_string_from_mapping_by_priority(
-        record,
-        "entity",
-        "object",
-        "dxfname",
-        "dxf_name",
-    ) or _first_string(
-        record,
-        "type",
-        "object_type",
-        "entity_type",
-        "fixedtype",
-        "fixed_type",
-        "name",
-        "dxf_name",
-        "class",
-    )
-    if raw_type is None:
-        return None
-
+def _normalize_record_type_token(raw_type: str) -> str | None:
     token = raw_type.strip()
     if not token:
         return None
@@ -950,6 +930,54 @@ def _extract_record_type(record: Mapping[str, Any]) -> str | None:
     if token_upper.startswith("ACDB"):
         token_upper = token_upper.removeprefix("ACDB")
     return token_upper or None
+
+
+def _extract_record_type(record: Mapping[str, Any]) -> str | None:
+    raw_type = _first_string_from_mapping_by_priority(
+        record,
+        "entity",
+        "object",
+        "dxfname",
+        "dxf_name",
+    )
+    if raw_type is not None:
+        return _normalize_record_type_token(raw_type)
+
+    legacy_type = _first_string_from_mapping_by_priority(record, "type")
+    legacy_type_upper = _normalize_record_type_token(legacy_type) if legacy_type else None
+    if legacy_type_upper is None:
+        fallback_type = _first_string_from_mapping_by_priority(
+            record,
+            "object_type",
+            "entity_type",
+            "fixedtype",
+            "fixed_type",
+            "name",
+            "dxf_name",
+            "class",
+        )
+        if fallback_type is None:
+            return None
+        return _normalize_record_type_token(fallback_type)
+
+    if legacy_type_upper in _NON_DRAWABLE_OBJECT_TYPES:
+        fallback_type = _first_string_from_mapping_by_priority(
+            record,
+            "object_type",
+            "entity_type",
+            "fixedtype",
+            "fixed_type",
+            "class",
+        )
+        if fallback_type is not None:
+            fallback_type_upper = _normalize_record_type_token(fallback_type)
+            if (
+                fallback_type_upper is not None
+                and fallback_type_upper not in _NON_DRAWABLE_OBJECT_TYPES
+            ):
+                return fallback_type_upper
+
+    return legacy_type_upper
 
 
 def _first_string_from_mapping_by_priority(
