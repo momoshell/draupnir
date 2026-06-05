@@ -341,7 +341,12 @@ def _parse_entities(
         if not isinstance(item, Mapping):
             continue
 
-        layout_key = _string(item.get("layout")) or _DEFAULT_LAYOUT_KEY
+        layout_key = (
+            _string(item.get("layout"))
+            or _string(item.get("layout_name"))
+            or _string(item.get("layoutName"))
+            or _DEFAULT_LAYOUT_KEY
+        )
         stable_id = (
             _string(item.get("entity_id"))
             or _string(item.get("id"))
@@ -388,6 +393,15 @@ def _ordered_layouts(
         if key in known:
             continue
         ordered.append(_OverlayLayout(key=key, label=key, page_number=None, bbox=None))
+
+    if (
+        ordered
+        and ordered[0].key == _DEFAULT_LAYOUT_KEY
+        and not grouped_entities.get(_DEFAULT_LAYOUT_KEY)
+        and any(key != _DEFAULT_LAYOUT_KEY for key in grouped_entities)
+    ):
+        ordered = [layout for layout in ordered if layout.key != _DEFAULT_LAYOUT_KEY]
+
     return tuple(ordered)
 
 
@@ -780,10 +794,29 @@ def _points(value: object) -> tuple[_Point, ...]:
 def _bbox(value: object) -> _BBox | None:
     if not isinstance(value, Mapping):
         return None
+
+    # Newer entities may nest bounds as
+    # {"bbox": {"min": {"x": ..., "y": ...}, "max": {"x": ..., "y": ...}}
     x_min = _float(value.get("x_min"))
     y_min = _float(value.get("y_min"))
     x_max = _float(value.get("x_max"))
     y_max = _float(value.get("y_max"))
+    if x_min is not None and y_min is not None and x_max is not None and y_max is not None:
+        minimum_x = min(x_min, x_max)
+        maximum_x = max(x_min, x_max)
+        minimum_y = min(y_min, y_max)
+        maximum_y = max(y_min, y_max)
+        return _BBox(x_min=minimum_x, y_min=minimum_y, x_max=maximum_x, y_max=maximum_y)
+
+    nested_min = value.get("min")
+    nested_max = value.get("max")
+    if not isinstance(nested_min, Mapping) or not isinstance(nested_max, Mapping):
+        return None
+
+    x_min = _float(nested_min.get("x"))
+    y_min = _float(nested_min.get("y"))
+    x_max = _float(nested_max.get("x"))
+    y_max = _float(nested_max.get("y"))
     if x_min is None or y_min is None or x_max is None or y_max is None:
         return None
     minimum_x = min(x_min, x_max)
