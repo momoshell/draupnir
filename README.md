@@ -8,24 +8,20 @@ geometry and semantic data, producing deterministic quantities and estimates,
 and exposing everything through a UI-agnostic API.
 
 The MVP product surface is API-only. Future clients may include a web UI, TUI,
-CLI, or other services, but this repository does not imply that a product CLI
-exists today.
-
-Phase 10 client interface work is deferred; no shipped first-party client is
-documented here.
+CLI, or other services, but this repository does not imply that any product
+client exists today.
 
 ## Current Status
 
-The Phase 0-9 MVP implementation in this repository is API-only. It supports
-project and file creation/upload, queued ingestion and reprocess jobs, revision
-reads with materialization and validation data, quantity takeoff workflows,
-estimation catalog/formula management and estimate job workflows, export job
-creation plus generated artifact metadata, changeset validate/apply flows, and
-the revised-DXF export path for eligible changeset-origin revisions.
+The current repository implementation is API-only. It supports project and file
+creation/upload, queued ingestion and reprocess jobs, revision reads with
+materialization and validation data, quantity takeoff workflows, estimation
+catalog/formula management and estimate job workflows, export job creation plus
+generated artifact metadata, changeset validate/apply flows, and the
+revised-DXF export path for eligible changeset-origin revisions.
 
 Docker Compose development infrastructure is available for local API and worker
-setup; see "Local Development" below. Phase 10 client interface work remains
-deferred, and no shipped first-party client is documented here.
+setup; see "Local Development" below.
 
 ## Local Development
 
@@ -46,8 +42,7 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
 >   fresh PostgreSQL 18 volume.
 > - If the data does not matter, reset the local stack destructively with:
 >   ```bash
->   make down -v
->   # or: docker compose down -v
+>   docker compose down -v
 >   ```
 > - Rollback note: after you migrate or reset to PostgreSQL 18, you cannot
 >   reuse that data directory with PostgreSQL 17; rolling back requires
@@ -64,35 +59,43 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
    # or: docker compose up -d
    ```
 
-3. **Verify services are running**:
-   ```bash
-   make ps
-   # or: docker compose ps
-   ```
-
-4. **Run database migrations**:
+3. **Run database migrations**:
    ```bash
    make migrate
    # or: uv run alembic upgrade head
    ```
 
-5. **Check API health**:
+4. **Verify containers are running**:
+   ```bash
+   make ps
+   # or: docker compose ps
+   ```
+
+5. **Verify the API responds**:
    ```bash
    curl http://localhost:8000/v1/health
    ```
 
-6. **View RabbitMQ management UI**:
-     - Open http://localhost:15672 in your browser
-     - Login: guest / guest
-     - AMQP is also exposed on localhost:5672 for host-side clients only
+6. **Run the Compose smoke workflow**:
+   ```bash
+   make compose-smoke
+   ```
 
-7. **View logs**:
+7. **Confirm background services are available**:
+   - RabbitMQ management UI: http://localhost:15672
+   - Login: `guest` / `guest`
+   - Flower dashboard: http://localhost:5555 (optional; start it with
+     `docker compose --profile debug up -d flower` when needed)
+
+   AMQP is also exposed on `localhost:5672` for host-side clients only.
+
+8. **View logs**:
    ```bash
    make logs
    # or: docker compose logs -f
    ```
 
-8. **Stop all services**:
+9. **Stop all services**:
    ```bash
    make down
    # or: docker compose down
@@ -106,10 +109,11 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
 | worker    | —                    | Celery background worker       |
 | postgres  | localhost:5432       | PostgreSQL 18 database         |
 | rabbitmq  | localhost:5672, localhost:15672 | RabbitMQ message broker |
-| flower    | localhost:5555       | Celery dashboard (optional)    |
+| flower    | localhost:5555       | Celery dashboard (`debug` profile only) |
 
-Postgres, RabbitMQ, and Flower host ports bind to `127.0.0.1` only. Containers
-still reach RabbitMQ over the internal Docker network at `rabbitmq:5672`.
+Postgres and RabbitMQ host ports bind to `127.0.0.1` only. Flower is optional
+and intended for debug/profile runs. Containers still reach RabbitMQ over the
+internal Docker network at `rabbitmq:5672`.
 
 ### Useful Commands
 
@@ -117,7 +121,7 @@ still reach RabbitMQ over the internal Docker network at `rabbitmq:5672`.
 make shell-api      # Open shell in API container
 make shell-worker   # Open shell in worker container
 make migrate        # Run database migrations
-make down -v        # Stop and remove volumes (destructive)
+docker compose down -v  # Stop and remove volumes (destructive)
 ```
 
 ### Pytest Lanes
@@ -288,8 +292,144 @@ shapes.
 
 ## API Consumer Quick Guide
 
-Use the live OpenAPI docs for exact request and response shapes. The summary
-below is the practical starting point for API consumers.
+Use the live OpenAPI docs for exact request and response shapes. The sections
+below give an operator-friendly local verification path and a curl-first API
+smoke workflow.
+
+### Local verification checklist
+
+After starting the stack, verify the basics in this order:
+
+1. `curl http://localhost:8000/v1/health`
+2. `curl http://localhost:8000/v1/system/health`
+3. `make compose-smoke`
+4. Open `http://localhost:8000/docs` for the live schema
+
+If `GET /v1/system/health` reports degraded adapter availability, expect only
+the adapters available in your environment to work.
+
+### End-to-end API smoke workflow
+
+This example walks the common API path: project -> upload -> job -> revision ->
+validation -> entities -> quantities -> exports -> artifacts.
+
+Set a reusable base URL:
+
+```bash
+export BASE_URL=http://localhost:8000
+```
+
+1. **Create a project**
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/projects" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: readme-project-1' \
+  -d '{"name":"README smoke project"}'
+```
+
+Save the returned project ID as `PROJECT_ID`.
+
+2. **Upload a file and create the ingestion job**
+
+```bash
+export PROJECT_ID=<project-id>
+
+curl -sS -X POST "$BASE_URL/v1/projects/$PROJECT_ID/files" \
+  -H 'Idempotency-Key: readme-upload-1' \
+  -F 'file=@tests/fixtures/dxf/simple-line.dxf'
+```
+
+Save the returned file ID as `FILE_ID` and the returned job ID as `JOB_ID`.
+
+3. **Poll the job to a terminal state**
+
+```bash
+export JOB_ID=<job-id>
+
+curl -sS "$BASE_URL/v1/jobs/$JOB_ID"
+```
+
+Repeat until the job reaches a terminal status such as `succeeded`, `failed`,
+or `cancelled`.
+
+4. **List revisions for the uploaded file**
+
+```bash
+export FILE_ID=<file-id>
+
+curl -sS "$BASE_URL/v1/files/$FILE_ID/revisions"
+```
+
+Save the active revision ID as `REVISION_ID`.
+
+5. **Inspect the validation report**
+
+```bash
+export REVISION_ID=<revision-id>
+
+curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/validation-report"
+```
+
+Check the returned validation outcome before starting downstream workflows.
+
+6. **Read materialized entities**
+
+```bash
+curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/entities"
+```
+
+7. **Create a quantity takeoff job**
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/revisions/$REVISION_ID/quantity-takeoffs" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: readme-quantity-1' \
+  -d '{}'
+```
+
+Save the returned quantity job ID, poll it via `GET /v1/jobs/{job_id}`, then
+list takeoffs:
+
+```bash
+curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/quantity-takeoffs"
+```
+
+Save the takeoff ID as `TAKEOFF_ID`. Use the returned gate/trust fields before
+treating quantities as billing or estimating inputs.
+
+8. **Create an export job**
+
+Create a revision JSON export:
+
+```bash
+curl -sS -X POST "$BASE_URL/v1/revisions/$REVISION_ID/exports/revision-json" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: readme-export-revision-json-1' \
+  -d '{"options":{}}'
+```
+
+Or create a quantity CSV export:
+
+```bash
+export TAKEOFF_ID=<takeoff-id>
+
+curl -sS -X POST "$BASE_URL/v1/revisions/$REVISION_ID/quantity-takeoffs/$TAKEOFF_ID/exports/quantity-csv" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: readme-export-quantity-csv-1' \
+  -d '{"options":{}}'
+```
+
+Save the returned export job ID and poll `GET /v1/jobs/{job_id}` to completion.
+
+9. **List generated artifacts metadata**
+
+```bash
+curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/generated-artifacts"
+```
+
+Use artifact endpoints for metadata and lineage. They do not expose raw bytes or
+download URLs.
 
 ### Health and capabilities
 
