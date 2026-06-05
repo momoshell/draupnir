@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+from app.core.config import settings
 from app.ingestion.adapters import libredwg as adapter_module
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
@@ -842,11 +843,54 @@ async def test_libredwg_adapter_rejects_oversized_output(
     _install_fake_subprocess(monkeypatch, process=process, output_text=oversized_output)
     monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
 
-    with pytest.raises(RuntimeError, match="output limit"):
+    with pytest.raises(adapter_module._OutputLimitExceededError, match="output limit"):
         await adapter_module.create_adapter().ingest(
             _build_source(),
             AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
         )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_rejects_oversized_output_when_cap_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_max_output_mb", 1)
+    oversized_output = json.dumps({"x": "y" * (1024 * 1024)})
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=oversized_output)
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    with pytest.raises(adapter_module._OutputLimitExceededError, match="JSON output exceeded"):
+        await adapter_module.create_adapter().ingest(
+            _build_source(),
+            AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_rejects_nonzero_exit_with_json_output_cap_saturation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_max_output_mb", 1)
+    oversized_output = json.dumps({"x": "y" * (1024 * 1024)})
+    process = _FakeProcess(complete_with=3)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=oversized_output,
+        stdout_text="failed for {source} in {tempdir}\n",
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    with pytest.raises(adapter_module._OutputLimitExceededError) as exc_info:
+        await adapter_module.create_adapter().ingest(
+            _build_source(),
+            AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+        )
+
+    assert exc_info.value.output_kind == "json"
+    assert exc_info.value.max_output_bytes == 1 * 1024 * 1024
+    assert exc_info.value.output_size_bytes >= exc_info.value.max_output_bytes
 
 
 @pytest.mark.asyncio

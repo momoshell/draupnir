@@ -15,6 +15,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
+from app.core.config import settings
 from app.ingestion.canonical.entity_provenance import build_entity_provenance
 from app.ingestion.canonical.hashing import (
     sha256_canonical_json_hex,
@@ -51,7 +52,7 @@ _PROCESS_TERMINATE_GRACE_SECONDS = 0.2
 _PROCESS_KILL_GRACE_SECONDS = 0.2
 _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
-_MAX_OUTPUT_BYTES = 1 * 1024 * 1024
+_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
 _LINE_ENTITY_CONFIDENCE_SCORE = 0.72
 _MIXED_ENTITY_CONFIDENCE_SCORE = 0.5
@@ -108,6 +109,27 @@ class _DwgreadRunResult:
     output_payload: Any
 
 
+class _OutputLimitExceededError(RuntimeError):
+    """Raised when dwgread output grows beyond the configured limit."""
+
+    def __init__(
+        self,
+        *,
+        message: str,
+        output_kind: str,
+        max_output_bytes: int,
+        output_size_bytes: int,
+        stage: str = "execute",
+    ) -> None:
+        super().__init__(message)
+        self.output_kind = output_kind
+        self.max_output_bytes = max_output_bytes
+        self.output_size_bytes = output_size_bytes
+        self.reason = "output_cap_exceeded"
+        self.stage = stage
+        self.adapter_key = "libredwg"
+
+
 @dataclass(frozen=True, slots=True)
 class _CanonicalBuildResult:
     canonical: _JSONDict
@@ -120,6 +142,11 @@ class _LiveFileLimit:
     path: Path
     limit_bytes: int
     overflow_message: str
+    output_kind: str | None = None
+
+
+def _configured_max_output_bytes() -> int:
+    return settings.libredwg_max_output_mb * 1024 * 1024
 
 
 def create_adapter() -> IngestionAdapter:
@@ -270,6 +297,8 @@ async def _run_dwgread(
     source: AdapterSource,
     options: AdapterExecutionOptions,
 ) -> _DwgreadRunResult:
+    max_output_bytes = _configured_max_output_bytes()
+
     with tempfile.TemporaryDirectory(prefix="libredwg-") as tempdir:
         temp_path = Path(tempdir)
         output_path = temp_path / "dwgread.json"
@@ -296,8 +325,9 @@ async def _run_dwgread(
             ),
             _LiveFileLimit(
                 path=output_path,
-                limit_bytes=_MAX_OUTPUT_BYTES,
+                limit_bytes=max_output_bytes,
                 overflow_message="LibreDWG JSON output exceeded the adapter output limit.",
+                output_kind="json",
             ),
         )
 
@@ -320,15 +350,28 @@ async def _run_dwgread(
             temp_path=temp_path,
         )
 
+        output_size_bytes = output_path.stat().st_size if output_path.exists() else None
+        if output_size_bytes is not None and output_size_bytes >= max_output_bytes:
+            raise _OutputLimitExceededError(
+                message="LibreDWG JSON output exceeded the adapter output limit.",
+                output_kind="json",
+                max_output_bytes=max_output_bytes,
+                output_size_bytes=output_size_bytes,
+            )
+
+        if output_size_bytes is None:
+            raise RuntimeError("LibreDWG dwgread did not produce JSON output.")
+
         if returncode != 0:
             raise RuntimeError("LibreDWG dwgread execution failed.")
 
-        if not output_path.exists():
-            raise RuntimeError("LibreDWG dwgread did not produce JSON output.")
-
-        output_size_bytes = output_path.stat().st_size
-        if output_size_bytes > _MAX_OUTPUT_BYTES:
-            raise RuntimeError("LibreDWG JSON output exceeded the adapter output limit.")
+        if output_size_bytes >= max_output_bytes:
+            raise _OutputLimitExceededError(
+                message="LibreDWG JSON output exceeded the adapter output limit.",
+                output_kind="json",
+                max_output_bytes=max_output_bytes,
+                output_size_bytes=output_size_bytes,
+            )
 
         output_payload = _load_output_payload(
             output_path,
@@ -409,7 +452,7 @@ async def _wait_for_process(
 
 
 def _configure_child_file_size_limit() -> None:
-    max_limit = max(_MAX_STDOUT_BYTES, _MAX_STDERR_BYTES, _MAX_OUTPUT_BYTES)
+    max_limit = max(_MAX_STDOUT_BYTES, _MAX_STDERR_BYTES, _configured_max_output_bytes())
 
     try:
         _, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
@@ -434,7 +477,14 @@ def _enforce_live_file_limits(live_limits: tuple[_LiveFileLimit, ...]) -> None:
             raise RuntimeError("LibreDWG process output could not be monitored.") from exc
 
         if size_bytes > live_limit.limit_bytes:
-            raise RuntimeError(live_limit.overflow_message)
+            if live_limit.output_kind is None:
+                raise RuntimeError(live_limit.overflow_message)
+            raise _OutputLimitExceededError(
+                message=live_limit.overflow_message,
+                output_kind=live_limit.output_kind,
+                max_output_bytes=live_limit.limit_bytes,
+                output_size_bytes=size_bytes,
+            )
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:

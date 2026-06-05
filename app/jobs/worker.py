@@ -178,6 +178,9 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "stage",
     "detected_format",
     "media_type",
+    "output_kind",
+    "max_output_bytes",
+    "output_size_bytes",
 )
 
 _WORKER_LOOP_RUNNER: asyncio.Runner | None = None
@@ -5399,11 +5402,18 @@ async def _handle_ingest_runner_error(
         )
         return
 
+    runner_error_details = (
+        _runner_error_log_fields(exc)
+        if exc.details.get("reason") == "output_cap_exceeded"
+        else None
+    )
+
     await _mark_job_failed(
         job_id,
         error_message=exc.message,
         error_code=exc.error_code,
         attempt_token=attempt_token,
+        error_details=runner_error_details,
     )
     logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
 

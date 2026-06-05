@@ -46,6 +46,42 @@ _EXECUTE_TIME_DEPENDENCIES: dict[str, str] = {
 }
 
 
+def _is_output_cap_error(exc: Exception) -> bool:
+    reason = getattr(exc, "reason", None)
+    if reason == "output_cap_exceeded":
+        return True
+
+    message = str(exc)
+    return "output exceeded the adapter output limit" in message
+
+
+def _build_output_cap_error_details(adapter_key: str, exc: Exception) -> dict[str, Any]:
+    stage = getattr(exc, "stage", "execute")
+    if stage is None:
+        stage = "execute"
+
+    reason = getattr(exc, "reason", "output_cap_exceeded")
+    details: dict[str, Any] = {
+        "adapter_key": adapter_key,
+        "stage": stage,
+        "reason": reason,
+    }
+
+    output_kind = getattr(exc, "output_kind", None)
+    if isinstance(output_kind, str) and output_kind:
+        details["output_kind"] = output_kind
+
+    max_output_bytes = getattr(exc, "max_output_bytes", None)
+    if isinstance(max_output_bytes, int):
+        details["max_output_bytes"] = max_output_bytes
+
+    output_size_bytes = getattr(exc, "output_size_bytes", None)
+    if isinstance(output_size_bytes, int):
+        details["output_size_bytes"] = output_size_bytes
+
+    return details
+
+
 @dataclass(frozen=True, slots=True)
 class IngestionRunRequest:
     """Immutable inputs required to run an adapter-backed ingest attempt."""
@@ -287,6 +323,17 @@ async def _execute_adapter(
         unavailable_error = _execute_preflight_unavailable_error(adapter_key, exc)
         if unavailable_error is not None:
             raise unavailable_error from exc
+
+        if _is_output_cap_error(exc):
+            return_output_cap_details = _build_output_cap_error_details(adapter_key, exc)
+            return_output_cap_details["adapter_key"] = adapter_key
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_FAILED,
+                failure_kind=AdapterFailureKind.FAILED,
+                message="Adapter execution failed.",
+                details=return_output_cap_details,
+            ) from exc
+
         raise IngestionRunnerError(
             error_code=ErrorCode.ADAPTER_FAILED,
             failure_kind=AdapterFailureKind.FAILED,

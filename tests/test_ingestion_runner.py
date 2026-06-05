@@ -18,6 +18,7 @@ import pytest
 import app.ingestion.registry as registry_module
 from app.core.errors import ErrorCode
 from app.ingestion.adapters import ifcopenshell as ifcopenshell_adapter_module
+from app.ingestion.adapters import libredwg as libredwg_adapter_module
 from app.ingestion.adapters import pymupdf as pymupdf_adapter_module
 from app.ingestion.contracts import (
     AdapterAvailability,
@@ -1737,6 +1738,68 @@ async def test_run_ingestion_keeps_pymupdf_cap_failure_without_raster_fallback(
     assert error.failure_kind.value == "failed"
     assert error.details == {"adapter_key": "pymupdf"}
     assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_output_cap_failure_to_runner_details(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"fake-dwg-body"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    imported_modules: list[str] = []
+
+    def _create_adapter() -> object:
+        class _Adapter:
+            def probe(self) -> AdapterAvailability:
+                return AdapterAvailability(status=AdapterStatus.AVAILABLE)
+
+            async def ingest(self, source, options) -> AdapterResult:  # type: ignore[no-untyped-def]
+                _ = (source, options)
+                raise libredwg_adapter_module._OutputLimitExceededError(
+                    message="LibreDWG JSON output exceeded the adapter output limit.",
+                    output_kind="json",
+                    max_output_bytes=1024,
+                    output_size_bytes=2048,
+                )
+
+        return _Adapter()
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.libredwg":
+            return _AdapterModule("libredwg_adapter_module", _create_adapter)
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="dwg",
+        media_type="application/acad",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.ADAPTER_FAILED
+    assert error.failure_kind.value == "failed"
+    assert error.details == {
+        "adapter_key": "libredwg",
+        "stage": "execute",
+        "reason": "output_cap_exceeded",
+        "output_kind": "json",
+        "max_output_bytes": 1024,
+        "output_size_bytes": 2048,
+    }
+    assert imported_modules == ["app.ingestion.adapters.libredwg"]
 
 
 @pytest.mark.asyncio

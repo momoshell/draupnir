@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 200
+    libredwg_max_output_mb: int = 32
     idempotency_key_hash_secret: str | None = None
     storage_local_root: str = Field(
         default="var/uploads",
@@ -47,6 +48,13 @@ class Settings(BaseSettings):
     def validate_max_upload_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("max_upload_mb must be positive")
+        return value
+
+    @field_validator("libredwg_max_output_mb")
+    @classmethod
+    def validate_libredwg_max_output_mb(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("libredwg_max_output_mb must be positive")
         return value
 
     @field_validator("storage_local_root")

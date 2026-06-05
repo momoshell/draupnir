@@ -144,6 +144,90 @@ class TestJobsWorkerIngest:
             )
         ]
 
+    async def test_process_ingest_job_persists_output_cap_error_details(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        logger_error_calls: list[tuple[str, dict[str, Any]]] = []
+
+        def _capture_logger_error(event: str, **kwargs: Any) -> None:
+            logger_error_calls.append((event, kwargs))
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _fail_run_ingestion(_: IngestionRunRequest) -> IngestFinalizationPayload:
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_FAILED,
+                failure_kind=AdapterFailureKind.FAILED,
+                message="Adapter execution failed.",
+                details={
+                    "adapter_key": "libredwg",
+                    "stage": "execute",
+                    "reason": "output_cap_exceeded",
+                    "output_kind": "json",
+                    "max_output_bytes": 8_388_608,
+                    "output_size_bytes": 16_000_000,
+                },
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _fail_run_ingestion)
+        monkeypatch.setattr(worker_module.logger, "error", _capture_logger_error)
+
+        with pytest.raises(IngestionRunnerError, match="Adapter execution failed"):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.ADAPTER_FAILED.value
+        assert updated_job.error_message == "Adapter execution failed."
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"][-1]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.ADAPTER_FAILED.value,
+            "error_message": "Adapter execution failed.",
+            "details": {
+                "status": "failed",
+                "error_code": ErrorCode.ADAPTER_FAILED.value,
+                "failure_kind": AdapterFailureKind.FAILED.value,
+                "error_message": "Adapter execution failed.",
+                "adapter_key": "libredwg",
+                "stage": "execute",
+                "reason": "output_cap_exceeded",
+                "output_kind": "json",
+                "max_output_bytes": 8_388_608,
+                "output_size_bytes": 16_000_000,
+            },
+        }
+        assert logger_error_calls == [
+            (
+                "ingest_job_failed",
+                {
+                    "job_id": str(job.id),
+                    "error_code": ErrorCode.ADAPTER_FAILED.value,
+                    "failure_kind": AdapterFailureKind.FAILED.value,
+                    "error_message": "Adapter execution failed.",
+                    "adapter_key": "libredwg",
+                    "stage": "execute",
+                    "reason": "output_cap_exceeded",
+                    "output_kind": "json",
+                    "max_output_bytes": 8_388_608,
+                    "output_size_bytes": 16_000_000,
+                },
+            )
+        ]
+
     async def test_process_ingest_job_persists_sanitized_real_runner_storage_failure(
         self,
         async_client: httpx.AsyncClient,
