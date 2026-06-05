@@ -128,6 +128,123 @@ def test_plan_svg_debug_overlay_emits_deterministic_svg_with_geometry_and_placeh
     assert '<polyline class="geometry cue-provisional"' in payload
 
 
+def test_plan_svg_debug_overlay_parses_layout_aliases_and_nested_bbox_for_line_geometry() -> None:
+    """LibreDWG-shaped entities should parse layout aliases and nested bbox."""
+    canonical: dict[str, JSONValue] = {
+        "layouts": (
+            {
+                "name": "Model",
+                "page_number": 1,
+                "bbox": {
+                    "x_min": 0.0,
+                    "y_min": 0.0,
+                    "x_max": 10.0,
+                    "y_max": 10.0,
+                },
+            },
+            {
+                "name": "Layout-B",
+                "page_number": 2,
+                "bbox": {
+                    "x_min": 0.0,
+                    "y_min": 0.0,
+                    "x_max": 12.0,
+                    "y_max": 12.0,
+                },
+            },
+        ),
+        "entities": (
+            {
+                "entity_id": "model-line",
+                "kind": "line",
+                "layout_name": "Model",
+                "bbox": {
+                    "min": {"x": 1.0, "y": 2.0},
+                    "max": {"x": 9.0, "y": 8.0},
+                },
+                "confidence_score": 0.37,
+            },
+            {
+                "entity_id": "alt-line",
+                "kind": "line",
+                "layoutName": "Layout-B",
+                "bbox": {
+                    "min": {"x": 1.0, "y": 2.0},
+                    "max": {"x": 3.0, "y": 4.0},
+                },
+                "confidence": {"score": 0.42},
+            },
+        ),
+    }
+
+    payload = plan_svg_debug_overlay(
+        canonical,
+        title="LibreDWG Entity Sample",
+        source_label="originals/example.dwg",
+        review_state="review_required",
+        confidence_score=0.93,
+    ).payload.decode("utf-8")
+
+    assert "Layout: __document__" not in payload
+    assert "Layout: document" not in payload
+    assert payload.count('<rect class="panel"') == 2
+    assert payload.count('class="bbox cue-review-required"') == 2
+    assert "Layout: Model | Page: 1" in payload
+    assert "Layout: Layout-B | Page: 2" in payload
+    assert "model-line | line | review_required | 0.37" in payload
+    assert "alt-line | line | review_required | 0.42" in payload
+    assert "No canonical geometry" not in payload
+
+
+def test_plan_svg_debug_overlay_parses_layout_name_and_nested_bbox_for_line_geometry() -> None:
+    """LibreDWG-shaped entities should render with layout_name and nested bbox."""
+    canonical: dict[str, JSONValue] = {
+        "entities": (
+            {
+                "entity_id": "model-line",
+                "kind": "line",
+                "layout_name": "Model",
+                "start": {"x": 1.0, "y": 2.0},
+                "end": {"x": 9.0, "y": 8.0},
+                "bbox": {
+                    "min": {"x": 1.0, "y": 2.0},
+                    "max": {"x": 9.0, "y": 8.0},
+                },
+                "confidence": {
+                    "score": 0.37,
+                },
+            },
+        ),
+    }
+
+    payload = plan_svg_debug_overlay(
+        canonical,
+        title="LibreDWG Entity Sample",
+        source_label="originals/example.dwg",
+        review_state="review_required",
+        confidence_score=0.93,
+    ).payload.decode("utf-8")
+
+    assert "Layout: __document__" not in payload
+    assert "Layout: document" not in payload
+    assert payload.count('<rect class="panel"') == 1
+
+    model_panel_match = re.search(
+        (
+            r'<rect class="panel"[^/]*/>\s*'
+            r'<text class="label"[^>]*>Layout: Model</text>\s*'
+            r'<text class="meta"[^>]*>Entities: 1</text>(?:(?!<rect class="panel").)*'
+        ),
+        payload,
+        re.S,
+    )
+    assert model_panel_match is not None
+    assert "model-line | line | review_required | 0.37" in model_panel_match.group(0)
+
+    assert '<line class="geometry cue-review-required"' in payload
+    assert "No canonical geometry" not in payload
+
+
 def test_plan_svg_debug_overlay_escapes_title_source_layout_and_entity_metadata() -> None:
     """Overlay SVG should HTML-escape user-provided metadata fields."""
     canonical: dict[str, JSONValue] = {
@@ -166,7 +283,7 @@ def test_plan_svg_debug_overlay_escapes_title_source_layout_and_entity_metadata(
 
     assert (
         '<title id="overlay-title">Debug &lt;Overlay&gt; &quot;Phase&quot; &amp; Check '
-        'debug overlay</title>'
+        "debug overlay</title>"
     ) in payload
     assert (
         "Diagnostic overlay for originals/&lt;plan&gt;&amp;&quot;sheet&quot;.pdf. "
@@ -184,8 +301,9 @@ def test_plan_svg_debug_overlay_escapes_title_source_layout_and_entity_metadata(
     assert 'entity<1>&"2" | line<kind>&"shape" | review<state>&"needed" | 0.51' not in payload
 
 
-def test_plan_svg_debug_overlay_degrades_invalid_geometry_to_placeholder_without_nan_or_inf(
-) -> None:
+def test_plan_svg_debug_overlay_degrades_invalid_geometry_to_placeholder_without_nan_or_inf() -> (
+    None
+):
     """Invalid or non-finite geometry should render as safe diagnostic placeholders."""
     canonical: dict[str, JSONValue] = {
         "layouts": ({"name": "page-1"},),
