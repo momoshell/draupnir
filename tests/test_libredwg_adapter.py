@@ -562,6 +562,72 @@ async def test_libredwg_adapter_handles_objects_variants_and_type_markers(
 
 
 @pytest.mark.asyncio
+async def test_libredwg_adapter_maps_legacy_type_records_with_fixed_type_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "DICTIONARY",
+                        "fixed_type": "LINE",
+                        "handle": "F1",
+                        "layer": "Legacy-Lines",
+                        "start": {"x": 10, "y": 5, "z": 0},
+                        "end": {"x": 13, "y": 9, "z": 0},
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_id"] == "libredwg-line-f1"
+    assert entity["entity_type"] == "line"
+    assert entity["kind"] == "line"
+    assert entity["source_entity_handle"] == "F1"
+    assert entity["geometry"] == {
+        "start": {"x": 10.0, "y": 5.0, "z": 0.0},
+        "end": {"x": 13.0, "y": 9.0, "z": 0.0},
+        "bbox": {
+            "min": {"x": 10.0, "y": 5.0, "z": 0.0},
+            "max": {"x": 13.0, "y": 9.0, "z": 0.0},
+        },
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "line_segment",
+            "length": 5.0,
+            "vertex_count": 2,
+        },
+    }
+    assert entity["bbox"] == {
+        "min": {"x": 10.0, "y": 5.0, "z": 0.0},
+        "max": {"x": 13.0, "y": 9.0, "z": 0.0},
+    }
+    assert entity["length"] == 5.0
+    assert entity["start"] == {"x": 10.0, "y": 5.0, "z": 0.0}
+    assert entity["end"] == {"x": 13.0, "y": 9.0, "z": 0.0}
+    assert entity["provenance"]["source_ref"] == "OBJECTS/LINE/F1"
+    assert entity["provenance"]["source_locator"] == "OBJECTS/LINE/F1"
+    assert entity["provenance"]["extraction_path"] == ("OBJECTS", "LINE")
+    assert entity["confidence"]["score"] == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
+    assert entity["confidence"]["review_required"] is True
+    assert entity["confidence"]["basis"] == "libredwg_line_mapping_units_unconfirmed"
+
+
+@pytest.mark.asyncio
 async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_drawables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
