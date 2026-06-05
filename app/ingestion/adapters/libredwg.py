@@ -55,6 +55,7 @@ _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
 _LINE_ENTITY_CONFIDENCE_SCORE = 0.72
+_TEXT_ENTITY_CONFIDENCE_SCORE = 0.72
 _MIXED_ENTITY_CONFIDENCE_SCORE = 0.5
 _UNKNOWN_ENTITY_CONFIDENCE_SCORE = 0.2
 _DEFAULT_LAYOUT_NAME = "Model"
@@ -585,6 +586,7 @@ def _build_canonical_output(
     entities: list[JSONValue] = []
     layers_seen: set[str] = set()
     supported_line_count = 0
+    supported_text_count = 0
     unsupported_drawable_count = 0
     malformed_drawable_count = 0
     unsupported_types: set[str] = set()
@@ -618,6 +620,15 @@ def _build_canonical_output(
             handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if handle is not None:
                 malformed_handles.add(handle)
+            continue
+
+        if record_type == "MTEXT":
+            text_entity = _build_text_entity(record)
+            entities.append(text_entity)
+            supported_text_count += 1
+            layer_name = cast(str | None, text_entity.get("layer_name"))
+            if layer_name:
+                layers_seen.add(layer_name)
             continue
 
         unsupported_drawable_count += 1
@@ -674,7 +685,8 @@ def _build_canonical_output(
             )
         )
 
-    has_mixed_entity_outcomes = supported_line_count > 0 and (
+    has_supported_drawable_count = supported_line_count + supported_text_count
+    has_mixed_entity_outcomes = has_supported_drawable_count > 0 and (
         unsupported_drawable_count > 0 or malformed_drawable_count > 0
     )
     if has_mixed_entity_outcomes:
@@ -683,6 +695,9 @@ def _build_canonical_output(
     elif supported_line_count > 0:
         confidence_score = _LINE_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_line_mapping"
+    elif supported_text_count > 0:
+        confidence_score = _TEXT_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_text_mapping"
     elif entities:
         confidence_score = _UNKNOWN_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_unknown_entity_mapping"
@@ -853,6 +868,141 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
         "end": end,
         "length": quantity_length,
     }
+
+
+def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
+    insertion_point = _extract_point(
+        record,
+        prefixes=("insertion", "insertion_point", "text_position"),
+    )
+    layer_name = _extract_layer_name(record)
+    layout_name = _extract_layout_name(record)
+    block_name = _extract_block_name(record)
+    source_handle = _extract_handle(record)
+    text = _extract_text_value(record)
+    text_length = len(text)
+
+    if insertion_point is None:
+        geometry_reason = "missing_text_placement"
+        point_json: _JSONDict | None = None
+        bbox = None
+    else:
+        if not _point_is_finite(insertion_point):
+            geometry_reason = "malformed_text_placement"
+            point_json = None
+            bbox = None
+        else:
+            geometry_reason = None
+            point_json = _point_json(insertion_point)
+            bbox = {
+                "min": {
+                    "x": insertion_point[0],
+                    "y": insertion_point[1],
+                    "z": insertion_point[2],
+                },
+                "max": {
+                    "x": insertion_point[0],
+                    "y": insertion_point[1],
+                    "z": insertion_point[2],
+                },
+            }
+
+    text_summary: _JSONDict = {
+        "kind": "text",
+        "source_type": "MTEXT",
+        "text_length": text_length,
+    }
+    if geometry_reason is not None:
+        text_summary["reason"] = geometry_reason
+
+    geometry_projection: _JSONDict = {
+        "text": text,
+        "units": {"normalized": "unknown"},
+        "geometry_summary": text_summary,
+    }
+    if point_json is not None:
+        geometry_projection["insertion"] = point_json
+    else:
+        geometry_projection.update({"bbox": None, "status": "absent", "reason": geometry_reason})
+
+    safe_projection = _safe_record_projection(
+        record,
+        record_type="MTEXT",
+        geometry={
+            "text": text,
+            "insertion": point_json,
+        },
+    )
+    provenance = _entity_provenance(
+        record,
+        record_type="MTEXT",
+        source_handle=source_handle,
+        safe_projection=safe_projection,
+        notes=("units_unconfirmed",),
+    )
+    safe_bbox = bbox
+    entity_bbox = None if geometry_reason is not None else safe_bbox
+
+    return {
+        "entity_id": _entity_id(record, record_type="text"),
+        "entity_type": "text",
+        "entity_schema_version": _SCHEMA_VERSION,
+        **provenance,
+        "source_entity_handle": source_handle,
+        "layout_name": layout_name,
+        "layer_name": layer_name,
+        "block_name": block_name,
+        "parent_entity_id": None,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": block_name,
+        "parent_entity_ref": None,
+        "bbox": entity_bbox,
+        "geometry": geometry_projection,
+        "properties": {
+            "source_type": "MTEXT",
+            "source_handle": source_handle,
+            "text": text,
+            "text_length": text_length,
+            "adapter_native": {
+                "libredwg": {
+                    "section": "OBJECTS",
+                    "record_type": "MTEXT",
+                    "handle": source_handle,
+                }
+            },
+        },
+        "provenance": provenance,
+        "confidence": {
+            "score": _TEXT_ENTITY_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": "libredwg_mtext_mapping_units_unconfirmed",
+        },
+        "kind": "text",
+        "text": text,
+        "text_length": text_length,
+    }
+
+
+def _extract_text_value(record: Mapping[str, Any]) -> str:
+    raw_text = _first_raw_string(
+        record,
+        "text",
+        "text_value",
+        "textstring",
+        "string",
+        "content",
+        "label",
+    )
+    if raw_text is not None:
+        return _sanitize_text_content(raw_text)
+
+    fallback = _first_raw_string(record, "value", "title", "description", "notes")
+    if fallback is None:
+        return ""
+    return _sanitize_text_content(fallback)
 
 
 def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDict:
@@ -1181,11 +1331,24 @@ def _first_value(record: Mapping[str, Any], *candidates: str) -> Any:
     return None
 
 
+def _first_raw_string(record: Mapping[str, Any], *candidates: str) -> str | None:
+    value = _first_value(record, *candidates)
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _first_string(record: Mapping[str, Any], *candidates: str) -> str | None:
     value = _first_value(record, *candidates)
     if not isinstance(value, str):
         return None
     return _sanitize_string_value(value)
+
+
+def _sanitize_text_content(value: str) -> str:
+    return "".join(
+        character if (character.isprintable() or character == "\n") else "?" for character in value
+    )
 
 
 def _mapping_get(mapping: Mapping[str, Any], *candidates: str) -> Any:

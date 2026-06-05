@@ -11,6 +11,7 @@ import pytest
 import app.db.session as session_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
+from app.ingestion.adapters import libredwg as libredwg_adapter
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.jobs.worker import process_ingest_job
@@ -523,6 +524,134 @@ class TestRevisionMaterializationApi:
                 "details": None,
             }
         }
+
+    async def test_revision_materialization_entity_filter_supports_text_entities(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_materialized_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                entities=[
+                    _build_contract_entity(
+                        entity_id="text-entity",
+                        entity_type="text",
+                        layout_ref="Model",
+                        layer_ref="A-WALL",
+                        source_id="text-source",
+                    ),
+                    _build_contract_entity(
+                        entity_id="line-entity",
+                        entity_type="line",
+                        layout_ref="Model",
+                        layer_ref="A-WALL",
+                        source_id="line-source",
+                        source_hash="b" * 64,
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_materialized_ingestion)
+
+        await process_ingest_job(job.id)
+
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        drawing_revision = drawing_revisions[0]
+
+        response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities",
+            params={"entity_type": "text"},
+        )
+        assert response.status_code == 200
+        assert [item["entity_id"] for item in response.json()["items"]] == ["text-entity"]
+        assert response.json()["items"][0]["entity_type"] == "text"
+
+        singular_response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/{quote('text-entity', safe='')}"
+        )
+        assert singular_response.status_code == 200
+        assert singular_response.json()["entity_id"] == "text-entity"
+        assert singular_response.json()["entity_type"] == "text"
+
+    async def test_revision_materialization_entity_filter_supports_libredwg_text_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_materialized_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            text_entity = libredwg_adapter._build_text_entity(
+                {
+                    "type": "MTEXT",
+                    "handle": "7Z",
+                    "layout": "Model",
+                    "layer": "A-WALL",
+                    "insertion": {"x": 10, "y": 20, "z": 0},
+                    "text": "Layout test text",
+                }
+            )
+            return _replace_fake_canonical_payload(payload, entities=[text_entity])
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_materialized_ingestion)
+
+        await process_ingest_job(job.id)
+
+        (
+            _adapter_outputs,
+            drawing_revisions,
+            _validation_reports,
+            _generated_artifacts,
+        ) = await _load_project_outputs(project["id"])
+        drawing_revision = drawing_revisions[0]
+
+        response = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities",
+            params={"layout_ref": "Model", "layer_ref": "A-WALL", "entity_type": "text"},
+        )
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert [item["entity_id"] for item in items] == ["libredwg-text-7z"]
+        assert items[0]["text"] == "Layout test text"
+
+        single = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities/{quote('libredwg-text-7z', safe='')}"
+        )
+        assert single.status_code == 200
+        assert single.json()["entity_id"] == "libredwg-text-7z"
+        assert single.json()["layout_ref"] == "Model"
+        assert single.json()["layer_ref"] == "A-WALL"
+        assert single.json()["text"] == "Layout test text"
 
     async def test_revision_entity_lookup_supports_singular_reads_and_encoded_paths(
         self,
