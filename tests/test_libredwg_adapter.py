@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,6 +194,16 @@ def _schedule_live_overflow_write(
         background_tasks.append(asyncio.create_task(_writer()))
 
     return _on_spawn
+
+
+def _contains_non_finite_numbers(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Mapping):
+        return any(_contains_non_finite_numbers(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_non_finite_numbers(item) for item in value)
+    return False
 
 
 def test_probe_reports_missing_binary_with_license_review_posture(
@@ -625,6 +636,277 @@ async def test_libredwg_adapter_maps_legacy_type_records_with_fixed_type_marker(
     assert entity["confidence"]["score"] == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
     assert entity["confidence"]["review_required"] is True
     assert entity["confidence"]["basis"] == "libredwg_line_mapping_units_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_mtext_entities_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "MTEXT",
+                        "handle": "7A",
+                        "layer": "Labels",
+                        "insertion": {"x": 10, "y": 20, "z": 0},
+                        "text": "Zone A-01",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-text-7a"
+    assert entity["entity_type"] == "text"
+    assert entity["entity_schema_version"] == "0.1"
+    assert entity["source_entity_handle"] == "7A"
+    assert entity["layout_name"] == "Model"
+    assert entity["layer_name"] == "Labels"
+    assert entity["block_name"] is None
+    assert entity["parent_entity_id"] is None
+    assert entity["drawing_revision_id"] is None
+    assert entity["source_file_id"] is None
+    assert entity["layout_ref"] == "Model"
+    assert entity["layer_ref"] == "Labels"
+    assert entity["block_ref"] is None
+    assert entity["parent_entity_ref"] is None
+    assert entity["bbox"] == {
+        "min": {"x": 10.0, "y": 20.0, "z": 0.0},
+        "max": {"x": 10.0, "y": 20.0, "z": 0.0},
+    }
+    assert entity["geometry"] == {
+        "text": "Zone A-01",
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "text",
+            "source_type": "MTEXT",
+            "text_length": 9,
+        },
+        "insertion": {"x": 10.0, "y": 20.0, "z": 0.0},
+    }
+    assert entity["properties"] == {
+        "source_type": "MTEXT",
+        "source_handle": "7A",
+        "text": "Zone A-01",
+        "text_length": 9,
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "MTEXT",
+                "handle": "7A",
+            }
+        },
+    }
+    assert entity["kind"] == "text"
+    assert entity["text"] == "Zone A-01"
+    assert entity["text_length"] == 9
+    assert entity["provenance"]["origin"] == "adapter_normalized"
+    assert entity["provenance"]["adapter"] == {"key": "libredwg"}
+    assert entity["provenance"]["source_ref"] == "OBJECTS/MTEXT/7A"
+    assert entity["provenance"]["source_identity"] == "7A"
+    assert entity["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
+        {
+            "record_type": "MTEXT",
+            "handle": "7A",
+            "layer_name": "Labels",
+            "layout_name": "Model",
+            "block_name": None,
+            "geometry": {"text": "Zone A-01", "insertion": {"x": 10.0, "y": 20.0, "z": 0.0}},
+        }
+    )
+    assert entity["provenance"]["normalized_source_hash"] == entity["provenance"]["source_hash"]
+    assert entity["provenance"]["extraction_path"] == ("OBJECTS", "MTEXT")
+    assert entity["provenance"]["notes"] == ("units_unconfirmed",)
+    assert entity["provenance"]["source_locator"] == "OBJECTS/MTEXT/7A"
+    assert entity["provenance"]["extra"] == {
+        "native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "MTEXT",
+                "handle": "7A",
+            }
+        },
+        "legacy_aliases": {
+            "adapter_key": "libredwg",
+            "source": "OBJECTS/MTEXT/7A",
+            "source_section": "OBJECTS",
+            "source_entity_ref": "OBJECTS/MTEXT/7A",
+            "source_locator": "OBJECTS/MTEXT/7A",
+            "entity_ref": "OBJECTS/MTEXT/7A",
+            "normalized_source_hash": entity["provenance"]["source_hash"],
+            "native_handle": "7A",
+            "source_entity_handle": "7A",
+            "record_hash": entity["provenance"]["record_hash"],
+        },
+    }
+    assert len(entity["provenance"]["source_hash"]) == 64
+    assert all(character in "0123456789abcdef" for character in entity["provenance"]["source_hash"])
+    assert entity["provenance"]["record_hash"] == f"sha256:{entity['provenance']['source_hash']}"
+    assert entity["confidence"] == {
+        "score": adapter_module._TEXT_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_mtext_mapping_units_unconfirmed",
+    }
+    _assert_score_within_libredwg_descriptor_range(entity["confidence"]["score"])
+
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._TEXT_ENTITY_CONFIDENCE_SCORE
+    assert result.confidence.review_required is True
+    assert result.confidence.basis == "libredwg_dwgread_json_text_mapping"
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_mtext_without_insertion_as_partial_text_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "MTEXT",
+                        "handle": "7B",
+                        "layer": "Labels",
+                        "text": "No insertion",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_type"] == "text"
+    assert entity["layout_ref"] == "Model"
+    assert entity["layer_ref"] == "Labels"
+    assert entity["block_ref"] is None
+    assert entity["bbox"] is None
+    assert entity["geometry"] == {
+        "text": "No insertion",
+        "units": {"normalized": "unknown"},
+        "status": "absent",
+        "reason": "missing_text_placement",
+        "geometry_summary": {
+            "kind": "text",
+            "source_type": "MTEXT",
+            "text_length": 12,
+            "reason": "missing_text_placement",
+        },
+        "bbox": None,
+    }
+    assert entity["confidence"]["score"] == adapter_module._TEXT_ENTITY_CONFIDENCE_SCORE
+    assert entity["confidence"]["basis"] == "libredwg_mtext_mapping_units_unconfirmed"
+    assert result.confidence is not None
+    assert result.confidence.basis == "libredwg_dwgread_json_text_mapping"
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_mtext_text_value_with_control_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "MTEXT",
+                        "handle": "7C",
+                        "layer": "Notes",
+                        "insertion": {"x": 0, "y": 0, "z": 0},
+                        "text": "Safe\nLabel\u0000Path:/tmp/file.txt",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-text-7c"
+    assert entity["text"] == "Safe\nLabel?Path:/tmp/file.txt"
+    assert entity["geometry"]["text"] == "Safe\nLabel?Path:/tmp/file.txt"
+    assert entity["properties"]["text"] == "Safe\nLabel?Path:/tmp/file.txt"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_marks_nonfinite_text_placement_as_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "MTEXT",
+                        "handle": "7D",
+                        "layer": "Labels",
+                        "insertion": {"x": "NaN", "y": 1, "z": 0},
+                        "text": "Bad placement",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["geometry"]["status"] == "absent"
+    assert entity["geometry"]["reason"] == "malformed_text_placement"
+    assert entity["geometry"]["geometry_summary"]["reason"] == "malformed_text_placement"
+    assert entity["bbox"] is None
+    assert "insertion" not in entity["geometry"]
+    assert not _contains_non_finite_numbers(entity["geometry"])
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
 
 
 @pytest.mark.asyncio
