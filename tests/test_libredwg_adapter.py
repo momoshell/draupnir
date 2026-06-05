@@ -435,6 +435,57 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
         ),
         (
             {
+                "OBJECTS": [
+                    {
+                        "type": "LAYER",
+                        "entity": "LINE",
+                        "handle": "GH",
+                        "layer": "D-PIPE",
+                        "start": {"x": 1, "y": 1},
+                        "end": {"x": 4, "y": 1},
+                    }
+                ]
+            },
+            "GH",
+            "D-PIPE",
+            3.0,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "DICTIONARY",
+                        "object": "LINE",
+                        "handle": "IJ",
+                        "layer": "E-DUCT",
+                        "start": {"x": 2, "y": 2},
+                        "end": {"x": 2, "y": 7},
+                    }
+                ]
+            },
+            "IJ",
+            "E-DUCT",
+            5.0,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "DWG_TYPE_UNKNOWN",
+                        "dxfname": "LINE",
+                        "handle": "KL",
+                        "layer": "F-CABLE",
+                        "start": {"x": 0, "y": 0},
+                        "end": {"x": 0, "y": 8},
+                    }
+                ]
+            },
+            "KL",
+            "F-CABLE",
+            8.0,
+        ),
+        (
+            {
                 "OBJECTS": {
                     "first": {
                         "name": "AcDbLine",
@@ -807,7 +858,15 @@ async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candid
         output_text=json.dumps(
             {
                 "OBJECTS": {
-                    "metadata": {"type": "DICTIONARY", "handle": "meta"},
+                    "metadata": {
+                        "type": "DICTIONARY",
+                        "handle": "meta",
+                        "data": {
+                            "entity": "LINE",
+                            "start": {"x": 0, "y": 0},
+                            "end": {"x": 1, "y": 1},
+                        },
+                    },
                     "layers": [{"type": "LAYER", "name": "Default"}],
                 }
             }
