@@ -642,7 +642,8 @@ class TestRevisionMaterializationApi:
         assert response.status_code == 200
         items = response.json()["items"]
         assert [item["entity_id"] for item in items] == ["libredwg-text-7z"]
-        assert items[0]["text"] == "Layout test text"
+        assert items[0]["geometry"]["text"] == "Layout test text"
+        assert items[0]["properties"]["text"] == "Layout test text"
 
         single = await async_client.get(
             f"/v1/revisions/{drawing_revision.id}/entities/{quote('libredwg-text-7z', safe='')}"
@@ -651,7 +652,8 @@ class TestRevisionMaterializationApi:
         assert single.json()["entity_id"] == "libredwg-text-7z"
         assert single.json()["layout_ref"] == "Model"
         assert single.json()["layer_ref"] == "A-WALL"
-        assert single.json()["text"] == "Layout test text"
+        assert single.json()["geometry"]["text"] == "Layout test text"
+        assert single.json()["properties"]["text"] == "Layout test text"
 
     async def test_revision_entity_lookup_supports_singular_reads_and_encoded_paths(
         self,
