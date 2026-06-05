@@ -917,7 +917,13 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
 
 
 def _extract_record_type(record: Mapping[str, Any]) -> str | None:
-    raw_type = _first_string(
+    raw_type = _first_string_from_mapping_by_priority(
+        record,
+        "entity",
+        "object",
+        "dxfname",
+        "dxf_name",
+    ) or _first_string(
         record,
         "type",
         "object_type",
@@ -944,6 +950,18 @@ def _extract_record_type(record: Mapping[str, Any]) -> str | None:
     if token_upper.startswith("ACDB"):
         token_upper = token_upper.removeprefix("ACDB")
     return token_upper or None
+
+
+def _first_string_from_mapping_by_priority(
+    mapping: Mapping[str, Any], *candidates: str
+) -> str | None:
+    for candidate in candidates:
+        value = _mapping_get(mapping, candidate)
+        if isinstance(value, str):
+            sanitized = _sanitize_string_value(value)
+            if sanitized is not None:
+                return sanitized
+    return None
 
 
 def _extract_handle(record: Mapping[str, Any]) -> str | None:
