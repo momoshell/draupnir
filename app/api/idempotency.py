@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -188,6 +189,54 @@ def _build_replay_response(record: IdempotencyKey) -> Response:
         )
 
     return JSONResponse(status_code=record.response_status_code, content=record.response_body_json)
+
+
+def _extract_replayable_http_error_snapshot(
+    exc: HTTPException,
+) -> tuple[int, dict[str, Any]] | None:
+    """Return a replay-safe HTTP error snapshot when the exception is deterministic."""
+
+    if exc.status_code < 400 or exc.status_code >= 500:
+        return None
+    if exc.headers:
+        return None
+    if not isinstance(exc.detail, dict) or set(exc.detail.keys()) != {"error"}:
+        return None
+
+    error = exc.detail.get("error")
+    if not isinstance(error, dict) or set(error.keys()) != {"code", "message", "details"}:
+        return None
+
+    code = error.get("code")
+    message = error.get("message")
+    details = error.get("details")
+    if not isinstance(code, str) or not isinstance(message, str):
+        return None
+    if not _is_json_compatible(details):
+        return None
+
+    try:
+        ErrorCode(code)
+    except ValueError:
+        return None
+
+    return exc.status_code, exc.detail
+
+
+def _is_json_compatible(value: Any) -> bool:
+    """Return whether a value matches the project's standard JSON-safe envelope contract."""
+
+    if value is None or isinstance(value, str | bool | int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_compatible(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_json_compatible(item) for key, item in value.items()
+        )
+    return False
 
 
 async def get_idempotency_key(
@@ -388,6 +437,7 @@ async def run_idempotent_mutation[ResultT](
     """Run the shared replay/claim/mutate/complete/commit mutation flow."""
 
     resolved_ops = ops or DEFAULT_IDEMPOTENT_MUTATION_OPS
+    after_commit: Callable[[], Awaitable[None]] | None = None
     replay_response = await resolved_ops.replay(
         db,
         key=key,
@@ -411,11 +461,11 @@ async def run_idempotent_mutation[ResultT](
     if isinstance(reservation_or_response, Response):
         return reservation_or_response
 
-    if reservation_or_response is not None and reload_after_claim is not None:
-        await reload_after_claim()
-
     commit_started = False
     try:
+        if reservation_or_response is not None and reload_after_claim is not None:
+            await reload_after_claim()
+
         mutation_result = await mutate()
         if isinstance(mutation_result, IdempotentMutationKnownError):
             response_body = mutation_result.response_body
@@ -434,6 +484,32 @@ async def run_idempotent_mutation[ResultT](
         )
         commit_started = True
         await db.commit()
+    except HTTPException as exc:
+        snapshot = (
+            _extract_replayable_http_error_snapshot(exc)
+            if reservation_or_response is not None
+            else None
+        )
+        if snapshot is None or commit_started:
+            if not commit_started and pre_commit_failure_cleanup is not None:
+                await pre_commit_failure_cleanup()
+            raise
+
+        try:
+            await db.rollback()
+            status_code, response_body = snapshot
+            response = await resolved_ops.complete(
+                db,
+                reservation_or_response,
+                status_code=status_code,
+                response_body=response_body,
+            )
+            commit_started = True
+            await db.commit()
+        except BaseException:
+            if not commit_started and pre_commit_failure_cleanup is not None:
+                await pre_commit_failure_cleanup()
+            raise
     except BaseException:
         if not commit_started and pre_commit_failure_cleanup is not None:
             await pre_commit_failure_cleanup()

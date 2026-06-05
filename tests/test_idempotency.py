@@ -247,10 +247,15 @@ class _CommitTrackingSession:
     def __init__(self, events: list[str]) -> None:
         self._events = events
         self.commit_calls = 0
+        self.rollback_calls = 0
 
     async def commit(self) -> None:
         self.commit_calls += 1
         self._events.append("commit")
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+        self._events.append("rollback")
 
 
 async def _upload_lineage_counts(project_id: str) -> tuple[int, int, int]:
@@ -587,6 +592,313 @@ async def test_run_idempotent_mutation_reloads_serializes_and_runs_after_commit(
         "commit",
         "after_commit",
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_idempotent_mutation_snapshots_replay_safe_reload_http_exception() -> None:
+    """Replay-safe HTTP errors from reload_after_claim should rollback, snapshot, and commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    expected_reservation = IdempotencyReservation(record_id=uuid.uuid4())
+    response_body = {
+        "error": {
+            "code": "REVISION_CONFLICT",
+            "message": "Base revision became stale.",
+            "details": None,
+        }
+    }
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == ("reload-http-key-1", "fingerprint-10b")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            "reload-http-key-1",
+            "fingerprint-10b",
+            "POST",
+            "/v1/files/file-1/reprocess",
+        )
+        return expected_reservation
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = db
+        events.append("complete")
+        assert reservation == expected_reservation
+        assert status_code == 409
+        assert response_body == {
+            "error": {
+                "code": "REVISION_CONFLICT",
+                "message": "Base revision became stale.",
+                "details": None,
+            }
+        }
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    async def _reload_after_claim() -> None:
+        events.append("reload")
+        raise HTTPException(status_code=409, detail=response_body)
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        raise AssertionError("mutate should not run after replay-safe reload error")
+
+    def _serialize(_: str) -> dict[str, Any]:
+        raise AssertionError("serialize should not run after replay-safe reload error")
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key="reload-http-key-1",
+        fingerprint="fingerprint-10b",
+        method="POST",
+        path="/v1/files/file-1/reprocess",
+        reload_after_claim=_reload_after_claim,
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response.status_code == 409
+    assert json.loads(bytes(response.body)) == response_body
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 1
+    assert events == ["replay", "claim", "reload", "rollback", "complete", "commit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("details", "case_id"),
+    [
+        pytest.param(None, "none-details", id="none-details"),
+        pytest.param(["field", {"reason": "invalid"}], "list-details", id="list-details"),
+        pytest.param("payload_invalid", "scalar-details", id="scalar-details"),
+    ],
+)
+async def test_run_idempotent_mutation_snapshots_replay_safe_mutate_http_exception(
+    details: Any,
+    case_id: str,
+) -> None:
+    """Replay-safe HTTP errors from mutate should rollback, snapshot, and commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+    expected_reservation = IdempotencyReservation(record_id=uuid.uuid4())
+    response_body = {
+        "error": {
+            "code": "INPUT_INVALID",
+            "message": "Payload is invalid.",
+            "details": details,
+        }
+    }
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = db
+        events.append("replay")
+        assert (key, fingerprint) == (f"mutate-http-key-1-{case_id}", f"fingerprint-10c-{case_id}")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = db
+        events.append("claim")
+        assert (key, fingerprint, method, path) == (
+            f"mutate-http-key-1-{case_id}",
+            f"fingerprint-10c-{case_id}",
+            "PATCH",
+            "/v1/projects/project-9",
+        )
+        return expected_reservation
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = db
+        events.append("complete")
+        assert reservation == expected_reservation
+        assert status_code == 400
+        assert response_body == {
+            "error": {
+                "code": "INPUT_INVALID",
+                "message": "Payload is invalid.",
+                "details": details,
+            }
+        }
+        return JSONResponse(status_code=status_code, content=response_body)
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        raise HTTPException(status_code=400, detail=response_body)
+
+    def _serialize(_: str) -> dict[str, Any]:
+        raise AssertionError("serialize should not run after replay-safe mutate error")
+
+    response = await run_idempotent_mutation(
+        cast(Any, session),
+        key=f"mutate-http-key-1-{case_id}",
+        fingerprint=f"fingerprint-10c-{case_id}",
+        method="PATCH",
+        path="/v1/projects/project-9",
+        mutate=_mutate,
+        serialize_result=_serialize,
+        ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+    )
+
+    assert response.status_code == 400
+    assert json.loads(bytes(response.body)) == response_body
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 1
+    assert events == ["replay", "claim", "mutate", "rollback", "complete", "commit"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "detail", "headers"),
+    [
+        pytest.param(
+            400,
+            {"detail": "not-envelope"},
+            None,
+            id="non-envelope-detail",
+        ),
+        pytest.param(
+            400,
+            {
+                "error": {
+                    "code": "INPUT_INVALID",
+                    "message": "Payload is invalid.",
+                    "details": {"labels"},
+                }
+            },
+            None,
+            id="non-json-compatible-details",
+        ),
+        pytest.param(
+            400,
+            {
+                "error": {
+                    "code": "NOT_A_REAL_ERROR_CODE",
+                    "message": "Payload is invalid.",
+                    "details": None,
+                }
+            },
+            None,
+            id="invalid-error-code",
+        ),
+        pytest.param(
+            409,
+            {
+                "error": {
+                    "code": "REVISION_CONFLICT",
+                    "message": "Base revision became stale.",
+                    "details": None,
+                }
+            },
+            {"Retry-After": "1"},
+            id="custom-headers",
+        ),
+        pytest.param(
+            500,
+            {
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Unexpected failure.",
+                    "details": None,
+                }
+            },
+            None,
+            id="server-error",
+        ),
+    ],
+)
+async def test_run_idempotent_mutation_does_not_snapshot_unsafe_http_exceptions(
+    status_code: int,
+    detail: Any,
+    headers: dict[str, str] | None,
+) -> None:
+    """Unsafe HTTP exceptions should propagate without rollback, completion, or commit."""
+
+    events: list[str] = []
+    session = _CommitTrackingSession(events)
+
+    async def _replay(db: AsyncSession, *, key: str | None, fingerprint: str) -> Response | None:
+        _ = (db, key, fingerprint)
+        events.append("replay")
+        return None
+
+    async def _claim(
+        db: AsyncSession,
+        *,
+        key: str | None,
+        fingerprint: str,
+        method: str,
+        path: str,
+    ) -> IdempotencyReservation | Response | None:
+        _ = (db, key, fingerprint, method, path)
+        events.append("claim")
+        return IdempotencyReservation(record_id=uuid.uuid4())
+
+    async def _complete(
+        db: AsyncSession,
+        reservation: IdempotencyReservation | None,
+        *,
+        status_code: int,
+        response_body: dict[str, Any] | None,
+    ) -> Response:
+        _ = (db, reservation, status_code, response_body)
+        raise AssertionError("complete should not run for unsafe HTTP exceptions")
+
+    async def _mutate() -> IdempotentMutationSuccess[str]:
+        events.append("mutate")
+        raise HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+    def _serialize(_: str) -> dict[str, Any]:
+        raise AssertionError("serialize should not run for unsafe HTTP exceptions")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await run_idempotent_mutation(
+            cast(Any, session),
+            key="unsafe-http-key-1",
+            fingerprint="fingerprint-10d",
+            method="POST",
+            path="/v1/projects",
+            mutate=_mutate,
+            serialize_result=_serialize,
+            ops=IdempotentMutationOps(replay=_replay, claim=_claim, complete=_complete),
+        )
+
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.detail == detail
+    assert exc_info.value.headers == headers
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 0
+    assert events == ["replay", "claim", "mutate"]
 
 
 @pytest.mark.asyncio
@@ -1669,6 +1981,90 @@ class TestEndpointIdempotency:
         assert second.status_code == 404
         assert second.json() == first.json()
         assert await _get_idempotency_record_or_none(key) is None
+
+    async def test_db_backed_helper_replays_completed_snapshot_for_post_claim_http_error(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """A replay-safe post-claim HTTP error should complete once and replay on retry."""
+
+        _ = self
+        _ = cleanup_projects
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        key = "db-backed-http-error-1"
+        fingerprint = build_idempotency_fingerprint(
+            "idempotency.test.post_claim_http_error",
+            {"project_id": "project-1"},
+        )
+        response_body = {
+            "error": {
+                "code": "INPUT_INVALID",
+                "message": "Payload is invalid.",
+                "details": None,
+            }
+        }
+        mutate_calls = 0
+        mutate_session: AsyncSession | None = None
+        disposable_project_id: uuid.UUID | None = None
+
+        async def _mutate() -> IdempotentMutationSuccess[str]:
+            nonlocal mutate_calls, mutate_session, disposable_project_id
+            mutate_calls += 1
+            assert mutate_session is not None
+            disposable_project = Project(name=f"disposable-project-{uuid.uuid4()}")
+            mutate_session.add(disposable_project)
+            await mutate_session.flush()
+            disposable_project_id = disposable_project.id
+            raise HTTPException(status_code=400, detail=response_body)
+
+        def _serialize(_: str) -> dict[str, Any]:
+            raise AssertionError("serialize should not run for replay-safe HTTP errors")
+
+        async with session_maker() as first_session:
+            mutate_session = first_session
+            first = await run_idempotent_mutation(
+                first_session,
+                key=key,
+                fingerprint=fingerprint,
+                method="POST",
+                path="/tests/idempotency/post-claim-http-error",
+                mutate=_mutate,
+                serialize_result=_serialize,
+            )
+
+        assert first.status_code == 400
+        assert json.loads(bytes(first.body)) == response_body
+
+        record = await _get_idempotency_record(key)
+        assert record.status == IdempotencyStatus.COMPLETED.value
+        assert record.response_status_code == 400
+        assert record.response_body_json == response_body
+        assert disposable_project_id is not None
+
+        async with session_maker() as verify_session:
+            assert (await verify_session.get(Project, disposable_project_id)) is None
+
+        async def _mutate_again() -> IdempotentMutationSuccess[str]:
+            raise AssertionError("mutate should not run when the completed snapshot replays")
+
+        async with session_maker() as second_session:
+            second = await run_idempotent_mutation(
+                second_session,
+                key=key,
+                fingerprint=fingerprint,
+                method="POST",
+                path="/tests/idempotency/post-claim-http-error",
+                mutate=_mutate_again,
+                serialize_result=_serialize,
+            )
+
+        assert mutate_calls == 1
+        assert second.status_code == 400
+        assert json.loads(bytes(second.body)) == response_body
+
+        async with session_maker() as verify_session:
+            assert (await verify_session.get(Project, disposable_project_id)) is None
 
     async def test_reprocess_publish_failure_replays_success_snapshot(
         self,
