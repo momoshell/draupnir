@@ -198,7 +198,6 @@ class TestJobsWorkerIngest:
             "error_code": ErrorCode.ADAPTER_FAILED.value,
             "error_message": "Adapter execution failed.",
             "details": {
-                "status": "failed",
                 "error_code": ErrorCode.ADAPTER_FAILED.value,
                 "failure_kind": AdapterFailureKind.FAILED.value,
                 "error_message": "Adapter execution failed.",
