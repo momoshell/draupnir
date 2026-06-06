@@ -209,6 +209,11 @@ make compose-smoke
 
 This lane stays manual and is not started automatically in CI.
 
+For local-only proprietary DWG/PDF extraction review runs, use the dedicated
+[local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md). That
+workflow is intentionally separate from committed fixtures: keep source samples,
+generated artifacts, and sensitive review notes out of git.
+
 ### Local Development (without Docker)
 
 Prerequisite: use PostgreSQL 18 for host-side database development, or point
@@ -451,6 +456,9 @@ download URLs.
 - Upload requests must include `Content-Length`.
 - The API accepts PDF, DWG, DXF, and IFC inputs when the relevant adapters are
   available.
+- Proprietary DWG/PDF samples used for local review must stay outside git and
+  outside `tests/fixtures/manifest.yaml`; see the
+  [local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md).
 
 ### Jobs
 
@@ -550,5 +558,6 @@ The repo holds normative docs that travel with code through PR review:
 - [MVP scope](docs/MVP.md)
 - [Technical requirements](docs/TRD.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md)
 - [Architecture decisions](docs/decisions/)
 - [Agent instructions](AGENTS.md)

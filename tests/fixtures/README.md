@@ -10,6 +10,7 @@ This directory contains test fixtures for the Draupnir CAD/BIM ingestion system.
 - All committed fixtures must be legally safe to distribute.
 - Keep generated artifacts out of git unless they are explicitly designated as fixtures.
 - Every fixture must be listed in `manifest.yaml`.
+- Local-only proprietary DWG/PDF review runs must stay outside git and outside `manifest.yaml`; use [`docs/local-dwg-pdf-review-workflow.md`](../../docs/local-dwg-pdf-review-workflow.md).
 
 ### Fixture Tiers
 
@@ -115,3 +116,8 @@ Do not store secrets, client names, private URLs, or sensitive project details i
 3. Ensure the license/source is safe for the intended git policy.
 4. Add or update the `manifest.yaml` entry with stable expectations only.
 5. Update this README if a new fixture tier or acceptance pattern is introduced.
+
+For proprietary DWG/PDF review work that should not create a committed fixture,
+follow the local-only workflow in
+[`docs/local-dwg-pdf-review-workflow.md`](../../docs/local-dwg-pdf-review-workflow.md)
+instead of adding a manifest entry.
