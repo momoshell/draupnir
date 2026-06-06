@@ -879,8 +879,14 @@ def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
 
 
 def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
-    start_point = _extract_point(record, prefixes=("start", "start_point", "point1", "p1", "from"))
-    end_point = _extract_point(record, prefixes=("end", "end_point", "point2", "p2", "to"))
+    start_point = _extract_point(
+        record,
+        prefixes=("start", "start_point", "first_endpoint", "point1", "p1", "from"),
+    )
+    end_point = _extract_point(
+        record,
+        prefixes=("end", "end_point", "second_endpoint", "point2", "p2", "to"),
+    )
     if start_point is None or end_point is None:
         return None
 
@@ -982,7 +988,7 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
 def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
     insertion_point = _extract_point(
         record,
-        prefixes=("insertion", "insertion_point", "text_position"),
+        prefixes=("insertion", "insertion_point", "ins_pt", "text_position"),
     )
     layer_name = _extract_layer_name(record)
     layout_name = _extract_layout_name(record)

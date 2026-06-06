@@ -579,6 +579,22 @@ async def test_libredwg_adapter_diagnostics_include_mapping_counts_and_confidenc
             "C-GRID",
             4.0,
         ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "MN",
+                        "layer": "Core-Lines",
+                        "first_endpoint": [1, 3, 0],
+                        "second_endpoint": [7, 3, 0],
+                    }
+                ]
+            },
+            "MN",
+            "Core-Lines",
+            6.0,
+        ),
     ],
 )
 async def test_libredwg_adapter_handles_objects_variants_and_type_markers(
@@ -1128,6 +1144,64 @@ async def test_libredwg_adapter_maps_mtext_entities_into_canonical_payload(
     assert result.confidence.review_required is True
     assert result.confidence.basis == "libredwg_dwgread_json_text_mapping"
     assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_mtext_ins_pt_list_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "MTEXT",
+                        "handle": "7E",
+                        "layer": "Labels",
+                        "ins_pt": [12, 24, 0],
+                        "text": "Zone A-02",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-text-7e"
+    assert entity["entity_type"] == "text"
+    assert entity["kind"] == "text"
+    assert entity["geometry"] == {
+        "text": "Zone A-02",
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "text",
+            "source_type": "MTEXT",
+            "text_length": 9,
+        },
+        "insertion": {"x": 12.0, "y": 24.0, "z": 0.0},
+    }
+    assert entity["bbox"] == {
+        "min": {"x": 12.0, "y": 24.0, "z": 0.0},
+        "max": {"x": 12.0, "y": 24.0, "z": 0.0},
+    }
+    assert entity["properties"]["text"] == "Zone A-02"
+    assert entity["properties"]["source_type"] == "MTEXT"
+    assert entity["text"] == "Zone A-02"
+    assert entity["text_length"] == 9
+    assert entity["confidence"]["score"] == adapter_module._TEXT_ENTITY_CONFIDENCE_SCORE
+    assert entity["confidence"]["review_required"] is True
 
 
 @pytest.mark.asyncio
