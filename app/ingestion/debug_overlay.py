@@ -25,6 +25,8 @@ _VIEWPORT_WIDTH: Final[float] = 400.0
 _VIEWPORT_PADDING: Final[float] = 12.0
 _CONFIDENCE_REVIEW_REQUIRED: Final[float] = 0.60
 _CONFIDENCE_PROVISIONAL: Final[float] = 0.95
+_TEXT_SNIPPET_MAX_LENGTH: Final[int] = 32
+_TEXT_SNIPPET_ELLIPSIS: Final[str] = "..."
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +121,7 @@ class _OverlayEntity:
     end: _Point | None
     cue: _CueStyle
     confidence_score: float | None
+    text_snippet: str | None = None
 
     @property
     def has_geometry(self) -> bool:
@@ -127,7 +130,10 @@ class _OverlayEntity:
     @property
     def summary(self) -> str:
         confidence = f"{self.confidence_score:.2f}" if self.confidence_score is not None else "n/a"
-        return f"{self.stable_id} | {self.kind} | {self.cue.review_state} | {confidence}"
+        summary = f"{self.stable_id} | {self.kind} | {self.cue.review_state} | {confidence}"
+        if self.text_snippet is None:
+            return summary
+        return f"{summary} | text={self.text_snippet}"
 
     def geometry_bounds(self) -> _BBox | None:
         if self.bbox is not None:
@@ -368,9 +374,69 @@ def _parse_entities(
                 end=_point(item.get("end")),
                 cue=_cue_style(entity_review_state, entity_confidence_score),
                 confidence_score=entity_confidence_score,
+                text_snippet=_entity_text_snippet(item, kind),
             )
         )
     return tuple(entities)
+
+
+def _entity_text_snippet(entity: Mapping[str, object], kind: str) -> str | None:
+    if kind.strip().lower() != "text":
+        return None
+
+    for candidate in (
+        _mapping_text_value(entity),
+        _mapping_text_value(entity.get("geometry")),
+        _mapping_text_value(entity.get("properties")),
+    ):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _mapping_text_value(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+
+    for key in ("text", "content", "value"):
+        raw = value.get(key)
+        if not isinstance(raw, str):
+            continue
+        snippet = _normalize_text_snippet(raw)
+        if snippet is not None:
+            return snippet
+    return None
+
+
+def _normalize_text_snippet(value: str) -> str | None:
+    collapsed_characters: list[str] = []
+    pending_space = False
+
+    for character in value:
+        if character.isprintable() and not character.isspace():
+            if pending_space and collapsed_characters:
+                collapsed_characters.append(" ")
+                if len(collapsed_characters) > _TEXT_SNIPPET_MAX_LENGTH:
+                    break
+            collapsed_characters.append(character)
+            if len(collapsed_characters) > _TEXT_SNIPPET_MAX_LENGTH:
+                break
+            pending_space = False
+            continue
+
+        if collapsed_characters:
+            pending_space = True
+
+    collapsed = "".join(collapsed_characters)
+    if not collapsed:
+        return None
+    if len(collapsed) <= _TEXT_SNIPPET_MAX_LENGTH:
+        return collapsed
+
+    head = collapsed[: _TEXT_SNIPPET_MAX_LENGTH - len(_TEXT_SNIPPET_ELLIPSIS)].rstrip()
+    if not head:
+        return _TEXT_SNIPPET_ELLIPSIS
+    return f"{head}{_TEXT_SNIPPET_ELLIPSIS}"
 
 
 def _group_entities_by_layout(

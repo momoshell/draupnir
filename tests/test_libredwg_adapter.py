@@ -330,7 +330,9 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
                     {
                         "type": "LINE",
                         "handle": "1A",
+                        "layout": "Sheet-A1",
                         "layer": "Walls",
+                        "block": "Door-Block",
                         "start": {"x": 1, "y": 2, "z": 0},
                         "end": {"x": 4, "y": 6, "z": 0},
                     }
@@ -363,7 +365,9 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert output_path.parent != _FIXTURE_PATH.parent
     assert payload.canonical_json["metadata"]["adapter_mode"] == "dwgread_json_v0_1"
     assert "empty_entities_reason" not in payload.canonical_json["metadata"]
+    assert payload.canonical_json["layouts"] == [{"name": "Model"}, {"name": "Sheet-A1"}]
     assert payload.canonical_json["layers"] == [{"name": "Walls"}]
+    assert payload.canonical_json["blocks"] == [{"name": "Door-Block"}]
 
     entities = cast(list[dict[str, Any]], payload.canonical_json["entities"])
     assert len(entities) == 1
@@ -372,15 +376,15 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert entity["entity_type"] == "line"
     assert entity["entity_schema_version"] == "0.1"
     assert entity["source_entity_handle"] == "1A"
-    assert entity["layout_name"] == "Model"
+    assert entity["layout_name"] == "Sheet-A1"
     assert entity["layer_name"] == "Walls"
-    assert entity["block_name"] is None
+    assert entity["block_name"] == "Door-Block"
     assert entity["parent_entity_id"] is None
     assert entity["drawing_revision_id"] is None
     assert entity["source_file_id"] is None
-    assert entity["layout_ref"] is None
-    assert entity["layer_ref"] is None
-    assert entity["block_ref"] is None
+    assert entity["layout_ref"] == "Sheet-A1"
+    assert entity["layer_ref"] == "Walls"
+    assert entity["block_ref"] == "Door-Block"
     assert entity["parent_entity_ref"] is None
     assert entity["bbox"] == {
         "min": {"x": 1.0, "y": 2.0, "z": 0.0},
@@ -428,8 +432,8 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
             "record_type": "LINE",
             "handle": "1A",
             "layer_name": "Walls",
-            "layout_name": "Model",
-            "block_name": None,
+            "layout_name": "Sheet-A1",
+            "block_name": "Door-Block",
             "geometry": {
                 "start": {"x": 1.0, "y": 2.0, "z": 0.0},
                 "end": {"x": 4.0, "y": 6.0, "z": 0.0},
@@ -501,6 +505,55 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
     assert validation.review_state == "review_required"
     assert validation.quantity_gate == "review_gated"
     assert not any(finding.get("check_key") == "placeholder_semantics" for finding in findings)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_emits_deterministic_top_level_layouts_and_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layout": "Sheet-B1",
+                        "layer": "Walls",
+                        "block": "Door-Block",
+                        "start": {"x": 1, "y": 2, "z": 0},
+                        "end": {"x": 4, "y": 6, "z": 0},
+                    },
+                    {
+                        "type": "HATCH",
+                        "handle": "20",
+                        "layout": "Sheet-A1",
+                        "layer": "Unsupported",
+                        "block": "Anchor-Block",
+                    },
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    assert result.canonical["layouts"] == (
+        {"name": "Model"},
+        {"name": "Sheet-A1"},
+        {"name": "Sheet-B1"},
+    )
+    assert result.canonical["blocks"] == (
+        {"name": "Anchor-Block"},
+        {"name": "Door-Block"},
+    )
 
 
 @pytest.mark.asyncio
@@ -1101,7 +1154,9 @@ async def test_libredwg_adapter_maps_circle_entities_into_canonical_payload(
                     {
                         "type": "CIRCLE",
                         "handle": "2A",
+                        "layout": "Detail-01",
                         "layer": "Curves",
+                        "block": "Valve-Block",
                         "center": {"x": 5, "y": 7, "z": 0},
                         "radius": 2.5,
                     }
@@ -1122,6 +1177,9 @@ async def test_libredwg_adapter_maps_circle_entities_into_canonical_payload(
 
     assert entity["entity_id"] == "libredwg-circle-2a"
     assert entity["entity_type"] == "circle"
+    assert entity["layout_ref"] == "Detail-01"
+    assert entity["layer_ref"] == "Curves"
+    assert entity["block_ref"] == "Valve-Block"
     assert entity["bbox"] == {
         "min": {"x": 2.5, "y": 4.5, "z": 0.0},
         "max": {"x": 7.5, "y": 9.5, "z": 0.0},
@@ -1167,8 +1225,8 @@ async def test_libredwg_adapter_maps_circle_entities_into_canonical_payload(
             "record_type": "CIRCLE",
             "handle": "2A",
             "layer_name": "Curves",
-            "layout_name": "Model",
-            "block_name": None,
+            "layout_name": "Detail-01",
+            "block_name": "Valve-Block",
             "geometry": {
                 "center": {"x": 5.0, "y": 7.0, "z": 0.0},
                 "radius": 2.5,
@@ -1224,6 +1282,9 @@ async def test_libredwg_adapter_maps_arc_entities_into_canonical_payload(
 
     assert entity["entity_id"] == "libredwg-arc-2b"
     assert entity["entity_type"] == "arc"
+    assert entity["layout_ref"] == "Model"
+    assert entity["layer_ref"] == "Curves"
+    assert entity["block_ref"] is None
     assert entity["center"] == {"x": 10.0, "y": 20.0, "z": 0.0}
     assert entity["radius"] == 5.0
     assert entity["start_angle_degrees"] == 45.0
@@ -1298,6 +1359,9 @@ async def test_libredwg_adapter_maps_lwpolyline_entities_into_canonical_payload(
 
     assert entity["entity_id"] == "libredwg-polyline-2c"
     assert entity["entity_type"] == "polyline"
+    assert entity["layout_ref"] == "Model"
+    assert entity["layer_ref"] == "Perimeter"
+    assert entity["block_ref"] is None
     assert entity["bbox"] == {
         "min": {"x": 0.0, "y": 0.0, "z": 0.0},
         "max": {"x": 3.0, "y": 4.0, "z": 0.0},
@@ -1742,7 +1806,13 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
                 "OBJECTS": [
                     {"type": "DICTIONARY", "handle": "10"},
                     {"type": "LAYER", "name": "Model"},
-                    {"type": "HATCH", "handle": "20", "layer": "Unsupported"},
+                    {
+                        "type": "HATCH",
+                        "handle": "20",
+                        "layout": "Sheet-H1",
+                        "layer": "Unsupported",
+                        "block": "Hatch-Block",
+                    },
                 ]
             }
         ),
@@ -1760,15 +1830,15 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
     assert entities[0]["entity_type"] == "unknown"
     assert entities[0]["entity_schema_version"] == "0.1"
     assert entities[0]["source_entity_handle"] == "20"
-    assert entities[0]["layout_name"] == "Model"
+    assert entities[0]["layout_name"] == "Sheet-H1"
     assert entities[0]["layer_name"] == "Unsupported"
-    assert entities[0]["block_name"] is None
+    assert entities[0]["block_name"] == "Hatch-Block"
     assert entities[0]["parent_entity_id"] is None
     assert entities[0]["drawing_revision_id"] is None
     assert entities[0]["source_file_id"] is None
-    assert entities[0]["layout_ref"] is None
-    assert entities[0]["layer_ref"] is None
-    assert entities[0]["block_ref"] is None
+    assert entities[0]["layout_ref"] == "Sheet-H1"
+    assert entities[0]["layer_ref"] == "Unsupported"
+    assert entities[0]["block_ref"] == "Hatch-Block"
     assert entities[0]["parent_entity_ref"] is None
     assert entities[0]["bbox"] is None
     assert entities[0]["geometry"] == {
@@ -1798,8 +1868,8 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
             "record_type": "HATCH",
             "handle": "20",
             "layer_name": "Unsupported",
-            "layout_name": "Model",
-            "block_name": None,
+            "layout_name": "Sheet-H1",
+            "block_name": "Hatch-Block",
         }
     )
     assert (
@@ -1844,6 +1914,8 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "review_required": True,
         "basis": "unsupported_drawable_record",
     }
+    assert result.canonical["layouts"] == ({"name": "Model"}, {"name": "Sheet-H1"})
+    assert result.canonical["blocks"] == ({"name": "Hatch-Block"},)
     _assert_score_within_libredwg_descriptor_range(entities[0]["confidence"]["score"])
     assert entities[0]["unknown_reason"] == "unsupported_drawable_record"
     assert [warning.code for warning in result.warnings] == [
@@ -1885,6 +1957,9 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
     assert len(entities) == 1
     assert entities[0]["entity_id"] == "libredwg-unknown-99"
     assert entities[0]["entity_type"] == "unknown"
+    assert entities[0]["layout_ref"] == "Model"
+    assert entities[0]["layer_ref"] == "Broken"
+    assert entities[0]["block_ref"] is None
     assert entities[0]["geometry"] == {
         "bbox": None,
         "units": {"normalized": "unknown"},

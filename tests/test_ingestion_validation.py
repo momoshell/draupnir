@@ -74,6 +74,7 @@ def _with_valid_provenance(entity: Mapping[str, JSONValue], *, index: int) -> di
 def _build_complete_canonical(
     *,
     entities: tuple[Mapping[str, JSONValue], ...] | None = None,
+    layers: tuple[Mapping[str, JSONValue], ...] | None = None,
     geometry_validity: JSONValue | None = None,
     pdf_scale: JSONValue | None = None,
     ifc_schema: str | None = None,
@@ -88,6 +89,9 @@ def _build_complete_canonical(
         },
     )
     source_entities = entities if entities is not None else default_entities
+    source_layers: tuple[Mapping[str, JSONValue], ...] = (
+        layers if layers is not None else ({"name": "A-WALL"},)
+    )
     canonical_entities = tuple(
         _with_valid_provenance(entity, index=index)
         for index, entity in enumerate(source_entities, start=1)
@@ -96,7 +100,7 @@ def _build_complete_canonical(
         "units": {"normalized": "meter"},
         "coordinate_system": {"name": "local"},
         "layouts": ({"name": "Model"},),
-        "layers": ({"name": "A-WALL"},),
+        "layers": source_layers,
         "blocks": (),
         "entities": canonical_entities,
         "xrefs": xrefs,
@@ -350,6 +354,127 @@ def test_build_validation_outcome_emits_required_checks_in_deterministic_order()
     }
     assert checks[8]["details"] == {"applicable": False}
     assert checks[9]["details"] == {"applicable": False}
+
+
+@pytest.mark.parametrize(
+    ("entity", "layers"),
+    [
+        (
+            {
+                "kind": "line",
+                "layer_ref": "layer-a-wall",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"ref": "layer-a-wall", "name": "A-WALL"},),
+        ),
+        (
+            {
+                "kind": "line",
+                "layer_ref": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"name": "A-WALL"},),
+        ),
+        (
+            {
+                "kind": "line",
+                "layer": "A-WALL",
+                "layer_ref": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"name": "A-WALL"},),
+        ),
+        (
+            {
+                "kind": "line",
+                "layer_name": "A-WALL",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"name": "A-WALL"},),
+        ),
+    ],
+)
+def test_build_validation_outcome_accepts_declared_canonical_layer_identifiers(
+    entity: Mapping[str, JSONValue],
+    layers: tuple[Mapping[str, JSONValue], ...],
+) -> None:
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=(entity,),
+            layers=layers,
+            geometry_validity="valid",
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    layer_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "layer_mapping_completeness"
+    ]
+
+    assert layer_check["status"] == "pass"
+    assert outcome.validation_status == "valid"
+    assert outcome.review_state == "approved"
+    assert outcome.quantity_gate == "allowed"
+
+
+@pytest.mark.parametrize(
+    ("entity", "layers", "expected_missing"),
+    [
+        (
+            {
+                "kind": "line",
+                "layer_ref": "layer-a-wall",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"ref": "layer-other", "name": "A-WALL"},),
+            ["layer-a-wall"],
+        ),
+        (
+            {
+                "kind": "line",
+                "layer_name": "A-DOOR",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 1.0, "y": 0.0},
+            },
+            ({"name": "A-WALL"},),
+            ["A-DOOR"],
+        ),
+    ],
+)
+def test_build_validation_outcome_reports_missing_canonical_layer_identifiers(
+    entity: Mapping[str, JSONValue],
+    layers: tuple[Mapping[str, JSONValue], ...],
+    expected_missing: list[str],
+) -> None:
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=(entity,),
+            layers=layers,
+            geometry_validity="valid",
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    layer_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "layer_mapping_completeness"
+    ]
+
+    assert layer_check["status"] == "review_required"
+    assert layer_check["details"]["missing_layers"] == expected_missing
+    assert outcome.validation_status == "needs_review"
+    assert outcome.review_state == "review_required"
+    assert outcome.quantity_gate == "review_gated"
 
 
 def test_build_validation_outcome_minimal_dxf_requires_review_for_missing_mvp_checks() -> None:

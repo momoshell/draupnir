@@ -448,20 +448,51 @@ def _build_layer_mapping_check(
         _metadata_candidate(canonical_json, "layer_mapping"),
         _metadata_candidate(canonical_json, "layer_map"),
     )
-    used_layers = {
-        str(layer).strip()
-        for entity in entities
-        for layer in [entity.get("layer")]
-        if isinstance(layer, str) and layer.strip()
-    }
-    declared_layers = {
-        str(name).strip()
-        for layer in _sequence_mappings(canonical_json.get("layers"))
-        for name in [layer.get("name")]
-        if isinstance(name, str) and name.strip()
-    }
+    used_layer_names: set[str] = set()
+    used_layer_refs: set[str] = set()
+    for entity in entities:
+        for layer_name in (entity.get("layer"), entity.get("layer_name")):
+            if isinstance(layer_name, str):
+                normalized_name = layer_name.strip()
+                if normalized_name:
+                    used_layer_names.add(normalized_name)
+        layer_ref = entity.get("layer_ref")
+        if isinstance(layer_ref, str):
+            normalized_ref = layer_ref.strip()
+            if normalized_ref:
+                used_layer_refs.add(normalized_ref)
+
+    declared_layer_names: set[str] = set()
+    declared_layer_refs: set[str] = set()
+    declared_layer_ref_fallbacks: set[str] = set()
+    for layer in _sequence_mappings(canonical_json.get("layers")):
+        layer_names: set[str] = set()
+        layer_refs: set[str] = set()
+        for layer_name in (layer.get("name"), layer.get("layer_name")):
+            if isinstance(layer_name, str):
+                normalized_name = layer_name.strip()
+                if normalized_name:
+                    layer_names.add(normalized_name)
+        for layer_ref in (layer.get("ref"), layer.get("layer_ref")):
+            if isinstance(layer_ref, str):
+                normalized_ref = layer_ref.strip()
+                if normalized_ref:
+                    layer_refs.add(normalized_ref)
+
+        declared_layer_names.update(layer_names)
+        declared_layer_refs.update(layer_refs)
+        if not layer_refs:
+            declared_layer_ref_fallbacks.update(layer_names)
+
+    used_layers = used_layer_names | used_layer_refs
+    declared_layers = declared_layer_names | declared_layer_refs
     missing_layers = (
-        sorted(used_layers - declared_layers) if declared_layers else sorted(used_layers)
+        sorted(
+            (used_layer_names - declared_layer_names)
+            | (used_layer_refs - (declared_layer_refs | declared_layer_ref_fallbacks))
+        )
+        if declared_layers
+        else sorted(used_layers)
     )
 
     if layer_mapping_hint is True:

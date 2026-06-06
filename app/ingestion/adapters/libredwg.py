@@ -597,7 +597,9 @@ def _build_canonical_output(
     run_result: _DwgreadRunResult,
 ) -> _CanonicalBuildResult:
     entities: list[JSONValue] = []
+    layouts_seen: set[str] = {_DEFAULT_LAYOUT_NAME}
     layers_seen: set[str] = set()
+    blocks_seen: set[str] = set()
     supported_geometry_count = 0
     supported_line_count = 0
     supported_text_count = 0
@@ -619,19 +621,25 @@ def _build_canonical_output(
             line_entity = _build_line_entity(record)
             if line_entity is not None:
                 entities.append(line_entity)
+                _collect_observed_collection_refs(
+                    line_entity,
+                    layouts_seen=layouts_seen,
+                    layers_seen=layers_seen,
+                    blocks_seen=blocks_seen,
+                )
                 supported_geometry_count += 1
                 supported_line_count += 1
-                layer_name = cast(str | None, line_entity.get("layer_name"))
-                if layer_name:
-                    layers_seen.add(layer_name)
                 continue
 
             malformed_drawable_count += 1
             unknown_entity = _build_unknown_entity(record, reason="malformed_line_geometry")
             entities.append(unknown_entity)
-            layer_name = cast(str | None, unknown_entity.get("layer_name"))
-            if layer_name:
-                layers_seen.add(layer_name)
+            _collect_observed_collection_refs(
+                unknown_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
             handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if handle is not None:
                 malformed_handles.add(handle)
@@ -641,18 +649,24 @@ def _build_canonical_output(
             circle_entity = _build_circle_entity(record)
             if circle_entity is not None:
                 entities.append(circle_entity)
+                _collect_observed_collection_refs(
+                    circle_entity,
+                    layouts_seen=layouts_seen,
+                    layers_seen=layers_seen,
+                    blocks_seen=blocks_seen,
+                )
                 supported_geometry_count += 1
-                layer_name = cast(str | None, circle_entity.get("layer_name"))
-                if layer_name:
-                    layers_seen.add(layer_name)
                 continue
 
             malformed_drawable_count += 1
             unknown_entity = _build_unknown_entity(record, reason="malformed_circle_geometry")
             entities.append(unknown_entity)
-            layer_name = cast(str | None, unknown_entity.get("layer_name"))
-            if layer_name:
-                layers_seen.add(layer_name)
+            _collect_observed_collection_refs(
+                unknown_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
             handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if handle is not None:
                 malformed_handles.add(handle)
@@ -662,18 +676,24 @@ def _build_canonical_output(
             arc_entity = _build_arc_entity(record)
             if arc_entity is not None:
                 entities.append(arc_entity)
+                _collect_observed_collection_refs(
+                    arc_entity,
+                    layouts_seen=layouts_seen,
+                    layers_seen=layers_seen,
+                    blocks_seen=blocks_seen,
+                )
                 supported_geometry_count += 1
-                layer_name = cast(str | None, arc_entity.get("layer_name"))
-                if layer_name:
-                    layers_seen.add(layer_name)
                 continue
 
             malformed_drawable_count += 1
             unknown_entity = _build_unknown_entity(record, reason="malformed_arc_geometry")
             entities.append(unknown_entity)
-            layer_name = cast(str | None, unknown_entity.get("layer_name"))
-            if layer_name:
-                layers_seen.add(layer_name)
+            _collect_observed_collection_refs(
+                unknown_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
             handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if handle is not None:
                 malformed_handles.add(handle)
@@ -683,18 +703,24 @@ def _build_canonical_output(
             polyline_entity = _build_lwpolyline_entity(record)
             if polyline_entity is not None:
                 entities.append(polyline_entity)
+                _collect_observed_collection_refs(
+                    polyline_entity,
+                    layouts_seen=layouts_seen,
+                    layers_seen=layers_seen,
+                    blocks_seen=blocks_seen,
+                )
                 supported_geometry_count += 1
-                layer_name = cast(str | None, polyline_entity.get("layer_name"))
-                if layer_name:
-                    layers_seen.add(layer_name)
                 continue
 
             malformed_drawable_count += 1
             unknown_entity = _build_unknown_entity(record, reason="malformed_lwpolyline_geometry")
             entities.append(unknown_entity)
-            layer_name = cast(str | None, unknown_entity.get("layer_name"))
-            if layer_name:
-                layers_seen.add(layer_name)
+            _collect_observed_collection_refs(
+                unknown_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
             handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if handle is not None:
                 malformed_handles.add(handle)
@@ -703,19 +729,25 @@ def _build_canonical_output(
         if record_type == "MTEXT":
             text_entity = _build_text_entity(record)
             entities.append(text_entity)
+            _collect_observed_collection_refs(
+                text_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
             supported_text_count += 1
-            layer_name = cast(str | None, text_entity.get("layer_name"))
-            if layer_name:
-                layers_seen.add(layer_name)
             continue
 
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
         unknown_entity = _build_unknown_entity(record, reason="unsupported_drawable_record")
         entities.append(unknown_entity)
-        layer_name = cast(str | None, unknown_entity.get("layer_name"))
-        if layer_name:
-            layers_seen.add(layer_name)
+        _collect_observed_collection_refs(
+            unknown_entity,
+            layouts_seen=layouts_seen,
+            layers_seen=layers_seen,
+            blocks_seen=blocks_seen,
+        )
 
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
@@ -800,9 +832,9 @@ def _build_canonical_output(
             "type": "cartesian",
             "source": "libredwg_dwgread_json",
         },
-        "layouts": ({"name": _DEFAULT_LAYOUT_NAME},),
+        "layouts": tuple({"name": layout_name} for layout_name in sorted(layouts_seen)),
         "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
-        "blocks": (),
+        "blocks": tuple({"name": block_name} for block_name in sorted(blocks_seen)),
         "entities": tuple(entities),
         "xrefs": (),
         "metadata": metadata,
@@ -817,6 +849,26 @@ def _build_canonical_output(
             basis=confidence_basis,
         ),
     )
+
+
+def _collect_observed_collection_refs(
+    entity: Mapping[str, Any],
+    *,
+    layouts_seen: set[str],
+    layers_seen: set[str],
+    blocks_seen: set[str],
+) -> None:
+    layout_name = cast(str | None, entity.get("layout_name"))
+    if layout_name:
+        layouts_seen.add(layout_name)
+
+    layer_name = cast(str | None, entity.get("layer_name"))
+    if layer_name:
+        layers_seen.add(layer_name)
+
+    block_name = cast(str | None, entity.get("block_name"))
+    if block_name:
+        blocks_seen.add(block_name)
 
 
 def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
@@ -950,9 +1002,9 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
         "parent_entity_id": None,
         "drawing_revision_id": None,
         "source_file_id": None,
-        "layout_ref": None,
-        "layer_ref": None,
-        "block_ref": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": block_name,
         "parent_entity_ref": None,
         "bbox": bbox,
         "geometry": {
@@ -1391,9 +1443,9 @@ def _build_supported_geometry_entity(
         "parent_entity_id": None,
         "drawing_revision_id": None,
         "source_file_id": None,
-        "layout_ref": None,
-        "layer_ref": None,
-        "block_ref": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": block_name,
         "parent_entity_ref": None,
         "bbox": bbox,
         "geometry": geometry,
@@ -1454,9 +1506,9 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
         "parent_entity_id": None,
         "drawing_revision_id": None,
         "source_file_id": None,
-        "layout_ref": None,
-        "layer_ref": None,
-        "block_ref": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": block_name,
         "parent_entity_ref": None,
         "bbox": None,
         "geometry": {

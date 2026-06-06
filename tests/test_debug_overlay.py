@@ -4,14 +4,36 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterator
 
 from app.ingestion.contracts import JSONValue
 from app.ingestion.debug_overlay import (
     SVG_DEBUG_OVERLAY_FILENAME,
     SVG_DEBUG_OVERLAY_MEDIA_TYPE,
+    _normalize_text_snippet,
     plan_svg_debug_overlay,
 )
 from app.storage.keys import build_generated_artifact_storage_key
+
+
+class _GuardedLongText(str):
+    __slots__ = ("iterated", "max_iterated")
+
+    max_iterated: int
+    iterated: int
+
+    def __new__(cls, value: str, *, max_iterated: int) -> _GuardedLongText:
+        instance = super().__new__(cls, value)
+        instance.max_iterated = max_iterated
+        instance.iterated = 0
+        return instance
+
+    def __iter__(self) -> Iterator[str]:
+        for character in str.__iter__(self):
+            self.iterated += 1
+            if self.iterated > self.max_iterated:
+                raise AssertionError("text normalization iterated past the guarded limit")
+            yield character
 
 
 def test_build_generated_artifact_storage_key_uses_artifact_namespace() -> None:
@@ -299,6 +321,108 @@ def test_plan_svg_debug_overlay_escapes_title_source_layout_and_entity_metadata(
     assert 'Debug <Overlay> "Phase" & Check debug overlay' not in payload
     assert 'Layout: Model <A>&"B" | Page: 2' not in payload
     assert 'entity<1>&"2" | line<kind>&"shape" | review<state>&"needed" | 0.51' not in payload
+
+
+def test_plan_svg_debug_overlay_adds_sanitized_text_snippets_only_for_text_entities() -> None:
+    """Canonical text entities should expose bounded normalized snippets in summaries."""
+    canonical: dict[str, JSONValue] = {
+        "layouts": ({"name": "Model"},),
+        "entities": (
+            {
+                "entity_id": "text-top-level",
+                "kind": "text",
+                "layout": "Model",
+                "text": "Panel\tA\nZone\x00North",
+                "bbox": {
+                    "x_min": 1.0,
+                    "y_min": 1.0,
+                    "x_max": 2.0,
+                    "y_max": 2.0,
+                },
+                "review_state": "approved",
+                "confidence_score": 0.96,
+            },
+            {
+                "entity_id": "text-geometry",
+                "kind": "text",
+                "layout": "Model",
+                "geometry": {"content": "Door\nTag"},
+                "bbox": {
+                    "x_min": 3.0,
+                    "y_min": 3.0,
+                    "x_max": 4.0,
+                    "y_max": 4.0,
+                },
+                "review_state": "provisional",
+                "confidence_score": 0.75,
+            },
+            {
+                "entity_id": "text-properties",
+                "kind": "text",
+                "layout": "Model",
+                "properties": {"value": "Window 01"},
+                "bbox": {
+                    "x_min": 5.0,
+                    "y_min": 5.0,
+                    "x_max": 6.0,
+                    "y_max": 6.0,
+                },
+                "review_state": "provisional",
+                "confidence_score": 0.61,
+            },
+            {
+                "entity_id": "text-escaped",
+                "kind": "text",
+                "layout": "Model",
+                "text": "<tag>\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "bbox": {
+                    "x_min": 7.0,
+                    "y_min": 7.0,
+                    "x_max": 8.0,
+                    "y_max": 8.0,
+                },
+                "review_state": "review_required",
+                "confidence_score": 0.55,
+            },
+            {
+                "entity_id": "line-1",
+                "kind": "line",
+                "layout": "Model",
+                "start": {"x": 0.0, "y": 0.0},
+                "end": {"x": 9.0, "y": 9.0},
+                "review_state": "approved",
+                "confidence_score": 0.97,
+            },
+        ),
+    }
+
+    payload = plan_svg_debug_overlay(
+        canonical,
+        title="Debug Overlay Sample",
+        source_label="originals/plan.pdf",
+        review_state="review_required",
+        confidence_score=0.42,
+    ).payload.decode("utf-8")
+
+    assert "text-top-level | text | approved | 0.96 | text=Panel A Zone North" in payload
+    assert "text-geometry | text | provisional | 0.75 | text=Door Tag" in payload
+    assert "text-properties | text | provisional | 0.61 | text=Window 01" in payload
+    assert (
+        "text-escaped | text | review_required | 0.55 | text=&lt;tag&gt; AAAAAAAAAAAAAAAAAAAAAAA..."
+    ) in payload
+    assert "text=Panel\tA\nZone" not in payload
+    assert "line-1 | line | approved | 0.97 | text=" not in payload
+
+
+def test_normalize_text_snippet_stops_after_snippet_budget_for_large_text() -> None:
+    """Large text snippets should normalize lazily once truncation is known."""
+    guarded = _GuardedLongText(
+        ("A" * 29) + "\n\t" + ("B" * 4096),
+        max_iterated=80,
+    )
+
+    assert _normalize_text_snippet(guarded) == f"{'A' * 29}..."
+    assert guarded.iterated <= 40
 
 
 def test_plan_svg_debug_overlay_degrades_invalid_geometry_to_placeholder_without_nan_or_inf() -> (
