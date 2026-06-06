@@ -80,6 +80,8 @@ If you need a committed fixture or a manifest entry for a proprietary sample, st
 
 Record only safe, non-sensitive notes.
 
+For a reusable comparison template, use [Local DWG/PDF extraction comparison checklist](./local-dwg-pdf-extraction-comparison-checklist.md) after you inspect the validation report, entities, and any local debug overlay.
+
 ### 1. Units and scale
 
 - Did the extracted units match the drawing expectation?
@@ -136,5 +138,6 @@ DWG, vector PDF, and especially raster PDF inputs may remain review-gated or blo
 
 - [README](../README.md)
 - [tests/fixtures/README.md](../tests/fixtures/README.md)
+- [Local DWG/PDF extraction comparison checklist](./local-dwg-pdf-extraction-comparison-checklist.md)
 - [Architecture](./ARCHITECTURE.md)
 - [Technical requirements](./TRD.md)
