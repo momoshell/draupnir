@@ -11,6 +11,7 @@ import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -60,6 +61,10 @@ _MIXED_ENTITY_CONFIDENCE_SCORE = 0.5
 _UNKNOWN_ENTITY_CONFIDENCE_SCORE = 0.2
 _DEFAULT_LAYOUT_NAME = "Model"
 _WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
+_SUPPORTED_LWPOLYLINE_FLAG_MASK = 0b1
+_SUPPORTED_ARC_ANGLE_UNIT_TOKENS = frozenset({"deg", "degree", "degrees"})
+_SUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"ccw", "counterclockwise"})
+_UNSUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"cw", "clockwise"})
 _NON_DRAWABLE_OBJECT_TYPES = frozenset(
     {
         "APPID",
@@ -217,6 +222,14 @@ class LibreDWGAdapter(IngestionAdapter):
         }
         if run_result.output_key_count is not None:
             diagnostic_details["output_key_count"] = run_result.output_key_count
+        entity_counts = _diagnostic_entity_counts(canonical_result.canonical)
+        if entity_counts is not None:
+            diagnostic_details["entity_counts"] = entity_counts
+        diagnostic_details["mapping_confidence"] = {
+            "score": canonical_result.confidence.score,
+            "review_required": canonical_result.confidence.review_required,
+            "basis": canonical_result.confidence.basis,
+        }
 
         return AdapterResult(
             canonical=canonical_result.canonical,
@@ -585,6 +598,7 @@ def _build_canonical_output(
 ) -> _CanonicalBuildResult:
     entities: list[JSONValue] = []
     layers_seen: set[str] = set()
+    supported_geometry_count = 0
     supported_line_count = 0
     supported_text_count = 0
     unsupported_drawable_count = 0
@@ -605,6 +619,7 @@ def _build_canonical_output(
             line_entity = _build_line_entity(record)
             if line_entity is not None:
                 entities.append(line_entity)
+                supported_geometry_count += 1
                 supported_line_count += 1
                 layer_name = cast(str | None, line_entity.get("layer_name"))
                 if layer_name:
@@ -613,6 +628,69 @@ def _build_canonical_output(
 
             malformed_drawable_count += 1
             unknown_entity = _build_unknown_entity(record, reason="malformed_line_geometry")
+            entities.append(unknown_entity)
+            layer_name = cast(str | None, unknown_entity.get("layer_name"))
+            if layer_name:
+                layers_seen.add(layer_name)
+            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
+        if record_type == "CIRCLE":
+            circle_entity = _build_circle_entity(record)
+            if circle_entity is not None:
+                entities.append(circle_entity)
+                supported_geometry_count += 1
+                layer_name = cast(str | None, circle_entity.get("layer_name"))
+                if layer_name:
+                    layers_seen.add(layer_name)
+                continue
+
+            malformed_drawable_count += 1
+            unknown_entity = _build_unknown_entity(record, reason="malformed_circle_geometry")
+            entities.append(unknown_entity)
+            layer_name = cast(str | None, unknown_entity.get("layer_name"))
+            if layer_name:
+                layers_seen.add(layer_name)
+            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
+        if record_type == "ARC":
+            arc_entity = _build_arc_entity(record)
+            if arc_entity is not None:
+                entities.append(arc_entity)
+                supported_geometry_count += 1
+                layer_name = cast(str | None, arc_entity.get("layer_name"))
+                if layer_name:
+                    layers_seen.add(layer_name)
+                continue
+
+            malformed_drawable_count += 1
+            unknown_entity = _build_unknown_entity(record, reason="malformed_arc_geometry")
+            entities.append(unknown_entity)
+            layer_name = cast(str | None, unknown_entity.get("layer_name"))
+            if layer_name:
+                layers_seen.add(layer_name)
+            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
+        if record_type == "LWPOLYLINE":
+            polyline_entity = _build_lwpolyline_entity(record)
+            if polyline_entity is not None:
+                entities.append(polyline_entity)
+                supported_geometry_count += 1
+                layer_name = cast(str | None, polyline_entity.get("layer_name"))
+                if layer_name:
+                    layers_seen.add(layer_name)
+                continue
+
+            malformed_drawable_count += 1
+            unknown_entity = _build_unknown_entity(record, reason="malformed_lwpolyline_geometry")
             entities.append(unknown_entity)
             layer_name = cast(str | None, unknown_entity.get("layer_name"))
             if layer_name:
@@ -650,7 +728,9 @@ def _build_canonical_output(
         },
         "entity_counts": {
             "drawable_candidates": drawable_candidate_count,
+            "supported_geometry": supported_geometry_count,
             "supported_lines": supported_line_count,
+            "supported_text": supported_text_count,
             "unsupported_drawables": unsupported_drawable_count,
             "malformed_drawables": malformed_drawable_count,
         },
@@ -685,16 +765,22 @@ def _build_canonical_output(
             )
         )
 
-    has_supported_drawable_count = supported_line_count + supported_text_count
+    has_supported_drawable_count = supported_geometry_count + supported_text_count
     has_mixed_entity_outcomes = has_supported_drawable_count > 0 and (
         unsupported_drawable_count > 0 or malformed_drawable_count > 0
     )
     if has_mixed_entity_outcomes:
         confidence_score = _MIXED_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_mixed_entity_mapping"
-    elif supported_line_count > 0:
+    elif supported_geometry_count > 0 and supported_text_count > 0:
+        confidence_score = _LINE_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_geometry_text_mapping"
+    elif supported_line_count > 0 and supported_line_count == supported_geometry_count:
         confidence_score = _LINE_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_line_mapping"
+    elif supported_geometry_count > 0:
+        confidence_score = _LINE_ENTITY_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_geometry_mapping"
     elif supported_text_count > 0:
         confidence_score = _TEXT_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_text_mapping"
@@ -731,6 +817,29 @@ def _build_canonical_output(
             basis=confidence_basis,
         ),
     )
+
+
+def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
+    metadata = _mapping_get(canonical, "metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    counts = _mapping_get(metadata, "entity_counts")
+    if not isinstance(counts, Mapping):
+        return None
+
+    sanitized_counts: _JSONDict = {}
+    for key in (
+        "drawable_candidates",
+        "supported_geometry",
+        "supported_lines",
+        "supported_text",
+        "unsupported_drawables",
+        "malformed_drawables",
+    ):
+        value = _mapping_get(counts, key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            sanitized_counts[key] = value
+    return sanitized_counts or None
 
 
 def _units_unconfirmed_warning() -> AdapterWarning:
@@ -986,6 +1095,304 @@ def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
     }
 
 
+def _build_circle_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+    center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
+    radius = _extract_positive_float(record, "radius")
+    if center_point is None or radius is None:
+        return None
+    if not _point_is_finite(center_point):
+        return None
+
+    center = _point_json(center_point)
+    bbox = _bbox_from_points(
+        (
+            (center_point[0] - radius, center_point[1] - radius, center_point[2]),
+            (center_point[0] + radius, center_point[1] + radius, center_point[2]),
+        )
+    )
+    circumference = 2.0 * math.pi * radius
+    diameter = 2.0 * radius
+    area = math.pi * radius * radius
+    if bbox is None or not _floats_are_finite(circumference, diameter, area):
+        return None
+    geometry_summary: _JSONDict = {
+        "kind": "circle",
+        "radius": radius,
+        "diameter": diameter,
+        "circumference": circumference,
+    }
+
+    return _build_supported_geometry_entity(
+        record,
+        record_type="CIRCLE",
+        entity_type="circle",
+        bbox=bbox,
+        geometry_projection={
+            "center": center,
+            "radius": radius,
+        },
+        geometry={
+            "center": center,
+            "radius": radius,
+            "bbox": bbox,
+            "units": {"normalized": "unknown"},
+            "geometry_summary": geometry_summary,
+        },
+        properties={
+            "source_type": "CIRCLE",
+            "quantity_hints": {
+                "length": circumference,
+                "area": area,
+                "count": 1.0,
+            },
+        },
+        confidence_basis="libredwg_circle_mapping_units_unconfirmed",
+        extra_fields={
+            "kind": "circle",
+            "center": center,
+            "radius": radius,
+            "diameter": diameter,
+        },
+    )
+
+
+def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+    center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
+    radius = _extract_positive_float(record, "radius")
+    if not _record_uses_supported_arc_angles(record):
+        return None
+    start_angle = _extract_angle_degrees(record, "start_angle", "startangle")
+    end_angle = _extract_angle_degrees(record, "end_angle", "endangle")
+    if center_point is None or radius is None or start_angle is None or end_angle is None:
+        return None
+    if not _point_is_finite(center_point):
+        return None
+
+    sweep_degrees = _arc_sweep_degrees(start_angle, end_angle)
+    if sweep_degrees is None:
+        return None
+
+    center = _point_json(center_point)
+    start_point = _point_on_circle(center_point, radius, start_angle)
+    end_point = _point_on_circle(center_point, radius, end_angle)
+    if start_point is None or end_point is None:
+        return None
+    bbox = _arc_bbox(
+        center_point=center_point,
+        radius=radius,
+        start_angle_degrees=start_angle,
+        sweep_degrees=sweep_degrees,
+        start_point=start_point,
+        end_point=end_point,
+    )
+    if bbox is None:
+        return None
+    start = _point_json(start_point)
+    end = _point_json(end_point)
+    length = radius * math.radians(sweep_degrees)
+    if not _floats_are_finite(length):
+        return None
+    geometry_summary: _JSONDict = {
+        "kind": "arc",
+        "radius": radius,
+        "start_angle_degrees": start_angle,
+        "end_angle_degrees": end_angle,
+        "sweep_degrees": sweep_degrees,
+        "length": length,
+    }
+
+    return _build_supported_geometry_entity(
+        record,
+        record_type="ARC",
+        entity_type="arc",
+        bbox=bbox,
+        geometry_projection={
+            "center": center,
+            "radius": radius,
+            "start_angle_degrees": start_angle,
+            "end_angle_degrees": end_angle,
+        },
+        geometry={
+            "center": center,
+            "radius": radius,
+            "start_angle_degrees": start_angle,
+            "end_angle_degrees": end_angle,
+            "start": start,
+            "end": end,
+            "bbox": bbox,
+            "units": {"normalized": "unknown"},
+            "geometry_summary": geometry_summary,
+        },
+        properties={
+            "source_type": "ARC",
+            "quantity_hints": {
+                "length": length,
+                "count": 1.0,
+            },
+        },
+        confidence_basis="libredwg_arc_mapping_units_unconfirmed",
+        extra_fields={
+            "kind": "arc",
+            "center": center,
+            "radius": radius,
+            "start_angle_degrees": start_angle,
+            "end_angle_degrees": end_angle,
+            "start": start,
+            "end": end,
+            "length": length,
+        },
+    )
+
+
+def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+    raw_vertices = _first_value(record, "vertices", "points", "vertexes")
+    vertices = _extract_vertices(raw_vertices)
+    if len(vertices) < 2:
+        return None
+    if any(not _point_is_finite(vertex) for vertex in vertices):
+        return None
+    if _mapping_has_nondefault_zero_value(
+        record,
+        "const_width",
+        "constant_width",
+        "width",
+        "start_width",
+        "end_width",
+    ):
+        return None
+    if _mapping_has_nondefault_zero_value(record, "bulge"):
+        return None
+    if _vertices_have_nondefault_zero_value(
+        raw_vertices,
+        "bulge",
+        "width",
+        "start_width",
+        "end_width",
+        "const_width",
+        "constant_width",
+    ):
+        return None
+
+    closed = _extract_closed(record)
+    if closed is None:
+        return None
+    bbox = _bbox_from_points(vertices)
+    if bbox is None:
+        return None
+    vertex_json = tuple(_point_json(vertex) for vertex in vertices)
+    length = _polyline_length(vertices, closed=closed)
+    if length is None:
+        return None
+    geometry_summary: _JSONDict = {
+        "kind": "polyline",
+        "length": length,
+        "vertex_count": len(vertices),
+        "closed": closed,
+    }
+
+    return _build_supported_geometry_entity(
+        record,
+        record_type="LWPOLYLINE",
+        entity_type="polyline",
+        bbox=bbox,
+        geometry_projection={
+            "vertices": vertex_json,
+            "closed": closed,
+        },
+        geometry={
+            "vertices": vertex_json,
+            "closed": closed,
+            "bbox": bbox,
+            "units": {"normalized": "unknown"},
+            "geometry_summary": geometry_summary,
+        },
+        properties={
+            "source_type": "LWPOLYLINE",
+            "quantity_hints": {
+                "length": length,
+                "count": 1.0,
+            },
+        },
+        confidence_basis="libredwg_lwpolyline_mapping_units_unconfirmed",
+        extra_fields={
+            "kind": "polyline",
+            "vertices": vertex_json,
+            "closed": closed,
+            "length": length,
+        },
+    )
+
+
+def _build_supported_geometry_entity(
+    record: Mapping[str, Any],
+    *,
+    record_type: str,
+    entity_type: str,
+    bbox: _JSONDict,
+    geometry_projection: _JSONDict,
+    geometry: _JSONDict,
+    properties: _JSONDict,
+    confidence_basis: str,
+    extra_fields: _JSONDict,
+) -> _JSONDict:
+    layout_name = _extract_layout_name(record)
+    layer_name = _extract_layer_name(record)
+    block_name = _extract_block_name(record)
+    source_handle = _extract_handle(record)
+    safe_projection = _safe_record_projection(
+        record,
+        record_type=record_type,
+        geometry=geometry_projection,
+    )
+    provenance = _entity_provenance(
+        record,
+        record_type=record_type,
+        source_handle=source_handle,
+        safe_projection=safe_projection,
+        notes=("units_unconfirmed",),
+    )
+    entity_properties = {
+        "source_type": record_type,
+        "source_handle": source_handle,
+        **properties,
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": record_type,
+                "handle": source_handle,
+            }
+        },
+    }
+
+    return {
+        "entity_id": _entity_id(record, record_type=entity_type),
+        "entity_type": entity_type,
+        "entity_schema_version": _SCHEMA_VERSION,
+        **provenance,
+        "source_entity_handle": source_handle,
+        "layout_name": layout_name,
+        "layer_name": layer_name,
+        "block_name": block_name,
+        "parent_entity_id": None,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": None,
+        "layer_ref": None,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "bbox": bbox,
+        "geometry": geometry,
+        "properties": entity_properties,
+        "provenance": provenance,
+        "confidence": {
+            "score": _LINE_ENTITY_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": confidence_basis,
+        },
+        **extra_fields,
+    }
+
+
 def _extract_text_value(record: Mapping[str, Any]) -> str:
     raw_text = _first_raw_string(
         record,
@@ -1232,6 +1639,282 @@ def _point_json(point: tuple[float, float, float]) -> _JSONDict:
     return {"x": point[0], "y": point[1], "z": point[2]}
 
 
+def _bbox_from_points(points: tuple[tuple[float, float, float], ...]) -> _JSONDict | None:
+    if not points or any(not _point_is_finite(point) for point in points):
+        return None
+    bbox: _JSONDict = {
+        "min": {
+            "x": min(point[0] for point in points),
+            "y": min(point[1] for point in points),
+            "z": min(point[2] for point in points),
+        },
+        "max": {
+            "x": max(point[0] for point in points),
+            "y": max(point[1] for point in points),
+            "z": max(point[2] for point in points),
+        },
+    }
+    return bbox if _bbox_is_finite(bbox) else None
+
+
+def _extract_positive_float(record: Mapping[str, Any], *candidates: str) -> float | None:
+    value = _first_value(record, *candidates)
+    number = _coerce_float(value)
+    if number is None or not math.isfinite(number) or number <= 0.0:
+        return None
+    return number
+
+
+def _extract_angle_degrees(record: Mapping[str, Any], *candidates: str) -> float | None:
+    value = _first_value(record, *candidates)
+    angle = _coerce_float(value)
+    if angle is None or not math.isfinite(angle):
+        return None
+    return _normalize_angle_degrees(angle)
+
+
+def _normalize_angle_degrees(angle: float) -> float:
+    normalized = math.fmod(angle, 360.0)
+    if normalized < 0.0:
+        normalized += 360.0
+    if normalized == -0.0:
+        return 0.0
+    return normalized
+
+
+def _arc_sweep_degrees(start_angle_degrees: float, end_angle_degrees: float) -> float | None:
+    sweep = end_angle_degrees - start_angle_degrees
+    if sweep < 0.0:
+        sweep += 360.0
+    if sweep <= 0.0:
+        return None
+    return sweep
+
+
+def _point_on_circle(
+    center_point: tuple[float, float, float],
+    radius: float,
+    angle_degrees: float,
+) -> tuple[float, float, float] | None:
+    radians = math.radians(angle_degrees)
+    point = (
+        center_point[0] + (radius * math.cos(radians)),
+        center_point[1] + (radius * math.sin(radians)),
+        center_point[2],
+    )
+    return point if _point_is_finite(point) else None
+
+
+def _arc_bbox(
+    *,
+    center_point: tuple[float, float, float],
+    radius: float,
+    start_angle_degrees: float,
+    sweep_degrees: float,
+    start_point: tuple[float, float, float],
+    end_point: tuple[float, float, float],
+) -> _JSONDict | None:
+    bbox_points = [start_point, end_point]
+    for cardinal_angle in (0.0, 90.0, 180.0, 270.0):
+        if _angle_in_ccw_sweep(cardinal_angle, start_angle_degrees, sweep_degrees):
+            point = _point_on_circle(center_point, radius, cardinal_angle)
+            if point is None:
+                return None
+            bbox_points.append(point)
+    return _bbox_from_points(tuple(bbox_points))
+
+
+def _angle_in_ccw_sweep(candidate_angle: float, start_angle: float, sweep_degrees: float) -> bool:
+    adjusted_candidate = candidate_angle
+    while adjusted_candidate < start_angle:
+        adjusted_candidate += 360.0
+    return adjusted_candidate <= start_angle + sweep_degrees + 1e-9
+
+
+def _extract_vertices(value: Any) -> tuple[tuple[float, float, float], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    vertices: list[tuple[float, float, float]] = []
+    for item in value:
+        point = _coerce_lwpolyline_vertex(item)
+        if point is None:
+            return ()
+        vertices.append(point)
+    return tuple(vertices)
+
+
+def _mapping_has_nondefault_zero_value(record: Mapping[str, Any], *candidates: str) -> bool:
+    normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
+    for view in _record_views(record):
+        for key, value in view.items():
+            if not isinstance(key, str):
+                continue
+            if _normalize_lookup_key(key) in normalized_candidates and not _is_default_zero_value(
+                value
+            ):
+                return True
+    return False
+
+
+def _vertices_have_nondefault_zero_value(value: Any, *candidates: str) -> bool:
+    if not isinstance(value, (list, tuple)):
+        return False
+    normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        for key, field_value in item.items():
+            if not isinstance(key, str):
+                continue
+            if _normalize_lookup_key(key) in normalized_candidates and not _is_default_zero_value(
+                field_value
+            ):
+                return True
+    return False
+
+
+def _is_default_zero_value(value: Any) -> bool:
+    if value is None:
+        return True
+    number = _coerce_float(value)
+    return number is not None and math.isfinite(number) and number == 0.0
+
+
+def _extract_closed(record: Mapping[str, Any]) -> bool | None:
+    closed_value = _first_value(record, "closed", "is_closed", "closed_flag")
+    coerced_closed = _coerce_closed_boolish(closed_value)
+    if (
+        _record_has_any_key(record, "closed", "is_closed", "closed_flag")
+        and closed_value is not None
+        and coerced_closed is None
+    ):
+        return None
+
+    raw_flags_value = _first_value(record, "flags", "flag")
+    if raw_flags_value is None:
+        return coerced_closed if coerced_closed is not None else False
+
+    flags_value = _coerce_float(raw_flags_value)
+    if flags_value is None or not math.isfinite(flags_value) or not flags_value.is_integer():
+        return None
+    flags = int(flags_value)
+    if flags < 0 or flags & ~_SUPPORTED_LWPOLYLINE_FLAG_MASK:
+        return None
+
+    flags_closed = bool(flags & _SUPPORTED_LWPOLYLINE_FLAG_MASK)
+    if coerced_closed is not None and coerced_closed != flags_closed:
+        return None
+    return coerced_closed if coerced_closed is not None else flags_closed
+
+
+def _coerce_closed_boolish(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        integer = int(value)
+        if integer in (0, 1):
+            return bool(integer)
+        return None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate == "0":
+            return False
+        if candidate == "1":
+            return True
+    return None
+
+
+def _coerce_boolish(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return bool(int(value))
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in {"true", "t", "yes", "y", "1", "closed"}:
+            return True
+        if candidate in {"false", "f", "no", "n", "0", "open"}:
+            return False
+    return None
+
+
+def _polyline_length(
+    vertices: tuple[tuple[float, float, float], ...], *, closed: bool
+) -> float | None:
+    length = 0.0
+    for start_vertex, end_vertex in pairwise(vertices):
+        segment_length = math.dist(start_vertex, end_vertex)
+        if not math.isfinite(segment_length):
+            return None
+        length += segment_length
+        if not math.isfinite(length):
+            return None
+    if closed:
+        closing_length = math.dist(vertices[-1], vertices[0])
+        if not math.isfinite(closing_length):
+            return None
+        length += closing_length
+        if not math.isfinite(length):
+            return None
+    return length
+
+
+def _coerce_lwpolyline_vertex(value: Any) -> tuple[float, float, float] | None:
+    if isinstance(value, (list, tuple)) and len(value) != 2:
+        return None
+    return _coerce_point(value)
+
+
+def _bbox_is_finite(bbox: Mapping[str, Any]) -> bool:
+    min_value = _mapping_get(bbox, "min")
+    max_value = _mapping_get(bbox, "max")
+    if not isinstance(min_value, Mapping) or not isinstance(max_value, Mapping):
+        return False
+
+    min_point = _coerce_point(min_value)
+    max_point = _coerce_point(max_value)
+    return (
+        min_point is not None
+        and max_point is not None
+        and _point_is_finite(min_point)
+        and _point_is_finite(max_point)
+    )
+
+
+def _floats_are_finite(*values: float) -> bool:
+    return all(math.isfinite(value) for value in values)
+
+
+def _record_uses_supported_arc_angles(record: Mapping[str, Any]) -> bool:
+    angle_unit = _first_string(record, "angle_unit", "angle_units", "angleunit")
+    if (
+        angle_unit is not None
+        and _normalize_lookup_key(angle_unit) not in _SUPPORTED_ARC_ANGLE_UNIT_TOKENS
+    ):
+        return False
+
+    clockwise_value = _first_value(record, "clockwise", "is_clockwise")
+    if clockwise_value is not None:
+        clockwise = _coerce_boolish(clockwise_value)
+        return clockwise is False
+
+    direction = _first_string(record, "direction", "arc_direction", "orientation")
+    if direction is None:
+        return True
+    normalized_direction = _normalize_lookup_key(direction)
+    if normalized_direction in _SUPPORTED_ARC_DIRECTION_TOKENS:
+        return True
+    if normalized_direction in _UNSUPPORTED_ARC_DIRECTION_TOKENS:
+        return False
+    return False
+
+
 def _entity_id(record: Mapping[str, Any], *, record_type: str) -> str:
     handle = _extract_handle(record)
     if handle is not None:
@@ -1321,6 +2004,15 @@ def _record_views(record: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
         if isinstance(nested_value, Mapping):
             views.append(cast(Mapping[str, Any], nested_value))
     return tuple(views)
+
+
+def _record_has_any_key(record: Mapping[str, Any], *candidates: str) -> bool:
+    normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
+    for view in _record_views(record):
+        for key in view:
+            if isinstance(key, str) and _normalize_lookup_key(key) in normalized_candidates:
+                return True
+    return False
 
 
 def _first_value(record: Mapping[str, Any], *candidates: str) -> Any:

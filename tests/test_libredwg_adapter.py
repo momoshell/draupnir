@@ -425,6 +425,52 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
 
 
 @pytest.mark.asyncio
+async def test_libredwg_adapter_diagnostics_include_mapping_counts_and_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layer": "Walls",
+                        "start": {"x": 1, "y": 2},
+                        "end": {"x": 4, "y": 6},
+                    },
+                    {"type": "HATCH", "handle": "20", "layer": "Unsupported"},
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == {
+        "drawable_candidates": 2,
+        "supported_geometry": 1,
+        "supported_lines": 1,
+        "supported_text": 0,
+        "unsupported_drawables": 1,
+        "malformed_drawables": 0,
+    }
+    assert diagnostic_details["mapping_confidence"] == {
+        "score": adapter_module._MIXED_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_dwgread_json_mixed_entity_mapping",
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("output_payload", "expected_handle", "expected_layer", "expected_length"),
     [
@@ -636,6 +682,319 @@ async def test_libredwg_adapter_maps_legacy_type_records_with_fixed_type_marker(
     assert entity["confidence"]["score"] == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
     assert entity["confidence"]["review_required"] is True
     assert entity["confidence"]["basis"] == "libredwg_line_mapping_units_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_circle_entities_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "CIRCLE",
+                        "handle": "2A",
+                        "layer": "Curves",
+                        "center": {"x": 5, "y": 7, "z": 0},
+                        "radius": 2.5,
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-circle-2a"
+    assert entity["entity_type"] == "circle"
+    assert entity["bbox"] == {
+        "min": {"x": 2.5, "y": 4.5, "z": 0.0},
+        "max": {"x": 7.5, "y": 9.5, "z": 0.0},
+    }
+    assert entity["geometry"] == {
+        "center": {"x": 5.0, "y": 7.0, "z": 0.0},
+        "radius": 2.5,
+        "bbox": {
+            "min": {"x": 2.5, "y": 4.5, "z": 0.0},
+            "max": {"x": 7.5, "y": 9.5, "z": 0.0},
+        },
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "circle",
+            "radius": 2.5,
+            "diameter": 5.0,
+            "circumference": pytest.approx(5.0 * math.pi),
+        },
+    }
+    assert entity["properties"] == {
+        "source_type": "CIRCLE",
+        "source_handle": "2A",
+        "quantity_hints": {
+            "length": pytest.approx(5.0 * math.pi),
+            "area": pytest.approx(6.25 * math.pi),
+            "count": 1.0,
+        },
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "CIRCLE",
+                "handle": "2A",
+            }
+        },
+    }
+    assert entity["kind"] == "circle"
+    assert entity["center"] == {"x": 5.0, "y": 7.0, "z": 0.0}
+    assert entity["radius"] == 2.5
+    assert entity["diameter"] == 5.0
+    assert entity["provenance"]["source_ref"] == "OBJECTS/CIRCLE/2A"
+    assert entity["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
+        {
+            "record_type": "CIRCLE",
+            "handle": "2A",
+            "layer_name": "Curves",
+            "layout_name": "Model",
+            "block_name": None,
+            "geometry": {
+                "center": {"x": 5.0, "y": 7.0, "z": 0.0},
+                "radius": 2.5,
+            },
+        }
+    )
+    assert entity["confidence"] == {
+        "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_circle_mapping_units_unconfirmed",
+    }
+    assert not _contains_non_finite_numbers(entity)
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
+    assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_arc_entities_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "ARC",
+                        "handle": "2B",
+                        "layer": "Curves",
+                        "center": {"x": 10, "y": 20, "z": 0},
+                        "radius": 5,
+                        "start_angle": 45,
+                        "end_angle": 135,
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-arc-2b"
+    assert entity["entity_type"] == "arc"
+    assert entity["center"] == {"x": 10.0, "y": 20.0, "z": 0.0}
+    assert entity["radius"] == 5.0
+    assert entity["start_angle_degrees"] == 45.0
+    assert entity["end_angle_degrees"] == 135.0
+    assert entity["start"] == pytest.approx({"x": 13.5355339059, "y": 23.5355339059, "z": 0.0})
+    assert entity["end"] == pytest.approx({"x": 6.4644660941, "y": 23.5355339059, "z": 0.0})
+    assert entity["bbox"]["min"]["x"] == pytest.approx(6.4644660941)
+    assert entity["bbox"]["min"]["y"] == pytest.approx(23.5355339059)
+    assert entity["bbox"]["min"]["z"] == pytest.approx(0.0)
+    assert entity["bbox"]["max"]["x"] == pytest.approx(13.5355339059)
+    assert entity["bbox"]["max"]["y"] == pytest.approx(25.0)
+    assert entity["bbox"]["max"]["z"] == pytest.approx(0.0)
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "arc",
+        "radius": 5.0,
+        "start_angle_degrees": 45.0,
+        "end_angle_degrees": 135.0,
+        "sweep_degrees": 90.0,
+        "length": pytest.approx(2.5 * math.pi),
+    }
+    assert entity["properties"]["quantity_hints"] == {
+        "length": pytest.approx(2.5 * math.pi),
+        "count": 1.0,
+    }
+    assert entity["confidence"] == {
+        "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_arc_mapping_units_unconfirmed",
+    }
+    assert not _contains_non_finite_numbers(entity)
+    assert result.confidence is not None
+    assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_lwpolyline_entities_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "2C",
+                        "layer": "Perimeter",
+                        "flags": 1,
+                        "vertices": [
+                            {"x": 0, "y": 0, "bulge": 0},
+                            {"x": 3, "y": 4},
+                            {"x": 3, "y": 0},
+                        ],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-polyline-2c"
+    assert entity["entity_type"] == "polyline"
+    assert entity["bbox"] == {
+        "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "max": {"x": 3.0, "y": 4.0, "z": 0.0},
+    }
+    assert entity["geometry"] == {
+        "vertices": (
+            {"x": 0.0, "y": 0.0, "z": 0.0},
+            {"x": 3.0, "y": 4.0, "z": 0.0},
+            {"x": 3.0, "y": 0.0, "z": 0.0},
+        ),
+        "closed": True,
+        "bbox": {
+            "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "max": {"x": 3.0, "y": 4.0, "z": 0.0},
+        },
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "polyline",
+            "length": 12.0,
+            "vertex_count": 3,
+            "closed": True,
+        },
+    }
+    assert entity["properties"] == {
+        "source_type": "LWPOLYLINE",
+        "source_handle": "2C",
+        "quantity_hints": {
+            "length": 12.0,
+            "count": 1.0,
+        },
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "LWPOLYLINE",
+                "handle": "2C",
+            }
+        },
+    }
+    assert entity["kind"] == "polyline"
+    assert entity["vertices"] == (
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+        {"x": 3.0, "y": 4.0, "z": 0.0},
+        {"x": 3.0, "y": 0.0, "z": 0.0},
+    )
+    assert entity["closed"] is True
+    assert entity["length"] == 12.0
+    assert entity["confidence"] == {
+        "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "libredwg_lwpolyline_mapping_units_unconfirmed",
+    }
+    assert not _contains_non_finite_numbers(entity)
+    assert result.confidence is not None
+    assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_value", ["unknown", 2])
+async def test_libredwg_adapter_rejects_invalid_lwpolyline_closed_values(
+    monkeypatch: pytest.MonkeyPatch,
+    closed_value: object,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "2D",
+                        "layer": "Broken",
+                        "closed": closed_value,
+                        "vertices": [
+                            {"x": 0, "y": 0},
+                            {"x": 3, "y": 4},
+                        ],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    assert entities[0]["entity_type"] == "unknown"
+    assert entities[0]["geometry"]["status"] == "absent"
+    assert entities[0]["geometry"]["reason"] == "malformed_lwpolyline_geometry"
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.malformed_drawable_record",
+    ]
 
 
 @pytest.mark.asyncio
@@ -922,7 +1281,7 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
                 "OBJECTS": [
                     {"type": "DICTIONARY", "handle": "10"},
                     {"type": "LAYER", "name": "Model"},
-                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
+                    {"type": "HATCH", "handle": "20", "layer": "Unsupported"},
                 ]
             }
         ),
@@ -958,7 +1317,7 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "reason": "unsupported_drawable_record",
         "geometry_summary": {
             "kind": "unknown",
-            "source_type": "CIRCLE",
+            "source_type": "HATCH",
             "reason": "unsupported_drawable_record",
         },
     }
@@ -966,16 +1325,16 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
     assert entities[0]["quantity_hints"] == {}
     assert entities[0]["adapter_native"] == {
         "section": "OBJECTS",
-        "record_type": "CIRCLE",
+        "record_type": "HATCH",
         "handle": "20",
     }
     assert entities[0]["provenance"]["origin"] == "adapter_normalized"
     assert entities[0]["provenance"]["adapter"] == {"key": "libredwg"}
-    assert entities[0]["provenance"]["source_ref"] == "OBJECTS/CIRCLE/20"
+    assert entities[0]["provenance"]["source_ref"] == "OBJECTS/HATCH/20"
     assert entities[0]["provenance"]["source_identity"] == "20"
     assert entities[0]["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
         {
-            "record_type": "CIRCLE",
+            "record_type": "HATCH",
             "handle": "20",
             "layer_name": "Unsupported",
             "layout_name": "Model",
@@ -986,7 +1345,7 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         entities[0]["provenance"]["normalized_source_hash"]
         == entities[0]["provenance"]["source_hash"]
     )
-    assert entities[0]["provenance"]["extraction_path"] == ("OBJECTS", "CIRCLE")
+    assert entities[0]["provenance"]["extraction_path"] == ("OBJECTS", "HATCH")
     assert entities[0]["provenance"]["notes"] == (
         "units_unconfirmed",
         "unsupported_drawable_record",
@@ -995,17 +1354,17 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
         "native": {
             "libredwg": {
                 "section": "OBJECTS",
-                "record_type": "CIRCLE",
+                "record_type": "HATCH",
                 "handle": "20",
             }
         },
         "legacy_aliases": {
             "adapter_key": "libredwg",
-            "source": "OBJECTS/CIRCLE/20",
+            "source": "OBJECTS/HATCH/20",
             "source_section": "OBJECTS",
-            "source_entity_ref": "OBJECTS/CIRCLE/20",
-            "source_locator": "OBJECTS/CIRCLE/20",
-            "entity_ref": "OBJECTS/CIRCLE/20",
+            "source_entity_ref": "OBJECTS/HATCH/20",
+            "source_locator": "OBJECTS/HATCH/20",
+            "entity_ref": "OBJECTS/HATCH/20",
             "normalized_source_hash": entities[0]["provenance"]["source_hash"],
             "native_handle": "20",
             "source_entity_handle": "20",
@@ -1095,13 +1454,9 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
     ),
     [
         (
-            {
-                "OBJECTS": [
-                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
-                ]
-            },
+            {"OBJECTS": [{"type": "HATCH", "handle": "20", "layer": "Unsupported"}]},
             "unsupported_drawable_record",
-            "CIRCLE",
+            "HATCH",
             ("libredwg.units_unconfirmed", "libredwg.unsupported_drawable_record"),
         ),
         (
@@ -1118,6 +1473,199 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
             },
             "malformed_line_geometry",
             "LINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "CIRCLE",
+                        "handle": "21",
+                        "layer": "Broken",
+                        "center": {"x": 0, "y": 0, "z": 0},
+                    }
+                ]
+            },
+            "malformed_circle_geometry",
+            "CIRCLE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "CIRCLE",
+                        "handle": "21B",
+                        "layer": "Broken",
+                        "center": {"x": 1e308, "y": 1e308, "z": 0},
+                        "radius": 1e308,
+                    }
+                ]
+            },
+            "malformed_circle_geometry",
+            "CIRCLE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "ARC",
+                        "handle": "22",
+                        "layer": "Broken",
+                        "center": {"x": 0, "y": 0, "z": 0},
+                        "radius": 2,
+                        "start_angle": 0,
+                    }
+                ]
+            },
+            "malformed_arc_geometry",
+            "ARC",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "ARC",
+                        "handle": "22B",
+                        "layer": "Broken",
+                        "center": {"x": 1e308, "y": 1e308, "z": 0},
+                        "radius": 1e308,
+                        "start_angle": 0,
+                        "end_angle": 90,
+                    }
+                ]
+            },
+            "malformed_arc_geometry",
+            "ARC",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "ARC",
+                        "handle": "22C",
+                        "layer": "Broken",
+                        "center": {"x": 0, "y": 0, "z": 0},
+                        "radius": 2,
+                        "start_angle": 0,
+                        "end_angle": 90,
+                        "angle_unit": "radians",
+                    }
+                ]
+            },
+            "malformed_arc_geometry",
+            "ARC",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "ARC",
+                        "handle": "22D",
+                        "layer": "Broken",
+                        "center": {"x": 0, "y": 0, "z": 0},
+                        "radius": 2,
+                        "start_angle": 0,
+                        "end_angle": 90,
+                        "direction": "clockwise",
+                    }
+                ]
+            },
+            "malformed_arc_geometry",
+            "ARC",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "23",
+                        "layer": "Broken",
+                        "vertices": [
+                            {"x": 0, "y": 0, "bulge": 0.25},
+                            {"x": 1, "y": 1},
+                        ],
+                    }
+                ]
+            },
+            "malformed_lwpolyline_geometry",
+            "LWPOLYLINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "23B",
+                        "layer": "Broken",
+                        "vertices": [[0, 0, 0], [1, 1]],
+                    }
+                ]
+            },
+            "malformed_lwpolyline_geometry",
+            "LWPOLYLINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "24",
+                        "layer": "Broken",
+                        "const_width": 0.5,
+                        "vertices": [
+                            {"x": 0, "y": 0},
+                            {"x": 1, "y": 1},
+                        ],
+                    }
+                ]
+            },
+            "malformed_lwpolyline_geometry",
+            "LWPOLYLINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "24B",
+                        "layer": "Broken",
+                        "flags": 128,
+                        "vertices": [
+                            {"x": 0, "y": 0},
+                            {"x": 1, "y": 1},
+                        ],
+                    }
+                ]
+            },
+            "malformed_lwpolyline_geometry",
+            "LWPOLYLINE",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LWPOLYLINE",
+                        "handle": "24C",
+                        "layer": "Broken",
+                        "vertices": [
+                            {"x": -1e308, "y": 0},
+                            {"x": 1e308, "y": 0},
+                        ],
+                    }
+                ]
+            },
+            "malformed_lwpolyline_geometry",
+            "LWPOLYLINE",
             ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
         ),
     ],
@@ -1176,7 +1724,7 @@ async def test_libredwg_adapter_lowers_confidence_for_mixed_entity_outcomes(
                         "start": {"x": 1, "y": 2},
                         "end": {"x": 4, "y": 6},
                     },
-                    {"type": "CIRCLE", "handle": "20", "layer": "Unsupported"},
+                    {"type": "HATCH", "handle": "20", "layer": "Unsupported"},
                 ]
             }
         ),
@@ -1193,6 +1741,56 @@ async def test_libredwg_adapter_lowers_confidence_for_mixed_entity_outcomes(
     assert result.confidence.review_required is True
     assert result.confidence.basis == "libredwg_dwgread_json_mixed_entity_mapping"
     _assert_score_within_libredwg_descriptor_range(result.confidence.score)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_uses_geometry_confidence_for_non_line_supported_geometry_mix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layer": "Walls",
+                        "start": {"x": 1, "y": 2},
+                        "end": {"x": 4, "y": 6},
+                    },
+                    {
+                        "type": "CIRCLE",
+                        "handle": "2A",
+                        "layer": "Curves",
+                        "center": {"x": 5, "y": 7, "z": 0},
+                        "radius": 2.5,
+                    },
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["entity_counts"] == {
+        "drawable_candidates": 2,
+        "supported_geometry": 2,
+        "supported_lines": 1,
+        "supported_text": 0,
+        "unsupported_drawables": 0,
+        "malformed_drawables": 0,
+    }
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
+    assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1830,9 @@ async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candid
     assert metadata["empty_entities_reason"] == "no_drawable_candidates_detected"
     assert metadata["entity_counts"] == {
         "drawable_candidates": 0,
+        "supported_geometry": 0,
         "supported_lines": 0,
+        "supported_text": 0,
         "unsupported_drawables": 0,
         "malformed_drawables": 0,
     }
