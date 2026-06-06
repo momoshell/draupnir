@@ -206,6 +206,85 @@ def _contains_non_finite_numbers(value: Any) -> bool:
     return False
 
 
+def _assert_line_wrapper_entity(entity: Mapping[str, Any]) -> None:
+    assert entity["entity_type"] == "line"
+    assert entity["kind"] == "line"
+    assert entity["start"] == {"x": 1.0, "y": 2.0, "z": 0.0}
+    assert entity["end"] == {"x": 1.0, "y": 5.0, "z": 0.0}
+    assert entity["length"] == 3.0
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "line_segment",
+        "length": 3.0,
+        "vertex_count": 2,
+    }
+
+
+def _assert_circle_wrapper_entity(entity: Mapping[str, Any]) -> None:
+    assert entity["entity_type"] == "circle"
+    assert entity["kind"] == "circle"
+    assert entity["center"] == {"x": 5.0, "y": 7.0, "z": 0.0}
+    assert entity["radius"] == 2.5
+    assert entity["diameter"] == 5.0
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "circle",
+        "radius": 2.5,
+        "diameter": 5.0,
+        "circumference": pytest.approx(5.0 * math.pi),
+    }
+
+
+def _assert_arc_wrapper_entity(entity: Mapping[str, Any]) -> None:
+    assert entity["entity_type"] == "arc"
+    assert entity["kind"] == "arc"
+    assert entity["center"] == {"x": 10.0, "y": 20.0, "z": 0.0}
+    assert entity["radius"] == 5.0
+    assert entity["start_angle_degrees"] == 45.0
+    assert entity["end_angle_degrees"] == 135.0
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "arc",
+        "radius": 5.0,
+        "start_angle_degrees": 45.0,
+        "end_angle_degrees": 135.0,
+        "sweep_degrees": 90.0,
+        "length": pytest.approx(2.5 * math.pi),
+    }
+
+
+def _assert_lwpolyline_wrapper_entity(entity: Mapping[str, Any]) -> None:
+    assert entity["entity_type"] == "polyline"
+    assert entity["kind"] == "polyline"
+    assert entity["vertices"] == (
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+        {"x": 3.0, "y": 4.0, "z": 0.0},
+        {"x": 3.0, "y": 0.0, "z": 0.0},
+    )
+    assert entity["closed"] is True
+    assert entity["length"] == 12.0
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "polyline",
+        "length": 12.0,
+        "vertex_count": 3,
+        "closed": True,
+    }
+
+
+def _assert_mtext_wrapper_entity(entity: Mapping[str, Any]) -> None:
+    assert entity["entity_type"] == "text"
+    assert entity["kind"] == "text"
+    assert entity["text"] == "Zone B-01"
+    assert entity["text_length"] == 9
+    assert entity["geometry"] == {
+        "text": "Zone B-01",
+        "units": {"normalized": "unknown"},
+        "geometry_summary": {
+            "kind": "text",
+            "source_type": "MTEXT",
+            "text_length": 9,
+        },
+        "insertion": {"x": 10.0, "y": 20.0, "z": 0.0},
+    }
+
+
 def test_probe_reports_missing_binary_with_license_review_posture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -631,6 +710,314 @@ async def test_libredwg_adapter_handles_objects_variants_and_type_markers(
         "kind": "line_segment",
         "length": expected_length,
         "vertex_count": 2,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "output_payload",
+        "expected_handle",
+        "expected_layer",
+        "expected_source_type",
+        "expected_counts",
+        "assert_entity",
+    ),
+    [
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "id": "W1",
+                        "layer_name": "A-WALL",
+                        "record": {
+                            "entity": "LINE",
+                            "data": {
+                                "start_point": [1, 2, 0],
+                                "end_point": [1, 5, 0],
+                            },
+                        },
+                    }
+                ]
+            },
+            "W1",
+            "A-WALL",
+            "LINE",
+            {
+                "drawable_candidates": 1,
+                "supported_geometry": 1,
+                "supported_lines": 1,
+                "supported_text": 0,
+                "unsupported_drawables": 0,
+                "malformed_drawables": 0,
+            },
+            _assert_line_wrapper_entity,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "object_handle": "C1",
+                        "owner_layer": "Curves",
+                        "payload": {
+                            "object": "AcDbCircle",
+                            "value": {
+                                "centerpoint": {"x": "5", "y": "7", "z": 0},
+                                "radius": "2.5",
+                            },
+                        },
+                    }
+                ]
+            },
+            "C1",
+            "Curves",
+            "CIRCLE",
+            {
+                "drawable_candidates": 1,
+                "supported_geometry": 1,
+                "supported_lines": 0,
+                "supported_text": 0,
+                "unsupported_drawables": 0,
+                "malformed_drawables": 0,
+            },
+            _assert_circle_wrapper_entity,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "entity_handle": "A1",
+                        "layer": "Curves",
+                        "entity": {
+                            "dxf_name": "ARC",
+                            "record": {
+                                "center_point": [10, 20, 0],
+                                "radius": "5",
+                                "startangle": "45",
+                                "endangle": "135",
+                                "angle_units": "degrees",
+                                "orientation": "counterclockwise",
+                            },
+                        },
+                    }
+                ]
+            },
+            "A1",
+            "Curves",
+            "ARC",
+            {
+                "drawable_candidates": 1,
+                "supported_geometry": 1,
+                "supported_lines": 0,
+                "supported_text": 0,
+                "unsupported_drawables": 0,
+                "malformed_drawables": 0,
+            },
+            _assert_arc_wrapper_entity,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "object_id": "P1",
+                        "owner_layer": "Perimeter",
+                        "payload": {
+                            "type": "DWG_TYPE_LWPOLYLINE",
+                            "data": {
+                                "closed_flag": "1",
+                                "vertexes": [[0, 0], [3, 4], [3, 0]],
+                            },
+                        },
+                    }
+                ]
+            },
+            "P1",
+            "Perimeter",
+            "LWPOLYLINE",
+            {
+                "drawable_candidates": 1,
+                "supported_geometry": 1,
+                "supported_lines": 0,
+                "supported_text": 0,
+                "unsupported_drawables": 0,
+                "malformed_drawables": 0,
+            },
+            _assert_lwpolyline_wrapper_entity,
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "id": "T1",
+                        "owner_layer": "Labels",
+                        "record": {
+                            "dxf_name": "MTEXT",
+                            "payload": {
+                                "text_position": [10, 20, 0],
+                                "textstring": "Zone B-01",
+                            },
+                        },
+                    }
+                ]
+            },
+            "T1",
+            "Labels",
+            "MTEXT",
+            {
+                "drawable_candidates": 1,
+                "supported_geometry": 0,
+                "supported_lines": 0,
+                "supported_text": 1,
+                "unsupported_drawables": 0,
+                "malformed_drawables": 0,
+            },
+            _assert_mtext_wrapper_entity,
+        ),
+    ],
+)
+async def test_libredwg_adapter_recovers_supported_drawable_wrapper_records(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+    expected_handle: str,
+    expected_layer: str,
+    expected_source_type: str,
+    expected_counts: dict[str, int],
+    assert_entity: Callable[[Mapping[str, Any]], None],
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["source_entity_handle"] == expected_handle
+    assert entity["layer_name"] == expected_layer
+    assert entity["layout_name"] == "Model"
+    assert entity["properties"]["source_type"] == expected_source_type
+    assert_entity(entity)
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == expected_counts
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_keeps_wrapper_record_and_sibling_drawable_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": {
+                    "data": {
+                        "id": "W1",
+                        "layer_name": "A-WALL",
+                        "record": {
+                            "entity": "LINE",
+                            "data": {
+                                "start_point": [1, 2, 0],
+                                "end_point": [1, 5, 0],
+                            },
+                        },
+                    },
+                    "sibling": {
+                        "type": "LINE",
+                        "handle": "W2",
+                        "layer": "B-WALL",
+                        "start": {"x": 2, "y": 1, "z": 0},
+                        "end": {"x": 6, "y": 1, "z": 0},
+                    },
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 2
+    assert [entity["source_entity_handle"] for entity in entities] == ["W1", "W2"]
+    assert [entity["layer_name"] for entity in entities] == ["A-WALL", "B-WALL"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == {
+        "drawable_candidates": 2,
+        "supported_geometry": 2,
+        "supported_lines": 2,
+        "supported_text": 0,
+        "unsupported_drawables": 0,
+        "malformed_drawables": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_keeps_list_wrapper_record_and_sibling_drawable_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "data": {
+                            "id": "LW1",
+                            "layer_name": "A-WALL",
+                            "record": {
+                                "entity": "LINE",
+                                "data": {
+                                    "start_point": [1, 2, 0],
+                                    "end_point": [1, 5, 0],
+                                },
+                            },
+                        },
+                        "sibling": {
+                            "type": "LINE",
+                            "handle": "LW2",
+                            "layer": "B-WALL",
+                            "start": {"x": 2, "y": 1, "z": 0},
+                            "end": {"x": 6, "y": 1, "z": 0},
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 2
+    assert [entity["source_entity_handle"] for entity in entities] == ["LW1", "LW2"]
+    assert [entity["layer_name"] for entity in entities] == ["A-WALL", "B-WALL"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == {
+        "drawable_candidates": 2,
+        "supported_geometry": 2,
+        "supported_lines": 2,
+        "supported_text": 0,
+        "unsupported_drawables": 0,
+        "malformed_drawables": 0,
     }
 
 

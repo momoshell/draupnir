@@ -863,10 +863,14 @@ def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
 
 def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, Mapping)]
+        list_candidates: list[Mapping[str, Any]] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                list_candidates.extend(_iter_mapping_candidates(item))
+        return list_candidates
     if not isinstance(value, Mapping):
         return []
-    if _extract_record_type(value) is not None:
+    if _extract_record_type_from_current_mapping(value) is not None:
         return [cast(Mapping[str, Any], value)]
 
     candidates: list[Mapping[str, Any]] = []
@@ -874,7 +878,12 @@ def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
         if isinstance(nested_value, Mapping):
             candidates.extend(_iter_mapping_candidates(nested_value))
         elif isinstance(nested_value, list):
-            candidates.extend(item for item in nested_value if isinstance(item, Mapping))
+            for item in nested_value:
+                if isinstance(item, Mapping):
+                    candidates.extend(_iter_mapping_candidates(item))
+
+    if len(candidates) == 1 and _extract_record_type_from_wrapper_views(value) is not None:
+        return [cast(Mapping[str, Any], value)]
     return candidates
 
 
@@ -1496,6 +1505,13 @@ def _normalize_record_type_token(raw_type: str) -> str | None:
 
 
 def _extract_record_type(record: Mapping[str, Any]) -> str | None:
+    current_record_type = _extract_record_type_from_current_mapping(record)
+    if current_record_type is not None:
+        return current_record_type
+    return _extract_record_type_from_wrapper_views(record)
+
+
+def _extract_record_type_from_current_mapping(record: Mapping[str, Any]) -> str | None:
     raw_type = _first_string_from_mapping_by_priority(
         record,
         "entity",
@@ -1541,6 +1557,39 @@ def _extract_record_type(record: Mapping[str, Any]) -> str | None:
                 return fallback_type_upper
 
     return legacy_type_upper
+
+
+def _extract_record_type_from_wrapper_views(record: Mapping[str, Any]) -> str | None:
+    return _extract_record_type_from_nested_wrappers(record, seen=set())
+
+
+def _extract_record_type_from_nested_wrappers(
+    record: Mapping[str, Any], *, seen: set[int]
+) -> str | None:
+    record_id = id(record)
+    if record_id in seen:
+        return None
+    seen.add(record_id)
+
+    for wrapper_key in _WRAPPER_KEYS:
+        nested_value = _mapping_get(record, wrapper_key)
+        if not isinstance(nested_value, Mapping):
+            continue
+        nested_record = cast(Mapping[str, Any], nested_value)
+        nested_record_type = _extract_record_type_from_current_mapping(nested_record)
+        if nested_record_type is not None:
+            if nested_record_type in _NON_DRAWABLE_OBJECT_TYPES:
+                continue
+            return nested_record_type
+
+        deeper_record_type = _extract_record_type_from_nested_wrappers(
+            nested_record,
+            seen=seen,
+        )
+        if deeper_record_type is not None:
+            return deeper_record_type
+
+    return None
 
 
 def _first_string_from_mapping_by_priority(
@@ -2004,12 +2053,24 @@ def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
 
 
 def _record_views(record: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    views: list[Mapping[str, Any]] = [record]
+    views: list[Mapping[str, Any]] = []
+    _append_record_views(record, views=views, seen=set())
+    return tuple(views)
+
+
+def _append_record_views(
+    record: Mapping[str, Any], *, views: list[Mapping[str, Any]], seen: set[int]
+) -> None:
+    record_id = id(record)
+    if record_id in seen:
+        return
+    seen.add(record_id)
+    views.append(record)
+
     for wrapper_key in _WRAPPER_KEYS:
         nested_value = _mapping_get(record, wrapper_key)
         if isinstance(nested_value, Mapping):
-            views.append(cast(Mapping[str, Any], nested_value))
-    return tuple(views)
+            _append_record_views(cast(Mapping[str, Any], nested_value), views=views, seen=seen)
 
 
 def _record_has_any_key(record: Mapping[str, Any], *candidates: str) -> bool:
