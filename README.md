@@ -211,8 +211,10 @@ This lane stays manual and is not started automatically in CI.
 
 For local-only proprietary DWG/PDF extraction review runs, use the dedicated
 [local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md). That
-workflow is intentionally separate from committed fixtures: keep source samples,
-generated artifacts, and sensitive review notes out of git.
+workflow now covers host-side vector PDF enablement as an opt-in path; default
+Compose remains DXF-only, raster PDF remains deferred locally, and proprietary
+source samples, generated artifacts, and sensitive review notes must stay out
+of git.
 
 ### Local Development (without Docker)
 
@@ -456,6 +458,13 @@ download URLs.
 - Upload requests must include `Content-Length`.
 - The API accepts PDF, DWG, DXF, and IFC inputs when the relevant adapters are
   available.
+- Local vector PDF ingestion is opt-in, not part of the default Compose bundle.
+  For host-side review or Compose rebuilds that need PyMuPDF, install either the
+  full `ingestion` extra or the narrower `pdf-vector` extra and set
+  `DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review` after reviewing
+  the ADR-0007 AGPL/commercial caveat.
+- Local raster PDF ingestion is still deferred/unavailable in the standard host
+  and Compose workflows documented here.
 - Proprietary DWG/PDF samples used for local review must stay outside git and
   outside `tests/fixtures/manifest.yaml`; see the
   [local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md).
@@ -511,6 +520,13 @@ download URLs.
   checks instead of assuming every format is enabled everywhere.
 - Current registry covers DWG, DXF, IFC, vector PDF, raster PDF, and a
   `revised_dxf` writer path.
+- Default Compose does not bundle the vector PDF adapter; enable it explicitly
+  with `DRAUPNIR_UV_EXTRAS="--extra db --extra jobs --extra dxf --extra pdf-vector"`
+  and `DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review` when you
+  intentionally want local vector PDF review support.
+- `ADAPTER_UNAVAILABLE` details differ between a missing package/runtime and a
+  missing license approval signal; use `GET /v1/system/health` and job/event
+  diagnostics to distinguish those cases.
 
 ### Idempotency
 

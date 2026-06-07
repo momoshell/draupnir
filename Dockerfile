@@ -18,14 +18,16 @@ WORKDIR /app
 # Copy dependency manifest first (cache-friendly layer)
 COPY pyproject.toml uv.lock README.md ./
 
+ARG DRAUPNIR_UV_EXTRAS="--extra db --extra jobs --extra dxf"
+
 # Sync runtime dependencies before project source is available
-RUN uv sync --locked --no-install-project --no-dev --extra db --extra jobs --extra dxf
+RUN uv sync --locked --no-install-project --no-dev ${DRAUPNIR_UV_EXTRAS}
 
 # Copy application source
 COPY app/ ./app/
 
 # Install project and runtime extras into the project environment
-RUN uv sync --locked --no-dev --extra db --extra jobs --extra dxf
+RUN uv sync --locked --no-dev ${DRAUPNIR_UV_EXTRAS}
 
 # Create non-root user and shared upload root
 RUN useradd -m -u 1000 appuser \

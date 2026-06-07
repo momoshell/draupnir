@@ -1097,6 +1097,32 @@ def test_pymupdf_probe_is_available_with_license_acknowledgement(
     }
 
 
+def test_pymupdf_probe_is_available_with_license_acknowledgement_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _runtime_version(_runtime: object) -> str:
+        return "1.26.0"
+
+    monkeypatch.setenv(
+        pymupdf_adapter._APPROVED_LICENSE_PROBES_ENV_VAR,
+        f"other-review, {pymupdf_adapter._LICENSE_PROBE_NAME}",
+    )
+    monkeypatch.setattr(pymupdf_adapter, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter, "_runtime_version", _runtime_version)
+    monkeypatch.setattr(pymupdf_adapter, "_package_version", lambda: "1.26.0")
+
+    availability = pymupdf_adapter.create_adapter().probe()
+
+    assert availability.status is AdapterStatus.AVAILABLE
+    assert availability.availability_reason is None
+    assert availability.license_state is LicenseState.PRESENT
+    assert availability.details == {
+        "package": "fitz",
+        "package_version": "1.26.0",
+        "license_acknowledged": True,
+    }
+
+
 def test_pymupdf_probe_uses_package_version_when_runtime_attrs_are_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import math
 import multiprocessing
+import os
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -43,6 +44,7 @@ from app.ingestion.registry import evaluate_availability, get_descriptor
 _DESCRIPTOR = get_descriptor(InputFamily.PDF_VECTOR)
 _DISTRIBUTION_NAME = "PyMuPDF"
 _LICENSE_PROBE_NAME = "pymupdf-deployment-review"
+_APPROVED_LICENSE_PROBES_ENV_VAR = "DRAUPNIR_APPROVED_LICENSE_PROBES"
 _RUNTIME_MODULE = "fitz"
 _SCHEMA_VERSION = "0.1"
 _DEFAULT_LAYER_NAME = "default"
@@ -149,7 +151,7 @@ def create_adapter(
     """Create the PyMuPDF adapter without importing fitz at module import time."""
 
     return PyMuPDFAdapter(
-        license_acknowledged=license_acknowledged or _license_unacknowledged,
+        license_acknowledged=license_acknowledged or _license_acknowledged_from_env,
     )
 
 
@@ -1607,8 +1609,15 @@ def _close_document(document: Any) -> None:
         close()
 
 
-def _license_unacknowledged() -> bool:
-    return False
+def _license_acknowledged_from_env() -> bool:
+    raw_value = os.getenv(_APPROVED_LICENSE_PROBES_ENV_VAR)
+    if raw_value is None:
+        return False
+
+    acknowledged_probes = {
+        candidate.strip() for candidate in raw_value.split(",") if candidate.strip()
+    }
+    return _LICENSE_PROBE_NAME in acknowledged_probes
 
 
 def _package_version() -> str | None:

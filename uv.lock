@@ -639,6 +639,9 @@ jobs = [
     { name = "flower" },
     { name = "redis" },
 ]
+pdf-vector = [
+    { name = "pymupdf" },
+]
 test = [
     { name = "factory-boy" },
     { name = "pytest" },
@@ -653,7 +656,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.29" },
     { name = "celery", marker = "extra == 'jobs'", specifier = ">=5.3" },
     { name = "celery-stubs", marker = "extra == 'jobs'", specifier = ">=0.1" },
-    { name = "draupnir", extras = ["db", "jobs", "dxf", "ingestion", "dev", "test"], marker = "extra == 'all'" },
+    { name = "draupnir", extras = ["db", "jobs", "dxf", "pdf-vector", "ingestion", "dev", "test"], marker = "extra == 'all'" },
     { name = "ezdxf", marker = "extra == 'dxf'", specifier = ">=1.2" },
     { name = "ezdxf", marker = "extra == 'ingestion'", specifier = ">=1.2" },
     { name = "factory-boy", marker = "extra == 'test'", specifier = ">=3.3" },
@@ -670,6 +673,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pymupdf", marker = "extra == 'ingestion'", specifier = ">=1.23" },
+    { name = "pymupdf", marker = "extra == 'pdf-vector'", specifier = ">=1.23" },
     { name = "pytesseract", marker = "extra == 'ingestion'", specifier = ">=0.3" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=0.23" },
@@ -687,7 +691,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.25" },
     { name = "vtracer", marker = "extra == 'ingestion'", specifier = ">=0.6" },
 ]
-provides-extras = ["db", "jobs", "dxf", "ingestion", "dev", "test", "all"]
+provides-extras = ["db", "jobs", "dxf", "pdf-vector", "ingestion", "dev", "test", "all"]
 
 [[package]]
 name = "ecdsa"
