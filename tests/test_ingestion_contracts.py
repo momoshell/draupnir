@@ -50,6 +50,7 @@ from app.ingestion.registry import (
     get_registry,
     get_registry_by_key,
     list_descriptors,
+    summarize_probe_requirements,
 )
 from app.ingestion.validation import build_validation_outcome
 from tests.ingestion_contract_harness import (
@@ -613,6 +614,26 @@ def test_pdf_upload_format_returns_vector_and_raster_candidates() -> None:
     )
 
     assert families == (InputFamily.PDF_VECTOR, InputFamily.PDF_RASTER)
+
+
+def test_pdf_registry_requirement_summaries_are_actionable_and_stable() -> None:
+    descriptors = get_registry_by_key()
+
+    vector_summary = summarize_probe_requirements(descriptors["pymupdf"])
+    raster_summary = summarize_probe_requirements(descriptors["vtracer_tesseract"])
+
+    assert vector_summary == (
+        "python_package:fitz (failure_status=unavailable) "
+        "PyMuPDF is required for vector PDF extraction.; "
+        "license:pymupdf-deployment-review (failure_status=unavailable) "
+        "Commercial or AGPL compliance review is required for deployment."
+    )
+    assert raster_summary == (
+        "python_package:vtracer (failure_status=unavailable) "
+        "VTracer is required for raster vectorization.; "
+        "binary:tesseract (failure_status=degraded) "
+        "Tesseract enables OCR and confidence scoring for raster PDFs."
+    )
 
 
 def test_pymupdf_create_adapter_returns_vector_pdf_adapter() -> None:

@@ -22,6 +22,7 @@ from app.ingestion.contracts import (
     AvailabilityReason,
     CancellationHandle,
     IngestionAdapter,
+    InputFamily,
     ProgressCallback,
 )
 from app.ingestion.finalization import (
@@ -91,6 +92,7 @@ class IngestionRunRequest:
     checksum_sha256: str
     detected_format: str | None
     media_type: str | None
+    requested_input_family: InputFamily | None = None
     original_name: str | None = None
     extraction_profile_id: UUID | None = None
     initial_job_id: UUID | None = None
@@ -165,6 +167,7 @@ async def run_ingestion(
         candidates = select_adapter_candidates(
             request.detected_format,
             media_type=request.media_type,
+            requested_input_family=request.requested_input_family,
         )
     except ValueError as exc:
         raise IngestionRunnerError(

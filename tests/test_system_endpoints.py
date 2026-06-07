@@ -77,6 +77,21 @@ def _fake_probe_observation(requirement: ProbeRequirement) -> ProbeObservation:
     )
 
 
+def _fake_probe_observation_with_missing_pymupdf_license(
+    requirement: ProbeRequirement,
+) -> ProbeObservation:
+    """Return deterministic observations with a missing PyMuPDF license approval."""
+
+    if requirement.kind is ProbeKind.LICENSE and requirement.name == "pymupdf-deployment-review":
+        return ProbeObservation(
+            kind=requirement.kind,
+            name=requirement.name,
+            status=ProbeStatus.MISSING,
+            detail=requirement.detail,
+        )
+    return _fake_probe_observation(requirement)
+
+
 @pytest.mark.asyncio
 async def test_system_capabilities_reflect_registry_availability_consistently(
     async_client: httpx.AsyncClient,
@@ -153,8 +168,60 @@ async def test_system_capabilities_reflect_registry_availability_consistently(
     assert adapters_by_key["vtracer_tesseract"]["status"] == "degraded"
     assert adapters_by_key["vtracer_tesseract"]["availability_reason"] == "missing_binary"
 
+    assert adapters_by_key["pymupdf"]["details"]["requirement_summary"] == (
+        "python_package:fitz (failure_status=unavailable) "
+        "PyMuPDF is required for vector PDF extraction.; "
+        "license:pymupdf-deployment-review (failure_status=unavailable) "
+        "Commercial or AGPL compliance review is required for deployment."
+    )
+    assert adapters_by_key["vtracer_tesseract"]["details"]["requirement_summary"] == (
+        "python_package:vtracer (failure_status=unavailable) "
+        "VTracer is required for raster vectorization.; "
+        "binary:tesseract (failure_status=degraded) "
+        "Tesseract enables OCR and confidence scoring for raster PDFs."
+    )
+    assert adapters_by_key["vtracer_tesseract"]["details"]["failing_requirement_summary"] == (
+        "binary:tesseract (observed=missing, failure_status=degraded) "
+        "Tesseract enables OCR and confidence scoring for raster PDFs."
+    )
+
     libredwg_confidence_range = adapters_by_key["libredwg"]["confidence_range"]
     assert libredwg_confidence_range == {"min": 0.2, "max": 0.72}
+
+
+@pytest.mark.asyncio
+async def test_system_capabilities_keep_missing_pymupdf_license_sanitized_and_actionable(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Capabilities should keep missing PDF license failures actionable without raw probes."""
+
+    monkeypatch.setattr(
+        system_api,
+        "_probe_requirement",
+        _fake_probe_observation_with_missing_pymupdf_license,
+    )
+
+    response = await async_client.get("/v1/system/capabilities")
+
+    assert response.status_code == 200
+    adapter_payload = {adapter["adapter_key"]: adapter for adapter in response.json()["adapters"]}[
+        "pymupdf"
+    ]
+
+    assert adapter_payload["status"] == "unavailable"
+    assert adapter_payload["availability_reason"] == "missing_license"
+    assert adapter_payload["details"]["requirement_summary"] == (
+        "python_package:fitz (failure_status=unavailable) "
+        "PyMuPDF is required for vector PDF extraction.; "
+        "license:pymupdf-deployment-review (failure_status=unavailable) "
+        "Commercial or AGPL compliance review is required for deployment."
+    )
+    assert adapter_payload["details"]["failing_requirement_summary"] == (
+        "license:pymupdf-deployment-review "
+        "(observed=missing, failure_status=unavailable) "
+        "Commercial or AGPL compliance review is required for deployment."
+    )
 
 
 @pytest.mark.asyncio
@@ -231,8 +298,23 @@ async def test_system_health_returns_503_and_degraded_when_some_adapters_are_una
     assert adapter_payloads["vtracer_tesseract"]["status"] == "degraded"
     assert adapter_payloads["vtracer_tesseract"]["error_code"] == "ADAPTER_UNAVAILABLE"
     assert (
-        adapter_payloads["vtracer_tesseract"]["details"]["availability_reason"]
-        == "missing_binary"
+        adapter_payloads["vtracer_tesseract"]["details"]["availability_reason"] == "missing_binary"
+    )
+    assert adapter_payloads["pymupdf"]["details"]["requirement_summary"] == (
+        "python_package:fitz (failure_status=unavailable) "
+        "PyMuPDF is required for vector PDF extraction.; "
+        "license:pymupdf-deployment-review (failure_status=unavailable) "
+        "Commercial or AGPL compliance review is required for deployment."
+    )
+    assert adapter_payloads["vtracer_tesseract"]["details"]["requirement_summary"] == (
+        "python_package:vtracer (failure_status=unavailable) "
+        "VTracer is required for raster vectorization.; "
+        "binary:tesseract (failure_status=degraded) "
+        "Tesseract enables OCR and confidence scoring for raster PDFs."
+    )
+    assert adapter_payloads["vtracer_tesseract"]["details"]["failing_requirement_summary"] == (
+        "binary:tesseract (observed=missing, failure_status=degraded) "
+        "Tesseract enables OCR and confidence scoring for raster PDFs."
     )
     assert adapter_payloads["libredwg"]["status"] == "ok"
 

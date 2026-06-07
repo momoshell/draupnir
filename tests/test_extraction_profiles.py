@@ -1,6 +1,7 @@
 """Integration tests for immutable extraction profiles and reprocessing."""
 
 import importlib.util
+import json
 import math
 import uuid
 from datetime import UTC, datetime
@@ -52,11 +53,18 @@ async def _create_project(async_client: httpx.AsyncClient) -> dict[str, Any]:
 async def _upload_file(
     async_client: httpx.AsyncClient,
     project_id: str,
+    extraction_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upload a supported file and return its payload."""
+    request_kwargs: dict[str, Any] = {
+        "files": {"file": ("plan.pdf", b"%PDF-1.7\nprofile-test\n", "application/pdf")},
+    }
+    if extraction_profile is not None:
+        request_kwargs["data"] = {"extraction_profile": json.dumps(extraction_profile)}
+
     response = await async_client.post(
         f"/v1/projects/{project_id}/files",
-        files={"file": ("plan.pdf", b"%PDF-1.7\nprofile-test\n", "application/pdf")},
+        **request_kwargs,
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
@@ -141,9 +149,35 @@ class TestExtractionProfiles:
         assert profile.block_handling == "expand"
         assert profile.text_extraction is True
         assert profile.dimension_extraction is True
+        assert profile.pdf_input_mode == "auto"
         assert profile.pdf_page_range is None
         assert profile.raster_calibration is None
         assert profile.confidence_threshold == pytest.approx(0.6)
+
+    async def test_upload_creates_initial_profile_from_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        stub_enqueue_ingest_job: None,
+    ) -> None:
+        """Uploading should persist an initial immutable profile from multipart payload."""
+        _ = self
+        _ = cleanup_projects
+        _ = stub_enqueue_ingest_job
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(
+            async_client,
+            project["id"],
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
+
+        profile_id = uuid.UUID(str(uploaded["initial_extraction_profile_id"]))
+        profile = await _get_extraction_profile(profile_id)
+        assert profile.project_id == uuid.UUID(project["id"])
+        assert profile.profile_version == "v0.1"
+        assert profile.pdf_input_mode == "raster"
+        assert profile.layout_mode == "auto"
 
     async def test_reprocess_reuses_existing_profile_by_id(
         self,
@@ -157,8 +191,15 @@ class TestExtractionProfiles:
         _ = stub_enqueue_ingest_job
 
         project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
+        uploaded = await _upload_file(
+            async_client,
+            project["id"],
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
         original_job = await _finalize_initial_revision(str(uploaded["id"]))
+        assert original_job.extraction_profile_id is not None
+        original_profile = await _get_extraction_profile(original_job.extraction_profile_id)
+        assert original_profile.pdf_input_mode == "raster"
 
         response = await async_client.post(
             f"/v1/projects/{project['id']}/files/{uploaded['id']}/reprocess",
@@ -181,6 +222,10 @@ class TestExtractionProfiles:
         assert jobs[1].id != original_job.id
         assert jobs[1].job_type == "reprocess"
         assert jobs[1].extraction_profile_id == original_job.extraction_profile_id
+
+        assert jobs[1].extraction_profile_id is not None
+        reused_profile = await _get_extraction_profile(jobs[1].extraction_profile_id)
+        assert reused_profile.pdf_input_mode == "raster"
 
     async def test_reprocess_creates_new_profile_from_payload(
         self,
@@ -208,6 +253,7 @@ class TestExtractionProfiles:
                     "block_handling": "preserve",
                     "text_extraction": False,
                     "dimension_extraction": True,
+                    "pdf_input_mode": "raster",
                     "pdf_page_range": "2-4",
                     "raster_calibration": {"scale": 48, "unit": "inch"},
                     "confidence_threshold": 0.95,
@@ -236,6 +282,7 @@ class TestExtractionProfiles:
         assert profile.block_handling == "preserve"
         assert profile.text_extraction is False
         assert profile.dimension_extraction is True
+        assert profile.pdf_input_mode == "raster"
         assert profile.pdf_page_range == "2-4"
         assert profile.raster_calibration == {"scale": 48, "unit": "inch"}
         assert profile.confidence_threshold == pytest.approx(0.95)
@@ -517,9 +564,7 @@ class TestExtractionProfiles:
                     ],
                 )
 
-                await conn.run_sync(
-                    lambda sync_conn: _run_migration_upgrade(sync_conn, migration)
-                )
+                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
 
                 jobs = (
                     (
@@ -723,9 +768,7 @@ class TestExtractionProfiles:
                     },
                 )
 
-                await conn.run_sync(
-                    lambda sync_conn: _run_migration_upgrade(sync_conn, migration)
-                )
+                await conn.run_sync(lambda sync_conn: _run_migration_upgrade(sync_conn, migration))
                 assert await _get_job_check_constraints(conn, schema_name) == {
                     "ck_jobs_error_code_valid": True,
                     "ck_jobs_ingest_extraction_profile_required": True,
@@ -948,6 +991,26 @@ def _load_job_constraints_migration() -> Any:
     return module
 
 
+def _load_pdf_input_mode_migration() -> Any:
+    """Load the PDF input mode migration module directly from disk."""
+    migration_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "2026_06_07_0030_add_extraction_profile_pdf_input_mode.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migration_2026_06_07_0030_add_extraction_profile_pdf_input_mode",
+        migration_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _install_pre_0004_schema(sync_conn: sa.Connection) -> None:
     """Create the minimal pre-0004 schema needed to exercise the migration."""
     metadata = sa.MetaData()
@@ -1077,19 +1140,16 @@ async def _get_job_check_constraints(conn: Any, schema_name: str) -> dict[str, b
         .mappings()
         .all()
     )
-    return {
-        cast(str, row["conname"]): cast(bool, row["convalidated"])
-        for row in rows
-    }
+    return {cast(str, row["conname"]): cast(bool, row["convalidated"]) for row in rows}
 
 
 class _FakeScalarResult:
     """Small scalar result stand-in for migration guard tests."""
 
-    def __init__(self, value: bool) -> None:
+    def __init__(self, value: int | None) -> None:
         self._value = value
 
-    def scalar(self) -> bool:
+    def scalar(self) -> int | None:
         """Return the configured scalar value."""
         return self._value
 
@@ -1097,19 +1157,19 @@ class _FakeScalarResult:
 class _FakeBind:
     """Minimal Alembic bind double for downgrade guard tests."""
 
-    def __init__(self, *, profile_rows_exist: bool) -> None:
-        self.profile_rows_exist = profile_rows_exist
+    def __init__(self, *, rows_exist: bool) -> None:
+        self.rows_exist = rows_exist
 
     def execute(self, *_: Any, **__: Any) -> _FakeScalarResult:
-        """Return the configured extraction-profile existence result."""
-        return _FakeScalarResult(self.profile_rows_exist)
+        """Return the configured existence result."""
+        return _FakeScalarResult(1 if self.rows_exist else None)
 
 
 class _FakeOp:
     """Minimal Alembic op double for downgrade guard tests."""
 
-    def __init__(self, *, profile_rows_exist: bool) -> None:
-        self._bind = _FakeBind(profile_rows_exist=profile_rows_exist)
+    def __init__(self, *, rows_exist: bool) -> None:
+        self._bind = _FakeBind(rows_exist=rows_exist)
         self.drop_calls: list[tuple[str, str]] = []
 
     def get_bind(self) -> _FakeBind:
@@ -1143,13 +1203,49 @@ def test_extraction_profiles_migration_downgrade_raises_when_rows_exist(
 ) -> None:
     """Downgrade should refuse to drop profile lineage when rows already exist."""
     migration = _load_extraction_profiles_migration()
-    fake_op = _FakeOp(profile_rows_exist=True)
+    fake_op = _FakeOp(rows_exist=True)
     monkeypatch.setattr(migration, "op", fake_op)
 
     with pytest.raises(RuntimeError, match="Manual data-preserving rollback is required"):
         migration.downgrade()
 
     assert fake_op.drop_calls == []
+
+
+def test_pdf_input_mode_migration_downgrade_raises_when_custom_rows_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Downgrade should refuse to drop pdf_input_mode when custom values exist."""
+    migration = _load_pdf_input_mode_migration()
+    fake_op = _FakeOp(rows_exist=True)
+    monkeypatch.setattr(migration, "op", fake_op)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"persisted non-auto extraction_profiles\.pdf_input_mode",
+    ):
+        migration.downgrade()
+
+    assert fake_op.drop_calls == []
+
+
+def test_pdf_input_mode_migration_downgrade_drops_column_when_only_auto_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Downgrade should drop pdf_input_mode when persisted rows only use the implicit auto mode."""
+    migration = _load_pdf_input_mode_migration()
+    fake_op = _FakeOp(rows_exist=False)
+    monkeypatch.setattr(migration, "op", fake_op)
+
+    migration.downgrade()
+
+    assert fake_op.drop_calls == [
+        (
+            "drop_constraint",
+            "extraction_profiles:ck_extraction_profiles_pdf_input_mode_valid",
+        ),
+        ("drop_column", "extraction_profiles:pdf_input_mode"),
+    ]
 
 
 def test_job_read_accepts_null_extraction_profile_id_during_rollback_window() -> None:
@@ -1174,6 +1270,27 @@ def test_job_read_accepts_null_extraction_profile_id_during_rollback_window() ->
     )
 
     assert job.extraction_profile_id is None
+
+
+def test_extraction_profile_create_defaults_pdf_input_mode_to_auto() -> None:
+    """Schema should default PDF input mode to auto."""
+    profile = ExtractionProfileCreate()
+
+    assert profile.pdf_input_mode == "auto"
+
+
+@pytest.mark.parametrize("value", ["auto", "vector", "raster"])
+def test_extraction_profile_create_accepts_pdf_input_mode_values(value: str) -> None:
+    """Schema should accept each supported PDF input mode."""
+    profile = ExtractionProfileCreate.model_validate({"pdf_input_mode": value})
+
+    assert profile.pdf_input_mode == value
+
+
+def test_extraction_profile_create_rejects_invalid_pdf_input_mode() -> None:
+    """Schema should reject unsupported PDF input modes."""
+    with pytest.raises(ValidationError, match="pdf_input_mode"):
+        ExtractionProfileCreate.model_validate({"pdf_input_mode": "bitmap"})
 
 
 @pytest.mark.parametrize(

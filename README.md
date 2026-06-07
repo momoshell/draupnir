@@ -211,10 +211,10 @@ This lane stays manual and is not started automatically in CI.
 
 For local-only proprietary DWG/PDF extraction review runs, use the dedicated
 [local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md). That
-workflow now covers host-side vector PDF enablement as an opt-in path; default
-Compose remains DXF-only, raster PDF remains deferred locally, and proprietary
-source samples, generated artifacts, and sensitive review notes must stay out
-of git.
+workflow covers host-side vector PDF opt-in and local raster PDF review with
+the full ingestion prerequisites; default Compose remains DXF-only, and
+proprietary source samples, generated artifacts, and sensitive review notes
+must stay out of git.
 
 ### Local Development (without Docker)
 
@@ -455,6 +455,7 @@ download URLs.
 
 - Start with project and file endpoints under `/v1`.
 - File upload is multipart and expects the file field name `file`.
+- Upload can also include an optional multipart `extraction_profile` JSON field, for example `{"pdf_input_mode":"vector"}` or `{"pdf_input_mode":"raster"}` for PDF mode selection.
 - Upload requests must include `Content-Length`.
 - The API accepts PDF, DWG, DXF, and IFC inputs when the relevant adapters are
   available.
@@ -463,8 +464,9 @@ download URLs.
   full `ingestion` extra or the narrower `pdf-vector` extra and set
   `DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review` after reviewing
   the ADR-0007 AGPL/commercial caveat.
-- Local raster PDF ingestion is still deferred/unavailable in the standard host
-  and Compose workflows documented here.
+- Local raster PDF ingestion is available when you intentionally install the full
+  `ingestion` extra; `vtracer` is required and `tesseract` remains optional/
+  degraded per capability reporting.
 - Proprietary DWG/PDF samples used for local review must stay outside git and
   outside `tests/fixtures/manifest.yaml`; see the
   [local DWG/PDF review workflow](docs/local-dwg-pdf-review-workflow.md).
@@ -524,6 +526,10 @@ download URLs.
   with `DRAUPNIR_UV_EXTRAS="--extra db --extra jobs --extra dxf --extra pdf-vector"`
   and `DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review` when you
   intentionally want local vector PDF review support.
+- Local raster PDF review is available only with the full `ingestion` extra;
+  `vtracer` is required and `tesseract` is optional with degraded extraction if
+  it is absent. Do not treat a future containerized PDF service as current
+  behavior.
 - `ADAPTER_UNAVAILABLE` details differ between a missing package/runtime and a
   missing license approval signal; use `GET /v1/system/health` and job/event
   diagnostics to distinguish those cases.

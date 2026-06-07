@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping
@@ -1225,13 +1226,19 @@ async def _upload_pdf(
     filename: str = "plan.pdf",
     content: bytes = b"%PDF-1.7\nidempotency\n",
     idempotency_key: str | None = None,
+    extraction_profile: Mapping[str, Any] | None = None,
 ) -> httpx.Response:
     """Upload a supported PDF file with optional idempotency headers."""
+    request_kwargs: dict[str, Any] = {
+        "files": {"file": (filename, content, "application/pdf")},
+        "headers": _headers(idempotency_key),
+    }
+    if extraction_profile is not None:
+        request_kwargs["data"] = {"extraction_profile": json.dumps(dict(extraction_profile))}
 
     return await async_client.post(
         f"/v1/projects/{project_id}/files",
-        files={"file": (filename, content, "application/pdf")},
-        headers=_headers(idempotency_key),
+        **request_kwargs,
     )
 
 
@@ -1295,6 +1302,18 @@ async def _get_job_for_file(file_id: str) -> Job:
         return (
             await session.execute(select(Job).where(Job.file_id == uuid.UUID(file_id)))
         ).scalar_one()
+
+
+async def _get_extraction_profile(profile_id: str | uuid.UUID) -> ExtractionProfile:
+    """Return the persisted extraction profile by identifier."""
+
+    session_maker = session_module.AsyncSessionLocal
+    assert session_maker is not None
+    async with session_maker() as session:
+        profile = await session.get(ExtractionProfile, uuid.UUID(str(profile_id)))
+
+    assert profile is not None
+    return profile
 
 
 async def _get_job(job_id: str | uuid.UUID) -> Job:
@@ -1605,14 +1624,26 @@ class TestEndpointIdempotency:
         project = cast(dict[str, Any], (await _create_project(async_client)).json())
         key = "file-upload-1"
 
-        first = await _upload_pdf(async_client, project_id=project["id"], idempotency_key=key)
-        second = await _upload_pdf(async_client, project_id=project["id"], idempotency_key=key)
+        first = await _upload_pdf(
+            async_client,
+            project_id=project["id"],
+            idempotency_key=key,
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
+        second = await _upload_pdf(
+            async_client,
+            project_id=project["id"],
+            idempotency_key=key,
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
 
         assert first.status_code == 201
         assert second.status_code == 201
         assert second.json() == first.json()
         assert len(enqueued_job_ids) == 1
         assert await _job_count_for_file(first.json()["id"]) == 1
+        profile = await _get_extraction_profile(first.json()["initial_extraction_profile_id"])
+        assert profile.pdf_input_mode == "raster"
 
     async def test_upload_same_key_different_request_returns_request_mismatch(
         self,
@@ -1646,6 +1677,115 @@ class TestEndpointIdempotency:
                 "details": {"reason": "request_mismatch"},
             }
         }
+
+    async def test_upload_same_key_different_profile_mode_returns_request_mismatch(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Changing upload profile mode under the same key should conflict."""
+
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        project = cast(dict[str, Any], (await _create_project(async_client)).json())
+        key = "file-upload-profile-mismatch-1"
+
+        first = await _upload_pdf(
+            async_client,
+            project_id=project["id"],
+            idempotency_key=key,
+            extraction_profile={"pdf_input_mode": "vector"},
+        )
+        second = await _upload_pdf(
+            async_client,
+            project_id=project["id"],
+            idempotency_key=key,
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 409
+        assert second.json() == {
+            "error": {
+                "code": "IDEMPOTENCY_CONFLICT",
+                "message": ("This Idempotency-Key is already associated with a different request."),
+                "details": {"reason": "request_mismatch"},
+            }
+        }
+
+    async def test_upload_invalid_profile_then_corrected_retry_with_same_key_succeeds(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """Malformed multipart profile data should not poison a corrected retry."""
+
+        _ = self
+        _ = cleanup_projects
+        project = cast(dict[str, Any], (await _create_project(async_client)).json())
+        key = "file-upload-invalid-profile-retry-1"
+        storage_put_calls: list[tuple[str, Path, bytes, bool]] = []
+
+        class _RecordingStorage:
+            async def put(
+                self,
+                key: str,
+                data: bytes | Path,
+                *,
+                immutable: bool = False,
+            ) -> Any:
+                assert isinstance(data, Path)
+                body = data.read_bytes()
+                storage_put_calls.append((key, data, body, immutable))
+                return type(
+                    "StoredObjectMeta",
+                    (),
+                    {
+                        "key": key,
+                        "storage_uri": f"memory://{key}",
+                        "size_bytes": len(body),
+                        "checksum_sha256": hashlib.sha256(body).hexdigest(),
+                    },
+                )()
+
+        app = _get_async_client_app(async_client)
+        get_storage_dependency = cast(Any, files_api).get_storage
+        app.dependency_overrides[get_storage_dependency] = lambda: _RecordingStorage()
+        try:
+            first = await async_client.post(
+                f"/v1/projects/{project['id']}/files",
+                files={"file": ("retry.pdf", b"%PDF-1.7\nretry-invalid\n", "application/pdf")},
+                data={"extraction_profile": json.dumps({"pdf_input_mode": "not-a-real-mode"})},
+                headers=_headers(key),
+            )
+            assert first.status_code == 400
+            assert first.json()["error"]["code"] == "INPUT_INVALID"
+            assert storage_put_calls == []
+            assert await _get_idempotency_record_or_none(key) is None
+            assert enqueued_job_ids == []
+
+            second = await _upload_pdf(
+                async_client,
+                project_id=project["id"],
+                idempotency_key=key,
+                extraction_profile={"pdf_input_mode": "raster"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage_dependency, None)
+
+        record = await _get_idempotency_record(key)
+
+        assert second.status_code == 201
+        assert second.json()["project_id"] == project["id"]
+        assert len(storage_put_calls) == 1
+        assert len(enqueued_job_ids) == 1
+        assert await _upload_lineage_counts(project["id"]) == (1, 1, 1)
+        assert record.status == IdempotencyStatus.COMPLETED.value
+        assert record.response_status_code == 201
+        assert record.response_body_json == second.json()
 
     async def test_upload_publish_failure_replays_success_snapshot(
         self,

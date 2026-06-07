@@ -10,6 +10,8 @@ AllowedUnitsOverride = Literal["metric", "imperial", "mm", "cm", "m", "inch", "f
 LayoutMode = Literal["auto", "model_space", "paper_space"]
 XrefHandling = Literal["preserve", "inline", "detach"]
 BlockHandling = Literal["expand", "preserve"]
+PdfInputMode = Literal["auto", "vector", "raster"]
+
 
 class RasterCalibration(BaseModel):
     """Strict raster calibration payload."""
@@ -71,6 +73,10 @@ class ExtractionProfileCreate(BaseModel):
     dimension_extraction: bool = Field(
         default=True,
         description="Whether dimension extraction is enabled",
+    )
+    pdf_input_mode: PdfInputMode = Field(
+        default="auto",
+        description="PDF input mode selection",
     )
     pdf_page_range: str | None = Field(
         default=None,
@@ -155,12 +161,9 @@ class FileReprocessRequest(BaseModel):
     @model_validator(mode="after")
     def validate_profile_selection(self) -> "FileReprocessRequest":
         """Require exactly one extraction profile selector."""
-        provided_values = (
-            int(self.extraction_profile_id is not None)
-            + int(self.extraction_profile is not None)
+        provided_values = int(self.extraction_profile_id is not None) + int(
+            self.extraction_profile is not None
         )
         if provided_values != 1:
-            raise ValueError(
-                "Provide exactly one of extraction_profile_id or extraction_profile."
-            )
+            raise ValueError("Provide exactly one of extraction_profile_id or extraction_profile.")
         return self

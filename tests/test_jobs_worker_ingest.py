@@ -15,6 +15,7 @@ from app.core.errors import ErrorCode
 from app.ingestion.contracts import (
     AdapterFailureKind,
     CancellationHandle,
+    InputFamily,
     ProgressCallback,
     ProgressUpdate,
 )
@@ -24,6 +25,7 @@ from app.ingestion.runner import (
     IngestionRunRequest,
 )
 from app.ingestion.runner import run_ingestion as real_run_ingestion
+from app.models.job import JobType
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import (
     _TEST_UPLOAD_BODY,
@@ -490,6 +492,247 @@ class TestJobsWorkerIngest:
         assert request.original_name == "plan.pdf"
         assert request.extraction_profile_id == job.extraction_profile_id
         assert request.initial_job_id == job.id
+        assert request.requested_input_family is None
+
+    async def test_build_ingestion_run_request_uses_raster_profile_input_family(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Persisted raster PDF mode should force raster runner selection."""
+        _ = self
+
+        job_id = uuid.uuid4()
+        project_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        extraction_profile_id = uuid.uuid4()
+        initial_job_id = uuid.uuid4()
+        attempt_token = uuid.uuid4()
+        session = object()
+
+        class _FakeSessionContext:
+            async def __aenter__(self) -> object:
+                return session
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        bootstrap = types.SimpleNamespace(project_id=project_id, file_id=file_id)
+        project = types.SimpleNamespace(deleted_at=None)
+        job = types.SimpleNamespace(
+            id=job_id,
+            project_id=project_id,
+            file_id=file_id,
+            extraction_profile_id=extraction_profile_id,
+            initial_job_id=initial_job_id,
+            base_revision_id=None,
+            job_type=JobType.INGEST.value,
+        )
+        source_file = types.SimpleNamespace(
+            id=file_id,
+            checksum_sha256="abc123",
+            detected_format="pdf",
+            media_type="application/pdf",
+            original_filename="plan.pdf",
+            initial_job_id=initial_job_id,
+            deleted_at=None,
+        )
+        extraction_profile = types.SimpleNamespace(pdf_input_mode="raster")
+
+        monkeypatch.setattr(worker_module, "get_session_maker", lambda: _FakeSessionContext)
+
+        async def _fake_get_job_lock_bootstrap(_: object, loaded_job_id: uuid.UUID) -> object:
+            assert loaded_job_id == job_id
+            return bootstrap
+
+        async def _fake_get_project(
+            _: object,
+            loaded_project_id: uuid.UUID,
+            *,
+            for_update: bool,
+        ) -> object:
+            assert loaded_project_id == project_id
+            assert for_update is True
+            return project
+
+        async def _fake_get_job_for_update_with_metadata(
+            _: object,
+            loaded_job_id: uuid.UUID,
+            *,
+            expected_project_id: uuid.UUID,
+            expected_file_id: uuid.UUID,
+        ) -> object:
+            assert loaded_job_id == job_id
+            assert expected_project_id == project_id
+            assert expected_file_id == file_id
+            return job
+
+        async def _fake_get_source_file(
+            _: object,
+            *,
+            project_id: uuid.UUID,
+            file_id: uuid.UUID,
+            for_update: bool,
+        ) -> object:
+            assert project_id == job.project_id
+            assert file_id == job.file_id
+            assert for_update is True
+            return source_file
+
+        async def _fake_get_extraction_profile(
+            _: object,
+            *,
+            extraction_profile_id: uuid.UUID,
+        ) -> object:
+            assert extraction_profile_id == job.extraction_profile_id
+            return extraction_profile
+
+        monkeypatch.setattr(worker_module, "_get_job_lock_bootstrap", _fake_get_job_lock_bootstrap)
+        monkeypatch.setattr(worker_module, "_get_project", _fake_get_project)
+        monkeypatch.setattr(
+            worker_module,
+            "_get_job_for_update_with_metadata",
+            _fake_get_job_for_update_with_metadata,
+        )
+        monkeypatch.setattr(worker_module, "_get_source_file", _fake_get_source_file)
+        monkeypatch.setattr(worker_module, "_get_extraction_profile", _fake_get_extraction_profile)
+        monkeypatch.setattr(
+            worker_module,
+            "_job_attempt_is_current",
+            lambda *_args, **_kwargs: True,
+        )
+
+        request = await worker_module._build_ingestion_run_request(
+            job_id,
+            attempt_token=attempt_token,
+        )
+
+        assert request.requested_input_family == InputFamily.PDF_RASTER
+
+    async def test_build_ingestion_run_request_preserves_non_pdf_detected_format_with_pdf_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _ = self
+
+        job_id = uuid.uuid4()
+        project_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        extraction_profile_id = uuid.uuid4()
+        initial_job_id = uuid.uuid4()
+        attempt_token = uuid.uuid4()
+        session = object()
+
+        class _FakeSessionContext:
+            async def __aenter__(self) -> object:
+                return session
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+        bootstrap = types.SimpleNamespace(project_id=project_id, file_id=file_id)
+        project = types.SimpleNamespace(deleted_at=None)
+        job = types.SimpleNamespace(
+            id=job_id,
+            project_id=project_id,
+            file_id=file_id,
+            extraction_profile_id=extraction_profile_id,
+            initial_job_id=initial_job_id,
+            base_revision_id=None,
+            job_type=JobType.INGEST.value,
+        )
+        source_file = types.SimpleNamespace(
+            id=file_id,
+            checksum_sha256="abc123",
+            detected_format="dxf",
+            media_type="application/dxf",
+            original_filename="plan.dxf",
+            initial_job_id=initial_job_id,
+            deleted_at=None,
+        )
+        extraction_profile = types.SimpleNamespace(pdf_input_mode="vector")
+
+        monkeypatch.setattr(worker_module, "get_session_maker", lambda: _FakeSessionContext)
+
+        async def _fake_get_job_lock_bootstrap(_: object, loaded_job_id: uuid.UUID) -> object:
+            assert loaded_job_id == job_id
+            return bootstrap
+
+        async def _fake_get_project(
+            _: object,
+            loaded_project_id: uuid.UUID,
+            *,
+            for_update: bool,
+        ) -> object:
+            assert loaded_project_id == project_id
+            assert for_update is True
+            return project
+
+        async def _fake_get_job_for_update_with_metadata(
+            _: object,
+            loaded_job_id: uuid.UUID,
+            *,
+            expected_project_id: uuid.UUID,
+            expected_file_id: uuid.UUID,
+        ) -> object:
+            assert loaded_job_id == job_id
+            assert expected_project_id == project_id
+            assert expected_file_id == file_id
+            return job
+
+        async def _fake_get_source_file(
+            _: object,
+            *,
+            project_id: uuid.UUID,
+            file_id: uuid.UUID,
+            for_update: bool,
+        ) -> object:
+            assert project_id == job.project_id
+            assert file_id == job.file_id
+            assert for_update is True
+            return source_file
+
+        async def _fake_get_extraction_profile(
+            _: object,
+            *,
+            extraction_profile_id: uuid.UUID,
+        ) -> object:
+            assert extraction_profile_id == job.extraction_profile_id
+            return extraction_profile
+
+        monkeypatch.setattr(worker_module, "_get_job_lock_bootstrap", _fake_get_job_lock_bootstrap)
+        monkeypatch.setattr(worker_module, "_get_project", _fake_get_project)
+        monkeypatch.setattr(
+            worker_module,
+            "_get_job_for_update_with_metadata",
+            _fake_get_job_for_update_with_metadata,
+        )
+        monkeypatch.setattr(worker_module, "_get_source_file", _fake_get_source_file)
+        monkeypatch.setattr(worker_module, "_get_extraction_profile", _fake_get_extraction_profile)
+        monkeypatch.setattr(
+            worker_module,
+            "_job_attempt_is_current",
+            lambda *_args, **_kwargs: True,
+        )
+
+        request = await worker_module._build_ingestion_run_request(
+            job_id,
+            attempt_token=attempt_token,
+        )
+
+        assert request.detected_format == "dxf"
+        assert request.media_type == "application/dxf"
+        assert request.requested_input_family == InputFamily.PDF_VECTOR
+
+    def test_requested_input_family_from_pdf_input_mode_maps_vector_and_auto(self) -> None:
+        """PDF mode mapping should preserve vector override and default auto behavior."""
+        _ = self
+
+        assert (
+            worker_module._requested_input_family_from_pdf_input_mode("vector")
+            == InputFamily.PDF_VECTOR
+        )
+        assert worker_module._requested_input_family_from_pdf_input_mode("auto") is None
+        assert worker_module._requested_input_family_from_pdf_input_mode(None) is None
 
     async def test_process_ingest_job_flushes_progress_events_before_failure(
         self,

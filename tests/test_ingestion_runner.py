@@ -421,6 +421,43 @@ def test_select_adapter_candidates_keeps_pdf_vector_then_raster_order() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("requested_input_family", "expected_input_family"),
+    [
+        (InputFamily.PDF_VECTOR, InputFamily.PDF_VECTOR),
+        (InputFamily.PDF_RASTER, InputFamily.PDF_RASTER),
+    ],
+)
+def test_select_adapter_candidates_honor_requested_pdf_family(
+    requested_input_family: InputFamily,
+    expected_input_family: InputFamily,
+) -> None:
+    candidates = select_adapter_candidates(
+        "pdf",
+        media_type="application/pdf",
+        requested_input_family=requested_input_family,
+    )
+
+    assert [(candidate.upload_format, candidate.input_family) for candidate in candidates] == [
+        (UploadFormat.PDF, expected_input_family),
+    ]
+
+
+@pytest.mark.parametrize(
+    "requested_input_family",
+    [InputFamily.PDF_VECTOR, InputFamily.PDF_RASTER],
+)
+def test_select_adapter_candidates_reject_requested_pdf_family_for_non_pdf_upload(
+    requested_input_family: InputFamily,
+) -> None:
+    with pytest.raises(ValueError, match=r"Unsupported upload format for ingestion\."):
+        select_adapter_candidates(
+            "dxf",
+            media_type="application/dxf",
+            requested_input_family=requested_input_family,
+        )
+
+
 def test_select_export_candidates_keep_registered_order_and_filter_capabilities(
     monkeypatch: pytest.MonkeyPatch,
     clear_registry_caches: None,
@@ -709,6 +746,56 @@ async def test_run_ingestion_falls_back_to_next_candidate_and_is_deterministic(
 
 
 @pytest.mark.asyncio
+async def test_run_ingestion_requested_pdf_raster_bypasses_vector_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    imported_modules: list[str] = []
+    seen_paths: list[Path] = []
+
+    raster_module = _AdapterModule(
+        "requested_raster_module",
+        lambda: _FakeAdapter(seen_paths=seen_paths),
+    )
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            raise AssertionError(
+                "Vector adapter should not be imported for explicit raster selection"
+            )
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            return raster_module
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        requested_input_family=InputFamily.PDF_RASTER,
+        original_name="sheet.pdf",
+    )
+
+    payload = await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    assert payload.adapter_key == "vtracer_tesseract"
+    assert payload.input_family == InputFamily.PDF_RASTER.value
+    assert imported_modules == ["app.ingestion.adapters.vtracer_tesseract"]
+    assert seen_paths
+    assert all(not path.exists() for path in seen_paths)
+
+
+@pytest.mark.asyncio
 async def test_run_ingestion_maps_missing_factory_to_sanitized_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -932,6 +1019,40 @@ async def test_run_ingestion_maps_unsupported_format_to_typed_error() -> None:
 
     with pytest.raises(IngestionRunnerError) as exc_info:
         await run_ingestion(request, storage=MemoryStorage())
+
+    error = exc_info.value
+    assert error.error_code is ErrorCode.INPUT_UNSUPPORTED_FORMAT
+    assert error.failure_kind.value == "unsupported_format"
+    assert error.message == "Input format is not supported for ingestion."
+
+
+@pytest.mark.parametrize(
+    "requested_input_family",
+    [InputFamily.PDF_VECTOR, InputFamily.PDF_RASTER],
+)
+@pytest.mark.asyncio
+async def test_run_ingestion_maps_incompatible_requested_pdf_family_to_typed_error(
+    requested_input_family: InputFamily,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="dxf",
+        media_type="application/dxf",
+        requested_input_family=requested_input_family,
+        original_name="plan.dxf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(request, storage=storage)
 
     error = exc_info.value
     assert error.error_code is ErrorCode.INPUT_UNSUPPORTED_FORMAT
@@ -1404,7 +1525,9 @@ async def test_run_ingestion_does_not_fall_through_after_runtime_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_input_family", [None, InputFamily.PDF_VECTOR])
 async def test_run_ingestion_maps_pymupdf_execute_dependency_missing_without_raster_fallback(
+    requested_input_family: InputFamily | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1461,6 +1584,7 @@ async def test_run_ingestion_maps_pymupdf_execute_dependency_missing_without_ras
         checksum_sha256=checksum,
         detected_format="pdf",
         media_type="application/pdf",
+        requested_input_family=requested_input_family,
         original_name="sheet.pdf",
     )
 
@@ -1482,7 +1606,9 @@ async def test_run_ingestion_maps_pymupdf_execute_dependency_missing_without_ras
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_input_family", [None, InputFamily.PDF_VECTOR])
 async def test_run_ingestion_maps_pymupdf_missing_license_without_raster_fallback(
+    requested_input_family: InputFamily | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1534,6 +1660,7 @@ async def test_run_ingestion_maps_pymupdf_missing_license_without_raster_fallbac
         checksum_sha256=checksum,
         detected_format="pdf",
         media_type="application/pdf",
+        requested_input_family=requested_input_family,
         original_name="sheet.pdf",
     )
 
