@@ -76,6 +76,23 @@ If a vector PDF upload fails with `ADAPTER_UNAVAILABLE`, distinguish the common 
 
 Use `GET /v1/system/health` plus the job failure/event diagnostics to tell those cases apart before retrying.
 
+## Extraction-readiness smoke procedure
+
+Use this named procedure when you have a representative local DWG/vector-PDF pair and want a repeatable readiness check before trusting follow-on comparison or quantity work.
+
+### Expected inputs
+
+- One representative DWG kept local-only.
+- One representative vector PDF for the same or equivalent drawing content, also kept local-only.
+- Neutral local labels for each file so your notes do not expose sample names or paths.
+
+### Smoke outcomes
+
+- **Pass**: title metadata, labels, geometry, overlay alignment, units/calibration, and entity/layer meaning are good enough for comparison; validation is `valid` or `valid_with_warnings`; quantity work can proceed only if the quantity gate is `allowed`.
+- **Provisional**: extraction is usable for review, but some warnings or partial recovery remain; quantity output stays provisional or otherwise not fully trusted.
+- **Review-gated**: extraction is review-first; use it for human comparison only. If the quantity gate is `review_gated`, or if units, calibration, or geometry are still unresolved, keep takeoff blocked or untrusted.
+- **Fail**: extraction is not reliable enough for comparison or downstream use; validation is `invalid`, geometry is materially wrong, or critical title/label/context recovery is missing.
+
 ## Run the local review
 
 1. Create a project:
@@ -110,12 +127,31 @@ Use `GET /v1/system/health` plus the job failure/event diagnostics to tell those
    curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/generated-artifacts"
    ```
 5. If the revision is eligible for a quantity run, create a takeoff job:
-   ```bash
-   curl -sS -X POST "$BASE_URL/v1/revisions/$REVISION_ID/quantity-takeoffs" \
-     -H 'Content-Type: application/json' \
-     -H 'Idempotency-Key: local-review-quantity-1' \
-     -d '{}'
-   ```
+    ```bash
+    curl -sS -X POST "$BASE_URL/v1/revisions/$REVISION_ID/quantity-takeoffs" \
+      -H 'Content-Type: application/json' \
+      -H 'Idempotency-Key: local-review-quantity-1' \
+      -d '{}'
+    ```
+
+### Repeatable extraction-readiness smoke flow
+
+Run these checks for the local DWG and the local vector PDF, then compare the two review records side by side.
+
+1. Pick a representative local DWG/vector-PDF pair and assign neutral labels.
+2. Run the upload and revision inspection flow for the DWG.
+3. Run the same flow for the vector PDF.
+4. For each revision, review:
+   - title metadata recovery such as drawing identity, revision markers, sheet markers, or dates
+   - containment and navigation cues such as rooms, spaces, zones, or enclosure boundaries when the drawing carries them
+   - equipment, fixture, callout, and room labels that a reviewer would use to confirm meaning
+   - route or path linework plus debug-overlay alignment against the source drawing
+   - units, PDF calibration status, and whether missing units or geometry makes quantities untrusted
+   - entity/layer meaning, including whether important content fell into unknown or fallback buckets
+   - validation status and any findings that still require review
+   - quantity gate, noting that `review_gated` or unresolved units/geometry means takeoff is still blocked or untrusted
+5. Classify each input as pass, provisional, review-gated, or fail.
+6. Only treat the pair as extraction-ready when both inputs are at least good enough for human comparison and neither has unresolved issues that would hide drawing meaning or make quantity trust impossible.
 
 ## Review checklist
 
@@ -145,6 +181,7 @@ For a reusable comparison template, use [Local DWG/PDF extraction comparison che
 ### 4. Labels, text, and layers
 
 - Are important labels or text blocks present and readable?
+- Are containment, equipment, fixture, or room labels present where the source depends on them?
 - Are layers/layouts attached where expected?
 - Are entities landing on obviously wrong layers or missing layer names entirely?
 
@@ -165,6 +202,8 @@ If you run quantities, check the returned gate/trust fields before using totals:
 - `allowed_provisional`: usable only as provisional output; do not treat as fully trusted.
 - `review_gated`: review-first; do not treat totals as trusted until reviewed.
 - `blocked`: do not use the quantity output.
+
+If units are missing, PDF calibration is still unresolved, or core geometry is materially wrong, keep the takeoff blocked or untrusted even if other checks look acceptable.
 
 DWG and vector PDF inputs may remain review-gated or blocked depending on extraction confidence and validation outcomes. Raster PDF remains deferred for local review in this workflow.
 

@@ -1,6 +1,6 @@
 # Local DWG/PDF Extraction Comparison Checklist
 
-Use this checklist after a local-only DWG, vector PDF, or raster PDF review run when you need to compare the source drawing against extracted outputs without committing proprietary artifacts or sensitive notes.
+Use this checklist after a local-only DWG or vector PDF review run when you need to compare the source drawing against extracted outputs without committing proprietary artifacts or sensitive notes.
 
 ## Hard rules
 
@@ -11,9 +11,10 @@ Use this checklist after a local-only DWG, vector PDF, or raster PDF review run 
 ## Review record
 
 - Review date: `<YYYY-MM-DD>`
-- Input type: `<DWG | vector PDF | raster PDF>`
+- Input type: `<DWG | vector PDF>`
 - Reviewer: `<initials-or-role>`
 - Local reference label: `<neutral-placeholder>`
+- Outcome: `<pass | provisional | review_gated | fail>`
 
 ## 1. Title-block identity
 
@@ -26,6 +27,7 @@ Use this checklist after a local-only DWG, vector PDF, or raster PDF review run 
 ## 2. Text and label recovery
 
 - Key labels are present and readable: `<yes | partial | no>`
+- Containment, equipment, fixture, or room labels are present where needed for review: `<yes | partial | no | not_applicable>`
 - Text placement is close enough to support review: `<yes | partial | no>`
 - Important text is missing, duplicated, or garbled: `<none | minor | material>`
 - Notes:
@@ -34,6 +36,7 @@ Use this checklist after a local-only DWG, vector PDF, or raster PDF review run 
 ## 3. Geometry and overlay comparison
 
 - Major linework/features appear in the extracted output: `<yes | partial | no>`
+- Routes, paths, or other navigation linework are recovered well enough for comparison: `<yes | partial | no | not_applicable>`
 - Overlay alignment looks acceptable: `<yes | partial | no>`
 - Missing or misplaced geometry is: `<none | minor | material>`
 - Extents/clustering issues are: `<none | minor | material>`
@@ -44,6 +47,7 @@ Use this checklist after a local-only DWG, vector PDF, or raster PDF review run 
 
 - Important layers/layouts are attached where expected: `<yes | partial | no>`
 - Entity types look plausible for the source content: `<yes | partial | no>`
+- Entity/layer meaning is understandable enough to identify rooms, equipment, containment, routes, or similar drawing intent: `<yes | partial | no>`
 - Unknown or fallback mappings are: `<expected | elevated | blocking>`
 - Notes:
   - `<neutral observation>`
@@ -70,6 +74,13 @@ Interpretation:
 - `needs_review`: human review still required; do not treat as trusted yet.
 - `invalid`: blocked for trusted downstream use.
 
+Suggested outcome mapping:
+
+- `pass`: usually `valid` or `valid_with_warnings`, with no material unresolved comparison problems.
+- `provisional`: comparison is usable, but warnings or partial recovery still limit trust.
+- `review_gated`: `needs_review`, or comparison still depends on unresolved human review.
+- `fail`: `invalid`, or the extraction is materially unusable for the intended comparison.
+
 ## 7. Quantity gate interpretation
 
 - Quantity run attempted: `<yes | no>`
@@ -84,6 +95,11 @@ Interpretation:
 - `allowed_provisional`: usable only as provisional output.
 - `review_gated`: review-first; do not treat totals as trusted.
 - `blocked`: do not use the quantity output.
+
+Takeoff safety rule:
+
+- If the quantity gate is `review_gated`, keep takeoff blocked for trusted use.
+- If units are unknown, PDF calibration is still required, or geometry is materially wrong/missing, keep takeoff blocked or untrusted even if a quantity run exists.
 
 ## Trust-before-takeoff decision
 
