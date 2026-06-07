@@ -5,13 +5,17 @@
 
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        DRAUPNIR_UV_EXTRAS: ${DRAUPNIR_UV_EXTRAS:---extra db --extra jobs --extra dxf}
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/draupnir
       - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - DRAUPNIR_APPROVED_LICENSE_PROBES
       - LOG_LEVEL=info
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-api
@@ -37,11 +41,15 @@ services:
       - upload_storage:/app/var/uploads:rw
 
   worker:
-    build: .
+    build:
+      context: .
+      args:
+        DRAUPNIR_UV_EXTRAS: ${DRAUPNIR_UV_EXTRAS:---extra db --extra jobs --extra dxf}
     command: celery -A app.jobs.worker worker --loglevel=info
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/draupnir
       - BROKER_URL=amqp://guest:guest@rabbitmq:5672//
+      - DRAUPNIR_APPROVED_LICENSE_PROBES
       - LOG_LEVEL=info
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-worker

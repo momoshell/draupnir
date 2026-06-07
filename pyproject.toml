@@ -93,6 +93,11 @@ dxf = [
     "ezdxf>=1.2",
 ]
 
+# Vector PDF runtime — explicit PyMuPDF opt-in without broader ingestion extras
+pdf-vector = [
+    "pymupdf>=1.23",
+]
+
 # Ingestion adapters — isolated behind the adapter contract (ADR-0006/0007/0008).
 # NOTE: LibreDWG still requires a system install; IfcOpenShell remains optional here.
 ingestion = [
@@ -143,7 +148,7 @@ test = [
 
 # Convenience: install everything
 all = [
-    "draupnir[db,jobs,dxf,ingestion,dev,test]",
+    "draupnir[db,jobs,dxf,pdf-vector,ingestion,dev,test]",
 ]
 
 # ---------------------------------------------------------------------------

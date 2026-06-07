@@ -1554,6 +1554,72 @@ async def test_run_ingestion_maps_pymupdf_missing_license_without_raster_fallbac
 
 
 @pytest.mark.asyncio
+async def test_run_ingestion_allows_pymupdf_execution_with_license_acknowledgement_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage = MemoryStorage()
+    file_id = uuid4()
+    body = b"%PDF-1.7\n"
+    checksum = hashlib.sha256(body).hexdigest()
+    key = build_original_storage_key(file_id, checksum)
+    await storage.put(key, body, immutable=True)
+    process_attempted = False
+    imported_modules: list[str] = []
+
+    def fake_import_module(module_name: str) -> types.ModuleType:
+        imported_modules.append(module_name)
+        if module_name == "app.ingestion.adapters.pymupdf":
+            return pymupdf_adapter_module
+        if module_name == "app.ingestion.adapters.vtracer_tesseract":
+            raise AssertionError(
+                "Raster fallback should not be imported after acknowledged vector execution"
+            )
+        raise AssertionError(f"Unexpected module import: {module_name}")
+
+    async def _extract_with_process(source, options) -> tuple[dict[str, Any], list[Any]]:  # type: ignore[no-untyped-def]
+        nonlocal process_attempted
+        process_attempted = True
+        assert source.file_path.exists()
+        _ = options
+        return {
+            "entities": (
+                _fake_line_entity(
+                    adapter_key="pymupdf",
+                    source_ref="originals/source.pdf",
+                ),
+            ),
+            "metadata": {"page_count": 1, "text_blocks": ()},
+        }, []
+
+    monkeypatch.setenv(
+        pymupdf_adapter_module._APPROVED_LICENSE_PROBES_ENV_VAR,
+        pymupdf_adapter_module._LICENSE_PROBE_NAME,
+    )
+    monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
+    monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
+    monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
+    monkeypatch.setattr(pymupdf_adapter_module, "_extract_with_process", _extract_with_process)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=file_id,
+        checksum_sha256=checksum,
+        detected_format="pdf",
+        media_type="application/pdf",
+        original_name="sheet.pdf",
+    )
+
+    payload = await run_ingestion(request, storage=storage, temp_root=tmp_path)
+
+    assert payload.adapter_key == "pymupdf"
+    assert payload.input_family == InputFamily.PDF_VECTOR.value
+    assert imported_modules == ["app.ingestion.adapters.pymupdf"]
+    assert process_attempted is True
+
+
+@pytest.mark.asyncio
 async def test_run_ingestion_maps_vector_execute_timeout_without_importing_raster_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1656,8 +1722,11 @@ async def test_run_ingestion_maps_pymupdf_internal_timeout_without_raster_fallba
         _ = (source, options)
         raise TimeoutError("PyMuPDF extraction timed out.")
 
+    monkeypatch.setenv(
+        pymupdf_adapter_module._APPROVED_LICENSE_PROBES_ENV_VAR,
+        pymupdf_adapter_module._LICENSE_PROBE_NAME,
+    )
     monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
-    monkeypatch.setattr(pymupdf_adapter_module, "_license_unacknowledged", lambda: True)
     monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
     monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
     monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
@@ -1714,8 +1783,11 @@ async def test_run_ingestion_keeps_pymupdf_cap_failure_without_raster_fallback(
             "PyMuPDF extraction exceeded entity limit."
         )
 
+    monkeypatch.setenv(
+        pymupdf_adapter_module._APPROVED_LICENSE_PROBES_ENV_VAR,
+        pymupdf_adapter_module._LICENSE_PROBE_NAME,
+    )
     monkeypatch.setattr("app.ingestion.loader.importlib.import_module", fake_import_module)
-    monkeypatch.setattr(pymupdf_adapter_module, "_license_unacknowledged", lambda: True)
     monkeypatch.setattr(pymupdf_adapter_module, "_load_runtime_module", lambda: object())
     monkeypatch.setattr(pymupdf_adapter_module, "_runtime_version", lambda _runtime: "1.26.0")
     monkeypatch.setattr(pymupdf_adapter_module, "_package_version", lambda: "1.26.0")
