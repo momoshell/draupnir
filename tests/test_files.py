@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta
@@ -51,11 +52,18 @@ async def _upload_file(
     filename: str,
     content: bytes,
     media_type: str,
+    extraction_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upload a file for a project and return response payload."""
+    request_kwargs: dict[str, Any] = {
+        "files": {"file": (filename, content, media_type)},
+    }
+    if extraction_profile is not None:
+        request_kwargs["data"] = {"extraction_profile": json.dumps(extraction_profile)}
+
     response = await async_client.post(
         f"/v1/projects/{project_id}/files",
-        files={"file": (filename, content, media_type)},
+        **request_kwargs,
     )
     assert response.status_code == 201
     return cast(dict[str, Any], response.json())
@@ -405,6 +413,74 @@ class TestProjectFiles:
         assert job.status == "pending"
         assert job.attempts == 0
         assert job.cancel_requested is False
+
+    async def test_upload_file_persists_optional_extraction_profile_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+    ) -> None:
+        """POST should persist an optional multipart extraction profile for the initial ingest."""
+        _ = self
+        uploaded = await _upload_file(
+            async_client=async_client,
+            project_id=created_project["id"],
+            filename="plan.pdf",
+            content=b"%PDF-1.7\nupload-profile\n",
+            media_type="application/pdf",
+            extraction_profile={"pdf_input_mode": "raster"},
+        )
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            profile = await session.get(
+                ExtractionProfile,
+                uuid.UUID(str(uploaded["initial_extraction_profile_id"])),
+            )
+
+        assert profile is not None
+        assert profile.project_id == uuid.UUID(str(created_project["id"]))
+        assert profile.profile_version == "v0.1"
+        assert profile.pdf_input_mode == "raster"
+
+    @pytest.mark.parametrize(
+        ("extraction_profile", "case_id"),
+        [
+            pytest.param("{not-json}", "invalid-json", id="invalid-json"),
+            pytest.param("[]", "non-object-json", id="non-object-json"),
+            pytest.param(
+                json.dumps({"pdf_input_mode": "not-a-real-mode"}),
+                "invalid-pdf-input-mode",
+                id="invalid-pdf-input-mode",
+            ),
+        ],
+    )
+    async def test_upload_file_rejects_invalid_extraction_profile_payload(
+        self,
+        async_client: httpx.AsyncClient,
+        created_project: dict[str, Any],
+        app: FastAPI,
+        extraction_profile: str,
+        case_id: str,
+    ) -> None:
+        """POST should reject malformed multipart extraction_profile before side effects."""
+        _ = self
+        _ = case_id
+        storage = RecordingStorage()
+        app.dependency_overrides[get_storage] = lambda: storage
+        try:
+            response = await async_client.post(
+                f"/v1/projects/{created_project['id']}/files",
+                files={"file": ("plan.pdf", b"%PDF-1.7\ninvalid-profile\n", "application/pdf")},
+                data={"extraction_profile": extraction_profile},
+            )
+        finally:
+            app.dependency_overrides.pop(get_storage, None)
+
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "INPUT_INVALID"
+        assert storage.put_calls == []
+        await _assert_upload_lineage_absent(created_project["id"])
 
     async def test_reupload_same_bytes_creates_new_file_row(
         self,

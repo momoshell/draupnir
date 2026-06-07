@@ -356,6 +356,26 @@ def descriptors_for_upload_format(upload_format: UploadFormat) -> tuple[AdapterD
     )
 
 
+def summarize_probe_requirements(descriptor: AdapterDescriptor) -> str | None:
+    """Return a stable operator-facing summary of declared probe requirements."""
+
+    if not descriptor.probes:
+        return None
+
+    parts = []
+    for requirement in descriptor.probes:
+        parts.append(
+            " ".join(
+                (
+                    f"{requirement.kind.value}:{requirement.name}",
+                    f"(failure_status={requirement.failure_status.value})",
+                    requirement.detail,
+                )
+            )
+        )
+    return "; ".join(parts)
+
+
 def evaluate_availability(
     descriptor: AdapterDescriptor,
     observations: tuple[ProbeObservation, ...],
@@ -446,4 +466,5 @@ __all__ = [
     "get_registry",
     "get_registry_by_key",
     "list_descriptors",
+    "summarize_probe_requirements",
 ]

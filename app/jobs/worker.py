@@ -75,7 +75,7 @@ from app.exports.revision_json import (
     render_revision_json_export,
 )
 from app.ingestion.canonical import EntityProvenanceError, canonicalize_entity_provenance
-from app.ingestion.contracts import AdapterTimeout, ProgressUpdate
+from app.ingestion.contracts import AdapterTimeout, InputFamily, ProgressUpdate
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
@@ -88,6 +88,7 @@ from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
 from app.models.export_job_input import ExportJobInput
+from app.models.extraction_profile import ExtractionProfile
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
@@ -1032,6 +1033,16 @@ async def _get_drawing_revision(
     """Load a drawing revision row by identifier."""
 
     return await session.get(DrawingRevision, revision_id)
+
+
+async def _get_extraction_profile(
+    session: AsyncSession,
+    *,
+    extraction_profile_id: UUID,
+) -> ExtractionProfile | None:
+    """Load an extraction profile row by identifier."""
+
+    return await session.get(ExtractionProfile, extraction_profile_id)
 
 
 async def _get_drawing_revision_for_changeset(
@@ -3224,6 +3235,18 @@ def _get_enqueue_job_error_message(job_type: str) -> str:
     return job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE.get(job_type, "Failed to enqueue job")
 
 
+def _requested_input_family_from_pdf_input_mode(
+    pdf_input_mode: str | None,
+) -> InputFamily | None:
+    """Map persisted PDF input mode to an explicit runner input family override."""
+
+    if pdf_input_mode == "vector":
+        return InputFamily.PDF_VECTOR
+    if pdf_input_mode == "raster":
+        return InputFamily.PDF_RASTER
+    return None
+
+
 async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> IngestionRunRequest:
     """Load persisted job and file metadata for the ingestion runner."""
     session_maker = get_session_maker()
@@ -3285,6 +3308,16 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
                 f"File with identifier '{job.file_id}' for job '{job_id}' is no longer active"
             )
 
+        requested_input_family = None
+        if job.extraction_profile_id is not None:
+            extraction_profile = await _get_extraction_profile(
+                session,
+                extraction_profile_id=job.extraction_profile_id,
+            )
+            requested_input_family = _requested_input_family_from_pdf_input_mode(
+                extraction_profile.pdf_input_mode if extraction_profile is not None else None
+            )
+
         return IngestionRunRequest(
             job_id=job.id,
             file_id=source_file.id,
@@ -3294,6 +3327,7 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
             original_name=source_file.original_filename,
             extraction_profile_id=job.extraction_profile_id,
             initial_job_id=source_file.initial_job_id,
+            requested_input_family=requested_input_family,
         )
 
 

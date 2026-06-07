@@ -31,7 +31,11 @@ from app.ingestion.contracts import (
     ProbeRequirement,
     ProbeStatus,
 )
-from app.ingestion.registry import evaluate_availability, list_descriptors
+from app.ingestion.registry import (
+    evaluate_availability,
+    list_descriptors,
+    summarize_probe_requirements,
+)
 from app.schemas.system import (
     AdapterCapabilityRead,
     AdapterHealthCheck,
@@ -259,12 +263,55 @@ def _confidence_range_from_descriptor(descriptor: AdapterDescriptor) -> Confiden
     return ConfidenceRange(min=minimum, max=maximum)
 
 
-def _availability_details(availability: AdapterAvailability) -> dict[str, object] | None:
+def _failing_requirement_summary(
+    descriptor: AdapterDescriptor,
+    availability: AdapterAvailability,
+) -> str | None:
+    """Return a sanitized summary of currently unmet probe requirements."""
+
+    if not availability.issues:
+        return None
+
+    issues_by_key = {(issue.kind, issue.name): issue for issue in availability.issues}
+    parts = []
+    for requirement in descriptor.probes:
+        issue = issues_by_key.get((requirement.kind, requirement.name))
+        if issue is None:
+            continue
+        parts.append(
+            " ".join(
+                (
+                    f"{requirement.kind.value}:{requirement.name}",
+                    f"(observed={issue.observed_status.value},",
+                    f"failure_status={requirement.failure_status.value})",
+                    requirement.detail,
+                )
+            )
+        )
+    if not parts:
+        return None
+    return "; ".join(parts)
+
+
+def _availability_details(
+    descriptor: AdapterDescriptor,
+    availability: AdapterAvailability,
+) -> dict[str, object] | None:
     """Return JSON-friendly adapter availability details."""
 
-    if availability.details is None:
-        return None
-    return dict(availability.details)
+    details: dict[str, object] = {}
+    if availability.details is not None:
+        details.update(dict(availability.details))
+
+    requirement_summary = summarize_probe_requirements(descriptor)
+    if requirement_summary is not None:
+        details["requirement_summary"] = requirement_summary
+
+    failing_requirement_summary = _failing_requirement_summary(descriptor, availability)
+    if failing_requirement_summary is not None:
+        details["failing_requirement_summary"] = failing_requirement_summary
+
+    return details or None
 
 
 def _capability_from_descriptor(
@@ -300,7 +347,7 @@ def _capability_from_descriptor(
         confidence_range=_confidence_range_from_descriptor(descriptor),
         bounded_probe_ms=descriptor.bounded_probe_ms,
         last_checked_at=availability.last_checked_at,
-        details=_availability_details(availability),
+        details=_availability_details(descriptor, availability),
     )
 
 
@@ -328,7 +375,10 @@ def _error_code_from_adapter_availability(availability: AdapterAvailability) -> 
     return ErrorCode.ADAPTER_UNAVAILABLE
 
 
-def _adapter_health_details(availability: AdapterAvailability) -> dict[str, object] | None:
+def _adapter_health_details(
+    descriptor: AdapterDescriptor,
+    availability: AdapterAvailability,
+) -> dict[str, object] | None:
     """Return health-safe details for a probed adapter."""
 
     details: dict[str, object] = {}
@@ -337,6 +387,15 @@ def _adapter_health_details(availability: AdapterAvailability) -> dict[str, obje
     details["license_state"] = availability.license_state.value
     if availability.details is not None:
         details.update(dict(availability.details))
+
+    requirement_summary = summarize_probe_requirements(descriptor)
+    if requirement_summary is not None:
+        details["requirement_summary"] = requirement_summary
+
+    failing_requirement_summary = _failing_requirement_summary(descriptor, availability)
+    if failing_requirement_summary is not None:
+        details["failing_requirement_summary"] = failing_requirement_summary
+
     return details or None
 
 
@@ -351,7 +410,7 @@ def _adapter_health_from_availability(
         status=_status_from_adapter_availability(availability),
         error_code=_error_code_from_adapter_availability(availability),
         latency_ms=availability.probe_elapsed_ms,
-        details=_adapter_health_details(availability),
+        details=_adapter_health_details(descriptor, availability),
     )
 
 

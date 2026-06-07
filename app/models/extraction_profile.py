@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -82,6 +83,13 @@ class ExtractionProfile(Base):
         nullable=False,
         default=True,
         comment="Whether dimension extraction is enabled",
+    )
+    pdf_input_mode: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="auto",
+        server_default=text("'auto'"),
+        comment="PDF input mode selection",
     )
     pdf_page_range: Mapped[str | None] = mapped_column(
         String(255),

@@ -1,17 +1,19 @@
 """Project-scoped file upload and retrieval endpoints."""
 
 import hashlib
+import json
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, NoReturn, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
 from fastapi import File as FilePart
 from fastapi.responses import Response
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,7 +194,12 @@ async def _rollback_upload_cleanup_transaction(db: AsyncSession) -> None:
         await db.rollback()
 
 
-async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: str) -> None:
+async def _raise_input_invalid_for_upload_metadata(
+    file: UploadFile,
+    message: str,
+    *,
+    details: Any = None,
+) -> NoReturn:
     """Close upload and raise standardized client validation error envelope."""
     await file.close()
     raise HTTPException(
@@ -200,9 +207,50 @@ async def _raise_input_invalid_for_upload_metadata(file: UploadFile, message: st
         detail=create_error_response(
             code=ErrorCode.INPUT_INVALID,
             message=message,
-            details=None,
+            details=details,
         ),
     )
+
+
+async def _parse_upload_extraction_profile(
+    file: UploadFile,
+    extraction_profile: str | None,
+) -> ExtractionProfileCreate | None:
+    """Validate an optional multipart upload extraction profile payload."""
+    if extraction_profile is None:
+        return None
+
+    try:
+        profile_payload = json.loads(extraction_profile)
+    except json.JSONDecodeError:
+        await _raise_input_invalid_for_upload_metadata(
+            file,
+            "extraction_profile must be valid JSON.",
+        )
+
+    if not isinstance(profile_payload, dict):
+        await _raise_input_invalid_for_upload_metadata(
+            file,
+            "extraction_profile must be a JSON object.",
+        )
+
+    try:
+        return ExtractionProfileCreate.model_validate(profile_payload)
+    except ValidationError as exc:
+        await _raise_input_invalid_for_upload_metadata(
+            file,
+            "extraction_profile is invalid.",
+            details=exc.errors(),
+        )
+
+
+def _dump_extraction_profile_payload(
+    profile: ExtractionProfileCreate | None,
+) -> dict[str, Any] | None:
+    """Serialize an optional extraction profile for stable request fingerprinting."""
+    if profile is None:
+        return None
+    return profile.model_dump(mode="json")
 
 
 def _build_extraction_profile(
@@ -414,6 +462,7 @@ async def upload_project_file(
     file: Annotated[UploadFile, FilePart(...)],
     db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[Storage, Depends(get_storage)],
+    extraction_profile: Annotated[str | None, Form()] = None,
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
 ) -> FileModel | Response:
     """Upload immutable source file bytes for a project and create ingest job."""
@@ -437,6 +486,8 @@ async def upload_project_file(
             file,
             "media_type exceeds maximum length of 255 characters.",
         )
+
+    upload_extraction_profile = await _parse_upload_extraction_profile(file, extraction_profile)
 
     file_id = uuid.uuid4()
     staging_path = _staging_path(file_id)
@@ -501,14 +552,17 @@ async def upload_project_file(
         async def _finalize_upload(persisted_storage_uri: str) -> FileModel:
             try:
                 await _get_active_project_or_404(db, project_id, for_update=True)
-                extraction_profile = _build_extraction_profile(project_id)
-                db.add(extraction_profile)
+                extraction_profile_row = _build_extraction_profile(
+                    project_id,
+                    upload_extraction_profile,
+                )
+                db.add(extraction_profile_row)
 
                 ingest_job = Job(
                     id=uuid.uuid4(),
                     project_id=project_id,
                     file_id=file_id,
-                    extraction_profile_id=extraction_profile.id,
+                    extraction_profile_id=extraction_profile_row.id,
                     job_type="ingest",
                     status="pending",
                     attempts=0,
@@ -527,7 +581,7 @@ async def upload_project_file(
                     checksum_sha256=checksum,
                     immutable=True,
                     initial_job_id=ingest_job.id,
-                    initial_extraction_profile_id=extraction_profile.id,
+                    initial_extraction_profile_id=extraction_profile_row.id,
                 )
                 db.add(file_row)
                 db.add(ingest_job)
@@ -555,6 +609,9 @@ async def upload_project_file(
                     "detected_format": detected_format,
                     "size_bytes": total_bytes,
                     "checksum_sha256": checksum,
+                    "extraction_profile": _dump_extraction_profile_payload(
+                        upload_extraction_profile
+                    ),
                 },
             )
 

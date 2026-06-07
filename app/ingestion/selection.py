@@ -26,15 +26,27 @@ def select_adapter_candidates(
     detected_format: str | UploadFormat | InputFamily | None,
     *,
     media_type: str | None,
+    requested_input_family: InputFamily | None = None,
 ) -> tuple[AdapterCandidate, ...]:
     """Resolve ordered adapter candidates for a detected upload."""
+    upload_format = resolve_upload_format(detected_format, media_type=media_type)
+
+    if requested_input_family is not None:
+        if upload_format is None:
+            raise ValueError("Unsupported upload format for ingestion.")
+
+        descriptor = get_descriptor(requested_input_family)
+        if upload_format not in descriptor.upload_formats:
+            raise ValueError("Unsupported upload format for ingestion.")
+
+        return (AdapterCandidate(upload_format, requested_input_family, descriptor),)
+
     input_family = resolve_input_family(detected_format)
     if input_family is not None:
         descriptor = get_descriptor(input_family)
         descriptor_upload_format = descriptor.upload_formats[0]
         return (AdapterCandidate(descriptor_upload_format, input_family, descriptor),)
 
-    upload_format = resolve_upload_format(detected_format, media_type=media_type)
     if upload_format is None:
         raise ValueError("Unsupported upload format for ingestion.")
 

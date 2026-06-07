@@ -1,12 +1,13 @@
 {
-  "PROJECT_OWNER": "momoshell",
-  "PROJECT_NUMBER": 1,
-  "PROJECT_URL": "https://github.com/users/momoshell/projects/1",
-  "PROJECT_ID": "PVT_kwHOBZYqs84BV5zB",
-  "STATUS_FIELD_ID": "PVTSSF_lAHOBZYqs84BV5zBzhRSIUw",
-  "STATUS_BACKLOG": "f75ad846",
-  "STATUS_READY": "61e4505c",
-  "STATUS_IN_PROGRESS": "47fc9ee4",
-  "STATUS_IN_REVIEW": "df73e18b",
-  "STATUS_DONE": "98236657"
+  "project_id": "PVT_kwHOBZYqs84BV5zB",
+  "project_url": "https://github.com/users/momoshell/projects/1",
+  "project_title": "Draupnir",
+  "status_field_id": "PVTSSF_lAHOBZYqs84BV5zBzhRSIUw",
+  "status_options": {
+    "Backlog": "f75ad846",
+    "Ready": "61e4505c",
+    "In Progress": "47fc9ee4",
+    "In Review": "df73e18b",
+    "Done": "98236657"
+  }
 }
