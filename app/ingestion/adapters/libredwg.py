@@ -628,6 +628,20 @@ def _build_canonical_output(
     malformed_hatch_handles: set[str] = set()
     drawable_candidate_count = 0
 
+    def _record_entity(entity: _JSONDict) -> None:
+        entities.append(entity)
+        _collect_observed_collection_refs(
+            entity,
+            layouts_seen=layouts_seen,
+            layers_seen=layers_seen,
+            blocks_seen=blocks_seen,
+        )
+
+    def _record_unknown(record: Mapping[str, Any], *, reason: str) -> str | None:
+        unknown_entity = _build_unknown_entity(record, reason=reason)
+        _record_entity(unknown_entity)
+        return cast(str | None, unknown_entity.get("source_entity_handle"))
+
     for record in _iter_object_records(run_result.output_payload):
         record_type = _extract_record_type(record)
         if record_type is None:
@@ -639,27 +653,13 @@ def _build_canonical_output(
         if record_type == "LINE":
             line_entity = _build_line_entity(record)
             if line_entity is not None:
-                entities.append(line_entity)
-                _collect_observed_collection_refs(
-                    line_entity,
-                    layouts_seen=layouts_seen,
-                    layers_seen=layers_seen,
-                    blocks_seen=blocks_seen,
-                )
+                _record_entity(line_entity)
                 supported_geometry_count += 1
                 supported_line_count += 1
                 continue
 
             malformed_drawable_count += 1
-            unknown_entity = _build_unknown_entity(record, reason="malformed_line_geometry")
-            entities.append(unknown_entity)
-            _collect_observed_collection_refs(
-                unknown_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
-            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            handle = _record_unknown(record, reason="malformed_line_geometry")
             if handle is not None:
                 malformed_handles.add(handle)
             continue
@@ -667,26 +667,12 @@ def _build_canonical_output(
         if record_type == "CIRCLE":
             circle_entity = _build_circle_entity(record)
             if circle_entity is not None:
-                entities.append(circle_entity)
-                _collect_observed_collection_refs(
-                    circle_entity,
-                    layouts_seen=layouts_seen,
-                    layers_seen=layers_seen,
-                    blocks_seen=blocks_seen,
-                )
+                _record_entity(circle_entity)
                 supported_geometry_count += 1
                 continue
 
             malformed_drawable_count += 1
-            unknown_entity = _build_unknown_entity(record, reason="malformed_circle_geometry")
-            entities.append(unknown_entity)
-            _collect_observed_collection_refs(
-                unknown_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
-            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            handle = _record_unknown(record, reason="malformed_circle_geometry")
             if handle is not None:
                 malformed_handles.add(handle)
             continue
@@ -694,26 +680,12 @@ def _build_canonical_output(
         if record_type == "ARC":
             arc_entity = _build_arc_entity(record)
             if arc_entity is not None:
-                entities.append(arc_entity)
-                _collect_observed_collection_refs(
-                    arc_entity,
-                    layouts_seen=layouts_seen,
-                    layers_seen=layers_seen,
-                    blocks_seen=blocks_seen,
-                )
+                _record_entity(arc_entity)
                 supported_geometry_count += 1
                 continue
 
             malformed_drawable_count += 1
-            unknown_entity = _build_unknown_entity(record, reason="malformed_arc_geometry")
-            entities.append(unknown_entity)
-            _collect_observed_collection_refs(
-                unknown_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
-            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            handle = _record_unknown(record, reason="malformed_arc_geometry")
             if handle is not None:
                 malformed_handles.add(handle)
             continue
@@ -721,26 +693,12 @@ def _build_canonical_output(
         if record_type == "LWPOLYLINE":
             polyline_entity = _build_lwpolyline_entity(record)
             if polyline_entity is not None:
-                entities.append(polyline_entity)
-                _collect_observed_collection_refs(
-                    polyline_entity,
-                    layouts_seen=layouts_seen,
-                    layers_seen=layers_seen,
-                    blocks_seen=blocks_seen,
-                )
+                _record_entity(polyline_entity)
                 supported_geometry_count += 1
                 continue
 
             malformed_drawable_count += 1
-            unknown_entity = _build_unknown_entity(record, reason="malformed_lwpolyline_geometry")
-            entities.append(unknown_entity)
-            _collect_observed_collection_refs(
-                unknown_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
-            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            handle = _record_unknown(record, reason="malformed_lwpolyline_geometry")
             if handle is not None:
                 malformed_handles.add(handle)
             continue
@@ -748,28 +706,14 @@ def _build_canonical_output(
         if record_type == "HATCH":
             hatch_result = _build_hatch_entity(record)
             if hatch_result.entity is not None:
-                entities.append(hatch_result.entity)
-                _collect_observed_collection_refs(
-                    hatch_result.entity,
-                    layouts_seen=layouts_seen,
-                    layers_seen=layers_seen,
-                    blocks_seen=blocks_seen,
-                )
+                _record_entity(hatch_result.entity)
                 supported_geometry_count += 1
                 continue
 
-            unknown_entity = _build_unknown_entity(
+            handle = _record_unknown(
                 record,
                 reason=hatch_result.reason or "unsupported_hatch_geometry",
             )
-            entities.append(unknown_entity)
-            _collect_observed_collection_refs(
-                unknown_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
-            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
             if hatch_result.malformed:
                 malformed_hatch_count += 1
                 if handle is not None:
@@ -782,26 +726,13 @@ def _build_canonical_output(
 
         if record_type == "MTEXT":
             text_entity = _build_text_entity(record)
-            entities.append(text_entity)
-            _collect_observed_collection_refs(
-                text_entity,
-                layouts_seen=layouts_seen,
-                layers_seen=layers_seen,
-                blocks_seen=blocks_seen,
-            )
+            _record_entity(text_entity)
             supported_text_count += 1
             continue
 
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
-        unknown_entity = _build_unknown_entity(record, reason="unsupported_drawable_record")
-        entities.append(unknown_entity)
-        _collect_observed_collection_refs(
-            unknown_entity,
-            layouts_seen=layouts_seen,
-            layers_seen=layers_seen,
-            blocks_seen=blocks_seen,
-        )
+        _record_unknown(record, reason="unsupported_drawable_record")
 
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
@@ -1496,10 +1427,12 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
         return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
 
     vertex_json = tuple(_point_json(vertex) for vertex in vertices)
+    kind = "hatch"
+    closed = True
     geometry_summary: _JSONDict = {
-        "kind": "hatch",
+        "kind": kind,
         "vertex_count": len(vertices),
-        "closed": True,
+        "closed": closed,
         "area": area,
         "perimeter": perimeter,
     }
@@ -1507,15 +1440,15 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
         _build_supported_geometry_entity(
             record,
             record_type="HATCH",
-            entity_type="hatch",
+            entity_type=kind,
             bbox=bbox,
             geometry_projection={
                 "vertices": vertex_json,
-                "closed": True,
+                "closed": closed,
             },
             geometry={
                 "vertices": vertex_json,
-                "closed": True,
+                "closed": closed,
                 "bbox": bbox,
                 "units": {"normalized": "unknown"},
                 "geometry_summary": geometry_summary,
@@ -1530,9 +1463,9 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
             },
             confidence_basis="libredwg_hatch_mapping_units_unconfirmed",
             extra_fields={
-                "kind": "hatch",
+                "kind": kind,
                 "vertices": vertex_json,
-                "closed": True,
+                "closed": closed,
                 "area": area,
                 "perimeter": perimeter,
             },
@@ -2142,6 +2075,9 @@ def _coerce_lwpolyline_vertex(value: Any) -> tuple[float, float, float] | None:
 
 
 def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchVerticesResult:
+    if _hatch_is_non_solid_fill(record):
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
     if _record_has_any_key(record, "boundary_loops", "boundaryloops", "loops"):
         return _extract_hatch_vertices_from_loops(
             _first_value(record, "boundary_loops", "boundaryloops", "loops"),
@@ -2368,6 +2304,11 @@ def _hatch_edge_is_curved(edge: Mapping[str, Any]) -> bool:
     return False
 
 
+def _hatch_is_non_solid_fill(record: Mapping[str, Any]) -> bool:
+    solid_value = _first_value(record, "solid", "is_solid", "solid_fill")
+    return solid_value is not None and _coerce_boolish(solid_value) is False
+
+
 def _hatch_mapping_is_explicitly_open(record: Mapping[str, Any]) -> bool:
     closed_value = _first_value(record, "closed", "is_closed", "closed_flag")
     if closed_value is not None and _coerce_closed_boolish(closed_value) is False:
@@ -2410,8 +2351,14 @@ def _normalize_hatch_vertices(
 ) -> tuple[tuple[float, float, float], ...] | None:
     if len(vertices) < 3:
         return None
-    normalized_vertices = list(vertices)
-    if _points_match(normalized_vertices[0], normalized_vertices[-1]):
+    normalized_vertices: list[tuple[float, float, float]] = []
+    for vertex in vertices:
+        if normalized_vertices and _points_match(normalized_vertices[-1], vertex):
+            continue
+        normalized_vertices.append(vertex)
+    if len(normalized_vertices) > 1 and _points_match(
+        normalized_vertices[0], normalized_vertices[-1]
+    ):
         normalized_vertices.pop()
     if len(normalized_vertices) < 3:
         return None
@@ -2420,7 +2367,7 @@ def _normalize_hatch_vertices(
 
 def _points_match(left: tuple[float, float, float], right: tuple[float, float, float]) -> bool:
     return all(
-        math.isclose(left_component, right_component, rel_tol=0.0, abs_tol=1e-9)
+        math.isclose(left_component, right_component, rel_tol=1e-9, abs_tol=1e-9)
         for left_component, right_component in zip(left, right, strict=True)
     )
 

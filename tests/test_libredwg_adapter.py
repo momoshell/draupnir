@@ -2123,6 +2123,53 @@ async def test_libredwg_adapter_maps_point_and_vertex_hatch_variants_into_canoni
 
 
 @pytest.mark.asyncio
+async def test_libredwg_adapter_dedupes_consecutive_hatch_boundary_vertices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicated_points = (
+        _HATCH_SQUARE_POINTS[0],
+        _HATCH_SQUARE_POINTS[1],
+        _HATCH_SQUARE_POINTS[1],
+        _HATCH_SQUARE_POINTS[2],
+        _HATCH_SQUARE_POINTS[3],
+    )
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "34",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "boundary_loops": [{"points": list(duplicated_points)}],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "hatch"
+    assert entity["geometry"]["geometry_summary"]["vertex_count"] == 4
+    assert entity["geometry"]["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["area"] == 12.0
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("output_payload", "expected_handle"),
     [
@@ -2644,6 +2691,22 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
             "malformed_hatch_geometry",
             "HATCH",
             ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20E",
+                        "layer": "Patterned",
+                        "solid": False,
+                        "boundary_loops": [{"points": list(_HATCH_SQUARE_POINTS)}],
+                    }
+                ]
+            },
+            "unsupported_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.unsupported_hatch_geometry"),
         ),
         (
             {
