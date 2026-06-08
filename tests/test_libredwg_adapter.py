@@ -2619,6 +2619,36 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
             {
                 "OBJECTS": [
                     {
+                        "type": "HATCH",
+                        "handle": "20C",
+                        "layer": "Broken",
+                        "boundary_loops": [{"points": 1}],
+                    }
+                ]
+            },
+            "malformed_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20D",
+                        "layer": "Broken",
+                        "boundary_loops": [{"points": None}],
+                    }
+                ]
+            },
+            "malformed_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
                         "type": "LINE",
                         "handle": "99",
                         "layer": "Broken",

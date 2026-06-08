@@ -2245,8 +2245,10 @@ def _extract_hatch_vertices_from_edges(raw_edges: Any) -> _HatchVerticesResult:
 
 def _validate_hatch_point_boundary(
     owner: Mapping[str, Any],
-    raw_vertices: list[Any] | tuple[Any, ...],
+    raw_vertices: Any,
 ) -> _HatchVerticesResult | None:
+    if not isinstance(raw_vertices, (list, tuple)):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
     mixed_boundary_result = _validate_mixed_hatch_boundary_geometry(owner)
     if mixed_boundary_result is not None:
         return mixed_boundary_result
