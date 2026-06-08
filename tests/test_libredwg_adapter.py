@@ -122,6 +122,9 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("block_references", 0)
     merged_counts.setdefault("unsupported_block_transforms", 0)
     merged_counts.setdefault("malformed_inserts", 0)
+    merged_counts.setdefault("materialized_inserts", 0)
+    merged_counts.setdefault("materialized_block_children", 0)
+    merged_counts.setdefault("block_materialization_guarded", 0)
     return merged_counts
 
 
@@ -3910,3 +3913,587 @@ async def test_libredwg_adapter_block_reference_passes_shared_contract_harness(
     entities = cast(list[dict[str, Any]], payload.canonical_json["entities"])
     assert [entity["entity_type"] for entity in entities] == ["insert"]
     assert payload.canonical_json["metadata"]["block_transform_validity"] is True
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_materializes_simple_insert_block_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Block child owned via an ``owner`` back-reference (shape b); INSERT applies translate +
+    # uniform scale + 90 degree rotation.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Door-Block"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "B1",
+                    "layer": "Walls",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "1A",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 1000.0, "y": 2000.0, "z": 0.0},
+                    "scale": {"x": 2.0, "y": 2.0, "z": 2.0},
+                    "rotation": math.pi / 2,
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert", "line"]
+    insert_entity, child = entities[0], entities[1]
+
+    # The placement stays a review-gated reference; geometry is carried by the child.
+    assert insert_entity["geometry"]["status"] == "reference"
+    assert insert_entity["block_reference"]["materialized"] is True
+    assert insert_entity["block_reference"]["materialized_child_count"] == 1
+
+    assert child["geometry"]["status"] == "materialized"
+    # 1mm segment, scaled to metres x2 (= 0.002), rotated 90 degrees about the insertion point.
+    assert child["start"] == {"x": pytest.approx(1.0), "y": pytest.approx(2.0), "z": 0.0}
+    assert child["end"] == {
+        "x": pytest.approx(1.0, abs=1e-9),
+        "y": pytest.approx(2.002),
+        "z": 0.0,
+    }
+    assert child["length"] == pytest.approx(0.002)
+    assert child["properties"]["quantity_hints"]["length"] == pytest.approx(0.002)
+
+    # Provenance + identity linkage back to the placing INSERT.
+    assert child["entity_id"] == "libredwg-line-1a-l1"
+    assert child["parent_entity_id"] == "libredwg-insert-1a"
+    assert child["parent_entity_ref"] == "OBJECTS/INSERT/1A"
+    child_notes = cast("tuple[str, ...]", child["provenance"]["notes"])
+    assert "materialized_from_block" in child_notes
+    assert "block:Door-Block" in child_notes
+    assert "via_insert:1A" in child_notes
+
+    assert result.canonical["metadata"]["block_transform_validity"] is True
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 1
+    assert counts["materialized_block_children"] == 1
+    assert counts["supported_geometry"] == 1
+    assert counts["supported_lines"] == 1
+    assert counts["block_references"] == 1
+
+    checks = _validation_checks(result)
+    assert checks["block_transform_validity"]["status"] == "pass"
+    assert checks["geometry_validity"]["status"] == "pass"
+
+    warning_codes = {warning.code for warning in result.warnings}
+    assert "libredwg.block_geometry_materialized" in warning_codes
+    assert "libredwg.block_reference_captured" not in warning_codes
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_subtracts_block_base_point_when_materializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The BLOCK base point (10mm on X) must be subtracted before placement, so an identity INSERT
+    # places the child at the origin rather than at the raw block coordinate.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Offset-Block"},
+                {
+                    "type": "BLOCK",
+                    "handle": "BK",
+                    "block_header": {"handle": "B1"},
+                    "base_point": {"x": 10.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 10.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 11.0, "y": 0.0, "z": 0.0},
+                },
+                {"type": "ENDBLK", "handle": "EB"},
+                {
+                    "type": "INSERT",
+                    "handle": "9Z",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "rotation": 0.0,
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert", "line"]
+    child = entities[1]
+    assert child["start"] == {"x": pytest.approx(0.0, abs=1e-12), "y": 0.0, "z": 0.0}
+    assert child["end"] == {"x": pytest.approx(0.001), "y": 0.0, "z": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_materializes_block_children_via_explicit_handle_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Shape (a): the BLOCK_HEADER carries an explicit child handle array.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {
+                    "type": "BLOCK_HEADER",
+                    "handle": "B1",
+                    "name": "Array-Block",
+                    "entities": [{"handle": "C1"}],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "C1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "AA",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 5.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert", "line"]
+    child = entities[1]
+    assert child["entity_id"] == "libredwg-line-aa-c1"
+    assert child["start"] == {"x": pytest.approx(5.0), "y": 0.0, "z": 0.0}
+    assert child["end"] == {"x": pytest.approx(6.0), "y": 0.0, "z": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_materializes_arc_block_geometry_with_scaled_rotated_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Arc-Block"},
+                {
+                    "type": "ARC",
+                    "handle": "A1",
+                    "owner": "B1",
+                    "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "radius": 1.0,
+                    "start_angle": 0,
+                    "end_angle": 90,
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "7G",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 2.0, "y": 2.0, "z": 2.0},
+                    "rotation": math.pi / 2,
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert", "arc"]
+    child = entities[1]
+    assert child["radius"] == pytest.approx(2.0)
+    # Sweep is rotation invariant; both angles shift by +90 degrees.
+    assert child["start_angle_degrees"] == pytest.approx(90.0)
+    assert child["end_angle_degrees"] == pytest.approx(180.0)
+    assert child["geometry"]["geometry_summary"]["sweep_degrees"] == pytest.approx(90.0)
+    assert child["length"] == pytest.approx(math.pi)
+    assert child["start"] == {
+        "x": pytest.approx(0.0, abs=1e-9),
+        "y": pytest.approx(2.0),
+        "z": 0.0,
+    }
+    assert child["end"] == {
+        "x": pytest.approx(-2.0),
+        "y": pytest.approx(0.0, abs=1e-9),
+        "z": 0.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_materialized_child_ids_are_unique_per_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Shared-Block"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "1A",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "2B",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 10.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    child_ids = [e["entity_id"] for e in entities if e["entity_type"] == "line"]
+    assert child_ids == ["libredwg-line-1a-l1", "libredwg-line-2b-l1"]
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 2
+    assert counts["materialized_block_children"] == 2
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_materializes_single_level_nested_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Outer block places an inner block; the inner LINE materializes with the composed transform.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "OUT", "name": "Outer"},
+                {"type": "BLOCK_HEADER", "handle": "INR", "name": "Inner"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "INR",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "NEST",
+                    "owner": "OUT",
+                    "block_header": {"handle": "INR"},
+                    "ins_pt": {"x": 2.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 2.0, "y": 2.0, "z": 2.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "TOP",
+                    "block_header": {"handle": "OUT"},
+                    "ins_pt": {"x": 10.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 3.0, "y": 3.0, "z": 3.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert", "line"]
+    child = entities[1]
+    # Inner local (0,0) -> nested ins 2 + 2*scale*0 = 2 -> top 10 + 3*2 = 16.
+    # Inner local (1,0) length 1 -> *2 (nested) *3 (top) = 6 -> 16 + 6 = 22.
+    assert child["start"] == {"x": pytest.approx(16.0), "y": 0.0, "z": 0.0}
+    assert child["end"] == {"x": pytest.approx(22.0), "y": 0.0, "z": 0.0}
+    assert child["length"] == pytest.approx(6.0)
+    assert child["parent_entity_id"] == "libredwg-insert-top"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_insert_when_nesting_depth_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(adapter_module, "_MAX_BLOCK_NESTING_DEPTH", 1)
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "A", "name": "A"},
+                {"type": "BLOCK_HEADER", "handle": "B", "name": "B"},
+                {"type": "BLOCK_HEADER", "handle": "C", "name": "C"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "C",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "BC",
+                    "owner": "B",
+                    "block_header": {"handle": "C"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "AB",
+                    "owner": "A",
+                    "block_header": {"handle": "B"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "TOP",
+                    "block_header": {"handle": "A"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert"]
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 0
+    assert counts["block_materialization_guarded"] == 1
+    guard_warning = next(
+        warning
+        for warning in result.warnings
+        if warning.code == "libredwg.block_materialization_guarded"
+    )
+    assert guard_warning.details["reasons"] == ("block_nesting_depth_exceeded",)
+    checks = _validation_checks(result)
+    assert checks["block_transform_validity"]["status"] == "review_required"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_insert_on_block_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A places B, B places A: must terminate and review-gate rather than recurse forever.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "A", "name": "A"},
+                {"type": "BLOCK_HEADER", "handle": "B", "name": "B"},
+                {
+                    "type": "INSERT",
+                    "handle": "AB",
+                    "owner": "A",
+                    "block_header": {"handle": "B"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "BA",
+                    "owner": "B",
+                    "block_header": {"handle": "A"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "TOP",
+                    "block_header": {"handle": "A"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert"]
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["block_materialization_guarded"] == 1
+    guard_warning = next(
+        warning
+        for warning in result.warnings
+        if warning.code == "libredwg.block_materialization_guarded"
+    )
+    assert guard_warning.details["reasons"] == ("block_self_reference_cycle",)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_insert_when_entity_cap_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(adapter_module, "_MAX_BLOCK_MATERIALIZED_ENTITIES", 1)
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Big-Block"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L2",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 0.0, "y": 1.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "1A",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    # All-or-nothing: no partial children emitted when the cap trips.
+    assert [entity["entity_type"] for entity in entities] == ["insert"]
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 0
+    assert counts["materialized_block_children"] == 0
+    assert counts["block_materialization_guarded"] == 1
+    guard_warning = next(
+        warning
+        for warning in result.warnings
+        if warning.code == "libredwg.block_materialization_guarded"
+    )
+    assert guard_warning.details["reasons"] == ("block_entity_count_exceeded",)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_block_with_unmaterializable_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A block mixing a LINE with a HATCH stays review-gated entirely (all-or-nothing).
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Mixed-Block"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {"type": "HATCH", "handle": "H1", "owner": "B1"},
+                {
+                    "type": "INSERT",
+                    "handle": "1A",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert"]
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 0
+    assert counts["block_materialization_guarded"] == 1
+    guard_warning = next(
+        warning
+        for warning in result.warnings
+        if warning.code == "libredwg.block_materialization_guarded"
+    )
+    assert guard_warning.details["reasons"] == ("block_contains_unmaterializable_child",)
+    checks = _validation_checks(result)
+    assert checks["block_transform_validity"]["status"] == "review_required"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_unsupported_transform_never_materializes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression of #361: a non-uniform scale stays review-gated and materializes nothing, and the
+    # block-definition child is not leaked as a standalone top-level entity.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Skewed-Block"},
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "3C",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 2.0, "y": 3.0, "z": 1.0},
+                },
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "insert"
+    assert entity["transform_supported"] is False
+    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
+    assert counts["materialized_inserts"] == 0
+    assert counts["materialized_block_children"] == 0
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_does_not_double_emit_block_definition_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Blk"},
+                {
+                    "type": "LINE",
+                    "handle": "BL",
+                    "owner": "B1",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "ML",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 2.0, "y": 0.0, "z": 0.0},
+                },
+                {
+                    "type": "INSERT",
+                    "handle": "IN",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    entity_ids = [entity["entity_id"] for entity in entities]
+    # Model line + INSERT + the single materialized child — the block-definition line is never
+    # emitted as a standalone top-level entity.
+    assert entity_ids == ["libredwg-line-ml", "libredwg-insert-in", "libredwg-line-in-bl"]
+    assert "libredwg-line-bl" not in entity_ids
