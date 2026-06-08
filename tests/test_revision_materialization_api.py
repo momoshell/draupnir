@@ -619,7 +619,8 @@ class TestRevisionMaterializationApi:
                     "layer": "A-WALL",
                     "insertion": {"x": 10, "y": 20, "z": 0},
                     "text": "Layout test text",
-                }
+                },
+                units=libredwg_adapter._resolve_units({}),
             )
             return _replace_fake_canonical_payload(payload, entities=[text_entity])
 
