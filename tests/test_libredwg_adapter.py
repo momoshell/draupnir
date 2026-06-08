@@ -115,6 +115,38 @@ def _assert_score_within_libredwg_descriptor_range(score: float | None) -> None:
     assert minimum_confidence <= score <= maximum_confidence
 
 
+def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
+    merged_counts = dict(counts)
+    merged_counts.setdefault("unsupported_hatches", 0)
+    merged_counts.setdefault("malformed_hatches", 0)
+    return merged_counts
+
+
+_HATCH_SQUARE_POINTS = (
+    {"x": 0.0, "y": 0.0, "z": 0.0},
+    {"x": 4.0, "y": 0.0, "z": 0.0},
+    {"x": 4.0, "y": 3.0, "z": 0.0},
+    {"x": 0.0, "y": 3.0, "z": 0.0},
+)
+
+_HATCH_TRIANGLE_POINTS = (
+    {"x": 0.0, "y": 0.0, "z": 0.0},
+    {"x": 2.0, "y": 0.0, "z": 0.0},
+    {"x": 0.0, "y": 2.0, "z": 0.0},
+)
+
+
+def _hatch_line_edges(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "type": "LINE",
+            "start": {"x": float(index), "y": 0.0, "z": 0.0},
+            "end": {"x": float(index + 1), "y": 0.0, "z": 0.0},
+        }
+        for index in range(count)
+    ]
+
+
 def _install_fake_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -592,8 +624,10 @@ async def test_libredwg_adapter_diagnostics_include_mapping_counts_and_confidenc
         "supported_geometry": 1,
         "supported_lines": 1,
         "supported_text": 0,
-        "unsupported_drawables": 1,
+        "unsupported_drawables": 0,
         "malformed_drawables": 0,
+        "unsupported_hatches": 1,
+        "malformed_hatches": 0,
     }
     assert diagnostic_details["mapping_confidence"] == {
         "score": adapter_module._MIXED_ENTITY_CONFIDENCE_SCORE,
@@ -957,7 +991,7 @@ async def test_libredwg_adapter_recovers_supported_drawable_wrapper_records(
     assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
 
     diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
-    assert diagnostic_details["entity_counts"] == expected_counts
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(expected_counts)
 
 
 @pytest.mark.asyncio
@@ -1006,14 +1040,16 @@ async def test_libredwg_adapter_keeps_wrapper_record_and_sibling_drawable_candid
     assert [entity["layer_name"] for entity in entities] == ["A-WALL", "B-WALL"]
 
     diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
-    assert diagnostic_details["entity_counts"] == {
-        "drawable_candidates": 2,
-        "supported_geometry": 2,
-        "supported_lines": 2,
-        "supported_text": 0,
-        "unsupported_drawables": 0,
-        "malformed_drawables": 0,
-    }
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 2,
+            "supported_geometry": 2,
+            "supported_lines": 2,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -1064,14 +1100,16 @@ async def test_libredwg_adapter_keeps_list_wrapper_record_and_sibling_drawable_c
     assert [entity["layer_name"] for entity in entities] == ["A-WALL", "B-WALL"]
 
     diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
-    assert diagnostic_details["entity_counts"] == {
-        "drawable_candidates": 2,
-        "supported_geometry": 2,
-        "supported_lines": 2,
-        "supported_text": 0,
-        "unsupported_drawables": 0,
-        "malformed_drawables": 0,
-    }
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 2,
+            "supported_geometry": 2,
+            "supported_lines": 2,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -1794,7 +1832,7 @@ async def test_libredwg_adapter_marks_nonfinite_text_placement_as_malformed(
 
 
 @pytest.mark.asyncio
-async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_drawables(
+async def test_libredwg_adapter_maps_supported_hatch_entities_into_canonical_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = _FakeProcess(complete_with=0)
@@ -1810,8 +1848,35 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
                         "type": "HATCH",
                         "handle": "20",
                         "layout": "Sheet-H1",
-                        "layer": "Unsupported",
+                        "layer": "Filled",
                         "block": "Hatch-Block",
+                        "boundary_loops": [
+                            {
+                                "flags": 1,
+                                "edges": [
+                                    {
+                                        "type": "LINE",
+                                        "start": {"x": 4, "y": 0, "z": 0},
+                                        "end": {"x": 4, "y": 3, "z": 0},
+                                    },
+                                    {
+                                        "type": "LINE",
+                                        "start": {"x": 0, "y": 0, "z": 0},
+                                        "end": {"x": 4, "y": 0, "z": 0},
+                                    },
+                                    {
+                                        "type": "LINE",
+                                        "start": {"x": 0, "y": 3, "z": 0},
+                                        "end": {"x": 0, "y": 0, "z": 0},
+                                    },
+                                    {
+                                        "type": "LINE",
+                                        "start": {"x": 4, "y": 3, "z": 0},
+                                        "end": {"x": 0, "y": 3, "z": 0},
+                                    },
+                                ],
+                            }
+                        ],
                     },
                 ]
             }
@@ -1826,62 +1891,90 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
 
     entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
     assert len(entities) == 1
-    assert entities[0]["entity_id"] == "libredwg-unknown-20"
-    assert entities[0]["entity_type"] == "unknown"
-    assert entities[0]["entity_schema_version"] == "0.1"
-    assert entities[0]["source_entity_handle"] == "20"
-    assert entities[0]["layout_name"] == "Sheet-H1"
-    assert entities[0]["layer_name"] == "Unsupported"
-    assert entities[0]["block_name"] == "Hatch-Block"
-    assert entities[0]["parent_entity_id"] is None
-    assert entities[0]["drawing_revision_id"] is None
-    assert entities[0]["source_file_id"] is None
-    assert entities[0]["layout_ref"] == "Sheet-H1"
-    assert entities[0]["layer_ref"] == "Unsupported"
-    assert entities[0]["block_ref"] == "Hatch-Block"
-    assert entities[0]["parent_entity_ref"] is None
-    assert entities[0]["bbox"] is None
-    assert entities[0]["geometry"] == {
-        "bbox": None,
+    entity = entities[0]
+    assert entity["entity_id"] == "libredwg-hatch-20"
+    assert entity["entity_type"] == "hatch"
+    assert entity["entity_schema_version"] == "0.1"
+    assert entity["source_entity_handle"] == "20"
+    assert entity["layout_name"] == "Sheet-H1"
+    assert entity["layer_name"] == "Filled"
+    assert entity["block_name"] == "Hatch-Block"
+    assert entity["layout_ref"] == "Sheet-H1"
+    assert entity["layer_ref"] == "Filled"
+    assert entity["block_ref"] == "Hatch-Block"
+    assert entity["bbox"] == {
+        "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "max": {"x": 4.0, "y": 3.0, "z": 0.0},
+    }
+    assert entity["geometry"] == {
+        "vertices": (
+            {"x": 4.0, "y": 0.0, "z": 0.0},
+            {"x": 4.0, "y": 3.0, "z": 0.0},
+            {"x": 0.0, "y": 3.0, "z": 0.0},
+            {"x": 0.0, "y": 0.0, "z": 0.0},
+        ),
+        "closed": True,
+        "bbox": {
+            "min": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "max": {"x": 4.0, "y": 3.0, "z": 0.0},
+        },
         "units": {"normalized": "unknown"},
-        "status": "absent",
-        "reason": "unsupported_drawable_record",
         "geometry_summary": {
-            "kind": "unknown",
-            "source_type": "HATCH",
-            "reason": "unsupported_drawable_record",
+            "kind": "hatch",
+            "vertex_count": 4,
+            "closed": True,
+            "area": 12.0,
+            "perimeter": 14.0,
         },
     }
-    assert entities[0]["geometry_reason"] == "unsupported_drawable_record"
-    assert entities[0]["quantity_hints"] == {}
-    assert entities[0]["adapter_native"] == {
-        "section": "OBJECTS",
-        "record_type": "HATCH",
-        "handle": "20",
+    assert entity["properties"] == {
+        "source_type": "HATCH",
+        "source_handle": "20",
+        "quantity_hints": {"length": 14.0, "area": 12.0, "count": 1.0},
+        "adapter_native": {
+            "libredwg": {
+                "section": "OBJECTS",
+                "record_type": "HATCH",
+                "handle": "20",
+            }
+        },
     }
-    assert entities[0]["provenance"]["origin"] == "adapter_normalized"
-    assert entities[0]["provenance"]["adapter"] == {"key": "libredwg"}
-    assert entities[0]["provenance"]["source_ref"] == "OBJECTS/HATCH/20"
-    assert entities[0]["provenance"]["source_identity"] == "20"
-    assert entities[0]["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
+    assert entity["kind"] == "hatch"
+    assert entity["vertices"] == (
+        {"x": 4.0, "y": 0.0, "z": 0.0},
+        {"x": 4.0, "y": 3.0, "z": 0.0},
+        {"x": 0.0, "y": 3.0, "z": 0.0},
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+    )
+    assert entity["closed"] is True
+    assert entity["area"] == 12.0
+    assert entity["perimeter"] == 14.0
+    assert entity["provenance"]["origin"] == "adapter_normalized"
+    assert entity["provenance"]["adapter"] == {"key": "libredwg"}
+    assert entity["provenance"]["source_ref"] == "OBJECTS/HATCH/20"
+    assert entity["provenance"]["source_identity"] == "20"
+    assert entity["provenance"]["source_hash"] == adapter_module._canonical_hash_json_value(
         {
             "record_type": "HATCH",
             "handle": "20",
-            "layer_name": "Unsupported",
+            "layer_name": "Filled",
             "layout_name": "Sheet-H1",
             "block_name": "Hatch-Block",
+            "geometry": {
+                "vertices": (
+                    {"x": 4.0, "y": 0.0, "z": 0.0},
+                    {"x": 4.0, "y": 3.0, "z": 0.0},
+                    {"x": 0.0, "y": 3.0, "z": 0.0},
+                    {"x": 0.0, "y": 0.0, "z": 0.0},
+                ),
+                "closed": True,
+            },
         }
     )
-    assert (
-        entities[0]["provenance"]["normalized_source_hash"]
-        == entities[0]["provenance"]["source_hash"]
-    )
-    assert entities[0]["provenance"]["extraction_path"] == ("OBJECTS", "HATCH")
-    assert entities[0]["provenance"]["notes"] == (
-        "units_unconfirmed",
-        "unsupported_drawable_record",
-    )
-    assert entities[0]["provenance"]["extra"] == {
+    assert entity["provenance"]["normalized_source_hash"] == entity["provenance"]["source_hash"]
+    assert entity["provenance"]["extraction_path"] == ("OBJECTS", "HATCH")
+    assert entity["provenance"]["notes"] == ("units_unconfirmed",)
+    assert entity["provenance"]["extra"] == {
         "native": {
             "libredwg": {
                 "section": "OBJECTS",
@@ -1896,31 +1989,586 @@ async def test_libredwg_adapter_ignores_non_entities_and_degrades_unsupported_dr
             "source_entity_ref": "OBJECTS/HATCH/20",
             "source_locator": "OBJECTS/HATCH/20",
             "entity_ref": "OBJECTS/HATCH/20",
-            "normalized_source_hash": entities[0]["provenance"]["source_hash"],
+            "normalized_source_hash": entity["provenance"]["source_hash"],
             "native_handle": "20",
             "source_entity_handle": "20",
-            "record_hash": f"sha256:{entities[0]['provenance']['source_hash']}",
+            "record_hash": f"sha256:{entity['provenance']['source_hash']}",
         },
     }
-    assert len(entities[0]["provenance"]["source_hash"]) == 64
-    assert all(
-        character in "0123456789abcdef" for character in entities[0]["provenance"]["source_hash"]
-    )
-    assert entities[0]["provenance"]["record_hash"] == (
-        f"sha256:{entities[0]['provenance']['source_hash']}"
-    )
-    assert entities[0]["confidence"] == {
-        "score": adapter_module._UNKNOWN_ENTITY_CONFIDENCE_SCORE,
+    assert len(entity["provenance"]["source_hash"]) == 64
+    assert all(character in "0123456789abcdef" for character in entity["provenance"]["source_hash"])
+    assert entity["provenance"]["record_hash"] == f"sha256:{entity['provenance']['source_hash']}"
+    assert entity["confidence"] == {
+        "score": adapter_module._LINE_ENTITY_CONFIDENCE_SCORE,
         "review_required": True,
-        "basis": "unsupported_drawable_record",
+        "basis": "libredwg_hatch_mapping_units_unconfirmed",
     }
     assert result.canonical["layouts"] == ({"name": "Model"}, {"name": "Sheet-H1"})
     assert result.canonical["blocks"] == ({"name": "Hatch-Block"},)
-    _assert_score_within_libredwg_descriptor_range(entities[0]["confidence"]["score"])
-    assert entities[0]["unknown_reason"] == "unsupported_drawable_record"
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
+    assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
+    assert not _contains_non_finite_numbers(entity)
+    _assert_score_within_libredwg_descriptor_range(entity["confidence"]["score"])
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_payload", "expected_handle"),
+    [
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "30",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "points": _HATCH_SQUARE_POINTS,
+                    }
+                ]
+            },
+            "30",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "31",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "vertices": _HATCH_SQUARE_POINTS,
+                    }
+                ]
+            },
+            "31",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "32",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "boundary_loops": [{"points": _HATCH_SQUARE_POINTS}],
+                    }
+                ]
+            },
+            "32",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "33",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "boundary_loops": [{"vertices": _HATCH_SQUARE_POINTS}],
+                    }
+                ]
+            },
+            "33",
+        ),
+    ],
+)
+async def test_libredwg_adapter_maps_point_and_vertex_hatch_variants_into_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+    expected_handle: str,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_id"] == f"libredwg-hatch-{expected_handle}"
+    assert entity["entity_type"] == "hatch"
+    assert entity["kind"] == "hatch"
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "hatch",
+        "vertex_count": 4,
+        "closed": True,
+        "area": 12.0,
+        "perimeter": 14.0,
+    }
+    assert entity["geometry"]["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["closed"] is True
+    assert entity["area"] == 12.0
+    assert entity["perimeter"] == 14.0
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 1,
+            "supported_geometry": 1,
+            "supported_lines": 0,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dedupes_consecutive_hatch_boundary_vertices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicated_points = (
+        _HATCH_SQUARE_POINTS[0],
+        _HATCH_SQUARE_POINTS[1],
+        _HATCH_SQUARE_POINTS[1],
+        _HATCH_SQUARE_POINTS[2],
+        _HATCH_SQUARE_POINTS[3],
+    )
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "34",
+                        "layout": "Sheet-H2",
+                        "layer": "Filled",
+                        "boundary_loops": [{"points": list(duplicated_points)}],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "hatch"
+    assert entity["geometry"]["geometry_summary"]["vertex_count"] == 4
+    assert entity["geometry"]["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["area"] == 12.0
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_payload", "expected_handle"),
+    [
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "40",
+                        "layout": "Sheet-H3",
+                        "layer": "Curved",
+                        "boundary_loops": [
+                            {
+                                "edges": [
+                                    {
+                                        "type": "ARC",
+                                        "center": {"x": 2, "y": 1, "z": 0},
+                                        "radius": 1,
+                                        "start_angle": 0,
+                                        "end_angle": 90,
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            },
+            "40",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "41",
+                        "layout": "Sheet-H3",
+                        "layer": "Bulged",
+                        "boundary_loops": [
+                            {
+                                "edges": [
+                                    {
+                                        "type": "LINE",
+                                        "start": {"x": 0, "y": 0, "z": 0},
+                                        "end": {"x": 2, "y": 0, "z": 0},
+                                        "bulge": 0.25,
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            },
+            "41",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "42",
+                        "layout": "Sheet-H3",
+                        "layer": "Ambiguous",
+                        "boundary_loops": [
+                            {"points": _HATCH_SQUARE_POINTS},
+                            {"points": _HATCH_TRIANGLE_POINTS},
+                        ],
+                    }
+                ]
+            },
+            "42",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "43",
+                        "layout": "Sheet-H3",
+                        "layer": "VertexBulge",
+                        "boundary_loops": [
+                            {
+                                "vertices": [
+                                    {"x": 0, "y": 0, "z": 0, "bulge": 0.25},
+                                    {"x": 4, "y": 0, "z": 0},
+                                    {"x": 4, "y": 3, "z": 0},
+                                    {"x": 0, "y": 3, "z": 0},
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            },
+            "43",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "44",
+                        "layout": "Sheet-H3",
+                        "layer": "MixedBoundary",
+                        "boundary_loops": [
+                            {
+                                "points": _HATCH_SQUARE_POINTS,
+                                "edges": [
+                                    {
+                                        "type": "ARC",
+                                        "center": {"x": 2, "y": 1.5, "z": 0},
+                                        "radius": 1,
+                                        "start_angle": 0,
+                                        "end_angle": 90,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+            "44",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "45",
+                        "layout": "Sheet-H3",
+                        "layer": "OwnerBulgeLoopPoints",
+                        "bulge": 0.25,
+                        "boundary_loops": [{"points": _HATCH_SQUARE_POINTS}],
+                    }
+                ]
+            },
+            "45",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "46",
+                        "layout": "Sheet-H3",
+                        "layer": "OwnerBulge",
+                        "points": _HATCH_SQUARE_POINTS,
+                        "bulge": 0.25,
+                    }
+                ]
+            },
+            "46",
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "47",
+                        "layout": "Sheet-H3",
+                        "layer": "LoopOwnerBulge",
+                        "boundary_loops": [
+                            {
+                                "points": _HATCH_SQUARE_POINTS,
+                                "bulge": 0.25,
+                            }
+                        ],
+                    }
+                ]
+            },
+            "47",
+        ),
+    ],
+)
+async def test_libredwg_adapter_degrades_curved_bulged_or_ambiguous_hatch_geometry_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+    expected_handle: str,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_id"] == f"libredwg-unknown-{expected_handle}"
+    assert entity["entity_type"] == "unknown"
+    assert entity["geometry"]["status"] == "absent"
+    assert entity["geometry"]["reason"] == "unsupported_hatch_geometry"
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "unknown",
+        "source_type": "HATCH",
+        "reason": "unsupported_hatch_geometry",
+    }
+    assert entity["geometry_reason"] == "unsupported_hatch_geometry"
+    assert entity["unknown_reason"] == "unsupported_hatch_geometry"
     assert [warning.code for warning in result.warnings] == [
         "libredwg.units_unconfirmed",
-        "libredwg.unsupported_drawable_record",
+        "libredwg.unsupported_hatch_geometry",
+    ]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 1,
+            "supported_geometry": 0,
+            "supported_lines": 0,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+            "unsupported_hatches": 1,
+            "malformed_hatches": 0,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_degrades_oversized_hatch_geometry_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "45",
+                        "layout": "Sheet-H4",
+                        "layer": "Oversized",
+                        "boundary_loops": [
+                            {
+                                "edges": _hatch_line_edges(
+                                    adapter_module._MAX_HATCH_BOUNDARY_COMPONENTS + 1
+                                )
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_id"] == "libredwg-unknown-45"
+    assert entity["entity_type"] == "unknown"
+    assert entity["geometry"]["status"] == "absent"
+    assert entity["geometry"]["reason"] == "unsupported_hatch_geometry"
+    assert entity["geometry_reason"] == "unsupported_hatch_geometry"
+    assert entity["unknown_reason"] == "unsupported_hatch_geometry"
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.unsupported_hatch_geometry",
+    ]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 1,
+            "supported_geometry": 0,
+            "supported_lines": 0,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+            "unsupported_hatches": 1,
+            "malformed_hatches": 0,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_degrades_unsupported_hatch_geometry_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "21",
+                        "layout": "Sheet-H1",
+                        "layer": "Unsupported",
+                        "block": "Hatch-Block",
+                        "boundary_loops": [
+                            {"points": [{"x": 0, "y": 0}, {"x": 2, "y": 0}, {"x": 0, "y": 2}]},
+                            {
+                                "points": [
+                                    {"x": 0.5, "y": 0.5},
+                                    {"x": 1, "y": 0.5},
+                                    {"x": 0.5, "y": 1},
+                                ]
+                            },
+                        ],
+                    },
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-unknown-21"
+    assert entity["entity_type"] == "unknown"
+    assert entity["geometry"]["status"] == "absent"
+    assert entity["geometry"]["reason"] == "unsupported_hatch_geometry"
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "unknown",
+        "source_type": "HATCH",
+        "reason": "unsupported_hatch_geometry",
+    }
+    assert entity["geometry_reason"] == "unsupported_hatch_geometry"
+    assert entity["unknown_reason"] == "unsupported_hatch_geometry"
+    assert entity["confidence"] == {
+        "score": adapter_module._UNKNOWN_ENTITY_CONFIDENCE_SCORE,
+        "review_required": True,
+        "basis": "unsupported_hatch_geometry",
+    }
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.unsupported_hatch_geometry",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_degrades_malformed_hatch_geometry_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "22",
+                        "layer": "Broken",
+                        "points": [
+                            {"x": 0, "y": 0, "z": 0},
+                            {"x": 2, "y": 0, "z": 1},
+                            {"x": 0, "y": 2, "z": 0},
+                        ],
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+
+    assert entity["entity_id"] == "libredwg-unknown-22"
+    assert entity["entity_type"] == "unknown"
+    assert entity["geometry"]["status"] == "absent"
+    assert entity["geometry"]["reason"] == "malformed_hatch_geometry"
+    assert entity["geometry"]["geometry_summary"] == {
+        "kind": "unknown",
+        "source_type": "HATCH",
+        "reason": "malformed_hatch_geometry",
+    }
+    assert entity["geometry_reason"] == "malformed_hatch_geometry"
+    assert entity["unknown_reason"] == "malformed_hatch_geometry"
+    assert [warning.code for warning in result.warnings] == [
+        "libredwg.units_unconfirmed",
+        "libredwg.malformed_hatch_geometry",
     ]
 
 
@@ -1991,9 +2639,74 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
     [
         (
             {"OBJECTS": [{"type": "HATCH", "handle": "20", "layer": "Unsupported"}]},
-            "unsupported_drawable_record",
+            "unsupported_hatch_geometry",
             "HATCH",
-            ("libredwg.units_unconfirmed", "libredwg.unsupported_drawable_record"),
+            ("libredwg.units_unconfirmed", "libredwg.unsupported_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20B",
+                        "layer": "Broken",
+                        "points": [
+                            {"x": 0, "y": 0, "z": 0},
+                            {"x": 1, "y": 0, "z": 1},
+                            {"x": 0, "y": 1, "z": 0},
+                        ],
+                    }
+                ]
+            },
+            "malformed_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20C",
+                        "layer": "Broken",
+                        "boundary_loops": [{"points": 1}],
+                    }
+                ]
+            },
+            "malformed_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20D",
+                        "layer": "Broken",
+                        "boundary_loops": [{"points": None}],
+                    }
+                ]
+            },
+            "malformed_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
+        ),
+        (
+            {
+                "OBJECTS": [
+                    {
+                        "type": "HATCH",
+                        "handle": "20E",
+                        "layer": "Patterned",
+                        "solid": False,
+                        "boundary_loops": [{"points": list(_HATCH_SQUARE_POINTS)}],
+                    }
+                ]
+            },
+            "unsupported_hatch_geometry",
+            "HATCH",
+            ("libredwg.units_unconfirmed", "libredwg.unsupported_hatch_geometry"),
         ),
         (
             {
@@ -2316,14 +3029,16 @@ async def test_libredwg_adapter_uses_geometry_confidence_for_non_line_supported_
     )
 
     metadata = cast(dict[str, Any], result.canonical["metadata"])
-    assert metadata["entity_counts"] == {
-        "drawable_candidates": 2,
-        "supported_geometry": 2,
-        "supported_lines": 1,
-        "supported_text": 0,
-        "unsupported_drawables": 0,
-        "malformed_drawables": 0,
-    }
+    assert metadata["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 2,
+            "supported_geometry": 2,
+            "supported_lines": 1,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+        }
+    )
     assert result.confidence is not None
     assert result.confidence.score == adapter_module._LINE_ENTITY_CONFIDENCE_SCORE
     assert result.confidence.basis == "libredwg_dwgread_json_geometry_mapping"
@@ -2364,14 +3079,16 @@ async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candid
     assert result.canonical["entities"] == ()
     metadata = cast(dict[str, Any], result.canonical["metadata"])
     assert metadata["empty_entities_reason"] == "no_drawable_candidates_detected"
-    assert metadata["entity_counts"] == {
-        "drawable_candidates": 0,
-        "supported_geometry": 0,
-        "supported_lines": 0,
-        "supported_text": 0,
-        "unsupported_drawables": 0,
-        "malformed_drawables": 0,
-    }
+    assert metadata["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 0,
+            "supported_geometry": 0,
+            "supported_lines": 0,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+        }
+    )
     assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
     assert result.confidence is not None
     _assert_score_within_libredwg_descriptor_range(result.confidence.score)
