@@ -261,6 +261,19 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/generated-artifacts/{artifact_id}/download",
+            "download_generated_artifact",
+            "download_generated_artifact",
+            None,
+            None,
+            (
+                ("path", "artifact_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+                ("dependency", "storage", None, None, None, None, "get_storage"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/generated-artifacts",
             "list_revision_generated_artifacts",
             "list_revision_generated_artifacts",

@@ -1,9 +1,10 @@
 """Revision generated-artifact read routes."""
 
-from typing import Annotated
+from typing import Annotated, NoReturn
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,14 +16,65 @@ from app.api.v1.revision_cursors import (
     _GeneratedArtifactCursor,
 )
 from app.api.v1.revision_lineage import _get_active_file, _get_active_revision
-from app.core.exceptions import raise_not_found
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.project import Project
 from app.schemas.revision import GeneratedArtifactListResponse, GeneratedArtifactRead
+from app.storage import Storage, get_storage
+from app.storage.base import StorageChecksumMismatchError
 
 generated_artifacts_router = APIRouter()
+
+
+def _content_disposition(filename: str) -> str:
+    """Return a safe attachment Content-Disposition for an artifact name."""
+
+    ascii_fallback = (
+        "".join(char for char in filename if 32 <= ord(char) < 127 and char not in '"\\').strip()
+        or "artifact"
+    )
+    encoded = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def _raise_artifact_storage_unavailable(artifact_id: UUID) -> NoReturn:
+    """Raise a sanitized 500 when stored artifact bytes are missing or corrupt."""
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=create_error_response(
+            code=ErrorCode.STORAGE_FAILED,
+            message=f"Stored bytes for generated artifact '{artifact_id}' are unavailable",
+            details=None,
+        ),
+    )
+
+
+async def _get_visible_generated_artifact(
+    artifact_id: UUID,
+    db: AsyncSession,
+) -> GeneratedArtifact | None:
+    """Return an active generated artifact visible through non-deleted lineage."""
+
+    result = await db.execute(
+        select(GeneratedArtifact)
+        .join(
+            File,
+            (File.id == GeneratedArtifact.source_file_id)
+            & (File.project_id == GeneratedArtifact.project_id),
+        )
+        .join(Project, Project.id == GeneratedArtifact.project_id)
+        .where(
+            (GeneratedArtifact.id == artifact_id)
+            & (GeneratedArtifact.deleted_at.is_(None))
+            & (File.deleted_at.is_(None))
+            & (Project.deleted_at.is_(None))
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 @generated_artifacts_router.get(
@@ -89,6 +141,43 @@ async def list_file_generated_artifacts(
     return GeneratedArtifactListResponse(
         items=[GeneratedArtifactRead.model_validate(artifact) for artifact in page],
         next_cursor=next_cursor,
+    )
+
+
+@generated_artifacts_router.get("/generated-artifacts/{artifact_id}/download")
+async def download_generated_artifact(
+    artifact_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    storage: Annotated[Storage, Depends(get_storage)],
+) -> Response:
+    """Stream stored bytes for a generated artifact visible through active lineage."""
+
+    artifact = await _get_visible_generated_artifact(artifact_id, db)
+    if artifact is None:
+        raise_not_found("Generated artifact", str(artifact_id))
+    assert artifact is not None
+
+    try:
+        stored = await storage.get(
+            artifact.storage_key,
+            expected_checksum_sha256=artifact.checksum_sha256,
+        )
+    except (FileNotFoundError, KeyError, StorageChecksumMismatchError):
+        # Immutable lineage guarantees bytes exist; absence or corruption is a
+        # server-side integrity failure, never a client-facing not-found.
+        _raise_artifact_storage_unavailable(artifact_id)
+
+    # Storage.get returns the full object body; the storage protocol exposes no
+    # chunk iterator, so larger artifacts would need a protocol extension to
+    # stream incrementally.
+    return Response(
+        content=stored.body,
+        media_type=artifact.media_type,
+        headers={
+            "Content-Disposition": _content_disposition(artifact.name),
+            "ETag": f'"{artifact.checksum_sha256}"',
+            "X-Checksum-SHA256": artifact.checksum_sha256,
+        },
     )
 
 

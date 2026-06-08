@@ -104,6 +104,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "changeset_api": DB_API_PYTEST_ARGS,
     "changeset_to_dxf_smoke": DB_API_PYTEST_ARGS,
     "export_create_api": DB_API_PYTEST_ARGS,
+    "generated_artifact_download_api": DB_API_PYTEST_ARGS,
     "revision_materialization_api": DB_API_PYTEST_ARGS,
     "validation_report_api": DB_API_PYTEST_ARGS,
     "revision_quantity_estimate_flow": DB_API_PYTEST_ARGS,
