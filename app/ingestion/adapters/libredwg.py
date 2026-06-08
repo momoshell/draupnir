@@ -8,7 +8,7 @@ import math
 import resource
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -65,6 +65,21 @@ _UNKNOWN_ENTITY_CONFIDENCE_SCORE = 0.2
 # INSERT scale components are treated as uniform when they agree within this relative
 # tolerance; anything outside it is a non-uniform transform we keep review-gated.
 _INSERT_SCALE_UNIFORM_TOLERANCE = 1e-9
+# Guards for materializing block geometry from supported INSERTs (#370). A nested INSERT chain
+# deeper than the depth cap, or a self-referential block cycle, or a block whose expansion would
+# exceed the entity cap, keeps the placing INSERT on the review-gated reference path rather than
+# materializing (partial or runaway) geometry.
+_MAX_BLOCK_NESTING_DEPTH = 8
+_MAX_BLOCK_MATERIALIZED_ENTITIES = 5000
+# Reserved layout block-header names. Their entities are model/paper-space geometry, not a
+# block definition that gets placed via INSERT, so they must never be treated as block-owned
+# children (otherwise real model-space geometry would be skipped at the top level).
+_LAYOUT_BLOCK_HEADER_NAME_PREFIXES = (
+    "*model_space",
+    "*paper_space",
+    "$model_space",
+    "$paper_space",
+)
 _DEFAULT_LAYOUT_NAME = "Model"
 _WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
 _SUPPORTED_LWPOLYLINE_FLAG_MASK = 0b1
@@ -204,6 +219,61 @@ class _InsertBuildResult:
     transform_supported: bool = False
     malformed: bool = False
     reason: str | None = None
+    materialized: bool = False
+    materialized_children: tuple[_JSONDict, ...] = ()
+    unmaterialized_child_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockDefinition:
+    """A resolved block definition: its identity, base point, and child drawable records.
+
+    ``base_point`` is in raw (pre-units-scale) drawing coordinates, matching the coordinate
+    space of the child records; INSERT materialization subtracts it before applying the
+    placement transform.
+    """
+
+    handle: str
+    name: str | None
+    base_point: tuple[float, float, float]
+    child_records: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockTransform:
+    """Affine placement of a block's child geometry into world (meter) space.
+
+    ``world = insertion + Rot(theta) @ (scale * (units_scale * (raw_point - base_point)))``
+
+    ``insertion`` is already units-scaled (meters); ``base_point`` is raw drawing coordinates and
+    is converted to meters via ``units_scale`` inside :meth:`apply_point`. ``scale`` is the uniform
+    positive scale scalar (callers pass a transform only for the verified-uniform subset).
+    """
+
+    insertion: tuple[float, float, float]
+    scale: float
+    rotation_radians: float
+    base_point: tuple[float, float, float]
+    units_scale: float
+
+    @property
+    def length_scale(self) -> float:
+        return self.units_scale * self.scale
+
+    def rotate_angle_degrees(self, degrees: float) -> float:
+        return degrees + math.degrees(self.rotation_radians)
+
+    def apply_point(self, raw_point: tuple[float, float, float]) -> tuple[float, float, float]:
+        local_x = (raw_point[0] - self.base_point[0]) * self.length_scale
+        local_y = (raw_point[1] - self.base_point[1]) * self.length_scale
+        local_z = (raw_point[2] - self.base_point[2]) * self.length_scale
+        cos_theta = math.cos(self.rotation_radians)
+        sin_theta = math.sin(self.rotation_radians)
+        return (
+            self.insertion[0] + local_x * cos_theta - local_y * sin_theta,
+            self.insertion[1] + local_x * sin_theta + local_y * cos_theta,
+            self.insertion[2] + local_z,
+        )
 
 
 def _configured_max_output_bytes() -> int:
@@ -670,6 +740,9 @@ def _build_canonical_output(
     block_reference_count = 0
     unsupported_transform_count = 0
     malformed_insert_count = 0
+    materialized_insert_count = 0
+    materialized_child_count = 0
+    block_materialization_guarded_count = 0
     unsupported_types: set[str] = set()
     malformed_handles: set[str] = set()
     unsupported_hatch_handles: set[str] = set()
@@ -678,10 +751,15 @@ def _build_canonical_output(
     unsupported_transform_handles: set[str] = set()
     unsupported_transform_reasons: set[str] = set()
     malformed_insert_handles: set[str] = set()
+    materialized_insert_handles: set[str] = set()
+    guarded_insert_handles: set[str] = set()
+    guard_reasons: set[str] = set()
     drawable_candidate_count = 0
     units = _resolve_units(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
     block_header_names = _build_block_header_name_map(records)
+    block_definitions = _build_block_definition_map(records)
+    block_definition_child_ids = _collect_block_definition_child_ids(block_definitions)
 
     def _record_entity(entity: _JSONDict) -> None:
         entities.append(entity)
@@ -697,11 +775,25 @@ def _build_canonical_output(
         _record_entity(unknown_entity)
         return cast(str | None, unknown_entity.get("source_entity_handle"))
 
+    def _count_supported_child(child_entity: _JSONDict) -> None:
+        nonlocal supported_geometry_count, supported_line_count, supported_text_count
+        entity_type = child_entity.get("entity_type")
+        if entity_type == "text":
+            supported_text_count += 1
+        else:
+            supported_geometry_count += 1
+            if entity_type == "line":
+                supported_line_count += 1
+
     for record in records:
         record_type = _extract_record_type(record)
         if record_type is None:
             continue
         if record_type in _NON_DRAWABLE_OBJECT_TYPES:
+            continue
+        # Block-definition geometry is emitted only through INSERT materialization, never as a
+        # free top-level entity.
+        if id(record) in block_definition_child_ids:
             continue
 
         drawable_candidate_count += 1
@@ -787,7 +879,10 @@ def _build_canonical_output(
 
         if record_type == "INSERT":
             insert_result = _build_insert_entity(
-                record, units=units, block_header_names=block_header_names
+                record,
+                units=units,
+                block_header_names=block_header_names,
+                block_definitions=block_definitions,
             )
             if insert_result.entity is not None:
                 _record_entity(insert_result.entity)
@@ -801,6 +896,25 @@ def _build_canonical_output(
                         unsupported_transform_handles.add(handle)
                     if insert_result.reason is not None:
                         unsupported_transform_reasons.add(insert_result.reason)
+                elif insert_result.materialized:
+                    materialized_insert_count += 1
+                    if handle is not None:
+                        materialized_insert_handles.add(handle)
+                    for child_entity in insert_result.materialized_children:
+                        _record_entity(child_entity)
+                        materialized_child_count += 1
+                        _count_supported_child(child_entity)
+                elif insert_result.unmaterialized_child_reason is not None:
+                    # A supported transform we could not faithfully materialize (guard trip or an
+                    # unmaterializable child): route through the review-gating channel so the
+                    # block-transform-validity hint stays unset rather than falsely reporting pass.
+                    block_materialization_guarded_count += 1
+                    unsupported_transform_count += 1
+                    guard_reasons.add(insert_result.unmaterialized_child_reason)
+                    unsupported_transform_reasons.add(insert_result.unmaterialized_child_reason)
+                    if handle is not None:
+                        guarded_insert_handles.add(handle)
+                        unsupported_transform_handles.add(handle)
                 continue
 
             malformed_insert_count += 1
@@ -836,6 +950,9 @@ def _build_canonical_output(
             "block_references": block_reference_count,
             "unsupported_block_transforms": unsupported_transform_count,
             "malformed_inserts": malformed_insert_count,
+            "materialized_inserts": materialized_insert_count,
+            "materialized_block_children": materialized_child_count,
+            "block_materialization_guarded": block_materialization_guarded_count,
         },
         "units": _units_summary(units),
     }
@@ -904,7 +1021,7 @@ def _build_canonical_output(
                 },
             )
         )
-    if block_reference_count > 0:
+    if block_reference_count > materialized_insert_count:
         warnings.append(
             AdapterWarning(
                 code="libredwg.block_reference_captured",
@@ -914,8 +1031,36 @@ def _build_canonical_output(
                 ),
                 details={
                     "count": block_reference_count,
+                    "unmaterialized_count": block_reference_count - materialized_insert_count,
                     "unsupported_transform_count": unsupported_transform_count,
                     "handles": tuple(sorted(block_reference_handles))[:10],
+                },
+            )
+        )
+    if materialized_insert_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.block_geometry_materialized",
+                message=("LibreDWG INSERT records were materialized into block child geometry."),
+                details={
+                    "count": materialized_insert_count,
+                    "materialized_children": materialized_child_count,
+                    "handles": tuple(sorted(materialized_insert_handles))[:10],
+                },
+            )
+        )
+    if block_materialization_guarded_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.block_materialization_guarded",
+                message=(
+                    "LibreDWG INSERT records were kept review-gated because block materialization "
+                    "hit a safety guard or an unmaterializable child."
+                ),
+                details={
+                    "count": block_materialization_guarded_count,
+                    "handles": tuple(sorted(guarded_insert_handles))[:10],
+                    "reasons": tuple(sorted(guard_reasons)),
                 },
             )
         )
@@ -1048,6 +1193,9 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "block_references",
         "unsupported_block_transforms",
         "malformed_inserts",
+        "materialized_inserts",
+        "materialized_block_children",
+        "block_materialization_guarded",
     ):
         value = _mapping_get(counts, key)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1148,6 +1296,25 @@ def _scale_point(point: tuple[float, float, float], scale: float) -> tuple[float
     return (point[0] * scale, point[1] * scale, point[2] * scale)
 
 
+def _resolve_placement(
+    units: _UnitsResolution, transform: _BlockTransform | None
+) -> tuple[Callable[[tuple[float, float, float]], tuple[float, float, float]], float, float]:
+    """Return ``(place, length_scale, angle_shift_degrees)`` for a geometry builder.
+
+    Without a block transform this reproduces today's behaviour (units scaling only). With one,
+    points are placed into world space via the affine, lengths/radii scale by ``length_scale``,
+    and arc angles shift by the block rotation.
+    """
+
+    if transform is None:
+        return (lambda point: _scale_point(point, units.scale), units.scale, 0.0)
+    return (
+        transform.apply_point,
+        transform.length_scale,
+        math.degrees(transform.rotation_radians),
+    )
+
+
 def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
     if isinstance(payload, Mapping):
         objects = _mapping_get(payload, "OBJECTS")
@@ -1185,7 +1352,9 @@ def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
     return candidates
 
 
-def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
+def _build_line_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution, transform: _BlockTransform | None = None
+) -> _JSONDict | None:
     start_point = _extract_point(
         record,
         prefixes=("start", "start_point", "first_endpoint", "point1", "p1", "from"),
@@ -1197,8 +1366,9 @@ def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) ->
     if start_point is None or end_point is None:
         return None
 
-    start_point = _scale_point(start_point, units.scale)
-    end_point = _scale_point(end_point, units.scale)
+    place, _length_scale, _angle_shift = _resolve_placement(units, transform)
+    start_point = place(start_point)
+    end_point = place(end_point)
     if not _point_is_finite(start_point) or not _point_is_finite(end_point):
         return None
 
@@ -1294,13 +1464,16 @@ def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) ->
     }
 
 
-def _build_text_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict:
+def _build_text_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution, transform: _BlockTransform | None = None
+) -> _JSONDict:
     insertion_point = _extract_point(
         record,
         prefixes=("insertion", "insertion_point", "ins_pt", "text_position"),
     )
     if insertion_point is not None:
-        insertion_point = _scale_point(insertion_point, units.scale)
+        place, _length_scale, _angle_shift = _resolve_placement(units, transform)
+        insertion_point = place(insertion_point)
     layer_name = _extract_layer_name(record)
     layout_name = _extract_layout_name(record)
     block_name = _extract_block_name(record)
@@ -1412,13 +1585,16 @@ def _build_text_entity(record: Mapping[str, Any], *, units: _UnitsResolution) ->
     }
 
 
-def _build_circle_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
+def _build_circle_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution, transform: _BlockTransform | None = None
+) -> _JSONDict | None:
     center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
     radius = _extract_positive_float(record, "radius")
     if center_point is None or radius is None:
         return None
-    center_point = _scale_point(center_point, units.scale)
-    radius = _scale_value(radius, units.scale)
+    place, length_scale, _angle_shift = _resolve_placement(units, transform)
+    center_point = place(center_point)
+    radius = radius * length_scale
     if not _point_is_finite(center_point):
         return None
 
@@ -1476,7 +1652,9 @@ def _build_circle_entity(record: Mapping[str, Any], *, units: _UnitsResolution) 
     )
 
 
-def _build_arc_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
+def _build_arc_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution, transform: _BlockTransform | None = None
+) -> _JSONDict | None:
     center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
     radius = _extract_positive_float(record, "radius")
     if not _record_uses_supported_arc_angles(record):
@@ -1485,8 +1663,13 @@ def _build_arc_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> 
     end_angle = _extract_angle_degrees(record, "end_angle", "endangle")
     if center_point is None or radius is None or start_angle is None or end_angle is None:
         return None
-    center_point = _scale_point(center_point, units.scale)
-    radius = _scale_value(radius, units.scale)
+    place, length_scale, angle_shift = _resolve_placement(units, transform)
+    center_point = place(center_point)
+    radius = radius * length_scale
+    # Uniform scale + rotation is conformal, so the arc stays a true arc: shift both angles by the
+    # block rotation (re-normalised to [0, 360)) and the existing CCW sweep/bbox math holds.
+    start_angle = _normalize_angle_degrees(start_angle + angle_shift)
+    end_angle = _normalize_angle_degrees(end_angle + angle_shift)
     if not _point_is_finite(center_point):
         return None
 
@@ -1568,14 +1751,14 @@ def _build_arc_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> 
 
 
 def _build_lwpolyline_entity(
-    record: Mapping[str, Any], *, units: _UnitsResolution
+    record: Mapping[str, Any], *, units: _UnitsResolution, transform: _BlockTransform | None = None
 ) -> _JSONDict | None:
     raw_vertices = _first_value(record, "vertices", "points", "vertexes")
     vertices = _extract_vertices(raw_vertices)
     if len(vertices) < 2:
         return None
-    if units.scale != 1.0:
-        vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
+    place, _length_scale, _angle_shift = _resolve_placement(units, transform)
+    vertices = tuple(place(vertex) for vertex in vertices)
     if any(not _point_is_finite(vertex) for vertex in vertices):
         return None
     if _mapping_has_nondefault_zero_value(
@@ -1738,6 +1921,153 @@ def _build_block_header_name_map(records: tuple[Mapping[str, Any], ...]) -> dict
     return names
 
 
+def _is_layout_block_header_name(name: str | None) -> bool:
+    if name is None:
+        return False
+    lowered = name.lower()
+    return any(lowered.startswith(prefix) for prefix in _LAYOUT_BLOCK_HEADER_NAME_PREFIXES)
+
+
+def _build_block_definition_map(
+    records: tuple[Mapping[str, Any], ...],
+) -> dict[str, _BlockDefinition]:
+    """Resolve BLOCK_HEADER handles to their base point and child drawable records.
+
+    Tolerant of the two shapes dwgread JSON uses to express block ownership: (a) the BLOCK_HEADER
+    carries an explicit array of child handle references; and (b) child entities sit between a
+    ``BLOCK``/``ENDBLK`` pair and/or carry an ``owner`` back-reference to the BLOCK_HEADER. Both
+    are unioned (deduped by record identity), so a block resolves whichever shape a file emits.
+    Keyed by lowercased BLOCK_HEADER handle. Model/paper-space layout headers are excluded — their
+    entities are top-level geometry, not a placeable block definition.
+    """
+
+    handle_index: dict[str, Mapping[str, Any]] = {}
+    header_names: dict[str, str | None] = {}
+    name_to_header: dict[str, str] = {}
+    for record in records:
+        handle = _extract_handle(record)
+        if handle is not None:
+            handle_index.setdefault(handle.lower(), record)
+        if _extract_record_type(record) != "BLOCK_HEADER" or handle is None:
+            continue
+        name = _first_string(record, "name", "block_name")
+        if _is_layout_block_header_name(name):
+            continue
+        header_names[handle.lower()] = name
+        if name is not None:
+            name_to_header.setdefault(name.lower(), handle.lower())
+
+    children: dict[str, list[Mapping[str, Any]]] = {key: [] for key in header_names}
+    seen_child_ids: dict[str, set[int]] = {key: set() for key in header_names}
+    base_points: dict[str, tuple[float, float, float]] = {}
+
+    def _attach(header_key: str, child: Mapping[str, Any]) -> None:
+        if header_key not in children:
+            return
+        child_type = _extract_record_type(child)
+        if child_type is None or child_type in _NON_DRAWABLE_OBJECT_TYPES:
+            return
+        if id(child) in seen_child_ids[header_key]:
+            return
+        seen_child_ids[header_key].add(id(child))
+        children[header_key].append(child)
+
+    # Shape (a): explicit child handle arrays carried on the BLOCK_HEADER.
+    for header_key in header_names:
+        header_record = handle_index.get(header_key)
+        if header_record is None:
+            continue
+        explicit = _first_value(
+            header_record, "entities", "block_entities", "owned_entities", "entities_handles"
+        )
+        if isinstance(explicit, (list, tuple)):
+            for element in explicit:
+                ref = _coerce_handle_ref(element)
+                if ref is None:
+                    continue
+                child = handle_index.get(ref.lower())
+                if child is not None:
+                    _attach(header_key, child)
+
+    # Shape (b): BLOCK/ENDBLK-delimited runs plus per-child owner back-references.
+    current_header_key: str | None = None
+    for record in records:
+        record_type = _extract_record_type(record)
+        if record_type == "BLOCK":
+            ref = _coerce_handle_ref(_first_value(record, "block_header", "block_record", "owner"))
+            block_header_key: str | None = ref.lower() if ref is not None else None
+            if block_header_key is None or block_header_key not in header_names:
+                block_name = _first_string(record, "name", "block_name")
+                block_header_key = name_to_header.get(block_name.lower()) if block_name else None
+            current_header_key = block_header_key
+            if block_header_key is not None and block_header_key in header_names:
+                base = _extract_point(
+                    record,
+                    prefixes=("base_point", "base", "origin", "ins_pt", "insertion", "point"),
+                )
+                if base is not None and _point_is_finite(base):
+                    base_points[block_header_key] = base
+            continue
+        if record_type == "ENDBLK":
+            current_header_key = None
+            continue
+        if record_type is None or record_type in _NON_DRAWABLE_OBJECT_TYPES:
+            continue
+        if current_header_key is not None:
+            _attach(current_header_key, record)
+        # Only genuine ownership fields back-reference the owning BLOCK_HEADER. An INSERT's
+        # ``block_header``/``block_record`` point at the block it *places*, not its owner, so they
+        # must not be consulted here (otherwise an INSERT would attach to its own target block).
+        owner_ref = _coerce_handle_ref(_first_value(record, "owner", "ownerhandle", "owner_handle"))
+        if owner_ref is not None and owner_ref.lower() in header_names:
+            _attach(owner_ref.lower(), record)
+
+    return {
+        header_key: _BlockDefinition(
+            handle=header_key,
+            name=header_names[header_key],
+            base_point=base_points.get(header_key, (0.0, 0.0, 0.0)),
+            child_records=tuple(child_records),
+        )
+        for header_key, child_records in children.items()
+    }
+
+
+def _resolve_referenced_block_definition(
+    record: Mapping[str, Any], *, block_definitions: Mapping[str, _BlockDefinition]
+) -> _BlockDefinition | None:
+    """Resolve the block definition an INSERT places (parallels block-name resolution)."""
+
+    ref = _coerce_handle_ref(
+        _first_value(record, "block_header", "block_record", "block_record_ref")
+    )
+    if ref is not None:
+        definition = block_definitions.get(ref.lower())
+        if definition is not None:
+            return definition
+    direct = _first_string(record, "block_header_name", "ref_block", "name")
+    if direct is not None:
+        lowered = direct.lower()
+        for definition in block_definitions.values():
+            if definition.name is not None and definition.name.lower() == lowered:
+                return definition
+    return None
+
+
+def _collect_block_definition_child_ids(
+    block_definitions: Mapping[str, _BlockDefinition],
+) -> frozenset[int]:
+    """Identity set of every record owned by a block definition.
+
+    Used to skip block-definition geometry at the top level so it is emitted only through INSERT
+    materialization, never as a free model-space entity.
+    """
+
+    return frozenset(
+        id(child) for definition in block_definitions.values() for child in definition.child_records
+    )
+
+
 def _coerce_handle_ref(value: Any) -> str | None:
     if isinstance(value, str):
         return _sanitize_string_value(value)
@@ -1840,23 +2170,193 @@ def _classify_insert_transform(
     return tuple(reasons)
 
 
+_INSERT_INSERTION_POINT_PREFIXES = (
+    "ins_pt",
+    "insertion_point",
+    "insertion",
+    "ins",
+    "position",
+    "point",
+    "location",
+)
+
+# Block-definition child record types this adapter can materialize, mapped to their builders.
+# HATCH and other types stay unmaterialized — a block containing one keeps its placing INSERT on
+# the review-gated reference path (all-or-nothing, no partial geometry).
+_MATERIALIZABLE_CHILD_BUILDERS: dict[str, Callable[..., _JSONDict | None]] = {
+    "LINE": _build_line_entity,
+    "CIRCLE": _build_circle_entity,
+    "ARC": _build_arc_entity,
+    "LWPOLYLINE": _build_lwpolyline_entity,
+    "MTEXT": _build_text_entity,
+}
+
+
+def _compose_block_transform(
+    parent: _BlockTransform,
+    *,
+    nested_insertion_raw: tuple[float, float, float],
+    nested_scale: float,
+    nested_rotation: float,
+    nested_base: tuple[float, float, float],
+) -> _BlockTransform:
+    """Compose a nested INSERT placement with its parent block placement.
+
+    The nested INSERT's insertion point is expressed in the parent block's local coordinates, so
+    mapping it through ``parent.apply_point`` yields the child block's world insertion; scales
+    multiply and rotations add. Derived from ``parent(nested(q))`` for the conformal subset.
+    """
+
+    return _BlockTransform(
+        insertion=parent.apply_point(nested_insertion_raw),
+        scale=parent.scale * nested_scale,
+        rotation_radians=parent.rotation_radians + nested_rotation,
+        base_point=nested_base,
+        units_scale=parent.units_scale,
+    )
+
+
+def _materialize_block_children(
+    block_definition: _BlockDefinition,
+    *,
+    transform: _BlockTransform,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+    block_definitions: Mapping[str, _BlockDefinition],
+    parent_insert_handle: str | None,
+    parent_entity_id: str,
+    parent_entity_ref: str,
+    depth: int,
+    ancestor_block_handles: frozenset[str],
+    results: list[_JSONDict],
+) -> str | None:
+    """Materialize a block's child geometry under ``transform`` (all-or-nothing).
+
+    Appends materialized child entities to ``results`` and returns ``None`` on success, or a
+    diagnostic reason code if any child cannot be faithfully materialized (unsupported type,
+    malformed geometry, nested-transform/guard trip) — in which case the caller keeps the placing
+    INSERT on the review-gated reference path.
+    """
+
+    for child_record in block_definition.child_records:
+        child_type = _extract_record_type(child_record)
+        if child_type == "INSERT":
+            reason = _materialize_nested_insert(
+                child_record,
+                parent_transform=transform,
+                units=units,
+                block_header_names=block_header_names,
+                block_definitions=block_definitions,
+                parent_insert_handle=parent_insert_handle,
+                parent_entity_id=parent_entity_id,
+                parent_entity_ref=parent_entity_ref,
+                depth=depth,
+                ancestor_block_handles=ancestor_block_handles,
+                results=results,
+            )
+            if reason is not None:
+                return reason
+            continue
+
+        builder = _MATERIALIZABLE_CHILD_BUILDERS.get(child_type) if child_type else None
+        if builder is None:
+            return "block_contains_unmaterializable_child"
+        child_entity = builder(child_record, units=units, transform=transform)
+        if child_entity is None:
+            return "block_contains_unmaterializable_child"
+        _finalize_materialized_child(
+            child_entity,
+            child_record=child_record,
+            parent_insert_handle=parent_insert_handle,
+            parent_entity_id=parent_entity_id,
+            parent_entity_ref=parent_entity_ref,
+            block_name=block_definition.name,
+            depth=depth,
+        )
+        results.append(child_entity)
+        if len(results) > _MAX_BLOCK_MATERIALIZED_ENTITIES:
+            return "block_entity_count_exceeded"
+    return None
+
+
+def _materialize_nested_insert(
+    record: Mapping[str, Any],
+    *,
+    parent_transform: _BlockTransform,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+    block_definitions: Mapping[str, _BlockDefinition],
+    parent_insert_handle: str | None,
+    parent_entity_id: str,
+    parent_entity_ref: str,
+    depth: int,
+    ancestor_block_handles: frozenset[str],
+    results: list[_JSONDict],
+) -> str | None:
+    """Expand a nested INSERT into the accumulating results, or return a guard/abort reason."""
+
+    if depth + 1 > _MAX_BLOCK_NESTING_DEPTH:
+        return "block_nesting_depth_exceeded"
+    insertion_raw = _extract_point(record, prefixes=_INSERT_INSERTION_POINT_PREFIXES)
+    if insertion_raw is None or not _point_is_finite(insertion_raw):
+        return "block_contains_unmaterializable_child"
+    scale = _extract_insert_scale(record)
+    raw_rotation = _coerce_float(_first_value(record, "rotation", "rotation_radians", "angle"))
+    rotation_radians = raw_rotation if raw_rotation is not None else 0.0
+    array = _extract_insert_array(record, units=units)
+    block_name = _resolve_referenced_block_name(record, block_header_names=block_header_names)
+    if _classify_insert_transform(
+        scale=scale, rotation_radians=rotation_radians, array=array, block_name=block_name
+    ):
+        return "block_contains_unmaterializable_child"
+    nested_definition = _resolve_referenced_block_definition(
+        record, block_definitions=block_definitions
+    )
+    if nested_definition is None:
+        return "block_contains_unmaterializable_child"
+    if nested_definition.handle in ancestor_block_handles:
+        return "block_self_reference_cycle"
+    composed = _compose_block_transform(
+        parent_transform,
+        nested_insertion_raw=insertion_raw,
+        nested_scale=scale[0],
+        nested_rotation=rotation_radians,
+        nested_base=nested_definition.base_point,
+    )
+    return _materialize_block_children(
+        nested_definition,
+        transform=composed,
+        units=units,
+        block_header_names=block_header_names,
+        block_definitions=block_definitions,
+        parent_insert_handle=parent_insert_handle,
+        parent_entity_id=parent_entity_id,
+        parent_entity_ref=parent_entity_ref,
+        depth=depth + 1,
+        ancestor_block_handles=ancestor_block_handles | {nested_definition.handle},
+        results=results,
+    )
+
+
 def _build_insert_entity(
     record: Mapping[str, Any],
     *,
     units: _UnitsResolution,
     block_header_names: Mapping[str, str],
+    block_definitions: Mapping[str, _BlockDefinition],
 ) -> _InsertBuildResult:
-    """Capture an INSERT as a review-gated block reference with safe transform metadata.
+    """Capture an INSERT as a review-gated block reference, materializing its child geometry.
 
-    Geometry is not materialized (that is deliberately out of scope); the placement is recorded
-    as an ``insert`` entity carrying the insertion point (scaled to meters), scale, rotation, and
-    array metadata, plus a supported/unsupported classification that drives validation review.
+    The placement itself is always recorded as a review-gated ``insert`` reference entity (the
+    #361 contract). When the transform is within the safe subset and the referenced block resolves
+    to a definition, the block's child geometry is additionally materialized under the placement
+    transform and returned via ``materialized_children`` with provenance linking back to this
+    INSERT. Unsupported transforms, unresolvable definitions, recursion/cycle/over-cap guards, and
+    blocks with any unmaterializable child keep the INSERT on the reference-only path (no partial
+    or wrong geometry).
     """
 
-    insertion_point = _extract_point(
-        record,
-        prefixes=("ins_pt", "insertion_point", "insertion", "ins", "position", "point", "location"),
-    )
+    insertion_point = _extract_point(record, prefixes=_INSERT_INSERTION_POINT_PREFIXES)
     if insertion_point is None or not _point_is_finite(insertion_point):
         return _InsertBuildResult(None, malformed=True, reason="malformed_insert_record")
 
@@ -1963,11 +2463,73 @@ def _build_insert_entity(
         "block_reference": block_reference,
         "transform_supported": transform_supported,
     }
+
+    if not transform_supported:
+        return _InsertBuildResult(
+            entity,
+            transform_supported=transform_supported,
+            malformed=False,
+            reason=primary_reason,
+        )
+
+    block_definition = _resolve_referenced_block_definition(
+        record, block_definitions=block_definitions
+    )
+    if block_definition is None:
+        # Supported transform but no resolvable block definition: keep the #361 reference-only
+        # behaviour (no geometry, but not a guard trip).
+        return _InsertBuildResult(
+            entity, transform_supported=transform_supported, malformed=False, reason=primary_reason
+        )
+
+    top_transform = _BlockTransform(
+        insertion=scaled_insertion,
+        scale=scale[0],
+        rotation_radians=rotation_radians,
+        base_point=block_definition.base_point,
+        units_scale=units.scale,
+    )
+    children: list[_JSONDict] = []
+    materialization_reason = _materialize_block_children(
+        block_definition,
+        transform=top_transform,
+        units=units,
+        block_header_names=block_header_names,
+        block_definitions=block_definitions,
+        parent_insert_handle=source_handle,
+        parent_entity_id=cast(str, entity["entity_id"]),
+        parent_entity_ref=_source_locator(record, record_type="INSERT"),
+        depth=0,
+        ancestor_block_handles=frozenset({block_definition.handle}),
+        results=children,
+    )
+    if materialization_reason is not None:
+        block_reference["materialized"] = False
+        return _InsertBuildResult(
+            entity,
+            transform_supported=transform_supported,
+            malformed=False,
+            reason=primary_reason,
+            unmaterialized_child_reason=materialization_reason,
+        )
+
+    if not children:
+        # Resolvable but empty block: no geometry to materialize, so keep the #361 reference-only
+        # behaviour rather than reporting a (zero-child) materialization.
+        return _InsertBuildResult(
+            entity, transform_supported=transform_supported, malformed=False, reason=primary_reason
+        )
+
+    block_reference["materialized"] = True
+    block_reference["materialized_child_count"] = len(children)
+    geometry_summary["materialized_child_count"] = len(children)
     return _InsertBuildResult(
         entity,
         transform_supported=transform_supported,
         malformed=False,
         reason=primary_reason,
+        materialized=True,
+        materialized_children=tuple(children),
     )
 
 
@@ -2925,6 +3487,63 @@ def _entity_id(record: Mapping[str, Any], *, record_type: str) -> str:
         _safe_record_projection(record, record_type=record_type.upper(), geometry=None)
     )
     return f"libredwg-{record_type}-{record_hash[:18]}"
+
+
+def _materialized_child_entity_id(
+    parent_insert_handle: str | None, child_record: Mapping[str, Any], entity_type: str
+) -> str:
+    """Parent-scoped id for a block child so multiple placements of one block never collide."""
+
+    parent_token = parent_insert_handle.lower() if parent_insert_handle is not None else "insert"
+    child_handle = _extract_handle(child_record)
+    if child_handle is not None:
+        child_token = child_handle.lower()
+    else:
+        child_token = _hash_json_value(
+            _safe_record_projection(child_record, record_type=entity_type.upper(), geometry=None)
+        )[:18]
+    return f"libredwg-{entity_type}-{parent_token}-{child_token}"
+
+
+def _finalize_materialized_child(
+    child: _JSONDict,
+    *,
+    child_record: Mapping[str, Any],
+    parent_insert_handle: str | None,
+    parent_entity_id: str,
+    parent_entity_ref: str,
+    block_name: str | None,
+    depth: int,
+) -> _JSONDict:
+    """Stamp block-child linkage, ``materialized`` status, and provenance notes onto a child."""
+
+    entity_type = cast(str, child.get("entity_type", "entity"))
+    child["entity_id"] = _materialized_child_entity_id(
+        parent_insert_handle, child_record, entity_type
+    )
+    child["parent_entity_id"] = parent_entity_id
+    child["parent_entity_ref"] = parent_entity_ref
+    geometry = child.get("geometry")
+    if isinstance(geometry, dict):
+        geometry["status"] = "materialized"
+    existing_notes = cast("tuple[str, ...]", child.get("notes") or ())
+    extra_notes: tuple[str, ...] = (
+        "materialized_from_block",
+        f"block:{block_name}" if block_name is not None else "block:unknown",
+        (
+            f"via_insert:{parent_insert_handle}"
+            if parent_insert_handle is not None
+            else "via_insert:unknown"
+        ),
+    )
+    if depth:
+        extra_notes = (*extra_notes, f"nested_depth:{depth}")
+    combined_notes = (*existing_notes, *extra_notes)
+    child["notes"] = combined_notes
+    provenance = child.get("provenance")
+    if isinstance(provenance, dict):
+        provenance["notes"] = combined_notes
+    return child
 
 
 def _entity_provenance(
