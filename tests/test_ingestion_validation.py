@@ -1142,3 +1142,66 @@ def test_build_ingest_finalization_payload_rejects_invalid_entity_provenance() -
         ],
         "generated_at": _GENERATED_AT.isoformat(),
     }
+
+
+def _block_reference_entity() -> dict[str, JSONValue]:
+    return {
+        "kind": "insert",
+        "layer": "A-WALL",
+        "block_name": "Door-Block",
+        "insert": {"x": 1.0, "y": 2.0},
+        "transform": {"supported": True},
+    }
+
+
+def test_build_validation_outcome_review_gates_block_reference_without_hint() -> None:
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(entities=(_block_reference_entity(),)),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    block_check = checks_by_key["block_transform_validity"]
+
+    assert block_check["status"] == "review_required"
+    assert block_check["details"]["block_references_present"] is True
+    assert outcome.review_state == "review_required"
+    assert outcome.quantity_gate == "review_gated"
+
+
+def test_build_validation_outcome_passes_block_reference_with_confirmed_hint() -> None:
+    canonical = _build_complete_canonical(entities=(_block_reference_entity(),))
+    canonical["block_transform_validity"] = True
+
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.95),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+
+    assert checks_by_key["block_transform_validity"]["status"] == "pass"
+
+
+def test_build_validation_outcome_fails_block_reference_with_invalid_hint() -> None:
+    canonical = _build_complete_canonical(entities=(_block_reference_entity(),))
+    canonical["block_transform_validity"] = False
+
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+
+    assert checks_by_key["block_transform_validity"]["status"] == "fail"
+    assert outcome.quantity_gate == "blocked"

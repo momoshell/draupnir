@@ -59,7 +59,11 @@ _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
 _LINE_ENTITY_CONFIDENCE_SCORE = 0.72
 _TEXT_ENTITY_CONFIDENCE_SCORE = 0.72
 _MIXED_ENTITY_CONFIDENCE_SCORE = 0.5
+_BLOCK_REFERENCE_CONFIDENCE_SCORE = 0.45
 _UNKNOWN_ENTITY_CONFIDENCE_SCORE = 0.2
+# INSERT scale components are treated as uniform when they agree within this relative
+# tolerance; anything outside it is a non-uniform transform we keep review-gated.
+_INSERT_SCALE_UNIFORM_TOLERANCE = 1e-9
 _DEFAULT_LAYOUT_NAME = "Model"
 _WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
 _SUPPORTED_LWPOLYLINE_FLAG_MASK = 0b1
@@ -69,8 +73,10 @@ _UNSUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"cw", "clockwise"})
 _NON_DRAWABLE_OBJECT_TYPES = frozenset(
     {
         "APPID",
+        "BLOCK",
         "BLOCK_CONTROL",
         "BLOCK_HEADER",
+        "ENDBLK",
         "CLASS",
         "DBPLACEHOLDER",
         "DICTIONARY",
@@ -191,6 +197,22 @@ class _HatchVerticesResult:
     vertices: tuple[tuple[float, float, float], ...] | None
     reason: str | None = None
     malformed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _InsertBuildResult:
+    """Outcome of mapping a single INSERT (block-reference) record.
+
+    ``entity`` is ``None`` only when the record is malformed (no usable insertion point) and
+    should fall back to the generic unknown path. A captured-but-review-gated block reference —
+    including one whose transform is unsupported — still returns an entity, with
+    ``transform_supported`` reflecting whether the captured transform is within the safe subset.
+    """
+
+    entity: _JSONDict | None
+    transform_supported: bool = False
+    malformed: bool = False
+    reason: str | None = None
 
 
 def _configured_max_output_bytes() -> int:
@@ -654,12 +676,21 @@ def _build_canonical_output(
     malformed_drawable_count = 0
     unsupported_hatch_count = 0
     malformed_hatch_count = 0
+    block_reference_count = 0
+    unsupported_transform_count = 0
+    malformed_insert_count = 0
     unsupported_types: set[str] = set()
     malformed_handles: set[str] = set()
     unsupported_hatch_handles: set[str] = set()
     malformed_hatch_handles: set[str] = set()
+    block_reference_handles: set[str] = set()
+    unsupported_transform_handles: set[str] = set()
+    unsupported_transform_reasons: set[str] = set()
+    malformed_insert_handles: set[str] = set()
     drawable_candidate_count = 0
     units = _resolve_units(run_result.output_payload)
+    records = _iter_object_records(run_result.output_payload)
+    block_header_names = _build_block_header_name_map(records)
 
     def _record_entity(entity: _JSONDict) -> None:
         entities.append(entity)
@@ -675,7 +706,7 @@ def _build_canonical_output(
         _record_entity(unknown_entity)
         return cast(str | None, unknown_entity.get("source_entity_handle"))
 
-    for record in _iter_object_records(run_result.output_payload):
+    for record in records:
         record_type = _extract_record_type(record)
         if record_type is None:
             continue
@@ -763,6 +794,32 @@ def _build_canonical_output(
             supported_text_count += 1
             continue
 
+        if record_type == "INSERT":
+            insert_result = _build_insert_entity(
+                record, units=units, block_header_names=block_header_names
+            )
+            if insert_result.entity is not None:
+                _record_entity(insert_result.entity)
+                block_reference_count += 1
+                handle = cast(str | None, insert_result.entity.get("source_entity_handle"))
+                if handle is not None:
+                    block_reference_handles.add(handle)
+                if not insert_result.transform_supported:
+                    unsupported_transform_count += 1
+                    if handle is not None:
+                        unsupported_transform_handles.add(handle)
+                    if insert_result.reason is not None:
+                        unsupported_transform_reasons.add(insert_result.reason)
+                continue
+
+            malformed_insert_count += 1
+            handle = _record_unknown(
+                record, reason=insert_result.reason or "malformed_insert_record"
+            )
+            if handle is not None:
+                malformed_insert_handles.add(handle)
+            continue
+
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
         _record_unknown(record, reason="unsupported_drawable_record")
@@ -785,9 +842,21 @@ def _build_canonical_output(
             "malformed_drawables": malformed_drawable_count,
             "unsupported_hatches": unsupported_hatch_count,
             "malformed_hatches": malformed_hatch_count,
+            "block_references": block_reference_count,
+            "unsupported_block_transforms": unsupported_transform_count,
+            "malformed_inserts": malformed_insert_count,
         },
         "units": _units_summary(units),
     }
+    # Confirm block-transform validity for the downstream validation check only when every
+    # captured block reference is within the supported transform subset; otherwise leave the
+    # hint unset so the reference stays review-gated.
+    if (
+        block_reference_count > 0
+        and unsupported_transform_count == 0
+        and malformed_insert_count == 0
+    ):
+        metadata["block_transform_validity"] = True
     if run_result.output_key_count is not None:
         dwgread_metadata = cast(dict[str, JSONValue], metadata["dwgread"])
         dwgread_metadata["output_key_count"] = run_result.output_key_count
@@ -844,6 +913,46 @@ def _build_canonical_output(
                 },
             )
         )
+    if block_reference_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.block_reference_captured",
+                message=(
+                    "LibreDWG INSERT records were captured as review-gated block references "
+                    "without materialized geometry."
+                ),
+                details={
+                    "count": block_reference_count,
+                    "unsupported_transform_count": unsupported_transform_count,
+                    "handles": tuple(sorted(block_reference_handles))[:10],
+                },
+            )
+        )
+    if unsupported_transform_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.unsupported_block_transform",
+                message=(
+                    "LibreDWG INSERT records use block transforms outside the supported subset."
+                ),
+                details={
+                    "count": unsupported_transform_count,
+                    "handles": tuple(sorted(unsupported_transform_handles))[:10],
+                    "reasons": tuple(sorted(unsupported_transform_reasons)),
+                },
+            )
+        )
+    if malformed_insert_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.malformed_insert_record",
+                message="LibreDWG INSERT records were missing a usable insertion point.",
+                details={
+                    "count": malformed_insert_count,
+                    "handles": tuple(sorted(malformed_insert_handles))[:10],
+                },
+            )
+        )
 
     has_supported_drawable_count = supported_geometry_count + supported_text_count
     has_mixed_entity_outcomes = has_supported_drawable_count > 0 and (
@@ -851,6 +960,8 @@ def _build_canonical_output(
         or malformed_drawable_count > 0
         or unsupported_hatch_count > 0
         or malformed_hatch_count > 0
+        or block_reference_count > 0
+        or malformed_insert_count > 0
     )
     if has_mixed_entity_outcomes:
         confidence_score = _MIXED_ENTITY_CONFIDENCE_SCORE
@@ -867,6 +978,9 @@ def _build_canonical_output(
     elif supported_text_count > 0:
         confidence_score = _TEXT_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_text_mapping"
+    elif block_reference_count > 0:
+        confidence_score = _BLOCK_REFERENCE_CONFIDENCE_SCORE
+        confidence_basis = "libredwg_dwgread_json_block_reference_mapping"
     elif entities:
         confidence_score = _UNKNOWN_ENTITY_CONFIDENCE_SCORE
         confidence_basis = "libredwg_dwgread_json_unknown_entity_mapping"
@@ -940,6 +1054,9 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "malformed_drawables",
         "unsupported_hatches",
         "malformed_hatches",
+        "block_references",
+        "unsupported_block_transforms",
+        "malformed_inserts",
     ):
         value = _mapping_get(counts, key)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1603,6 +1720,257 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
                 "perimeter": perimeter,
             },
         )
+    )
+
+
+def _build_block_header_name_map(records: tuple[Mapping[str, Any], ...]) -> dict[str, str]:
+    """Map BLOCK_HEADER handles to block names so INSERT references resolve to a name.
+
+    Keyed by lowercased handle to tolerate case differences between the BLOCK_HEADER handle and
+    the handle reference an INSERT carries in its ``block_header`` field.
+    """
+
+    names: dict[str, str] = {}
+    for record in records:
+        if _extract_record_type(record) != "BLOCK_HEADER":
+            continue
+        handle = _extract_handle(record)
+        name = _first_string(record, "name", "block_name")
+        if handle is not None and name is not None:
+            names[handle.lower()] = name
+    return names
+
+
+def _coerce_handle_ref(value: Any) -> str | None:
+    if isinstance(value, str):
+        return _sanitize_string_value(value)
+    if isinstance(value, Mapping):
+        handle = _mapping_get(value, "handle", "absolute_ref", "ref", "value", "code")
+        return _coerce_handle_ref(handle) if handle is not None else None
+    if isinstance(value, (list, tuple)) and value:
+        return _coerce_handle_ref(value[0])
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _sanitize_string_value(str(int(value)))
+    return None
+
+
+def _resolve_referenced_block_name(
+    record: Mapping[str, Any], *, block_header_names: Mapping[str, str]
+) -> str | None:
+    """Resolve the block an INSERT references, by direct name or BLOCK_HEADER handle lookup.
+
+    The ``block``/``block_name`` owner fields are intentionally not consulted here: for an INSERT
+    those identify the owning space (e.g. model space), not the block being placed.
+    """
+
+    direct = _first_string(record, "block_header_name", "ref_block", "name")
+    if direct is not None:
+        return direct
+    ref = _coerce_handle_ref(
+        _first_value(record, "block_header", "block_record", "block_record_ref")
+    )
+    if ref is None:
+        return None
+    return block_header_names.get(ref.lower())
+
+
+def _extract_insert_scale(record: Mapping[str, Any]) -> tuple[float, float, float]:
+    scale_point = _coerce_point(_first_value(record, "scale", "scale_factor"))
+    if scale_point is not None:
+        return scale_point
+    x_scale = _coerce_float(_first_value(record, "xscale", "scale_x", "x_scale"))
+    y_scale = _coerce_float(_first_value(record, "yscale", "scale_y", "y_scale"))
+    z_scale = _coerce_float(_first_value(record, "zscale", "scale_z", "z_scale"))
+    return (
+        x_scale if x_scale is not None else 1.0,
+        y_scale if y_scale is not None else 1.0,
+        z_scale if z_scale is not None else 1.0,
+    )
+
+
+def _extract_insert_array(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict:
+    columns = _coerce_float(_first_value(record, "num_cols", "numcols", "column_count", "ncols"))
+    rows = _coerce_float(_first_value(record, "num_rows", "numrows", "row_count", "nrows"))
+    column_spacing = _coerce_float(
+        _first_value(record, "col_spacing", "column_spacing", "colspacing")
+    )
+    row_spacing = _coerce_float(_first_value(record, "row_spacing", "rowspacing"))
+    return {
+        "columns": int(columns) if columns is not None and columns >= 1 else 1,
+        "rows": int(rows) if rows is not None and rows >= 1 else 1,
+        "column_spacing": _scale_value(column_spacing, units.scale)
+        if column_spacing is not None
+        else 0.0,
+        "row_spacing": _scale_value(row_spacing, units.scale) if row_spacing is not None else 0.0,
+    }
+
+
+def _scales_are_uniform(scale: tuple[float, float, float]) -> bool:
+    reference, *rest = scale
+    return all(
+        math.isclose(
+            component,
+            reference,
+            rel_tol=_INSERT_SCALE_UNIFORM_TOLERANCE,
+            abs_tol=_INSERT_SCALE_UNIFORM_TOLERANCE,
+        )
+        for component in rest
+    )
+
+
+def _classify_insert_transform(
+    *,
+    scale: tuple[float, float, float],
+    rotation_radians: float,
+    array: Mapping[str, Any],
+    block_name: str | None,
+) -> tuple[str, ...]:
+    """Return the ordered reasons an INSERT transform is outside the safe subset (empty == safe)."""
+
+    reasons: list[str] = []
+    if block_name is None:
+        reasons.append("unresolved_block_reference")
+    if not _floats_are_finite(*scale) or any(component == 0.0 for component in scale):
+        reasons.append("unsupported_degenerate_scale")
+    elif any(component < 0.0 for component in scale):
+        reasons.append("unsupported_mirrored_scale")
+    elif not _scales_are_uniform(scale):
+        reasons.append("unsupported_nonuniform_scale")
+    if int(array.get("columns", 1)) > 1 or int(array.get("rows", 1)) > 1:
+        reasons.append("unsupported_block_array")
+    if not math.isfinite(rotation_radians):
+        reasons.append("unsupported_rotation")
+    return tuple(reasons)
+
+
+def _build_insert_entity(
+    record: Mapping[str, Any],
+    *,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+) -> _InsertBuildResult:
+    """Capture an INSERT as a review-gated block reference with safe transform metadata.
+
+    Geometry is not materialized (that is deliberately out of scope); the placement is recorded
+    as an ``insert`` entity carrying the insertion point (scaled to meters), scale, rotation, and
+    array metadata, plus a supported/unsupported classification that drives validation review.
+    """
+
+    insertion_point = _extract_point(
+        record,
+        prefixes=("ins_pt", "insertion_point", "insertion", "ins", "position", "point", "location"),
+    )
+    if insertion_point is None or not _point_is_finite(insertion_point):
+        return _InsertBuildResult(None, malformed=True, reason="malformed_insert_record")
+
+    scaled_insertion = _scale_point(insertion_point, units.scale)
+    scale = _extract_insert_scale(record)
+    raw_rotation = _coerce_float(_first_value(record, "rotation", "rotation_radians", "angle"))
+    rotation_radians = raw_rotation if raw_rotation is not None else 0.0
+    array = _extract_insert_array(record, units=units)
+    block_name = _resolve_referenced_block_name(record, block_header_names=block_header_names)
+
+    reasons = _classify_insert_transform(
+        scale=scale,
+        rotation_radians=rotation_radians,
+        array=array,
+        block_name=block_name,
+    )
+    transform_supported = not reasons
+    primary_reason = reasons[0] if reasons else None
+    rotation_finite = math.isfinite(rotation_radians)
+
+    transform: _JSONDict = {
+        "insertion_point": _point_json(scaled_insertion),
+        "scale": {"x": scale[0], "y": scale[1], "z": scale[2]},
+        "rotation_degrees": math.degrees(rotation_radians) if rotation_finite else None,
+        "rotation_radians": rotation_radians if rotation_finite else None,
+        "array": array,
+        "supported": transform_supported,
+        "unsupported_reasons": reasons,
+    }
+
+    source_handle = _extract_handle(record)
+    layout_name = _extract_layout_name(record)
+    layer_name = _extract_layer_name(record)
+    safe_projection = _safe_record_projection(record, record_type="INSERT", geometry=None)
+    extra_notes = (primary_reason,) if primary_reason is not None else ()
+    provenance = _entity_provenance(
+        record,
+        record_type="INSERT",
+        source_handle=source_handle,
+        safe_projection=safe_projection,
+        notes=(*_units_notes(units), "block_reference_unmaterialized", *extra_notes),
+    )
+    geometry_summary: _JSONDict = {
+        "kind": "insert",
+        "block_name": block_name,
+        "transform_supported": transform_supported,
+        "reason": primary_reason,
+    }
+    block_reference: _JSONDict = {
+        "block_name": block_name,
+        "transform_supported": transform_supported,
+        "reason": primary_reason,
+    }
+
+    entity: _JSONDict = {
+        "entity_id": _entity_id(record, record_type="insert"),
+        "entity_type": "insert",
+        "entity_schema_version": _SCHEMA_VERSION,
+        **provenance,
+        "source_entity_handle": source_handle,
+        "layout_name": layout_name,
+        "layer_name": layer_name,
+        "block_name": block_name,
+        "parent_entity_id": None,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": block_name,
+        "parent_entity_ref": None,
+        "bbox": None,
+        "geometry": {
+            "bbox": None,
+            "units": _units_label(units),
+            "status": "reference",
+            "geometry_summary": geometry_summary,
+            "transform": transform,
+        },
+        # The top-level ``insert`` coordinate lets the geometry-validity check recognise the
+        # placement; ``transform``/``kind`` drive the block-transform-validity check.
+        "insert": _point_json(scaled_insertion),
+        "transform": transform,
+        "quantity_hints": {},
+        "properties": {
+            "source_type": "INSERT",
+            "source_handle": source_handle,
+            "quantity_hints": {},
+            "block_reference": block_reference,
+            "adapter_native": {
+                "libredwg": {
+                    "section": "OBJECTS",
+                    "record_type": "INSERT",
+                    "handle": source_handle,
+                }
+            },
+        },
+        "provenance": provenance,
+        "confidence": {
+            "score": _BLOCK_REFERENCE_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": f"libredwg_dwgread_json_block_reference_{_units_basis_suffix(units)}",
+        },
+        "kind": "insert",
+        "block_reference": block_reference,
+        "transform_supported": transform_supported,
+    }
+    return _InsertBuildResult(
+        entity,
+        transform_supported=transform_supported,
+        malformed=False,
+        reason=primary_reason,
     )
 
 
