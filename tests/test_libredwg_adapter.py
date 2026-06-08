@@ -119,6 +119,9 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts = dict(counts)
     merged_counts.setdefault("unsupported_hatches", 0)
     merged_counts.setdefault("malformed_hatches", 0)
+    merged_counts.setdefault("block_references", 0)
+    merged_counts.setdefault("unsupported_block_transforms", 0)
+    merged_counts.setdefault("malformed_inserts", 0)
     return merged_counts
 
 
@@ -619,16 +622,18 @@ async def test_libredwg_adapter_diagnostics_include_mapping_counts_and_confidenc
     )
 
     diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
-    assert diagnostic_details["entity_counts"] == {
-        "drawable_candidates": 2,
-        "supported_geometry": 1,
-        "supported_lines": 1,
-        "supported_text": 0,
-        "unsupported_drawables": 0,
-        "malformed_drawables": 0,
-        "unsupported_hatches": 1,
-        "malformed_hatches": 0,
-    }
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 2,
+            "supported_geometry": 1,
+            "supported_lines": 1,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+            "unsupported_hatches": 1,
+            "malformed_hatches": 0,
+        }
+    )
     assert diagnostic_details["mapping_confidence"] == {
         "score": adapter_module._MIXED_ENTITY_CONFIDENCE_SCORE,
         "review_required": True,
@@ -3576,3 +3581,332 @@ async def test_libredwg_adapter_degrades_ambiguous_units_to_unconfirmed(
 
     units_check = _units_check(result)
     assert units_check["status"] == "review_required"
+
+
+def _validation_checks(result: Any) -> Mapping[str, Mapping[str, Any]]:
+    validation = build_validation_outcome(
+        input_family=InputFamily.DWG,
+        canonical_json=result.canonical,
+        canonical_entity_schema_version=cast(
+            str,
+            result.canonical["canonical_entity_schema_version"],
+        ),
+        result=result,
+        generated_at=datetime.now(UTC),
+    )
+    checks = cast(list[Mapping[str, Any]], validation.report_json["checks"])
+    return {check["check_key"]: check for check in checks}
+
+
+def _single_entity(result: Any) -> Mapping[str, Any]:
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert len(entities) == 1
+    return entities[0]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_captures_supported_insert_as_block_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Door-Block"},
+                {
+                    "type": "INSERT",
+                    "handle": "1A",
+                    "layer": "A-DOOR",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 1000, "y": 2000, "z": 0},
+                    "scale": {"x": 2, "y": 2, "z": 2},
+                    "rotation": 0.0,
+                },
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "insert"
+    assert entity["kind"] == "insert"
+    assert entity["entity_id"] == "libredwg-insert-1a"
+    assert entity["block_name"] == "Door-Block"
+    assert entity["block_ref"] == "Door-Block"
+    # Insertion point scaled from millimetres to metres; scale factors stay unitless.
+    assert entity["insert"] == {"x": 1.0, "y": 2.0, "z": 0.0}
+    assert entity["transform"]["insertion_point"] == {"x": 1.0, "y": 2.0, "z": 0.0}
+    assert entity["transform"]["scale"] == {"x": 2.0, "y": 2.0, "z": 2.0}
+    assert entity["transform"]["rotation_degrees"] == 0.0
+    assert entity["transform"]["supported"] is True
+    assert entity["transform"]["unsupported_reasons"] == ()
+    assert entity["transform_supported"] is True
+    assert entity["geometry"]["status"] == "reference"
+    assert entity["confidence"]["basis"] == "libredwg_dwgread_json_block_reference_units_meter"
+    assert "block_reference_unmaterialized" in entity["provenance"]["notes"]
+
+    assert result.canonical["metadata"]["block_transform_validity"] is True
+    assert result.canonical["blocks"] == ({"name": "Door-Block"},)
+    assert result.confidence is not None
+    assert result.confidence.score == adapter_module._BLOCK_REFERENCE_CONFIDENCE_SCORE
+    assert result.confidence.basis == "libredwg_dwgread_json_block_reference_mapping"
+    _assert_score_within_libredwg_descriptor_range(result.confidence.score)
+    assert [warning.code for warning in result.warnings] == ["libredwg.block_reference_captured"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    assert diagnostic_details["entity_counts"] == _with_hatch_counts(
+        {
+            "drawable_candidates": 1,
+            "supported_geometry": 0,
+            "supported_lines": 0,
+            "supported_text": 0,
+            "unsupported_drawables": 0,
+            "malformed_drawables": 0,
+            "block_references": 1,
+        }
+    )
+
+    checks = _validation_checks(result)
+    assert checks["block_transform_validity"]["status"] == "pass"
+    assert checks["geometry_validity"]["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_resolves_insert_block_name_by_direct_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {
+                    "type": "INSERT",
+                    "handle": "2B",
+                    "block_header_name": "Window-Block",
+                    "ins_pt": {"x": 3.0, "y": 4.0, "z": 0.0},
+                }
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "insert"
+    assert entity["block_name"] == "Window-Block"
+    # Absent scale/rotation default to identity and remain within the supported subset.
+    assert entity["transform"]["scale"] == {"x": 1.0, "y": 1.0, "z": 1.0}
+    assert entity["transform"]["supported"] is True
+    assert result.canonical["metadata"]["block_transform_validity"] is True
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_non_uniform_insert_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK_HEADER", "handle": "B1", "name": "Skewed-Block"},
+                {
+                    "type": "INSERT",
+                    "handle": "3C",
+                    "block_header": {"handle": "B1"},
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 2.0, "y": 3.0, "z": 1.0},
+                },
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "insert"
+    assert entity["transform_supported"] is False
+    assert entity["transform"]["unsupported_reasons"] == ("unsupported_nonuniform_scale",)
+    # No confirmation hint is emitted, so the downstream check stays review-gated.
+    assert "block_transform_validity" not in result.canonical["metadata"]
+
+    warning_codes = sorted(warning.code for warning in result.warnings)
+    assert warning_codes == [
+        "libredwg.block_reference_captured",
+        "libredwg.unsupported_block_transform",
+    ]
+    transform_warning = next(
+        warning
+        for warning in result.warnings
+        if warning.code == "libredwg.unsupported_block_transform"
+    )
+    assert transform_warning.details["reasons"] == ("unsupported_nonuniform_scale",)
+
+    checks = _validation_checks(result)
+    assert checks["block_transform_validity"]["status"] == "review_required"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_insert_block_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {
+                    "type": "INSERT",
+                    "handle": "4D",
+                    "block_header_name": "Grid-Block",
+                    "ins_pt": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "num_cols": 3,
+                    "num_rows": 2,
+                    "col_spacing": 1000,
+                    "row_spacing": 500,
+                }
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["transform_supported"] is False
+    assert entity["transform"]["unsupported_reasons"] == ("unsupported_block_array",)
+    # Array spacing is scaled to metres alongside the insertion point.
+    assert entity["transform"]["array"] == {
+        "columns": 3,
+        "rows": 2,
+        "column_spacing": 1.0,
+        "row_spacing": 0.5,
+    }
+    assert "block_transform_validity" not in result.canonical["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_review_gates_unresolved_insert_block_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {
+                    "type": "INSERT",
+                    "handle": "5E",
+                    "block_header": {"handle": "missing"},
+                    "ins_pt": {"x": 1.0, "y": 1.0, "z": 0.0},
+                }
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "insert"
+    assert entity["block_name"] is None
+    assert entity["transform_supported"] is False
+    assert entity["transform"]["unsupported_reasons"] == ("unresolved_block_reference",)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_falls_back_to_unknown_for_malformed_insert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {
+                    "type": "INSERT",
+                    "handle": "6F",
+                    "block_header_name": "No-Point-Block",
+                }
+            ],
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "unknown"
+    assert entity["geometry"]["reason"] == "malformed_insert_record"
+    assert [warning.code for warning in result.warnings] == ["libredwg.malformed_insert_record"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    counts = cast(Mapping[str, int], diagnostic_details["entity_counts"])
+    assert counts["malformed_inserts"] == 1
+    assert counts["block_references"] == 0
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_skips_block_definition_delimiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 6},
+            "OBJECTS": [
+                {"type": "BLOCK", "handle": "X1", "name": "Door-Block"},
+                {"type": "ENDBLK", "handle": "X2"},
+                {
+                    "type": "LINE",
+                    "handle": "7G",
+                    "layer": "Walls",
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 5.0, "y": 0.0, "z": 0.0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["line"]
+
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    counts = cast(Mapping[str, int], diagnostic_details["entity_counts"])
+    assert counts["drawable_candidates"] == 1
+    assert counts["unsupported_drawables"] == 0
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_block_reference_passes_shared_contract_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _build_source()
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "HEADER": {"INSUNITS": 6},
+                "OBJECTS": [
+                    {"type": "BLOCK_HEADER", "handle": "B1", "name": "Door-Block"},
+                    {
+                        "type": "INSERT",
+                        "handle": "1A",
+                        "layer": "A-DOOR",
+                        "block_header": {"handle": "B1"},
+                        "ins_pt": {"x": 1.0, "y": 2.0, "z": 0.0},
+                        "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    },
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    payload = await exercise_adapter_contract(
+        adapter_module.create_adapter(),
+        source=source,
+        input_family=InputFamily.DWG,
+        adapter_key="libredwg",
+        expectation=ContractFinalizationExpectation(
+            validation_status="needs_review",
+            review_state="review_required",
+            quantity_gate="review_gated",
+            warning_codes=("libredwg.block_reference_captured",),
+            diagnostic_codes=("libredwg.extract",),
+        ),
+    )
+
+    entities = cast(list[dict[str, Any]], payload.canonical_json["entities"])
+    assert [entity["entity_type"] for entity in entities] == ["insert"]
+    assert payload.canonical_json["metadata"]["block_transform_validity"] is True
