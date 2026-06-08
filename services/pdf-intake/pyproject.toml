@@ -1,0 +1,30 @@
+[project]
+name = "draupnir-pdf-intake"
+version = "0.1.0"
+description = "Containerized PDF intake service boundary for Draupnir (deps isolated from the core)."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+]
+
+# PDF tooling lives here, isolated from the lean core API/worker runtime.
+# `vector` carries the AGPL-or-commercial PyMuPDF stack; `raster` carries the
+# permissive raster pipeline. Installed explicitly per deployment. See ADR 0010.
+[project.optional-dependencies]
+vector = [
+    "pymupdf>=1.24",
+]
+raster = [
+    "vtracer>=0.6",
+    "pytesseract>=0.3.10",
+    "pillow>=10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

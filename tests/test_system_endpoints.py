@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -13,9 +14,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 
 from app.api.v1 import system as system_api
+from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.ingestion.contracts import (
     AdapterDescriptor,
+    AdapterStatus,
     ProbeKind,
     ProbeObservation,
     ProbeRequirement,
@@ -550,3 +553,103 @@ async def test_probe_storage_check_surfaces_local_storage_details(
     }
     assert "root" not in result.details
     assert "nearest_existing_ancestor" not in result.details
+
+
+def _service_requirement() -> ProbeRequirement:
+    return ProbeRequirement(
+        kind=ProbeKind.SERVICE,
+        name="pdf-intake-service",
+        failure_status=AdapterStatus.DEGRADED,
+        detail="PDF intake service is optional.",
+    )
+
+
+def test_probe_service_requirement_missing_when_url_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unset service URL resolves to missing without any network call."""
+
+    monkeypatch.setattr(settings, "pdf_intake_service_url", None)
+
+    observation = system_api._probe_service_requirement(_service_requirement())
+
+    assert observation.status is ProbeStatus.MISSING
+    assert "not configured" in (observation.detail or "")
+
+
+def test_probe_service_requirement_available_when_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable configured service resolves to available via a bounded connect."""
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(settings, "pdf_intake_service_url", f"http://127.0.0.1:{port}")
+
+        observation = system_api._probe_service_requirement(_service_requirement())
+
+    assert observation.status is ProbeStatus.AVAILABLE
+
+
+def test_probe_service_requirement_missing_when_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured but unreachable service resolves to missing (not available)."""
+
+    # Reserve a port, then close it so the connection is refused.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        port = probe_socket.getsockname()[1]
+    monkeypatch.setattr(settings, "pdf_intake_service_url", f"http://127.0.0.1:{port}")
+
+    observation = system_api._probe_service_requirement(_service_requirement())
+
+    assert observation.status is ProbeStatus.MISSING
+    assert "unreachable" in (observation.detail or "")
+
+
+@pytest.mark.asyncio
+async def test_system_capabilities_advertise_pdf_intake_service_disabled_by_default(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optional PDF intake service is advertised but disabled when unconfigured."""
+
+    monkeypatch.setattr(settings, "pdf_intake_service_url", None)
+
+    response = await async_client.get("/v1/system/capabilities")
+
+    assert response.status_code == 200
+    adapters_by_key = {a["adapter_key"]: a for a in response.json()["adapters"]}
+    service = adapters_by_key["pdf_intake_service"]
+
+    assert service["status"] == "degraded"
+    assert service["availability_reason"] == "disabled_by_config"
+    assert service["can_read"] is False
+    assert service["input_family"] == "pdf_vector"
+
+
+@pytest.mark.asyncio
+async def test_system_health_excludes_non_routable_pdf_intake_service(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The informational boundary descriptor must not appear in or degrade health."""
+
+    async def _ok_dependency() -> DependencyHealthCheck:
+        return DependencyHealthCheck(status=SystemCheckStatus.OK, latency_ms=1.0)
+
+    monkeypatch.setattr(settings, "pdf_intake_service_url", None)
+    monkeypatch.setattr(system_api, "_probe_database_check", _ok_dependency)
+    monkeypatch.setattr(system_api, "_probe_storage_check", _ok_dependency)
+    monkeypatch.setattr(system_api, "_probe_broker_check", _ok_dependency)
+    monkeypatch.setattr(system_api, "_probe_requirement", _fake_probe_observation)
+
+    response = await async_client.get("/v1/system/health")
+
+    payload = response.json()
+    adapter_keys = {item["adapter_key"] for item in payload["checks"]["adapters"]}
+    assert "pdf_intake_service" not in adapter_keys
+    assert "ezdxf" in adapter_keys

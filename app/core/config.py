@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # Message broker configuration
     broker_url: str = "amqp://guest:guest@localhost:5672//"
 
+    # PDF intake service boundary (optional, off by default).
+    # When unset the core reports the pdf_intake_service adapter as
+    # disabled_by_config and never attempts a network probe. See ADR 0010.
+    pdf_intake_service_url: str | None = None
+    pdf_intake_service_timeout_seconds: float = 0.5
+
     # Application settings
     max_upload_mb: int = 200
     libredwg_max_output_mb: int = 32
@@ -55,6 +61,13 @@ class Settings(BaseSettings):
     def validate_libredwg_max_output_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
+        return value
+
+    @field_validator("pdf_intake_service_timeout_seconds")
+    @classmethod
+    def validate_pdf_intake_service_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("pdf_intake_service_timeout_seconds must be positive")
         return value
 
     @field_validator("storage_local_root")

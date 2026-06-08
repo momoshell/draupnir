@@ -81,6 +81,8 @@ def _probe_requirement(requirement: ProbeRequirement) -> ProbeObservation:
         return _probe_python_package_requirement(requirement)
     if requirement.kind is ProbeKind.LICENSE:
         return _probe_license_requirement(requirement)
+    if requirement.kind is ProbeKind.SERVICE:
+        return _probe_service_requirement(requirement)
 
     return ProbeObservation(
         kind=requirement.kind,
@@ -143,6 +145,62 @@ def _probe_license_requirement(requirement: ProbeRequirement) -> ProbeObservatio
         name=requirement.name,
         status=ProbeStatus.MISSING,
         detail=requirement.detail,
+    )
+
+
+def _pdf_intake_service_endpoint(service_url: str) -> tuple[str, int]:
+    """Return the host and port for the configured PDF intake service."""
+
+    parsed = urlparse(service_url)
+    host = parsed.hostname
+    if host is None:
+        raise ValueError("PDF intake service host is not configured.")
+
+    if parsed.port is not None:
+        return host, parsed.port
+    if parsed.scheme in {"http", ""}:
+        return host, 80
+    if parsed.scheme == "https":
+        return host, 443
+    raise ValueError("PDF intake service URL scheme is not supported for health probing.")
+
+
+def _probe_service_requirement(requirement: ProbeRequirement) -> ProbeObservation:
+    """Resolve reachability of an optional remote service without routing work to it.
+
+    An unset URL is the steady, off-by-default state and never triggers a network
+    call. A configured URL is checked with a bounded TCP handshake. See ADR 0010.
+    """
+
+    service_url = settings.pdf_intake_service_url
+    if not service_url:
+        return ProbeObservation(
+            kind=requirement.kind,
+            name=requirement.name,
+            status=ProbeStatus.MISSING,
+            detail="PDF intake service URL is not configured (PDF_INTAKE_SERVICE_URL).",
+        )
+
+    try:
+        host, port = _pdf_intake_service_endpoint(service_url)
+        with socket.create_connection(
+            (host, port),
+            timeout=settings.pdf_intake_service_timeout_seconds,
+        ):
+            pass
+    except (OSError, ValueError):
+        return ProbeObservation(
+            kind=requirement.kind,
+            name=requirement.name,
+            status=ProbeStatus.MISSING,
+            detail="PDF intake service is configured but unreachable.",
+        )
+
+    return ProbeObservation(
+        kind=requirement.kind,
+        name=requirement.name,
+        status=ProbeStatus.AVAILABLE,
+        detail="PDF intake service is reachable.",
     )
 
 
@@ -550,7 +608,15 @@ async def _probe_broker_check() -> DependencyHealthCheck:
 async def _build_adapter_health_checks() -> tuple[list[AdapterHealthCheck], SystemCheckStatus]:
     """Build per-adapter health checks and the aggregate adapter-group status."""
 
-    descriptors = list_descriptors()
+    # Health aggregation covers active read/write adapters only. Non-routable
+    # boundary descriptors (e.g. the optional PDF intake service) are advertised
+    # in /v1/system/capabilities but must not degrade overall system health when
+    # they are intentionally not configured. See ADR 0010.
+    descriptors = tuple(
+        descriptor
+        for descriptor in list_descriptors()
+        if descriptor.capabilities.can_read or descriptor.capabilities.can_write
+    )
     availabilities = await asyncio.gather(
         *(_probe_descriptor_availability(descriptor) for descriptor in descriptors)
     )

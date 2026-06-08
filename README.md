@@ -110,10 +110,17 @@ Local Docker Compose development and GitHub Actions CI both run PostgreSQL 18.
 | postgres  | localhost:5432       | PostgreSQL 18 database         |
 | rabbitmq  | localhost:5672, localhost:15672 | RabbitMQ message broker |
 | flower    | localhost:5555       | Celery dashboard (`debug` profile only) |
+| pdf-intake | localhost:8100      | PDF intake service boundary (`pdf` profile only) |
 
 Postgres and RabbitMQ host ports bind to `127.0.0.1` only. Flower is optional
 and intended for debug/profile runs. Containers still reach RabbitMQ over the
 internal Docker network at `rabbitmq:5672`.
+
+The optional `pdf-intake` service isolates PDF tooling from the lean core and is
+off by default. Start it with `docker compose --profile pdf up pdf-intake` and
+point the core at it via `PDF_INTAKE_SERVICE_URL`. When unset, the core reports
+the `pdf_intake_service` adapter as `disabled_by_config`. See
+`docs/decisions/0010-pdf-intake-service-boundary.md`.
 
 ### Useful Commands
 

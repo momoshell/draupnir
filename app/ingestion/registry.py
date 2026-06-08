@@ -204,6 +204,45 @@ _ADAPTER_DESCRIPTORS: tuple[AdapterDescriptor, ...] = (
             "quantity hints remain deferred.",
         ),
     ),
+    AdapterDescriptor(
+        key="pdf_intake_service",
+        family=InputFamily.PDF_VECTOR,
+        upload_formats=(UploadFormat.PDF,),
+        display_name="PDF intake service (remote)",
+        module="app.ingestion.adapters.pdf_service",
+        license_name="N/A (remote service boundary)",
+        # Non-routable boundary descriptor: can_read=False keeps it out of the
+        # family-keyed read registry and runner selection, so the in-process
+        # PyMuPDF / VTracer paths are unaffected. It still surfaces in
+        # /v1/system/capabilities and /v1/system/health to advertise the
+        # service's reachability and supported modes. See ADR 0010.
+        capabilities=AdapterCapabilities(
+            can_read=False,
+            extracts_canonical=False,
+            extracts_provenance=False,
+            extracts_confidence=False,
+            extracts_warnings=False,
+            extracts_diagnostics=False,
+        ),
+        confidence_range=(0.0, 0.0),
+        probes=(
+            ProbeRequirement(
+                kind=ProbeKind.SERVICE,
+                name="pdf-intake-service",
+                failure_status=AdapterStatus.DEGRADED,
+                detail=(
+                    "PDF intake service is optional; set PDF_INTAKE_SERVICE_URL "
+                    "to enable the containerized boundary."
+                ),
+            ),
+        ),
+        notes=(
+            "Advertises the optional containerized PDF intake service and its "
+            "supported modes (vector, raster; future modes). Routing of real "
+            "PDF extraction through the service is deferred; the in-process "
+            "PyMuPDF and VTracer adapters remain the active read paths.",
+        ),
+    ),
 )
 
 
@@ -232,6 +271,8 @@ def _availability_reason_for_issue(issue: ProbeIssue) -> AvailabilityReason:
         return AvailabilityReason.MISSING_BINARY
     if issue.kind is ProbeKind.LICENSE:
         return AvailabilityReason.MISSING_LICENSE
+    if issue.kind is ProbeKind.SERVICE:
+        return AvailabilityReason.DISABLED_BY_CONFIG
     return AvailabilityReason.PROBE_FAILED
 
 
