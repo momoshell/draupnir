@@ -54,6 +54,7 @@ _PROCESS_KILL_GRACE_SECONDS = 0.2
 _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+_MAX_HATCH_BOUNDARY_COMPONENTS = 512
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
 _LINE_ENTITY_CONFIDENCE_SCORE = 0.72
 _TEXT_ENTITY_CONFIDENCE_SCORE = 0.72
@@ -149,6 +150,20 @@ class _LiveFileLimit:
     limit_bytes: int
     overflow_message: str
     output_kind: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _HatchBuildResult:
+    entity: _JSONDict | None
+    reason: str | None = None
+    malformed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HatchVerticesResult:
+    vertices: tuple[tuple[float, float, float], ...] | None
+    reason: str | None = None
+    malformed: bool = False
 
 
 def _configured_max_output_bytes() -> int:
@@ -605,8 +620,12 @@ def _build_canonical_output(
     supported_text_count = 0
     unsupported_drawable_count = 0
     malformed_drawable_count = 0
+    unsupported_hatch_count = 0
+    malformed_hatch_count = 0
     unsupported_types: set[str] = set()
     malformed_handles: set[str] = set()
+    unsupported_hatch_handles: set[str] = set()
+    malformed_hatch_handles: set[str] = set()
     drawable_candidate_count = 0
 
     for record in _iter_object_records(run_result.output_payload):
@@ -726,6 +745,41 @@ def _build_canonical_output(
                 malformed_handles.add(handle)
             continue
 
+        if record_type == "HATCH":
+            hatch_result = _build_hatch_entity(record)
+            if hatch_result.entity is not None:
+                entities.append(hatch_result.entity)
+                _collect_observed_collection_refs(
+                    hatch_result.entity,
+                    layouts_seen=layouts_seen,
+                    layers_seen=layers_seen,
+                    blocks_seen=blocks_seen,
+                )
+                supported_geometry_count += 1
+                continue
+
+            unknown_entity = _build_unknown_entity(
+                record,
+                reason=hatch_result.reason or "unsupported_hatch_geometry",
+            )
+            entities.append(unknown_entity)
+            _collect_observed_collection_refs(
+                unknown_entity,
+                layouts_seen=layouts_seen,
+                layers_seen=layers_seen,
+                blocks_seen=blocks_seen,
+            )
+            handle = cast(str | None, unknown_entity.get("source_entity_handle"))
+            if hatch_result.malformed:
+                malformed_hatch_count += 1
+                if handle is not None:
+                    malformed_hatch_handles.add(handle)
+            else:
+                unsupported_hatch_count += 1
+                if handle is not None:
+                    unsupported_hatch_handles.add(handle)
+            continue
+
         if record_type == "MTEXT":
             text_entity = _build_text_entity(record)
             entities.append(text_entity)
@@ -765,6 +819,8 @@ def _build_canonical_output(
             "supported_text": supported_text_count,
             "unsupported_drawables": unsupported_drawable_count,
             "malformed_drawables": malformed_drawable_count,
+            "unsupported_hatches": unsupported_hatch_count,
+            "malformed_hatches": malformed_hatch_count,
         },
     }
     if run_result.output_key_count is not None:
@@ -796,10 +852,38 @@ def _build_canonical_output(
                 },
             )
         )
+    if unsupported_hatch_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.unsupported_hatch_geometry",
+                message=(
+                    "LibreDWG emitted HATCH records outside the supported straight "
+                    "single-loop subset."
+                ),
+                details={
+                    "count": unsupported_hatch_count,
+                    "handles": tuple(sorted(unsupported_hatch_handles))[:10],
+                },
+            )
+        )
+    if malformed_hatch_count > 0:
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.malformed_hatch_geometry",
+                message="LibreDWG emitted HATCH records with malformed boundary geometry.",
+                details={
+                    "count": malformed_hatch_count,
+                    "handles": tuple(sorted(malformed_hatch_handles))[:10],
+                },
+            )
+        )
 
     has_supported_drawable_count = supported_geometry_count + supported_text_count
     has_mixed_entity_outcomes = has_supported_drawable_count > 0 and (
-        unsupported_drawable_count > 0 or malformed_drawable_count > 0
+        unsupported_drawable_count > 0
+        or malformed_drawable_count > 0
+        or unsupported_hatch_count > 0
+        or malformed_hatch_count > 0
     )
     if has_mixed_entity_outcomes:
         confidence_score = _MIXED_ENTITY_CONFIDENCE_SCORE
@@ -887,6 +971,8 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "supported_text",
         "unsupported_drawables",
         "malformed_drawables",
+        "unsupported_hatches",
+        "malformed_hatches",
     ):
         value = _mapping_get(counts, key)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1387,6 +1473,70 @@ def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "closed": closed,
             "length": length,
         },
+    )
+
+
+def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
+    vertices_result = _extract_hatch_vertices(record)
+    if vertices_result.reason is not None:
+        return _HatchBuildResult(
+            None,
+            reason=vertices_result.reason,
+            malformed=vertices_result.malformed,
+        )
+
+    vertices = cast(tuple[tuple[float, float, float], ...], vertices_result.vertices)
+    bbox = _bbox_from_points(vertices)
+    if bbox is None:
+        return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
+
+    perimeter = _polyline_length(vertices, closed=True)
+    area = _polygon_area(vertices)
+    if perimeter is None or area is None or not _floats_are_finite(perimeter, area) or area <= 0.0:
+        return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
+
+    vertex_json = tuple(_point_json(vertex) for vertex in vertices)
+    geometry_summary: _JSONDict = {
+        "kind": "hatch",
+        "vertex_count": len(vertices),
+        "closed": True,
+        "area": area,
+        "perimeter": perimeter,
+    }
+    return _HatchBuildResult(
+        _build_supported_geometry_entity(
+            record,
+            record_type="HATCH",
+            entity_type="hatch",
+            bbox=bbox,
+            geometry_projection={
+                "vertices": vertex_json,
+                "closed": True,
+            },
+            geometry={
+                "vertices": vertex_json,
+                "closed": True,
+                "bbox": bbox,
+                "units": {"normalized": "unknown"},
+                "geometry_summary": geometry_summary,
+            },
+            properties={
+                "source_type": "HATCH",
+                "quantity_hints": {
+                    "length": perimeter,
+                    "area": area,
+                    "count": 1.0,
+                },
+            },
+            confidence_basis="libredwg_hatch_mapping_units_unconfirmed",
+            extra_fields={
+                "kind": "hatch",
+                "vertices": vertex_json,
+                "closed": True,
+                "area": area,
+                "perimeter": perimeter,
+            },
+        )
     )
 
 
@@ -1972,10 +2122,305 @@ def _polyline_length(
     return length
 
 
+def _polygon_area(vertices: tuple[tuple[float, float, float], ...]) -> float | None:
+    if len(vertices) < 3:
+        return None
+    area = 0.0
+    closing_vertices = (*vertices, vertices[0])
+    for start_vertex, end_vertex in pairwise(closing_vertices):
+        area += (start_vertex[0] * end_vertex[1]) - (end_vertex[0] * start_vertex[1])
+        if not math.isfinite(area):
+            return None
+    normalized_area = abs(area) * 0.5
+    return normalized_area if math.isfinite(normalized_area) else None
+
+
 def _coerce_lwpolyline_vertex(value: Any) -> tuple[float, float, float] | None:
     if isinstance(value, (list, tuple)) and len(value) != 2:
         return None
     return _coerce_point(value)
+
+
+def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchVerticesResult:
+    if _record_has_any_key(record, "boundary_loops", "boundaryloops", "loops"):
+        return _extract_hatch_vertices_from_loops(
+            _first_value(record, "boundary_loops", "boundaryloops", "loops"),
+            owner=record,
+        )
+
+    if _record_has_any_key(record, "vertices", "points"):
+        return _extract_hatch_vertices_from_points(
+            _first_value(record, "vertices", "points"),
+            owner=record,
+        )
+
+    if _record_has_any_key(record, "edges", "boundary_edges", "boundaryedges"):
+        return _extract_hatch_vertices_from_edges(
+            _first_value(record, "edges", "boundary_edges", "boundaryedges")
+        )
+
+    return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+
+def _extract_hatch_vertices_from_loops(
+    raw_loops: Any,
+    *,
+    owner: Mapping[str, Any] | None = None,
+) -> _HatchVerticesResult:
+    if not isinstance(raw_loops, (list, tuple)):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_loops) != 1:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    loop = raw_loops[0]
+    if not isinstance(loop, Mapping):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if _hatch_loop_flags_are_ambiguous(loop):
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    if _record_has_any_key(loop, "vertices", "points"):
+        raw_vertices = _first_value(loop, "vertices", "points")
+        if owner is not None:
+            boundary_validation = _validate_hatch_point_boundary(owner, raw_vertices)
+            if boundary_validation is not None:
+                return boundary_validation
+        return _extract_hatch_vertices_from_points(
+            raw_vertices,
+            owner=loop,
+        )
+    if _record_has_any_key(loop, "edges", "boundary_edges", "boundaryedges"):
+        return _extract_hatch_vertices_from_edges(
+            _first_value(loop, "edges", "boundary_edges", "boundaryedges")
+        )
+    return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+
+def _extract_hatch_vertices_from_points(
+    raw_vertices: Any,
+    *,
+    owner: Mapping[str, Any] | None = None,
+) -> _HatchVerticesResult:
+    if not isinstance(raw_vertices, (list, tuple)):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_vertices) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    if owner is not None:
+        boundary_validation = _validate_hatch_point_boundary(owner, raw_vertices)
+        if boundary_validation is not None:
+            return boundary_validation
+
+    vertices: list[tuple[float, float, float]] = []
+    for item in raw_vertices:
+        point = _coerce_point(item)
+        if point is None or not _point_is_finite(point) or point[2] != 0.0:
+            return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+        vertices.append((point[0], point[1], 0.0))
+    normalized_vertices = _normalize_hatch_vertices(tuple(vertices))
+    if normalized_vertices is None:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    return _HatchVerticesResult(normalized_vertices)
+
+
+def _extract_hatch_vertices_from_edges(raw_edges: Any) -> _HatchVerticesResult:
+    if not isinstance(raw_edges, (list, tuple)):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_edges) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    parsed_edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+    for edge in raw_edges:
+        parsed_edge = _extract_hatch_edge(edge)
+        if parsed_edge is None:
+            return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+        if isinstance(parsed_edge, str):
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+        parsed_edges.append(parsed_edge)
+    ordered_vertices = _order_hatch_edges(tuple(parsed_edges))
+    if ordered_vertices is None:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    normalized_vertices = _normalize_hatch_vertices(ordered_vertices)
+    if normalized_vertices is None:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    return _HatchVerticesResult(normalized_vertices)
+
+
+def _validate_hatch_point_boundary(
+    owner: Mapping[str, Any],
+    raw_vertices: list[Any] | tuple[Any, ...],
+) -> _HatchVerticesResult | None:
+    mixed_boundary_result = _validate_mixed_hatch_boundary_geometry(owner)
+    if mixed_boundary_result is not None:
+        return mixed_boundary_result
+    if _hatch_edge_is_curved(owner):
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    if _hatch_mapping_is_explicitly_open(owner):
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    for item in raw_vertices:
+        if not isinstance(item, Mapping):
+            continue
+        if _record_has_any_key(item, "bulge"):
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+        if _hatch_edge_is_curved(item) or _hatch_mapping_is_explicitly_open(item):
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    return None
+
+
+def _validate_mixed_hatch_boundary_geometry(
+    owner: Mapping[str, Any],
+) -> _HatchVerticesResult | None:
+    if not _record_has_any_key(owner, "edges", "boundary_edges", "boundaryedges"):
+        return None
+
+    raw_edges = _first_value(owner, "edges", "boundary_edges", "boundaryedges")
+    if not isinstance(raw_edges, (list, tuple)):
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if raw_edges:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    return None
+
+
+def _hatch_loop_flags_are_ambiguous(loop: Mapping[str, Any]) -> bool:
+    raw_flags = _first_value(loop, "flags", "flag", "loop_flags", "loopflag")
+    if raw_flags is None:
+        return False
+    if isinstance(raw_flags, bool):
+        return False
+    if isinstance(raw_flags, (int, float)):
+        if not math.isfinite(float(raw_flags)) or not float(raw_flags).is_integer():
+            return True
+        return int(raw_flags) not in {0, 1}
+    if isinstance(raw_flags, str):
+        normalized = _normalize_lookup_key(raw_flags)
+        return normalized not in {"0", "1", "default", "external", "polyline"}
+    return True
+
+
+def _extract_hatch_edge(
+    edge: Any,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | str | None:
+    if not isinstance(edge, Mapping):
+        return None
+    if _hatch_edge_is_curved(edge):
+        return "unsupported"
+
+    edge_type = _first_string(edge, "type", "edge_type", "kind")
+    if edge_type is not None and _normalize_lookup_key(edge_type) not in {
+        "line",
+        "straight",
+        "segment",
+    }:
+        return "unsupported"
+
+    start_point = _extract_point(
+        edge,
+        prefixes=("start", "start_point", "first_endpoint", "point1", "from"),
+    )
+    end_point = _extract_point(
+        edge,
+        prefixes=("end", "end_point", "second_endpoint", "point2", "to"),
+    )
+    if start_point is None or end_point is None:
+        raw_vertices = _first_value(edge, "vertices", "points")
+        if isinstance(raw_vertices, (list, tuple)) and len(raw_vertices) == 2:
+            start_point = _coerce_point(raw_vertices[0])
+            end_point = _coerce_point(raw_vertices[1])
+    if start_point is None or end_point is None:
+        return None
+    if (
+        not _point_is_finite(start_point)
+        or not _point_is_finite(end_point)
+        or start_point[2] != 0.0
+        or end_point[2] != 0.0
+    ):
+        return None
+    return ((start_point[0], start_point[1], 0.0), (end_point[0], end_point[1], 0.0))
+
+
+def _hatch_edge_is_curved(edge: Mapping[str, Any]) -> bool:
+    edge_type = _first_string(edge, "type", "edge_type", "kind")
+    if edge_type is not None and _normalize_lookup_key(edge_type) in {
+        "arc",
+        "circle",
+        "bulge",
+        "ellipse",
+        "ellipticarc",
+        "spline",
+        "bezier",
+        "curve",
+    }:
+        return True
+    for key in (
+        "bulge",
+        "radius",
+        "center",
+        "start_angle",
+        "end_angle",
+        "major_axis",
+        "minor_axis",
+        "control_points",
+        "fit_points",
+        "knots",
+        "degree",
+    ):
+        if _record_has_any_key(edge, key):
+            return True
+    return False
+
+
+def _hatch_mapping_is_explicitly_open(record: Mapping[str, Any]) -> bool:
+    closed_value = _first_value(record, "closed", "is_closed", "closed_flag")
+    if closed_value is not None and _coerce_closed_boolish(closed_value) is False:
+        return True
+
+    open_value = _first_value(record, "open", "is_open", "open_flag")
+    return open_value is not None and _coerce_boolish(open_value) is True
+
+
+def _order_hatch_edges(
+    edges: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...],
+) -> tuple[tuple[float, float, float], ...] | None:
+    if len(edges) < 3:
+        return None
+
+    ordered_vertices: list[tuple[float, float, float]] = [edges[0][0], edges[0][1]]
+    current_point = edges[0][1]
+    remaining_edges = list(edges[1:])
+    while remaining_edges:
+        matches: list[tuple[int, tuple[float, float, float]]] = []
+        for index, (start_point, end_point) in enumerate(remaining_edges):
+            if _points_match(start_point, current_point):
+                matches.append((index, end_point))
+            elif _points_match(end_point, current_point):
+                matches.append((index, start_point))
+        if len(matches) != 1:
+            return None
+        match_index, next_point = matches[0]
+        ordered_vertices.append(next_point)
+        current_point = next_point
+        remaining_edges.pop(match_index)
+
+    if not _points_match(ordered_vertices[-1], ordered_vertices[0]):
+        return None
+    return tuple(ordered_vertices[:-1])
+
+
+def _normalize_hatch_vertices(
+    vertices: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[float, float, float], ...] | None:
+    if len(vertices) < 3:
+        return None
+    normalized_vertices = list(vertices)
+    if _points_match(normalized_vertices[0], normalized_vertices[-1]):
+        normalized_vertices.pop()
+    if len(normalized_vertices) < 3:
+        return None
+    return tuple(normalized_vertices)
+
+
+def _points_match(left: tuple[float, float, float], right: tuple[float, float, float]) -> bool:
+    return all(
+        math.isclose(left_component, right_component, rel_tol=0.0, abs_tol=1e-9)
+        for left_component, right_component in zip(left, right, strict=True)
+    )
 
 
 def _bbox_is_finite(bbox: Mapping[str, Any]) -> bool:
