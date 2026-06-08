@@ -20,6 +20,10 @@ services:
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-api
       - STORAGE_LOCAL_ROOT=/app/var/uploads
+      # Optional PDF intake service boundary; empty unless the `pdf` profile is
+      # started. When unset the pdf_intake_service adapter reports
+      # disabled_by_config. See ADR 0010.
+      - PDF_INTAKE_SERVICE_URL=${PDF_INTAKE_SERVICE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,6 +58,7 @@ services:
       - MAX_UPLOAD_MB=50
       - SERVICE_NAME=draupnir-worker
       - STORAGE_LOCAL_ROOT=/app/var/uploads
+      - PDF_INTAKE_SERVICE_URL=${PDF_INTAKE_SERVICE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,6 +112,25 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    restart: unless-stopped
+    networks:
+      - draupnir-network
+
+  pdf-intake:
+    build:
+      context: ./services/pdf-intake
+      dockerfile: Containerfile
+    profiles:
+      - pdf
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8100
+    ports:
+      - "127.0.0.1:${PDF_INTAKE_HOST_PORT:-8100}:8100"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
     networks:
       - draupnir-network
