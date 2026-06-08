@@ -98,6 +98,24 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
 
 _JSONDict = dict[str, JSONValue]
 
+# Curated, confidence-gated subset of AutoCAD INSUNITS codes that map to an unambiguous,
+# well-defined length scale to meters. Codes outside this table (0/unitless, exotic or rare
+# codes, missing or non-integral values) stay review-gated as ``unknown``. Easy to extend
+# later (e.g. US survey foot, code 21) once those conversions are deliberately reviewed.
+_INSUNITS_METER_SCALE: dict[int, float] = {
+    1: 0.0254,  # inch
+    2: 0.3048,  # foot
+    3: 1609.344,  # mile
+    4: 0.001,  # millimeter
+    5: 0.01,  # centimeter
+    6: 1.0,  # meter
+    7: 1000.0,  # kilometer
+    10: 0.9144,  # yard
+    14: 0.1,  # decimeter
+    15: 10.0,  # decameter
+    16: 100.0,  # hectometer
+}
+
 
 @dataclass(frozen=True, slots=True)
 class _CapturedText:
@@ -142,6 +160,15 @@ class _CanonicalBuildResult:
     canonical: _JSONDict
     warnings: tuple[AdapterWarning, ...]
     confidence: ConfidenceSummary
+
+
+@dataclass(frozen=True, slots=True)
+class _UnitsResolution:
+    """Resolved drawing units for a single ingest, threaded through every builder."""
+
+    payload: _JSONDict
+    scale: float
+    confirmed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +272,11 @@ class LibreDWGAdapter(IngestionAdapter):
             "review_required": canonical_result.confidence.review_required,
             "basis": canonical_result.confidence.basis,
         }
+        canonical_metadata = canonical_result.canonical.get("metadata")
+        if isinstance(canonical_metadata, Mapping):
+            units_summary = canonical_metadata.get("units")
+            if isinstance(units_summary, Mapping):
+                diagnostic_details["units"] = dict(units_summary)
 
         return AdapterResult(
             canonical=canonical_result.canonical,
@@ -627,6 +659,7 @@ def _build_canonical_output(
     unsupported_hatch_handles: set[str] = set()
     malformed_hatch_handles: set[str] = set()
     drawable_candidate_count = 0
+    units = _resolve_units(run_result.output_payload)
 
     def _record_entity(entity: _JSONDict) -> None:
         entities.append(entity)
@@ -638,7 +671,7 @@ def _build_canonical_output(
         )
 
     def _record_unknown(record: Mapping[str, Any], *, reason: str) -> str | None:
-        unknown_entity = _build_unknown_entity(record, reason=reason)
+        unknown_entity = _build_unknown_entity(record, reason=reason, units=units)
         _record_entity(unknown_entity)
         return cast(str | None, unknown_entity.get("source_entity_handle"))
 
@@ -651,7 +684,7 @@ def _build_canonical_output(
 
         drawable_candidate_count += 1
         if record_type == "LINE":
-            line_entity = _build_line_entity(record)
+            line_entity = _build_line_entity(record, units=units)
             if line_entity is not None:
                 _record_entity(line_entity)
                 supported_geometry_count += 1
@@ -665,7 +698,7 @@ def _build_canonical_output(
             continue
 
         if record_type == "CIRCLE":
-            circle_entity = _build_circle_entity(record)
+            circle_entity = _build_circle_entity(record, units=units)
             if circle_entity is not None:
                 _record_entity(circle_entity)
                 supported_geometry_count += 1
@@ -678,7 +711,7 @@ def _build_canonical_output(
             continue
 
         if record_type == "ARC":
-            arc_entity = _build_arc_entity(record)
+            arc_entity = _build_arc_entity(record, units=units)
             if arc_entity is not None:
                 _record_entity(arc_entity)
                 supported_geometry_count += 1
@@ -691,7 +724,7 @@ def _build_canonical_output(
             continue
 
         if record_type == "LWPOLYLINE":
-            polyline_entity = _build_lwpolyline_entity(record)
+            polyline_entity = _build_lwpolyline_entity(record, units=units)
             if polyline_entity is not None:
                 _record_entity(polyline_entity)
                 supported_geometry_count += 1
@@ -704,7 +737,7 @@ def _build_canonical_output(
             continue
 
         if record_type == "HATCH":
-            hatch_result = _build_hatch_entity(record)
+            hatch_result = _build_hatch_entity(record, units=units)
             if hatch_result.entity is not None:
                 _record_entity(hatch_result.entity)
                 supported_geometry_count += 1
@@ -725,7 +758,7 @@ def _build_canonical_output(
             continue
 
         if record_type == "MTEXT":
-            text_entity = _build_text_entity(record)
+            text_entity = _build_text_entity(record, units=units)
             _record_entity(text_entity)
             supported_text_count += 1
             continue
@@ -753,6 +786,7 @@ def _build_canonical_output(
             "unsupported_hatches": unsupported_hatch_count,
             "malformed_hatches": malformed_hatch_count,
         },
+        "units": _units_summary(units),
     }
     if run_result.output_key_count is not None:
         dwgread_metadata = cast(dict[str, JSONValue], metadata["dwgread"])
@@ -760,7 +794,9 @@ def _build_canonical_output(
     if not entities:
         metadata["empty_entities_reason"] = "no_drawable_candidates_detected"
 
-    warnings = [_units_unconfirmed_warning()]
+    warnings: list[AdapterWarning] = []
+    if not units.confirmed:
+        warnings.append(_units_unconfirmed_warning())
     if unsupported_drawable_count > 0:
         warnings.append(
             AdapterWarning(
@@ -841,7 +877,7 @@ def _build_canonical_output(
     canonical: _JSONDict = {
         "schema_version": _SCHEMA_VERSION,
         "canonical_entity_schema_version": _SCHEMA_VERSION,
-        "units": {"normalized": "unknown"},
+        "units": dict(units.payload),
         "coordinate_system": {
             "name": "local",
             "type": "cartesian",
@@ -919,6 +955,81 @@ def _units_unconfirmed_warning() -> AdapterWarning:
     )
 
 
+def _resolve_units(payload: Any) -> _UnitsResolution:
+    """Resolve drawing units from the dwgread ``HEADER.INSUNITS`` code.
+
+    Confirms (and scales to meters) only the curated ``_INSUNITS_METER_SCALE`` subset; every
+    other case (unitless code 0, unsupported/exotic codes, missing or non-integral values, or a
+    list payload without a header) degrades to the review-gated ``{"normalized": "unknown"}``
+    shape that the adapter has always emitted. Mirrors ``ezdxf._units_payload`` (the DXF adapter)
+    except libredwg's header key is ``INSUNITS`` (no ``$``).
+    """
+
+    code = _extract_insunits_code(payload)
+    if code is not None and code in _INSUNITS_METER_SCALE:
+        factor = _INSUNITS_METER_SCALE[code]
+        return _UnitsResolution(
+            payload={
+                "normalized": "meter",
+                "source": "INSUNITS",
+                "source_value": code,
+                "conversion_target": "meter",
+                "conversion_factor": factor,
+            },
+            scale=factor,
+            confirmed=True,
+        )
+
+    return _UnitsResolution(payload={"normalized": "unknown"}, scale=1.0, confirmed=False)
+
+
+def _extract_insunits_code(payload: Any) -> int | None:
+    if not isinstance(payload, Mapping):
+        return None
+    header = _mapping_get(payload, "HEADER")
+    if not isinstance(header, Mapping):
+        return None
+    coerced = _coerce_float(_mapping_get(header, "INSUNITS"))
+    if coerced is None or not math.isfinite(coerced) or not coerced.is_integer():
+        return None
+    return int(coerced)
+
+
+def _units_summary(units: _UnitsResolution) -> _JSONDict:
+    """Diagnostic-only units summary for metadata and the extract diagnostic details."""
+
+    return {
+        "normalized": units.payload["normalized"],
+        "source": "INSUNITS",
+        "source_value": units.payload.get("source_value"),
+        "confirmed": units.confirmed,
+    }
+
+
+def _units_label(units: _UnitsResolution) -> _JSONDict:
+    return {"normalized": "meter" if units.confirmed else "unknown"}
+
+
+def _units_notes(units: _UnitsResolution) -> tuple[str, ...]:
+    return () if units.confirmed else ("units_unconfirmed",)
+
+
+def _units_basis_suffix(units: _UnitsResolution) -> str:
+    return "units_meter" if units.confirmed else "units_unconfirmed"
+
+
+def _scale_value(value: float, scale: float) -> float:
+    if scale == 1.0:
+        return value
+    return value * scale
+
+
+def _scale_point(point: tuple[float, float, float], scale: float) -> tuple[float, float, float]:
+    if scale == 1.0:
+        return point
+    return (point[0] * scale, point[1] * scale, point[2] * scale)
+
+
 def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
     if isinstance(payload, Mapping):
         objects = _mapping_get(payload, "OBJECTS")
@@ -956,7 +1067,7 @@ def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
     return candidates
 
 
-def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
     start_point = _extract_point(
         record,
         prefixes=("start", "start_point", "first_endpoint", "point1", "p1", "from"),
@@ -968,6 +1079,8 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     if start_point is None or end_point is None:
         return None
 
+    start_point = _scale_point(start_point, units.scale)
+    end_point = _scale_point(end_point, units.scale)
     if not _point_is_finite(start_point) or not _point_is_finite(end_point):
         return None
 
@@ -1004,7 +1117,7 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
         record_type="LINE",
         source_handle=source_handle,
         safe_projection=safe_projection,
-        notes=("units_unconfirmed",),
+        notes=_units_notes(units),
     )
 
     return {
@@ -1028,7 +1141,7 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "start": start,
             "end": end,
             "bbox": bbox,
-            "units": {"normalized": "unknown"},
+            "units": _units_label(units),
             "geometry_summary": {
                 "kind": "line_segment",
                 "length": quantity_length,
@@ -1054,7 +1167,7 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
         "confidence": {
             "score": _LINE_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
-            "basis": "libredwg_line_mapping_units_unconfirmed",
+            "basis": f"libredwg_line_mapping_{_units_basis_suffix(units)}",
         },
         "kind": "line",
         "start": start,
@@ -1063,11 +1176,13 @@ def _build_line_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     }
 
 
-def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
+def _build_text_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict:
     insertion_point = _extract_point(
         record,
         prefixes=("insertion", "insertion_point", "ins_pt", "text_position"),
     )
+    if insertion_point is not None:
+        insertion_point = _scale_point(insertion_point, units.scale)
     layer_name = _extract_layer_name(record)
     layout_name = _extract_layout_name(record)
     block_name = _extract_block_name(record)
@@ -1110,7 +1225,7 @@ def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
 
     geometry_projection: _JSONDict = {
         "text": text,
-        "units": {"normalized": "unknown"},
+        "units": _units_label(units),
         "geometry_summary": text_summary,
     }
     if point_json is not None:
@@ -1131,7 +1246,7 @@ def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
         record_type="MTEXT",
         source_handle=source_handle,
         safe_projection=safe_projection,
-        notes=("units_unconfirmed",),
+        notes=_units_notes(units),
     )
     safe_bbox = bbox
     entity_bbox = None if geometry_reason is not None else safe_bbox
@@ -1171,7 +1286,7 @@ def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
         "confidence": {
             "score": _TEXT_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
-            "basis": "libredwg_mtext_mapping_units_unconfirmed",
+            "basis": f"libredwg_mtext_mapping_{_units_basis_suffix(units)}",
         },
         "kind": "text",
         "text": text,
@@ -1179,11 +1294,13 @@ def _build_text_entity(record: Mapping[str, Any]) -> _JSONDict:
     }
 
 
-def _build_circle_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+def _build_circle_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
     center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
     radius = _extract_positive_float(record, "radius")
     if center_point is None or radius is None:
         return None
+    center_point = _scale_point(center_point, units.scale)
+    radius = _scale_value(radius, units.scale)
     if not _point_is_finite(center_point):
         return None
 
@@ -1219,7 +1336,7 @@ def _build_circle_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "center": center,
             "radius": radius,
             "bbox": bbox,
-            "units": {"normalized": "unknown"},
+            "units": _units_label(units),
             "geometry_summary": geometry_summary,
         },
         properties={
@@ -1230,7 +1347,8 @@ def _build_circle_entity(record: Mapping[str, Any]) -> _JSONDict | None:
                 "count": 1.0,
             },
         },
-        confidence_basis="libredwg_circle_mapping_units_unconfirmed",
+        units=units,
+        confidence_basis_prefix="libredwg_circle_mapping",
         extra_fields={
             "kind": "circle",
             "center": center,
@@ -1240,7 +1358,7 @@ def _build_circle_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     )
 
 
-def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+def _build_arc_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
     center_point = _extract_point(record, prefixes=("center", "center_point", "centerpoint"))
     radius = _extract_positive_float(record, "radius")
     if not _record_uses_supported_arc_angles(record):
@@ -1249,6 +1367,8 @@ def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     end_angle = _extract_angle_degrees(record, "end_angle", "endangle")
     if center_point is None or radius is None or start_angle is None or end_angle is None:
         return None
+    center_point = _scale_point(center_point, units.scale)
+    radius = _scale_value(radius, units.scale)
     if not _point_is_finite(center_point):
         return None
 
@@ -1304,7 +1424,7 @@ def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "start": start,
             "end": end,
             "bbox": bbox,
-            "units": {"normalized": "unknown"},
+            "units": _units_label(units),
             "geometry_summary": geometry_summary,
         },
         properties={
@@ -1314,7 +1434,8 @@ def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
                 "count": 1.0,
             },
         },
-        confidence_basis="libredwg_arc_mapping_units_unconfirmed",
+        units=units,
+        confidence_basis_prefix="libredwg_arc_mapping",
         extra_fields={
             "kind": "arc",
             "center": center,
@@ -1328,11 +1449,14 @@ def _build_arc_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     )
 
 
-def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
+def _build_lwpolyline_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution
+) -> _JSONDict | None:
     raw_vertices = _first_value(record, "vertices", "points", "vertexes")
     vertices = _extract_vertices(raw_vertices)
     if len(vertices) < 2:
         return None
+    vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
     if any(not _point_is_finite(vertex) for vertex in vertices):
         return None
     if _mapping_has_nondefault_zero_value(
@@ -1387,7 +1511,7 @@ def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
             "vertices": vertex_json,
             "closed": closed,
             "bbox": bbox,
-            "units": {"normalized": "unknown"},
+            "units": _units_label(units),
             "geometry_summary": geometry_summary,
         },
         properties={
@@ -1397,7 +1521,8 @@ def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
                 "count": 1.0,
             },
         },
-        confidence_basis="libredwg_lwpolyline_mapping_units_unconfirmed",
+        units=units,
+        confidence_basis_prefix="libredwg_lwpolyline_mapping",
         extra_fields={
             "kind": "polyline",
             "vertices": vertex_json,
@@ -1407,7 +1532,7 @@ def _build_lwpolyline_entity(record: Mapping[str, Any]) -> _JSONDict | None:
     )
 
 
-def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
+def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _HatchBuildResult:
     vertices_result = _extract_hatch_vertices(record)
     if vertices_result.reason is not None:
         return _HatchBuildResult(
@@ -1417,6 +1542,7 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
         )
 
     vertices = cast(tuple[tuple[float, float, float], ...], vertices_result.vertices)
+    vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
     bbox = _bbox_from_points(vertices)
     if bbox is None:
         return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
@@ -1450,7 +1576,7 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
                 "vertices": vertex_json,
                 "closed": closed,
                 "bbox": bbox,
-                "units": {"normalized": "unknown"},
+                "units": _units_label(units),
                 "geometry_summary": geometry_summary,
             },
             properties={
@@ -1461,7 +1587,8 @@ def _build_hatch_entity(record: Mapping[str, Any]) -> _HatchBuildResult:
                     "count": 1.0,
                 },
             },
-            confidence_basis="libredwg_hatch_mapping_units_unconfirmed",
+            units=units,
+            confidence_basis_prefix="libredwg_hatch_mapping",
             extra_fields={
                 "kind": kind,
                 "vertices": vertex_json,
@@ -1482,7 +1609,8 @@ def _build_supported_geometry_entity(
     geometry_projection: _JSONDict,
     geometry: _JSONDict,
     properties: _JSONDict,
-    confidence_basis: str,
+    units: _UnitsResolution,
+    confidence_basis_prefix: str,
     extra_fields: _JSONDict,
 ) -> _JSONDict:
     layout_name = _extract_layout_name(record)
@@ -1499,7 +1627,7 @@ def _build_supported_geometry_entity(
         record_type=record_type,
         source_handle=source_handle,
         safe_projection=safe_projection,
-        notes=("units_unconfirmed",),
+        notes=_units_notes(units),
     )
     entity_properties = {
         "source_type": record_type,
@@ -1537,7 +1665,7 @@ def _build_supported_geometry_entity(
         "confidence": {
             "score": _LINE_ENTITY_CONFIDENCE_SCORE,
             "review_required": True,
-            "basis": confidence_basis,
+            "basis": f"{confidence_basis_prefix}_{_units_basis_suffix(units)}",
         },
         **extra_fields,
     }
@@ -1562,7 +1690,9 @@ def _extract_text_value(record: Mapping[str, Any]) -> str:
     return _sanitize_text_content(fallback)
 
 
-def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDict:
+def _build_unknown_entity(
+    record: Mapping[str, Any], *, reason: str, units: _UnitsResolution
+) -> _JSONDict:
     record_type = _extract_record_type(record) or "UNKNOWN"
     layout_name = _extract_layout_name(record)
     layer_name = _extract_layer_name(record)
@@ -1574,7 +1704,7 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
         record_type=record_type,
         source_handle=source_handle,
         safe_projection=safe_projection,
-        notes=("units_unconfirmed", reason),
+        notes=(*_units_notes(units), reason),
     )
 
     return {
@@ -1596,7 +1726,7 @@ def _build_unknown_entity(record: Mapping[str, Any], *, reason: str) -> _JSONDic
         "bbox": None,
         "geometry": {
             "bbox": None,
-            "units": {"normalized": "unknown"},
+            "units": _units_label(units),
             "status": "absent",
             "reason": reason,
             "geometry_summary": {
