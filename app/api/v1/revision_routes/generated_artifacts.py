@@ -1,10 +1,16 @@
 """Revision generated-artifact read routes."""
 
+import asyncio
+import shutil
+import tempfile
+from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Annotated, NoReturn
 from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,9 +30,11 @@ from app.models.generated_artifact import GeneratedArtifact
 from app.models.project import Project
 from app.schemas.revision import GeneratedArtifactListResponse, GeneratedArtifactRead
 from app.storage import Storage, get_storage
-from app.storage.base import StorageChecksumMismatchError
+from app.storage.base import StorageChecksumMismatchError, StorageReadError
 
 generated_artifacts_router = APIRouter()
+
+_DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 
 
 def _content_disposition(filename: str) -> str:
@@ -157,24 +165,40 @@ async def download_generated_artifact(
         raise_not_found("Generated artifact", str(artifact_id))
     assert artifact is not None
 
+    # Stage the object to a private temp file and stream that to the client, instead of
+    # loading the whole body into memory. ``copy_to_path`` verifies the checksum during
+    # the copy and raises before any bytes reach the client, so the integrity guarantee
+    # is preserved. ``copy_to_path`` creates the destination exclusively, so we hand it
+    # a fresh path inside a temp directory we own and clean up.
+    temp_dir = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="artifact-download-"))
+    temp_path = temp_dir / "artifact"
     try:
-        stored = await storage.get(
+        meta = await storage.copy_to_path(
             artifact.storage_key,
+            temp_path,
             expected_checksum_sha256=artifact.checksum_sha256,
         )
-    except (FileNotFoundError, KeyError, StorageChecksumMismatchError):
+    except (FileNotFoundError, KeyError, StorageChecksumMismatchError, StorageReadError):
+        await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
         # Immutable lineage guarantees bytes exist; absence or corruption is a
         # server-side integrity failure, never a client-facing not-found.
         _raise_artifact_storage_unavailable(artifact_id)
 
-    # Storage.get returns the full object body; the storage protocol exposes no
-    # chunk iterator, so larger artifacts would need a protocol extension to
-    # stream incrementally.
-    return Response(
-        content=stored.body,
+    async def _stream_and_cleanup() -> AsyncIterator[bytes]:
+        try:
+            with temp_path.open("rb") as stream:
+                while chunk := await asyncio.to_thread(stream.read, _DOWNLOAD_CHUNK_SIZE_BYTES):
+                    yield chunk
+        finally:
+            # Runs on normal completion and on client disconnect (generator close).
+            await asyncio.to_thread(shutil.rmtree, temp_dir, ignore_errors=True)
+
+    return StreamingResponse(
+        _stream_and_cleanup(),
         media_type=artifact.media_type,
         headers={
             "Content-Disposition": _content_disposition(artifact.name),
+            "Content-Length": str(meta.size_bytes),
             "ETag": f'"{artifact.checksum_sha256}"',
             "X-Checksum-SHA256": artifact.checksum_sha256,
         },

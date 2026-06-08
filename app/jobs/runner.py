@@ -24,6 +24,7 @@ class BeginOrResumeLogKeys:
     inactive_source: str
     reclaimed_stale_running: str
     duplicate_delivery: str
+    max_attempts_exceeded: str
     cancelled: str
 
 
@@ -125,6 +126,7 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             inactive_source="ingest_job_cancelled_inactive_source",
             reclaimed_stale_running="ingest_job_reclaimed_stale_running_status",
             duplicate_delivery="ingest_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="ingest_job_max_attempts_exceeded",
             cancelled="ingest_job_cancelled",
         ),
     ),
@@ -137,6 +139,7 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             inactive_source="quantity_takeoff_job_cancelled_inactive_source",
             reclaimed_stale_running="quantity_takeoff_job_reclaimed_stale_running_status",
             duplicate_delivery="quantity_takeoff_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="quantity_takeoff_job_max_attempts_exceeded",
             cancelled="quantity_takeoff_job_cancelled",
         ),
     ),
@@ -149,6 +152,7 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             inactive_source="estimate_job_cancelled_inactive_source",
             reclaimed_stale_running="estimate_job_reclaimed_stale_running_status",
             duplicate_delivery="estimate_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="estimate_job_max_attempts_exceeded",
             cancelled="estimate_job_cancelled",
         ),
     ),
@@ -161,6 +165,7 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             inactive_source="export_job_cancelled_inactive_source",
             reclaimed_stale_running="export_job_reclaimed_stale_running_status",
             duplicate_delivery="export_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="export_job_max_attempts_exceeded",
             cancelled="export_job_cancelled",
         ),
     ),
@@ -173,6 +178,7 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             inactive_source="changeset_apply_job_cancelled_inactive_source",
             reclaimed_stale_running="changeset_apply_job_reclaimed_stale_running_status",
             duplicate_delivery="changeset_apply_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="changeset_apply_job_max_attempts_exceeded",
             cancelled="changeset_apply_job_cancelled",
         ),
     ),

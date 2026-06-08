@@ -495,7 +495,9 @@ async def _run_dwgread(
         )
 
         output_size_bytes = output_path.stat().st_size if output_path.exists() else None
-        if output_size_bytes is not None and output_size_bytes >= max_output_bytes:
+        # Use strict ">" to match the live RLIMIT_FSIZE monitor: a file exactly at the
+        # cap completed without being truncated and is valid output.
+        if output_size_bytes is not None and output_size_bytes > max_output_bytes:
             raise _OutputLimitExceededError(
                 message="LibreDWG JSON output exceeded the adapter output limit.",
                 output_kind="json",
@@ -508,14 +510,6 @@ async def _run_dwgread(
 
         if returncode != 0:
             raise RuntimeError("LibreDWG dwgread execution failed.")
-
-        if output_size_bytes >= max_output_bytes:
-            raise _OutputLimitExceededError(
-                message="LibreDWG JSON output exceeded the adapter output limit.",
-                output_kind="json",
-                max_output_bytes=max_output_bytes,
-                output_size_bytes=output_size_bytes,
-            )
 
         output_payload = _load_output_payload(
             output_path,
@@ -1090,13 +1084,18 @@ def _build_canonical_output(
             )
         )
 
+    # Inserts that we captured as a reference but could not faithfully materialize into
+    # supported geometry (unsupported/guarded transforms). Cleanly-materialized inserts
+    # contribute their children to the supported counts and must NOT be treated as a
+    # degraded "mixed" outcome, otherwise a fully-materialized drawing is under-scored.
+    unresolved_block_reference_count = block_reference_count - materialized_insert_count
     has_supported_drawable_count = supported_geometry_count + supported_text_count
     has_mixed_entity_outcomes = has_supported_drawable_count > 0 and (
         unsupported_drawable_count > 0
         or malformed_drawable_count > 0
         or unsupported_hatch_count > 0
         or malformed_hatch_count > 0
-        or block_reference_count > 0
+        or unresolved_block_reference_count > 0
         or malformed_insert_count > 0
     )
     if has_mixed_entity_outcomes:

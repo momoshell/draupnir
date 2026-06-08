@@ -2543,15 +2543,22 @@ class TestJobsWorkerEstimate:
 
         published: list[dict[str, Any]] = []
 
-        def _fake_apply_async(*, args: tuple[str, ...], task_id: str, retry: bool) -> None:
-            published.append({"args": args, "task_id": task_id, "retry": retry})
+        def _fake_apply_async(
+            *, args: tuple[str, ...], task_id: str, retry: bool, countdown: float | None = None
+        ) -> None:
+            published.append(
+                {"args": args, "task_id": task_id, "retry": retry, "countdown": countdown}
+            )
 
         job_id = uuid.uuid4()
         monkeypatch.setattr(worker_module.run_estimate_job, "apply_async", _fake_apply_async)
 
         worker_module.enqueue_estimate_job(job_id)
 
-        assert published == [{"args": (str(job_id),), "task_id": str(job_id), "retry": False}]
+        # A first attempt enqueues with no backoff countdown.
+        assert published == [
+            {"args": (str(job_id),), "task_id": str(job_id), "retry": False, "countdown": None}
+        ]
 
     def test_run_estimate_job_dispatches_persisted_processor(
         self,
@@ -2584,6 +2591,13 @@ class TestJobsWorkerEstimate:
         calls: list[tuple[Any, ...]] = []
 
         monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
+
+        async def _no_cancel_before_compute(*_args: Any, **_kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            worker_module, "_cancel_registered_job_if_requested", _no_cancel_before_compute
+        )
 
         async def _fake_begin_or_resume_registered_job(
             job_id_value: uuid.UUID,

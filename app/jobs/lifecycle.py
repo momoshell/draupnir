@@ -64,6 +64,7 @@ class _BeginOrResumeLogKeys:
     inactive_source: str
     reclaimed_stale_running: str
     duplicate_delivery: str
+    max_attempts_exceeded: str
     cancelled: str
 
 
@@ -556,6 +557,44 @@ async def _mark_job_cancelled(
     return True
 
 
+async def _fail_job_if_attempts_exhausted(
+    session: AsyncSession,
+    job: Job,
+    *,
+    emit_job_event_func: Callable[..., Awaitable[bool]],
+    logger_instance: Any,
+    log_key: str,
+    job_id: UUID,
+) -> bool:
+    """Fail a job terminally when it has no attempts left, returning whether it did.
+
+    Guards the begin/resume claim paths against poison jobs: a task that keeps
+    crashing the worker (so it never reaches a terminal state) would otherwise be
+    redelivered or reclaimed forever, incrementing ``attempts`` without bound.
+    """
+    if job.attempts < job.max_attempts:
+        return False
+
+    await _persist_job_failed(
+        session,
+        job,
+        error_message=(
+            f"Job exhausted its {job.max_attempts} attempt(s) without reaching a terminal state."
+        ),
+        error_code=ErrorCode.MAX_ATTEMPTS_EXCEEDED,
+        error_details={"attempts": job.attempts, "max_attempts": job.max_attempts},
+        emit_job_event_func=emit_job_event_func,
+    )
+    await session.commit()
+    logger_instance.warning(
+        log_key,
+        job_id=str(job_id),
+        attempts=job.attempts,
+        max_attempts=job.max_attempts,
+    )
+    return True
+
+
 async def _begin_or_resume_job(
     job_id: UUID,
     *,
@@ -656,6 +695,15 @@ async def _begin_or_resume_job(
         if not job.cancel_requested:
             if job.status == "running":
                 if is_stale_running_job_impl(job, now=now, stale_after=stale_after):
+                    if await _fail_job_if_attempts_exhausted(
+                        session,
+                        job,
+                        emit_job_event_func=emit_job_event_impl,
+                        logger_instance=logger_impl,
+                        log_key=log_keys.max_attempts_exceeded,
+                        job_id=job_id,
+                    ):
+                        return None
                     lease = claim_job_attempt_lease_impl(
                         job,
                         now=now,
@@ -686,6 +734,16 @@ async def _begin_or_resume_job(
                     job_id=str(job_id),
                     status=job.status,
                 )
+                return None
+
+            if await _fail_job_if_attempts_exhausted(
+                session,
+                job,
+                emit_job_event_func=emit_job_event_impl,
+                logger_instance=logger_impl,
+                log_key=log_keys.max_attempts_exceeded,
+                job_id=job_id,
+            ):
                 return None
 
             lease = claim_job_attempt_lease_impl(
@@ -746,6 +804,7 @@ async def _begin_or_resume_ingest_job(
             inactive_source="ingest_job_cancelled_inactive_source",
             reclaimed_stale_running="ingest_job_reclaimed_stale_running_status",
             duplicate_delivery="ingest_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="ingest_job_max_attempts_exceeded",
             cancelled="ingest_job_cancelled",
         ),
         session_maker_factory=session_maker_factory,
@@ -787,6 +846,7 @@ async def _begin_or_resume_quantity_takeoff_job(
             inactive_source="quantity_takeoff_job_cancelled_inactive_source",
             reclaimed_stale_running="quantity_takeoff_job_reclaimed_stale_running_status",
             duplicate_delivery="quantity_takeoff_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="quantity_takeoff_job_max_attempts_exceeded",
             cancelled="quantity_takeoff_job_cancelled",
         ),
         session_maker_factory=session_maker_factory,
@@ -828,6 +888,7 @@ async def _begin_or_resume_estimate_job(
             inactive_source="estimate_job_cancelled_inactive_source",
             reclaimed_stale_running="estimate_job_reclaimed_stale_running_status",
             duplicate_delivery="estimate_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="estimate_job_max_attempts_exceeded",
             cancelled="estimate_job_cancelled",
         ),
         session_maker_factory=session_maker_factory,
@@ -869,6 +930,7 @@ async def _begin_or_resume_export_job(
             inactive_source="export_job_cancelled_inactive_source",
             reclaimed_stale_running="export_job_reclaimed_stale_running_status",
             duplicate_delivery="export_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="export_job_max_attempts_exceeded",
             cancelled="export_job_cancelled",
         ),
         session_maker_factory=session_maker_factory,

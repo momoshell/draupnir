@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Final
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -62,11 +62,27 @@ def capabilities() -> CapabilitiesResponse:
 
 
 @app.post("/v1/ingest")
-def ingest() -> JSONResponse:
-    """Placeholder ingest endpoint.
+async def ingest(file: UploadFile, mode: str = Form(...)) -> JSONResponse:
+    """Ingest a PDF for extraction.
 
-    Returns 501 until remote PDF extraction is implemented behind this boundary.
+    The request contract is the boundary the core ``PdfIntakeServiceAdapter`` posts
+    to: a multipart ``file`` upload plus a ``mode`` form field whose value must be one
+    of :data:`SUPPORTED_MODES`. The contract is validated here even though extraction
+    itself is deferred (a well-formed request still returns HTTP 501) so the boundary
+    is testable and rejects malformed requests with HTTP 400 rather than 501.
     """
+
+    _ = file
+    if mode not in SUPPORTED_MODES:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "code": "UNSUPPORTED_MODE",
+                "message": (
+                    f"Unsupported mode '{mode}'. Supported modes: {', '.join(SUPPORTED_MODES)}."
+                ),
+            },
+        )
 
     return JSONResponse(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,

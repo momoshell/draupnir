@@ -32,12 +32,18 @@ from app.estimating.formulas import (
     ValueContract,
     evaluate_formula,
 )
-from app.estimating.money import CATALOG_QUANTUM, round_money
+from app.estimating.money import (
+    CATALOG_QUANTUM,
+    MONEY_SCALE,
+    round_catalog_decimal,
+    round_money,
+)
 
 type _SnapshotValueType = Literal["quantity_input", "rate", "material", "assumption"]
 
 _CATALOG_QUANTUM = CATALOG_QUANTUM
 _CHECKSUM_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_MAX_TAX_RATE = Decimal("1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +193,13 @@ def _validate_engine_input(engine_input: EstimateEngineInput) -> None:
         )
     if engine_input.tax_rate < 0:
         raise_input_invalid(reason="negative_tax_rate", message="tax_rate must be nonnegative")
+    if engine_input.tax_rate > _MAX_TAX_RATE:
+        # A tax rate is a fraction (0.20 == 20%). A value above 1 is almost always a
+        # fat-fingered percentage (e.g. 20 instead of 0.20) that would 100x the estimate.
+        raise_input_invalid(
+            reason="tax_rate_out_of_range",
+            message="tax_rate must be between 0 and 1 (a fraction, not a percentage)",
+        )
     if not engine_input.line_inputs:
         raise_input_invalid(
             reason="missing_line_items",
@@ -225,6 +238,9 @@ def _build_quantity_snapshot(
         source_payload=quantity_entry.source_payload,
         source_quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_quantity_item_id=quantity_entry.source_quantity_item_id,
+        # The source checksum is validated above for input integrity but intentionally
+        # not persisted: the ck_estimate_snapshot_entries_source_fields_by_type DB
+        # constraint requires source_checksum_sha256 IS NULL for quantity_input entries.
         source_checksum_sha256=None,
         quantity_value=quantity_value,
         unit=quantity_entry.unit,
@@ -307,6 +323,18 @@ def _build_formula_snapshot(
             reason="formula_checksum_mismatch",
             message="formula entry checksum must match definition checksum",
         )
+    definition_rounding = formula_entry.definition.rounding
+    if definition_rounding is not None and definition_rounding.scale > MONEY_SCALE:
+        # A money formula that rounds to more decimal places than money supports would
+        # be rounded a second time by the money quantize step, and chained rounding is
+        # not equal to a single rounding. Constrain it so the formula rounding stays
+        # authoritative and the money step only normalizes representation.
+        raise_input_invalid(
+            reason="unsupported_formula_rounding",
+            message=(
+                f"money formula rounding scale must not exceed the money scale ({MONEY_SCALE})"
+            ),
+        )
     return EstimateSnapshotEntrySpec(
         id=deterministic_snapshot_entry_id(engine_input.estimate_job_id, formula_entry.entry_key),
         entry_type="formula",
@@ -348,6 +376,8 @@ def _build_assumption_snapshot(
         entry_label=assumption_entry.entry_label,
         sort_order=assumption_entry.sort_order,
         source_payload=assumption_entry.source_payload,
+        # Validated above but not persisted: the source-fields-by-type DB constraint
+        # requires source_checksum_sha256 IS NULL for assumption entries.
         source_checksum_sha256=None,
         money_amount=assumption_entry.amount,
     )
@@ -680,7 +710,9 @@ def _money(value: Decimal) -> Decimal:
 
 
 def _quantity_decimal(value: Decimal) -> Decimal:
-    return value.quantize(_CATALOG_QUANTUM)
+    # Use the shared HALF_UP catalog rounding so quantities, rates, and money all
+    # round the same way and the result never depends on the ambient Decimal context.
+    return round_catalog_decimal(value)
 
 
 def _validate_money_rate_entry(

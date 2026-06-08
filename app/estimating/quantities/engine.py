@@ -19,6 +19,12 @@ from app.estimating.quantities.dedup import (
 )
 from app.estimating.quantities.geometry import GeometryQuantity, extract_geometry_quantities
 
+# Tolerance for matching a geometry-derived quantity against a declared hint. Both are
+# floats, so an exact comparison would spuriously flag accumulated rounding noise as a
+# conflict.
+_HINT_MATCH_REL_TOL = 1e-9
+_HINT_MATCH_ABS_TOL = 1e-9
+
 
 class NormalizedHint(TypedDict):
     quantity_type: QuantityType
@@ -109,7 +115,12 @@ def compute_quantities(
             geometry_quantity = geometry_quantities.get(key)
             if geometry_quantity is None:
                 continue
-            if geometry_quantity.value != hint["value"]:
+            if not math.isclose(
+                geometry_quantity.value,
+                hint["value"],
+                rel_tol=_HINT_MATCH_REL_TOL,
+                abs_tol=_HINT_MATCH_ABS_TOL,
+            ):
                 exclusions.append(
                     QuantityExclusion(
                         entity_id=entity.entity_id,

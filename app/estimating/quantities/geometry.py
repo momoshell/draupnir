@@ -104,15 +104,14 @@ def extract_geometry_quantities(entity: RevisionEntityInput) -> GeometryExtracti
             )
         is_closed = _is_closed_polyline(geometry, points)
         segment_total = math.fsum(
-            _segment_length(points[index], points[index + 1])
-            for index in range(len(points) - 1)
+            _segment_length(points[index], points[index + 1]) for index in range(len(points) - 1)
         )
         exclusions: list[QuantityExclusion] = []
         quantities: list[GeometryQuantity] = []
         bbox = _bbox(points)
         if is_closed:
             perimeter = segment_total
-            if points[0] != points[-1]:
+            if not _points_coincide(points[0], points[-1]):
                 perimeter += _segment_length(points[-1], points[0])
             quantities.append(
                 GeometryQuantity(
@@ -297,6 +296,22 @@ def _extract_point(raw_point: JSONValue) -> Point | None:
     return None
 
 
+# Tolerance for treating two polyline endpoints as coincident. Float coordinates that
+# should be identical (e.g. an explicitly closed loop) can differ by accumulated rounding
+# noise, so closure detection must not rely on exact equality.
+_POINT_REL_TOL = 1e-9
+_POINT_ABS_TOL = 1e-9
+
+
+def _points_coincide(start: Point, end: Point) -> bool:
+    """Return whether two points are equal within a small floating-point tolerance."""
+    dimensions = min(len(start), len(end))
+    return all(
+        math.isclose(start[index], end[index], rel_tol=_POINT_REL_TOL, abs_tol=_POINT_ABS_TOL)
+        for index in range(dimensions)
+    )
+
+
 def _segment_length(start: Point, end: Point) -> float:
     dimensions = min(len(start), len(end))
     return math.dist(start[:dimensions], end[:dimensions])
@@ -339,11 +354,11 @@ def _is_closed_polyline(geometry: dict[str, JSONValue], points: list[Point]) -> 
     raw_closed = geometry.get("closed")
     if isinstance(raw_closed, bool):
         return raw_closed
-    return points[0] == points[-1]
+    return _points_coincide(points[0], points[-1])
 
 
 def _polygon_area(points: list[Point]) -> float | None:
-    unique_points = points[:-1] if points[0] == points[-1] else points
+    unique_points = points[:-1] if _points_coincide(points[0], points[-1]) else points
     if len(unique_points) < 3:
         return None
 

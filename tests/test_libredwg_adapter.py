@@ -3984,6 +3984,10 @@ async def test_libredwg_adapter_materializes_simple_insert_block_geometry(
     assert counts["supported_lines"] == 1
     assert counts["block_references"] == 1
 
+    # A cleanly-materialized insert is not a degraded "mixed" outcome: the result is
+    # scored on its supported geometry, not down-graded for capturing a block reference.
+    assert result.confidence.basis == "libredwg_dwgread_json_line_mapping"
+
     checks = _validation_checks(result)
     assert checks["block_transform_validity"]["status"] == "pass"
     assert checks["geometry_validity"]["status"] == "pass"

@@ -39,6 +39,7 @@ from app.exports._base import (
     build_artifact,
     normalize_datetime,
     normalize_json_value_tree,
+    normalize_options,
 )
 from app.models.estimate_version import EstimateItem, EstimateVersion
 
@@ -413,11 +414,11 @@ def _normalize_pdf_bytes(content_bytes: bytes) -> bytes:
 
 
 def _normalize_options(options: Mapping[str, object] | None) -> dict[str, JSONValue]:
-    if options is None:
-        return {}
-    return {
-        _normalize_mapping_key(key): _normalize_json_value(value) for key, value in options.items()
-    }
+    return normalize_options(
+        options,
+        normalize_value=_normalize_json_value,
+        normalize_mapping_key=_normalize_mapping_key,
+    )
 
 
 def _normalize_json_value(value: object) -> JSONValue:

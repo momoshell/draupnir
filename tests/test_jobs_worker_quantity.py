@@ -2028,6 +2028,13 @@ class TestJobsWorkerQuantity:
 
         monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
 
+        async def _no_cancel_before_compute(*_args: Any, **_kwargs: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            worker_module, "_cancel_registered_job_if_requested", _no_cancel_before_compute
+        )
+
         async def _fake_begin_or_resume_registered_job(
             job_id_value: uuid.UUID,
             *,
