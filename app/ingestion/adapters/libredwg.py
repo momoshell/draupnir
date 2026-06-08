@@ -17,6 +17,7 @@ from time import perf_counter
 from typing import Any, cast
 
 from app.core.config import settings
+from app.ingestion.adapters._units import resolve_units
 from app.ingestion.canonical.entity_provenance import build_entity_provenance
 from app.ingestion.canonical.hashing import (
     sha256_canonical_json_hex,
@@ -104,23 +105,13 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
 
 _JSONDict = dict[str, JSONValue]
 
-# Curated, confidence-gated subset of AutoCAD INSUNITS codes that map to an unambiguous,
-# well-defined length scale to meters. Codes outside this table (0/unitless, exotic or rare
-# codes, missing or non-integral values) stay review-gated as ``unknown``. Easy to extend
-# later (e.g. US survey foot, code 21) once those conversions are deliberately reviewed.
-_INSUNITS_METER_SCALE: dict[int, float] = {
-    1: 0.0254,  # inch
-    2: 0.3048,  # foot
-    3: 1609.344,  # mile
-    4: 0.001,  # millimeter
-    5: 0.01,  # centimeter
-    6: 1.0,  # meter
-    7: 1000.0,  # kilometer
-    10: 0.9144,  # yard
-    14: 0.1,  # decimeter
-    15: 10.0,  # decameter
-    16: 100.0,  # hectometer
-}
+# Curated, confidence-gated subset of AutoCAD INSUNITS codes this adapter is willing to
+# confirm. The code → meter factors themselves live in the shared ``_units`` module (one
+# source of truth with the ezdxf adapter, see #369); this allowlist is libredwg's *policy*
+# layered on top. Codes outside it (0/unitless, exotic or rare codes, missing or non-integral
+# values) stay review-gated as ``unknown``. Easy to extend later (e.g. US survey foot, code 21)
+# once those conversions are deliberately reviewed.
+_CONFIRMED_INSUNITS_CODES = frozenset({1, 2, 3, 4, 5, 6, 7, 10, 14, 15, 16})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1075,25 +1066,31 @@ def _units_unconfirmed_warning() -> AdapterWarning:
 def _resolve_units(payload: Any) -> _UnitsResolution:
     """Resolve drawing units from the dwgread ``HEADER.INSUNITS`` code.
 
-    Confirms (and scales to meters) only the curated ``_INSUNITS_METER_SCALE`` subset; every
-    other case (unitless code 0, unsupported/exotic codes, missing or non-integral values, or a
-    list payload without a header) degrades to the review-gated ``{"normalized": "unknown"}``
-    shape that the adapter has always emitted. Mirrors ``ezdxf._units_payload`` (the DXF adapter)
-    except libredwg's header key is ``INSUNITS`` (no ``$``).
+    Confirms (and scales to meters) only the curated ``_CONFIRMED_INSUNITS_CODES`` subset, using
+    the shared ``_units.METER_SCALE`` factors; every other case (unitless code 0,
+    unsupported/exotic codes, missing or non-integral values, or a list payload without a header)
+    degrades to the review-gated ``{"normalized": "unknown"}`` shape that the adapter has always
+    emitted. Shares its conversion factors with ``ezdxf._units_payload`` (the DXF adapter) via the
+    ``_units`` module; libredwg's header key is ``INSUNITS`` (no ``$``) and its unconfirmed label
+    is ``"unknown"`` (not ezdxf's unit-name fallback) — a deliberate policy difference.
     """
 
     code = _extract_insunits_code(payload)
-    if code is not None and code in _INSUNITS_METER_SCALE:
-        factor = _INSUNITS_METER_SCALE[code]
+    resolution = resolve_units(
+        code,
+        allowed_codes=_CONFIRMED_INSUNITS_CODES,
+        fallback_label=lambda _code: "unknown",
+    )
+    if resolution.confirmed:
         return _UnitsResolution(
             payload={
                 "normalized": "meter",
                 "source": "INSUNITS",
                 "source_value": code,
                 "conversion_target": "meter",
-                "conversion_factor": factor,
+                "conversion_factor": resolution.conversion_factor,
             },
-            scale=factor,
+            scale=resolution.scale,
             confirmed=True,
         )
 

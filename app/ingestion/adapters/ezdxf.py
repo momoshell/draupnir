@@ -12,6 +12,7 @@ from math import isfinite, sqrt
 from pathlib import Path
 from typing import Any, cast
 
+from app.ingestion.adapters._units import METER_SCALE, resolve_units, unit_name
 from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.canonical.geometry import canonical_bbox_from_points
 from app.ingestion.contracts import (
@@ -38,42 +39,13 @@ from app.ingestion.registry import evaluate_availability, get_descriptor
 
 _DESCRIPTOR = get_descriptor(InputFamily.DXF)
 _CANONICAL_SCHEMA_VERSION = "0.1"
-_METER_UNITS = 6
 _MODEL_LAYOUT_NAME = "Model"
 _MAX_POLYLINE_VERTICES = 10_000
-_UNIT_NAMES: dict[int, str] = {
-    0: "unitless",
-    1: "inch",
-    2: "foot",
-    3: "mile",
-    4: "millimeter",
-    5: "centimeter",
-    6: "meter",
-    7: "kilometer",
-    8: "microinch",
-    9: "mil",
-    10: "yard",
-    11: "angstrom",
-    12: "nanometer",
-    13: "micron",
-    14: "decimeter",
-    15: "decameter",
-    16: "hectometer",
-    17: "gigameter",
-    18: "astronomical_unit",
-    19: "light_year",
-    20: "parsec",
-    21: "us_survey_foot",
-    22: "us_survey_inch",
-    23: "us_survey_yard",
-    24: "us_survey_mile",
-}
 
 
 @dataclass(frozen=True, slots=True)
 class _RuntimeBindings:
     ezdxf: Any
-    units: Any
     dxf_structure_error: type[Exception]
 
 
@@ -151,7 +123,7 @@ class EzdxfAdapter:
         document = self._read_document(source.file_path)
         load_elapsed_ms = (time.monotonic() - load_started_at) * 1000
         budget.check()
-        units_payload = _units_payload(document, self._runtime.units)
+        units_payload = _units_payload(document)
 
         modelspace_entities = list(document.modelspace())
         total_entities = len(modelspace_entities)
@@ -465,12 +437,10 @@ def create_adapter() -> EzdxfAdapter:
 
 def _load_runtime() -> _RuntimeBindings:
     import ezdxf
-    from ezdxf import units
     from ezdxf.lldxf.const import DXFStructureError
 
     return _RuntimeBindings(
         ezdxf=ezdxf,
-        units=units,
         dxf_structure_error=DXFStructureError,
     )
 
@@ -498,34 +468,26 @@ def _emit_progress(
     )
 
 
-def _units_payload(document: Any, units_module: Any) -> dict[str, JSONValue]:
+def _units_payload(document: Any) -> dict[str, JSONValue]:
     source_value = int(document.header.get("$INSUNITS", document.units))
-    conversion_factor_to_meter: float | None = None
-    if source_value != 0:
-        try:
-            candidate = float(units_module.conversion_factor(source_value, _METER_UNITS))
-        except Exception:
-            pass
-        else:
-            if isfinite(candidate) and candidate > 0:
-                conversion_factor_to_meter = candidate
-
-    normalized = (
-        "meter" if conversion_factor_to_meter is not None else _normalized_unit_name(source_value)
+    resolution = resolve_units(
+        source_value,
+        allowed_codes=METER_SCALE,
+        fallback_label=unit_name,
     )
 
     payload: dict[str, JSONValue] = {
-        "normalized": normalized,
+        "normalized": resolution.normalized,
         "source": "$INSUNITS",
         "source_value": source_value,
         "conversion_target": "meter",
-        "conversion_factor": conversion_factor_to_meter,
+        "conversion_factor": resolution.conversion_factor,
     }
     return payload
 
 
 def _normalized_unit_name(source_value: int) -> str:
-    return _UNIT_NAMES.get(source_value, "unitless")
+    return unit_name(source_value)
 
 
 def _units_are_normalized_to_meter(units: dict[str, JSONValue]) -> bool:
