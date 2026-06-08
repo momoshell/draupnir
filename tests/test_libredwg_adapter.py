@@ -3429,3 +3429,150 @@ def test_libredwg_hash_helpers_preserve_raw_and_prefixed_forms() -> None:
     assert adapter_module._canonical_hash_json_value(value) == expected_raw_hash
     assert adapter_module._hash_json_value(value) == f"sha256:{expected_raw_hash}"
     assert adapter_module._hash_json_value(value) != expected_raw_hash
+
+
+async def _ingest_output_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    output_payload: dict[str, Any],
+) -> Any:
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(monkeypatch, process=process, output_text=json.dumps(output_payload))
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+    return await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+
+def _units_check(result: Any) -> Mapping[str, Any]:
+    validation = build_validation_outcome(
+        input_family=InputFamily.DWG,
+        canonical_json=result.canonical,
+        canonical_entity_schema_version=cast(
+            str,
+            result.canonical["canonical_entity_schema_version"],
+        ),
+        result=result,
+        generated_at=datetime.now(UTC),
+    )
+    checks = cast(list[Mapping[str, Any]], validation.report_json["checks"])
+    return {check["check_key"]: check for check in checks}["units_presence_normalization"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_confirms_and_scales_explicit_supported_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                }
+            ],
+        },
+    )
+
+    assert result.canonical["units"] == {
+        "normalized": "meter",
+        "source": "INSUNITS",
+        "source_value": 4,
+        "conversion_target": "meter",
+        "conversion_factor": 0.001,
+    }
+    assert "libredwg.units_unconfirmed" not in [warning.code for warning in result.warnings]
+
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["units"] == {
+        "normalized": "meter",
+        "source": "INSUNITS",
+        "source_value": 4,
+        "confirmed": True,
+    }
+    diagnostic_details = cast(Mapping[str, Any], result.diagnostics[0].details)
+    assert diagnostic_details["units"] == metadata["units"]
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    entity = entities[0]
+    assert entity["start"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert entity["end"] == {"x": pytest.approx(0.005), "y": 0.0, "z": 0.0}
+    assert entity["length"] == pytest.approx(0.005)
+    assert entity["geometry"]["units"] == {"normalized": "meter"}
+    assert entity["geometry"]["geometry_summary"]["length"] == pytest.approx(0.005)
+    assert "units_unconfirmed" not in entity["provenance"]["notes"]
+    assert entity["confidence"]["basis"] == "libredwg_line_mapping_units_meter"
+
+    units_check = _units_check(result)
+    assert units_check["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_keeps_units_unconfirmed_when_header_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                }
+            ],
+        },
+    )
+
+    assert result.canonical["units"] == {"normalized": "unknown"}
+    assert "libredwg.units_unconfirmed" in [warning.code for warning in result.warnings]
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    entity = entities[0]
+    assert entity["length"] == 5.0
+    assert entity["end"] == {"x": 5.0, "y": 0.0, "z": 0.0}
+    assert entity["geometry"]["units"] == {"normalized": "unknown"}
+    assert "units_unconfirmed" in entity["provenance"]["notes"]
+    assert entity["confidence"]["basis"] == "libredwg_line_mapping_units_unconfirmed"
+
+    units_check = _units_check(result)
+    assert units_check["status"] == "review_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("insunits_value", [0, "abc"])
+async def test_libredwg_adapter_degrades_ambiguous_units_to_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    insunits_value: Any,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": insunits_value},
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                }
+            ],
+        },
+    )
+
+    assert result.canonical["units"] == {"normalized": "unknown"}
+    assert "libredwg.units_unconfirmed" in [warning.code for warning in result.warnings]
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    entity = entities[0]
+    assert entity["length"] == 5.0
+    assert entity["geometry"]["units"] == {"normalized": "unknown"}
+
+    units_check = _units_check(result)
+    assert units_check["status"] == "review_required"
