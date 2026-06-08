@@ -1007,6 +1007,10 @@ def _units_summary(units: _UnitsResolution) -> _JSONDict:
 
 
 def _units_label(units: _UnitsResolution) -> _JSONDict:
+    # Per-entity geometry intentionally carries only the slim normalized label (not the full
+    # canonical units payload that ezdxf stamps on each entity); the full payload lives on the
+    # top-level canonical ``units``. Unconfirmed stays ``"unknown"`` (not ezdxf's ``"unitless"``)
+    # so the validation units check keeps libredwg review-gated. Both divergences are deliberate.
     return {"normalized": "meter" if units.confirmed else "unknown"}
 
 
@@ -1456,7 +1460,8 @@ def _build_lwpolyline_entity(
     vertices = _extract_vertices(raw_vertices)
     if len(vertices) < 2:
         return None
-    vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
+    if units.scale != 1.0:
+        vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
     if any(not _point_is_finite(vertex) for vertex in vertices):
         return None
     if _mapping_has_nondefault_zero_value(
@@ -1542,7 +1547,8 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
         )
 
     vertices = cast(tuple[tuple[float, float, float], ...], vertices_result.vertices)
-    vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
+    if units.scale != 1.0:
+        vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
     bbox = _bbox_from_points(vertices)
     if bbox is None:
         return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
