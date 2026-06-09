@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import pytest
 
 from app.estimating.catalog.selection import SelectedFormula
+from app.estimating.decimal_text import display_text
 from app.estimating.engine import (
     EstimateEngineError,
     EstimateEngineInput,
@@ -20,7 +21,6 @@ from app.estimating.engine import (
     formula_definition_from_json,
     formula_definition_from_selected_formula,
 )
-from app.estimating.engine._decimal import _decimal_text
 from app.estimating.formulas import (
     FormulaDefinition,
     FormulaInputDefinition,
@@ -48,7 +48,7 @@ def test_decimal_text_normalizes_estimate_engine_decimal_strings(
     value: Decimal,
     expected: str,
 ) -> None:
-    assert _decimal_text(value) == expected
+    assert display_text(value) == expected
 
 
 def test_engine_contracts_expose_deterministic_ids_and_frozen_specs() -> None:

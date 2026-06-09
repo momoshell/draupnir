@@ -6,9 +6,10 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from uuid import UUID
 
+from app.estimating.decimal_text import checksum_text
 from app.estimating.formulas import (
     FormulaInputDefinition,
     FormulaNode,
@@ -16,10 +17,7 @@ from app.estimating.formulas import (
     ValueContract,
     validate_formula_definition_json,
 )
-from app.estimating.money import CATALOG_QUANTUM, validate_catalog_money
-
-_SIX_DECIMAL_PLACES = CATALOG_QUANTUM
-_ZERO = Decimal("0.000000")
+from app.estimating.money import validate_catalog_money
 
 
 def rate_checksum_sha256(
@@ -182,7 +180,7 @@ def _canonicalize(value: object) -> object:
     if isinstance(value, UUID):
         return str(value)
     if isinstance(value, Decimal):
-        return _decimal_text(value)
+        return checksum_text(value)
     if isinstance(value, date | datetime):
         return value.isoformat()
     if isinstance(value, float):
@@ -197,18 +195,6 @@ def _canonicalize(value: object) -> object:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return [_canonicalize(item) for item in value]
     raise ValueError(f"Unsupported canonical checksum payload value type: {type(value).__name__}.")
-
-
-def _decimal_text(value: Decimal) -> str:
-    if not value.is_finite():
-        raise ValueError("canonical checksum decimal values must be finite.")
-    try:
-        quantized = value.quantize(_SIX_DECIMAL_PLACES)
-    except InvalidOperation as exc:
-        raise ValueError("canonical checksum decimal values must fit six decimal places.") from exc
-    if quantized == _ZERO:
-        quantized = _ZERO
-    return format(quantized, ".6f")
 
 
 def _validate_scope(scope_type: str, project_id: UUID | None) -> None:

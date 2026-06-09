@@ -14,6 +14,8 @@ from decimal import (
 )
 from typing import Final, NoReturn
 
+from app.estimating.decimal_text import canonical_text
+
 from .contracts import (
     FormulaDefinition,
     FormulaEvaluationError,
@@ -591,23 +593,12 @@ def _parse_canonical_decimal(value: str) -> Decimal:
         ) from exc
     if not decimal_value.is_finite():
         _raise_input_invalid("literal_invalid", f"Invalid decimal literal '{value}'.")
-    if value != _canonical_decimal_string(decimal_value):
+    if value != canonical_text(decimal_value):
         _raise_input_invalid(
             "literal_not_canonical",
             f"Decimal literal '{value}' is not canonical.",
         )
     return decimal_value
-
-
-def _canonical_decimal_string(value: Decimal) -> str:
-    normalized = value.normalize()
-    if normalized == normalized.to_integral():
-        text = format(normalized.quantize(Decimal("1")), "f")
-    else:
-        text = format(normalized, "f")
-    if text == "-0":
-        return "0"
-    return text
 
 
 def _round_decimal(value: Decimal, rounding: RoundingSpec | None) -> Decimal:
