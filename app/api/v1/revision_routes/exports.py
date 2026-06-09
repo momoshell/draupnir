@@ -11,24 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.idempotency import (
     IdempotentMutationOps,
     IdempotentMutationSuccess,
+    build_idempotency_fingerprint,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
+    replay_idempotency_response,
     run_idempotent_mutation,
-)
-
-# These collaborators are imported under module-private aliases so tests can swap them
-# with monkeypatch.setattr(exports, "_name", ...) and the route code, which resolves
-# them as module globals at call time, picks up the double — no wrapper layer needed.
-from app.api.idempotency import (
-    build_idempotency_fingerprint as _build_idempotency_fingerprint,
-)
-from app.api.idempotency import (
-    claim_idempotency_response as _claim_idempotency_response,
-)
-from app.api.idempotency import (
-    complete_idempotency_response as _complete_idempotency_response,
-)
-from app.api.idempotency import (
-    replay_idempotency_response as _replay_idempotency_response,
 )
 from app.api.v1.revision_estimate_inputs import (
     _raise_estimate_takeoff_gate_invalid,
@@ -41,9 +29,11 @@ from app.api.v1.revision_lineage import (
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
-from app.jobs.worker import enqueue_export_job as _enqueue_export_job
-from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent
-from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent
+from app.jobs.worker import (
+    enqueue_export_job,
+    prepare_job_enqueue_intent,
+    publish_job_enqueue_intent,
+)
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
@@ -60,6 +50,18 @@ from app.schemas.export import (
 from app.schemas.job import JobRead
 
 exports_router = APIRouter()
+
+# Module-private aliases for the route collaborators. Assigned (not re-imported under
+# the private name) so they are genuine module attributes that tests can swap with
+# monkeypatch.setattr(exports, "_name", ...); the routes resolve them as module globals
+# at call time, so no wrapper layer is needed.
+_build_idempotency_fingerprint = build_idempotency_fingerprint
+_claim_idempotency_response = claim_idempotency_response
+_complete_idempotency_response = complete_idempotency_response
+_replay_idempotency_response = replay_idempotency_response
+_enqueue_export_job = enqueue_export_job
+_prepare_job_enqueue_intent = prepare_job_enqueue_intent
+_publish_job_enqueue_intent = publish_job_enqueue_intent
 
 type _ExportPreclaimLoader = Callable[[], Awaitable[None]]
 type _ExportJobCreator = Callable[[], Awaitable[Job]]
