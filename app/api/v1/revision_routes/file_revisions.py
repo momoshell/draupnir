@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
+from app.api.pagination import paginate_overfetched as _paginate_overfetched
 from app.api.v1.revision_cursors import (
     _decode_revision_cursor,
     _DrawingRevisionCursor,
@@ -76,19 +77,17 @@ async def list_file_revisions(
             DrawingRevision.id.asc(),
         ).limit(limit + 1)
     )
-    revisions = result.scalars().all()
-    page = revisions[:limit]
-    next_cursor = None
-
-    if len(revisions) > limit and page:
-        last_revision = page[-1]
-        next_cursor = _encode_cursor(
+    page, next_cursor = _paginate_overfetched(
+        result.scalars().all(),
+        limit=limit,
+        encode_cursor=lambda last_revision: _encode_cursor(
             _DrawingRevisionCursor(
                 revision_sequence=last_revision.revision_sequence,
                 created_at=last_revision.created_at,
                 id=last_revision.id,
             )
-        )
+        ),
+    )
 
     return DrawingRevisionListResponse(
         items=[DrawingRevisionRead.model_validate(revision) for revision in page],

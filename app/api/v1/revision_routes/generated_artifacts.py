@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
+from app.api.pagination import paginate_overfetched as _paginate_overfetched
 from app.api.v1.revision_cursors import (
     _decode_artifact_cursor,
     _encode_cursor,
@@ -133,18 +134,16 @@ async def list_file_generated_artifacts(
             limit + 1
         )
     )
-    artifacts = result.scalars().all()
-    page = artifacts[:limit]
-    next_cursor = None
-
-    if len(artifacts) > limit and page:
-        last_artifact = page[-1]
-        next_cursor = _encode_cursor(
+    page, next_cursor = _paginate_overfetched(
+        result.scalars().all(),
+        limit=limit,
+        encode_cursor=lambda last_artifact: _encode_cursor(
             _GeneratedArtifactCursor(
                 created_at=last_artifact.created_at,
                 id=last_artifact.id,
             )
-        )
+        ),
+    )
 
     return GeneratedArtifactListResponse(
         items=[GeneratedArtifactRead.model_validate(artifact) for artifact in page],
@@ -253,18 +252,16 @@ async def list_revision_generated_artifacts(
             limit + 1
         )
     )
-    artifacts = result.scalars().all()
-    page = artifacts[:limit]
-    next_cursor = None
-
-    if len(artifacts) > limit and page:
-        last_artifact = page[-1]
-        next_cursor = _encode_cursor(
+    page, next_cursor = _paginate_overfetched(
+        result.scalars().all(),
+        limit=limit,
+        encode_cursor=lambda last_artifact: _encode_cursor(
             _GeneratedArtifactCursor(
                 created_at=last_artifact.created_at,
                 id=last_artifact.id,
             )
-        )
+        ),
+    )
 
     return GeneratedArtifactListResponse(
         items=[GeneratedArtifactRead.model_validate(artifact) for artifact in page],

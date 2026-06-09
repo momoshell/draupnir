@@ -29,6 +29,7 @@ from app.api.pagination import (
     MAX_PAGE_SIZE,
     decode_cursor_payload,
     encode_keyset_cursor,
+    paginate_overfetched,
     read_cursor_datetime,
     read_cursor_uuid,
 )
@@ -850,19 +851,15 @@ async def list_project_files(
         )
 
     rows = (await db.execute(query.limit(limit + 1))).scalars().all()
-
-    has_next = len(rows) > limit
-    if has_next:
-        rows = rows[:-1]
-
-    next_cursor = None
-    if has_next and rows:
-        last_item = rows[-1]
-        next_cursor = _encode_cursor(last_item.created_at, last_item.id)
+    page, next_cursor = paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda file_row: _encode_cursor(file_row.created_at, file_row.id),
+    )
 
     items = [
         FileRead.model_validate(row)
-        for row in await _attach_initial_upload_metadata_for_files(db, rows)
+        for row in await _attach_initial_upload_metadata_for_files(db, page)
     ]
     return FileListResponse(items=items, next_cursor=next_cursor)
 

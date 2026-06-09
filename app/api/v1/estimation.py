@@ -31,6 +31,7 @@ from app.api.pagination import (
     MAX_PAGE_SIZE,
     decode_keyset_cursor,
     encode_keyset_cursor,
+    paginate_overfetched,
 )
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
@@ -317,11 +318,11 @@ async def _list_catalog_entries[CatalogReadT: BaseModel, CatalogListT: BaseModel
             statement.order_by(model.created_at.desc(), model.id.desc()).limit(limit + 1)
         )
     ).all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row[0].created_at, last_row[0].id)
+    page, next_cursor = paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda row: _encode_timestamp_cursor(row[0].created_at, row[0].id),
+    )
     return build_response([serialize_row(row) for row in page], next_cursor)
 
 

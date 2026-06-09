@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
+from app.api.pagination import paginate_overfetched as _paginate_overfetched
 from app.api.v1.revision_cursors import (
     _decode_materialization_cursor,
     _encode_materialization_cursor,
@@ -70,12 +71,13 @@ async def list_revision_layouts(
         ).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_materialization_cursor(
+            last_row.sequence_index, last_row.id
+        ),
+    )
 
     counts = _manifest_counts(manifest)
     return RevisionLayoutListResponse(
@@ -113,12 +115,13 @@ async def list_revision_layers(
         query.order_by(RevisionLayer.sequence_index.asc(), RevisionLayer.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_materialization_cursor(
+            last_row.sequence_index, last_row.id
+        ),
+    )
 
     counts = _manifest_counts(manifest)
     return RevisionLayerListResponse(
@@ -156,12 +159,13 @@ async def list_revision_blocks(
         query.order_by(RevisionBlock.sequence_index.asc(), RevisionBlock.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_materialization_cursor(
+            last_row.sequence_index, last_row.id
+        ),
+    )
 
     counts = _manifest_counts(manifest)
     return RevisionBlockListResponse(
@@ -226,12 +230,13 @@ async def list_revision_entities(
         ).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_materialization_cursor(last_row.sequence_index, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_materialization_cursor(
+            last_row.sequence_index, last_row.id
+        ),
+    )
 
     counts = _manifest_counts(manifest)
     return RevisionEntityListResponse(

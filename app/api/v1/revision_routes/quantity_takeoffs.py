@@ -31,6 +31,7 @@ from app.api.idempotency import (
 )
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
+from app.api.pagination import paginate_overfetched as _paginate_overfetched
 from app.api.v1.revision_cursors import _decode_timestamp_cursor, _encode_timestamp_cursor
 from app.api.v1.revision_lineage import (
     _get_active_revision as _get_active_revision_direct,
@@ -263,11 +264,11 @@ async def list_revision_quantity_takeoffs(
         query.order_by(QuantityTakeoff.created_at.asc(), QuantityTakeoff.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_timestamp_cursor(last_row.created_at, last_row.id),
+    )
 
     return QuantityTakeoffListResponse(
         items=[QuantityTakeoffRead.model_validate(row) for row in page],
@@ -347,11 +348,11 @@ async def list_revision_quantity_takeoff_items(
         query.order_by(QuantityItem.created_at.asc(), QuantityItem.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_timestamp_cursor(last_row.created_at, last_row.id),
+    )
 
     return QuantityItemListResponse(
         items=[QuantityItemRead.model_validate(row) for row in page],
