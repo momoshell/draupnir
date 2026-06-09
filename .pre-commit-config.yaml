@@ -37,7 +37,11 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: uv run mypy
+        # Check the whole tree (matches CI's `mypy app tests`) rather than only the
+        # changed files: a change in app/ can break an unchanged test's types, which a
+        # per-file check would miss locally and only surface in CI.
+        entry: uv run mypy app tests
         language: system
         types: [python]
-        pass_filenames: true
+        pass_filenames: false
+        require_serial: true
