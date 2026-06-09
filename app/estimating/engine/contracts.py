@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from app.estimating.engine._decimal import _decimal_text
+from app.estimating.decimal_text import display_text
 from app.estimating.formulas import (
     FormulaDefinition,
     FormulaInputDefinition,
@@ -351,7 +351,7 @@ def _snapshot_source_payload_json(snapshot: EstimateSnapshotEntrySpec) -> dict[s
     if snapshot.formula_definition is not None:
         payload["formula_definition"] = _formula_definition_json(snapshot.formula_definition)
     if snapshot.money_amount is not None:
-        payload["money_amount"] = _decimal_text(snapshot.money_amount)
+        payload["money_amount"] = display_text(snapshot.money_amount)
     return payload
 
 

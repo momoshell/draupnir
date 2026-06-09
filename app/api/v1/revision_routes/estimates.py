@@ -31,6 +31,7 @@ from app.api.idempotency import (
 )
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
 from app.api.pagination import MAX_PAGE_SIZE as _MAX_PAGE_SIZE
+from app.api.pagination import paginate_overfetched as _paginate_overfetched
 from app.api.v1.revision_cursors import (
     _decode_estimate_item_cursor,
     _decode_estimate_snapshot_entry_cursor,
@@ -413,11 +414,11 @@ async def list_revision_estimates(
         query.order_by(EstimateVersion.created_at.asc(), EstimateVersion.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_timestamp_cursor(last_row.created_at, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_timestamp_cursor(last_row.created_at, last_row.id),
+    )
 
     return EstimateVersionListResponse(
         items=[EstimateVersionRead.model_validate(row) for row in page],
@@ -643,11 +644,13 @@ async def list_revision_estimate_items(
         query.order_by(EstimateItem.line_number.asc(), EstimateItem.id.asc()).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_estimate_item_cursor(last_row.line_number, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_estimate_item_cursor(
+            last_row.line_number, last_row.id
+        ),
+    )
 
     return EstimateItemListResponse(
         items=[EstimateItemRead.model_validate(row) for row in page],
@@ -711,11 +714,13 @@ async def list_revision_estimate_snapshot_entries(
         ).limit(limit + 1)
     )
     rows = result.scalars().all()
-    page = rows[:limit]
-    next_cursor = None
-    if len(rows) > limit and page:
-        last_row = page[-1]
-        next_cursor = _encode_estimate_snapshot_entry_cursor(last_row.sort_order, last_row.id)
+    page, next_cursor = _paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda last_row: _encode_estimate_snapshot_entry_cursor(
+            last_row.sort_order, last_row.id
+        ),
+    )
 
     return EstimateSnapshotEntryListResponse(
         items=[EstimateSnapshotEntryRead.model_validate(row) for row in page],

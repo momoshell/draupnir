@@ -24,6 +24,7 @@ from app.api.pagination import (
     MAX_PAGE_SIZE,
     decode_cursor_payload,
     encode_keyset_cursor,
+    paginate_overfetched,
     raise_invalid_cursor,
     read_cursor_datetime,
     read_cursor_int,
@@ -269,12 +270,11 @@ async def list_job_events(
         JobEvent.id.asc(),
     ).limit(limit + 1)
     result = await db.execute(statement)
-    events = list(result.scalars())
-
-    next_cursor: str | None = None
-    if len(events) > limit:
-        next_cursor = _encode_job_events_cursor(events[limit - 1])
-        events = events[:limit]
+    events, next_cursor = paginate_overfetched(
+        list(result.scalars()),
+        limit=limit,
+        encode_cursor=_encode_job_events_cursor,
+    )
 
     return JobEventPage(
         items=[JobEventRead.model_validate(event) for event in events],

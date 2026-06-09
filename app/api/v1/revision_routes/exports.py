@@ -11,37 +11,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.idempotency import (
     IdempotentMutationOps,
     IdempotentMutationSuccess,
+    build_idempotency_fingerprint,
+    claim_idempotency_response,
+    complete_idempotency_response,
     get_idempotency_key,
+    replay_idempotency_response,
     run_idempotent_mutation,
 )
-from app.api.idempotency import (
-    build_idempotency_fingerprint as _build_idempotency_fingerprint_direct,
-)
-from app.api.idempotency import (
-    claim_idempotency_response as _claim_idempotency_response_direct,
-)
-from app.api.idempotency import (
-    complete_idempotency_response as _complete_idempotency_response_direct,
-)
-from app.api.idempotency import (
-    replay_idempotency_response as _replay_idempotency_response_direct,
-)
 from app.api.v1.revision_estimate_inputs import (
-    _raise_estimate_takeoff_gate_invalid as _raise_estimate_takeoff_gate_invalid_direct,
-)
-from app.api.v1.revision_lineage import _get_active_revision as _get_active_revision_direct
-from app.api.v1.revision_lineage import (
-    _get_revision_estimate_version_or_404 as _get_revision_estimate_version_or_404_direct,
+    _raise_estimate_takeoff_gate_invalid,
 )
 from app.api.v1.revision_lineage import (
-    _get_revision_quantity_takeoff_or_404 as _get_revision_quantity_takeoff_or_404_direct,
+    _get_active_revision,
+    _get_revision_estimate_version_or_404,
+    _get_revision_quantity_takeoff_or_404,
 )
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
-from app.jobs.worker import enqueue_export_job as _enqueue_export_job_direct
-from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
-from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
+from app.jobs.worker import (
+    enqueue_export_job,
+    prepare_job_enqueue_intent,
+    publish_job_enqueue_intent,
+)
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
@@ -59,20 +51,21 @@ from app.schemas.job import JobRead
 
 exports_router = APIRouter()
 
+# Module-private aliases for the route collaborators. Assigned (not re-imported under
+# the private name) so they are genuine module attributes that tests can swap with
+# monkeypatch.setattr(exports, "_name", ...); the routes resolve them as module globals
+# at call time, so no wrapper layer is needed.
+_build_idempotency_fingerprint = build_idempotency_fingerprint
+_claim_idempotency_response = claim_idempotency_response
+_complete_idempotency_response = complete_idempotency_response
+_replay_idempotency_response = replay_idempotency_response
+_enqueue_export_job = enqueue_export_job
+_prepare_job_enqueue_intent = prepare_job_enqueue_intent
+_publish_job_enqueue_intent = publish_job_enqueue_intent
+
 type _ExportPreclaimLoader = Callable[[], Awaitable[None]]
 type _ExportJobCreator = Callable[[], Awaitable[Job]]
 type _ExportPreclaim = Callable[[], Awaitable[Response | None]]
-
-
-async def _get_active_revision(
-    revision_id: UUID,
-    db: AsyncSession,
-    *,
-    for_update: bool = False,
-) -> DrawingRevision | None:
-    """Route-local seam for active revision lookup."""
-
-    return await _get_active_revision_direct(revision_id, db, for_update=for_update)
 
 
 async def _get_locked_active_revision_or_404(
@@ -86,78 +79,6 @@ async def _get_locked_active_revision_or_404(
         raise_not_found("Drawing revision", str(revision_id))
     assert revision is not None
     return revision
-
-
-async def _get_revision_quantity_takeoff_or_404(
-    revision_id: UUID,
-    takeoff_id: UUID,
-    db: AsyncSession,
-) -> QuantityTakeoff:
-    """Route-local seam for revision quantity takeoff lookup."""
-
-    return await _get_revision_quantity_takeoff_or_404_direct(revision_id, takeoff_id, db)
-
-
-async def _get_revision_estimate_version_or_404(
-    revision_id: UUID,
-    estimate_version_id: UUID,
-    db: AsyncSession,
-) -> EstimateVersion:
-    """Route-local seam for revision estimate lookup."""
-
-    return await _get_revision_estimate_version_or_404_direct(
-        revision_id,
-        estimate_version_id,
-        db,
-    )
-
-
-def _build_idempotency_fingerprint(*args: Any, **kwargs: Any) -> str:
-    """Route-local seam for fingerprint construction."""
-
-    return _build_idempotency_fingerprint_direct(*args, **kwargs)
-
-
-async def _replay_idempotency_response(*args: Any, **kwargs: Any) -> Response | None:
-    """Route-local seam for idempotency replay."""
-
-    return await _replay_idempotency_response_direct(*args, **kwargs)
-
-
-async def _claim_idempotency_response(*args: Any, **kwargs: Any) -> Any:
-    """Route-local seam for idempotency claim."""
-
-    return await _claim_idempotency_response_direct(*args, **kwargs)
-
-
-async def _complete_idempotency_response(*args: Any, **kwargs: Any) -> Response:
-    """Route-local seam for idempotency completion."""
-
-    return await _complete_idempotency_response_direct(*args, **kwargs)
-
-
-def _prepare_job_enqueue_intent(job: Job) -> None:
-    """Route-local seam for enqueue intent staging."""
-
-    _prepare_job_enqueue_intent_direct(job)
-
-
-async def _publish_job_enqueue_intent(*args: Any, **kwargs: Any) -> bool:
-    """Route-local seam for durable enqueue publication."""
-
-    return await _publish_job_enqueue_intent_direct(*args, **kwargs)
-
-
-def _enqueue_export_job(job_id: UUID) -> None:
-    """Route-local seam for export job queue publication."""
-
-    _enqueue_export_job_direct(job_id)
-
-
-def _raise_estimate_takeoff_gate_invalid(takeoff: QuantityTakeoff) -> None:
-    """Route-local seam for the standard invalid-takeoff export error."""
-
-    _raise_estimate_takeoff_gate_invalid_direct(takeoff)
 
 
 def _build_export_request_body(

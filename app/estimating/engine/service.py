@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from app.estimating.engine._decimal import _decimal_text
+from app.estimating.decimal_text import display_text
 from app.estimating.engine.contracts import (
     EstimateAssumptionEntryInput,
     EstimateEngineInput,
@@ -459,7 +459,7 @@ def _build_line_item(
             line_number=line_number,
             subtotal_amount=subtotal_amount,
             assumption_snapshot_entry_id=assumption_value.snapshot.id,
-            details={"amount": _decimal_text(assumption_value.amount)},
+            details={"amount": display_text(assumption_value.amount)},
         )
 
     if line_input.line_type == "adjustment":
@@ -488,7 +488,7 @@ def _build_line_item(
             subtotal_amount=subtotal_amount,
             formula_snapshot_entry_id=formula_snapshot_entry_id,
             assumption_snapshot_entry_id=assumption_snapshot_entry_id,
-            details={"adjustment_amount": _decimal_text(adjustment_amount)},
+            details={"adjustment_amount": display_text(adjustment_amount)},
         )
 
     if line_input.line_type == "formula":
@@ -580,8 +580,8 @@ def _build_formula_line_item(
         "formula_version": resolved_formula_entry.definition.version,
         "formula_checksum": resolved_formula_entry.definition.checksum,
         "bound_input_keys": bound_input_keys_json,
-        "pre_round_amount": _decimal_text(pre_round_amount),
-        "evaluated_amount": _decimal_text(evaluated_amount),
+        "pre_round_amount": display_text(pre_round_amount),
+        "evaluated_amount": display_text(evaluated_amount),
     }
     if formula_result.rounding is not None:
         details["applied_rounding"] = {

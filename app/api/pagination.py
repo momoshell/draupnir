@@ -3,7 +3,7 @@
 import base64
 import binascii
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Never, cast
 from uuid import UUID
@@ -16,6 +16,26 @@ from app.core.exceptions import create_error_response
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
+
+
+def paginate_overfetched[ItemT](
+    rows: Sequence[ItemT],
+    *,
+    limit: int,
+    encode_cursor: Callable[[ItemT], str],
+) -> tuple[list[ItemT], str | None]:
+    """Split ``limit + 1`` overfetched keyset rows into a page and a next cursor.
+
+    Every keyset list route shares this tail: fetch ``limit + 1`` rows ordered by a
+    stable key, and if the extra row is present there is another page whose cursor is
+    encoded from the last returned row. The per-route query, ordering direction, and
+    cursor shape stay in the route; only this slice/has-next/encode logic is shared.
+    """
+
+    has_next = len(rows) > limit
+    page = list(rows[:limit]) if has_next else list(rows)
+    next_cursor = encode_cursor(page[-1]) if has_next and page else None
+    return page, next_cursor
 
 
 def encode_cursor_payload(

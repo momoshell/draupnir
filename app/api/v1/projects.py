@@ -24,6 +24,7 @@ from app.api.pagination import (
     MAX_PAGE_SIZE,
     decode_cursor_payload,
     encode_keyset_cursor,
+    paginate_overfetched,
     read_cursor_datetime,
     read_cursor_uuid,
 )
@@ -163,21 +164,14 @@ async def list_projects(
             | ((Project.created_at == created_at) & (Project.id < project_id))
         )
 
-    # Fetch limit + 1 to determine if there's a next page
-    items = (await db.execute(query.limit(limit + 1))).scalars().all()
+    # Overfetch one row to detect a next page, then split into page + cursor.
+    rows = (await db.execute(query.limit(limit + 1))).scalars().all()
+    items, next_cursor = paginate_overfetched(
+        rows,
+        limit=limit,
+        encode_cursor=lambda project: _encode_cursor(project.created_at, project.id),
+    )
 
-    # Check if there's a next page
-    has_next = len(items) > limit
-    if has_next:
-        items = items[:-1]  # Remove the extra item
-
-    # Generate next cursor if there's a next page
-    next_cursor = None
-    if has_next and items:
-        last_item = items[-1]
-        next_cursor = _encode_cursor(last_item.created_at, last_item.id)
-
-    # Convert Sequence[Project] to list[ProjectRead] for response
     project_reads = [ProjectRead.model_validate(project) for project in items]
     return ProjectListResponse(items=project_reads, next_cursor=next_cursor)
 

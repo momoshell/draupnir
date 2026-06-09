@@ -338,9 +338,9 @@ def test_evaluate_formula_rejects_exponent_literals_before_canonical_formatting(
     )
 
     def fail_if_called(_: Decimal) -> str:
-        raise AssertionError("_canonical_decimal_string must not run")
+        raise AssertionError("canonical_text must not run")
 
-    monkeypatch.setattr(evaluator_module, "_canonical_decimal_string", fail_if_called)
+    monkeypatch.setattr(evaluator_module, "canonical_text", fail_if_called)
 
     with pytest.raises(FormulaEvaluationError) as exc_info:
         evaluate_formula(definition, {})

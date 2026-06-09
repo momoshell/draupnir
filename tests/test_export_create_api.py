@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -910,7 +911,7 @@ async def test_create_export_revalidates_active_revision_after_idempotency_claim
 ) -> None:
     lineage = await _seed_export_lineage()
     idempotency_key = f"export-create-revalidate-{uuid4().hex}"
-    original_claim = export_routes._claim_idempotency_response
+    original_claim: Any = export_routes._claim_idempotency_response
 
     async def claim_and_delete_revision(*args: object, **kwargs: object) -> object:
         claim = await original_claim(*args, **kwargs)

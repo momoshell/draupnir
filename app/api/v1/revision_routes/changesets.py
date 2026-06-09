@@ -69,6 +69,7 @@ _run_idempotent_mutation = idempotency.run_idempotent_mutation
 _IdempotentMutationSuccess = idempotency.IdempotentMutationSuccess
 _encode_keyset_cursor = pagination.encode_keyset_cursor
 _decode_keyset_cursor = pagination.decode_keyset_cursor
+_paginate_overfetched = pagination.paginate_overfetched
 _load_change_set_apply_input = changeset_loading.load_change_set_apply_input
 _validate_change_set = validate_change_set
 _prepare_job_enqueue_intent = prepare_job_enqueue_intent
@@ -260,15 +261,6 @@ def _build_fingerprint(revision_id: UUID, payload: dict[str, Any]) -> str:
     return idempotency.build_idempotency_fingerprint(
         "revision_changeset_create",
         {"revision_id": str(revision_id), "body": payload},
-    )
-
-
-def _build_next_cursor(change_sets: list[CadChangeSet], *, has_more: bool) -> str | None:
-    if not has_more or not change_sets:
-        return None
-    last_item = change_sets[-1]
-    return _encode_keyset_cursor(
-        CadChangeSetCursor(created_at=last_item.created_at, id=last_item.id)
     )
 
 
@@ -494,9 +486,13 @@ async def list_revision_changesets(
         query = _apply_after_cursor(query, decoded_cursor)
 
     result = await db.execute(query.limit(limit + 1))
-    rows = list(result.scalars())
-    has_more = len(rows) > limit
-    items = rows[:limit]
+    items, next_cursor = _paginate_overfetched(
+        list(result.scalars()),
+        limit=limit,
+        encode_cursor=lambda last_item: _encode_keyset_cursor(
+            CadChangeSetCursor(created_at=last_item.created_at, id=last_item.id)
+        ),
+    )
     operations_by_change_set = await _load_change_set_operations(
         db,
         project_id=active_revision.project_id,
@@ -511,7 +507,7 @@ async def list_revision_changesets(
             )
             for change_set in items
         ],
-        next_cursor=_build_next_cursor(items, has_more=has_more),
+        next_cursor=next_cursor,
     )
 
 
