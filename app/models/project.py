@@ -56,12 +56,16 @@ class Project(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=func.now(),
+        server_default=func.now(),
+        nullable=False,
         comment="Project creation timestamp",
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=func.now(),
+        server_default=func.now(),
         onupdate=func.now(),
+        nullable=False,
         comment="Project last update timestamp",
     )
     deleted_at: Mapped[datetime | None] = mapped_column(

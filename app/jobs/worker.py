@@ -12,6 +12,7 @@ import math
 import threading
 import uuid
 from collections.abc import Callable, Coroutine, Mapping, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -117,6 +118,33 @@ _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
 _ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
+# Capped exponential backoff between job attempts. The first attempt runs with no
+# delay; each subsequent re-enqueue waits base * 2**(attempt-1), capped, so a job
+# that keeps failing is spaced out instead of being retried as fast as the broker
+# can redeliver it (the attempt count is still bounded by ``Job.max_attempts``).
+_ENQUEUE_BACKOFF_BASE_SECONDS = 5.0
+_ENQUEUE_BACKOFF_MAX_SECONDS = 300.0
+
+
+def _enqueue_backoff_seconds(attempts: int) -> float:
+    """Return the retry delay for a job that has already made ``attempts`` tries."""
+    if attempts <= 1:
+        return 0.0
+    delay = _ENQUEUE_BACKOFF_BASE_SECONDS * (2.0 ** (attempts - 2))
+    return min(delay, _ENQUEUE_BACKOFF_MAX_SECONDS)
+
+
+# Carries the computed backoff to the real ``enqueue_*`` publishers without changing
+# their ``(job_id)`` call signature (test fakes and direct calls see the 0.0 default).
+_ENQUEUE_COUNTDOWN_SECONDS: ContextVar[float] = ContextVar("enqueue_countdown_seconds", default=0.0)
+
+
+def _current_enqueue_countdown() -> float | None:
+    """Return the active enqueue backoff in seconds, or None when there is none."""
+    countdown = _ENQUEUE_COUNTDOWN_SECONDS.get()
+    return countdown if countdown > 0.0 else None
+
+
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
 _ENQUEUE_INGEST_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
     JobType.INGEST.value
@@ -660,6 +688,7 @@ class _ClaimedJobEnqueueIntent:
 
     lease: _EnqueueIntentLease
     job_type: str
+    attempts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -4931,6 +4960,45 @@ async def _poll_job_cancellation(
             continue
 
 
+async def _cancel_registered_job_if_requested(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    log_event: str,
+) -> bool:
+    """Honor a cancellation requested before compute begins; return True if cancelled.
+
+    Ingest runs a continuous cancellation poll because its adapter work yields at
+    ``await`` points. The other job types compute synchronously (``compute_quantities``,
+    ``compose_estimate``, export rendering) and block the event loop while they run, so
+    they cannot be preempted mid-compute without threading cancellation into otherwise
+    pure deterministic code. This checkpoint closes the common race — a cancel issued
+    after the attempt was claimed but before compute starts — so such cancels take effect
+    immediately instead of waiting until finalization. Cancellation that arrives *during*
+    a synchronous compute is still only observed at the finalize row-lock.
+    """
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        job = await session.get(Job, job_id)
+
+    if job is None:
+        raise LookupError(f"Job with identifier '{job_id}' not found")
+
+    if not _job_attempt_is_current(job, attempt_token=attempt_token):
+        return False
+
+    if not job.cancel_requested and job.status != "cancelled":
+        return False
+
+    cancelled = await _mark_job_cancelled(job_id, attempt_token=attempt_token)
+    if cancelled:
+        logger.info(log_event, job_id=str(job_id))
+    return cancelled
+
+
 async def _stop_job_execution_monitor(
     *,
     progress_bridge: _JobProgressEventBridge,
@@ -5158,8 +5226,9 @@ async def _claim_job_enqueue_intent(job_id: UUID) -> _ClaimedJobEnqueueIntent | 
             return None
 
         lease = _claim_enqueue_intent_lease(job, now=now)
+        attempts = job.attempts
         await session.commit()
-        return _ClaimedJobEnqueueIntent(lease=lease, job_type=job.job_type)
+        return _ClaimedJobEnqueueIntent(lease=lease, job_type=job.job_type, attempts=attempts)
 
 
 async def _release_job_enqueue_intent(job_id: UUID, *, lease_token: UUID) -> bool:
@@ -5234,9 +5303,13 @@ async def publish_job_enqueue_intent(
         if publish is None:
             await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
             return False
+        countdown_token = _ENQUEUE_COUNTDOWN_SECONDS.set(
+            _enqueue_backoff_seconds(claimed_intent.attempts)
+        )
         try:
             publish(job_id)
         except Exception:
+            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
             await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
             if recovery:
                 await _mark_recovery_enqueue_failed(job_id, job_type=claimed_intent.job_type)
@@ -5248,6 +5321,8 @@ async def publish_job_enqueue_intent(
                     recovery_action="worker_start_recovery",
                 )
             return False
+        else:
+            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
 
         await _mark_job_enqueue_published(job_id, lease_token=claimed_intent.lease.token)
         return True
@@ -5339,6 +5414,7 @@ async def _begin_or_resume_registered_job(
             inactive_source=route.log_keys.inactive_source,
             reclaimed_stale_running=route.log_keys.reclaimed_stale_running,
             duplicate_delivery=route.log_keys.duplicate_delivery,
+            max_attempts_exceeded=route.log_keys.max_attempts_exceeded,
             cancelled=route.log_keys.cancelled,
         ),
         session_maker_factory=get_session_maker,
@@ -5487,6 +5563,13 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
 
     lease = await _begin_or_resume_registered_job(job_id, process_name=handler.process_name)
     if lease is None:
+        return
+
+    if await _cancel_registered_job_if_requested(
+        job_id,
+        attempt_token=lease.token,
+        log_event=spec.cancelled_during_execution_log_event,
+    ):
         return
 
     execute_job = cast(Any, _resolve_registered_job_callable(execute_name))
@@ -6428,7 +6511,12 @@ def run_ingest_job(job_id: str) -> None:
 
 def enqueue_ingest_job(job_id: UUID) -> None:
     """Publish a persisted ingest job to Celery."""
-    run_ingest_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+    run_ingest_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )
 
 
 async def process_quantity_takeoff_job(job_id: UUID) -> None:
@@ -6449,7 +6537,12 @@ def run_quantity_takeoff_job(job_id: str) -> None:
 
 def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
     """Publish a persisted quantity takeoff job to Celery."""
-    run_quantity_takeoff_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+    run_quantity_takeoff_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )
 
 
 async def process_estimate_job(job_id: UUID) -> None:
@@ -6470,7 +6563,12 @@ def run_estimate_job(job_id: str) -> None:
 
 def enqueue_estimate_job(job_id: UUID) -> None:
     """Publish a persisted estimate job to Celery."""
-    run_estimate_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+    run_estimate_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )
 
 
 async def process_export_job(job_id: UUID) -> None:
@@ -6497,7 +6595,12 @@ def run_export_job(job_id: str) -> None:
 def enqueue_export_job(job_id: UUID) -> None:
     """Publish a persisted export job to Celery."""
 
-    run_export_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+    run_export_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )
 
 
 @celery_app.task(
@@ -6513,4 +6616,9 @@ def run_changeset_apply_job(job_id: str) -> None:
 
 def enqueue_changeset_apply_job(job_id: UUID) -> None:
     """Publish a persisted changeset apply job to Celery."""
-    run_changeset_apply_job.apply_async(args=(str(job_id),), task_id=str(job_id), retry=False)
+    run_changeset_apply_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )

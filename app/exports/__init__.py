@@ -22,6 +22,15 @@ from app.exports.estimate_pdf import (
     EstimatePdfExportResult,
     render_estimate_pdf_export,
 )
+from app.exports.revised_dxf import (
+    REVISED_DXF_EXPORT_FORMAT,
+    REVISED_DXF_EXPORT_GENERATOR_NAME,
+    REVISED_DXF_EXPORT_GENERATOR_VERSION,
+    REVISED_DXF_EXPORT_MEDIA_TYPE,
+    RevisedDxfExportError,
+    RevisedDxfExportResult,
+    render_revised_dxf_export,
+)
 from app.exports.revision_json import (
     REVISION_JSON_EXPORT_GENERATOR_NAME,
     REVISION_JSON_EXPORT_GENERATOR_VERSION,
@@ -43,6 +52,10 @@ __all__ = [
     "QUANTITY_CSV_EXPORT_GENERATOR_NAME",
     "QUANTITY_CSV_EXPORT_GENERATOR_VERSION",
     "QUANTITY_CSV_EXPORT_HEADERS",
+    "REVISED_DXF_EXPORT_FORMAT",
+    "REVISED_DXF_EXPORT_GENERATOR_NAME",
+    "REVISED_DXF_EXPORT_GENERATOR_VERSION",
+    "REVISED_DXF_EXPORT_MEDIA_TYPE",
     "REVISION_JSON_EXPORT_GENERATOR_NAME",
     "REVISION_JSON_EXPORT_GENERATOR_VERSION",
     "REVISION_JSON_EXPORT_MEDIA_TYPE",
@@ -52,10 +65,13 @@ __all__ = [
     "EstimatePdfExportError",
     "EstimatePdfExportResult",
     "QuantityCsvExportError",
+    "RevisedDxfExportError",
+    "RevisedDxfExportResult",
     "RevisionJsonExportError",
     "RevisionJsonExportResult",
     "render_estimate_csv_export",
     "render_estimate_pdf_export",
     "render_quantity_csv_export",
+    "render_revised_dxf_export",
     "render_revision_json_export",
 ]

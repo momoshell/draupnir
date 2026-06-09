@@ -7,6 +7,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncGenerator, Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -1420,21 +1421,23 @@ async def _insert_in_progress_record(
     fingerprint: str,
     method: str,
     path: str,
+    created_at: datetime | None = None,
 ) -> None:
     """Insert an in-progress reservation to drive conflict behavior."""
 
     session_maker = session_module.AsyncSessionLocal
     assert session_maker is not None
     async with session_maker() as session:
-        session.add(
-            IdempotencyKey(
-                key_hash=hash_idempotency_key(raw_key),
-                request_fingerprint=fingerprint,
-                request_method=method,
-                request_path=path,
-                status=IdempotencyStatus.IN_PROGRESS.value,
-            )
+        record = IdempotencyKey(
+            key_hash=hash_idempotency_key(raw_key),
+            request_fingerprint=fingerprint,
+            request_method=method,
+            request_path=path,
+            status=IdempotencyStatus.IN_PROGRESS.value,
         )
+        if created_at is not None:
+            record.created_at = created_at
+        session.add(record)
         await session.commit()
 
 
@@ -1571,6 +1574,37 @@ class TestEndpointIdempotency:
                 "details": {"reason": "in_progress"},
             }
         }
+
+    async def test_stale_in_progress_reservation_is_reclaimed_not_conflicted(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+    ) -> None:
+        """An abandoned (stale) in-progress reservation is taken over by a matching retry."""
+
+        _ = self
+        _ = cleanup_projects
+        key = "project-stale-in-progress-1"
+        payload = {"name": "Abandoned Project"}
+        fingerprint = build_idempotency_fingerprint("projects.create", payload)
+        stale_created_at = datetime.now(UTC) - timedelta(
+            seconds=settings.idempotency_in_progress_ttl_seconds + 60
+        )
+        await _insert_in_progress_record(
+            raw_key=key,
+            fingerprint=fingerprint,
+            method="POST",
+            path="/projects",
+            created_at=stale_created_at,
+        )
+
+        response = await _create_project(async_client, payload=payload, idempotency_key=key)
+
+        # The stale reservation is reclaimed and the request runs, instead of a 409 forever.
+        assert response.status_code == 201
+        record = await _get_idempotency_record(key)
+        assert record.status == IdempotencyStatus.COMPLETED.value
+        assert record.created_at > stale_created_at
 
     async def test_update_matching_in_progress_reservation_returns_conflict_with_retry_after(
         self,

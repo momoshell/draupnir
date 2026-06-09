@@ -5,6 +5,9 @@ from decimal import ROUND_HALF_UP, Decimal
 GBP_MONEY_QUANTUM = Decimal("0.01")
 CATALOG_QUANTUM = Decimal("0.000001")
 MONEY_QUANTUM = GBP_MONEY_QUANTUM
+# Number of decimal places money is expressed in (derived from the quantum so the
+# two never drift). Used to keep formula-output rounding from re-rounding money.
+MONEY_SCALE = -int(GBP_MONEY_QUANTUM.as_tuple().exponent)
 _CATALOG_SCALE_EXPONENT = -6
 _ZERO = Decimal("0")
 

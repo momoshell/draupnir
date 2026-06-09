@@ -37,6 +37,11 @@ from tests.jobs_test_helpers import (
 )
 
 
+async def _no_cancel_before_compute(*_args: Any, **_kwargs: Any) -> bool:
+    """Stub the pre-compute cancellation checkpoint as 'not cancelled' for unit tests."""
+    return False
+
+
 def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
     """Runner registry should explicitly describe the persisted worker job types."""
     expected_recoverable_job_types = (
@@ -249,6 +254,9 @@ async def test_process_ingest_job_wrapper_late_binds_registered_callables(
 
     monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
     monkeypatch.setattr(
+        worker_module, "_cancel_registered_job_if_requested", _no_cancel_before_compute
+    )
+    monkeypatch.setattr(
         worker_module,
         "_begin_or_resume_registered_job",
         _fake_begin_or_resume_registered_job,
@@ -308,6 +316,9 @@ async def test_process_export_job_wrapper_late_binds_registered_callables(
 
     monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
     monkeypatch.setattr(
+        worker_module, "_cancel_registered_job_if_requested", _no_cancel_before_compute
+    )
+    monkeypatch.setattr(
         worker_module,
         "_begin_or_resume_registered_job",
         _fake_begin_or_resume_registered_job,
@@ -362,6 +373,9 @@ async def test_process_changeset_apply_job_wrapper_late_binds_registered_callabl
 
     monkeypatch.setattr(worker_module, "_ensure_worker_database_configured", lambda: None)
     monkeypatch.setattr(
+        worker_module, "_cancel_registered_job_if_requested", _no_cancel_before_compute
+    )
+    monkeypatch.setattr(
         worker_module,
         "_begin_or_resume_registered_job",
         _fake_begin_or_resume_registered_job,
@@ -402,6 +416,18 @@ def test_worker_task_names_preserve_public_compatibility() -> None:
     assert ingest_handler.run_task_name == worker_module.run_ingest_job.__name__
     assert export_handler.run_task_name == worker_module.run_export_job.__name__
     assert changeset_apply_handler.run_task_name == worker_module.run_changeset_apply_job.__name__
+
+
+def test_enqueue_backoff_seconds_is_capped_exponential() -> None:
+    """Backoff is zero for the first attempt and grows, capped, after that."""
+    assert worker_module._enqueue_backoff_seconds(0) == 0.0
+    assert worker_module._enqueue_backoff_seconds(1) == 0.0
+    assert worker_module._enqueue_backoff_seconds(2) == worker_module._ENQUEUE_BACKOFF_BASE_SECONDS
+    assert worker_module._enqueue_backoff_seconds(3) == (
+        worker_module._ENQUEUE_BACKOFF_BASE_SECONDS * 2
+    )
+    # Large attempt counts saturate at the cap rather than growing without bound.
+    assert worker_module._enqueue_backoff_seconds(50) == worker_module._ENQUEUE_BACKOFF_MAX_SECONDS
 
 
 @pytest.mark.usefixtures(fake_ingestion_runner.__name__)
@@ -831,6 +857,71 @@ class TestJobsWorkerLifecycle:
 
         artifacts = await _get_generated_artifacts_for_job(job.id)
         assert artifacts == []
+
+    async def test_begin_or_resume_fails_job_that_exhausted_max_attempts(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """A pending job at its attempt ceiling is failed terminally, not re-leased."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await _update_job(job.id, status="pending", attempts=3, max_attempts=3)
+
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert lease is None
+        updated = await _get_job(job.id)
+        assert updated.status == "failed"
+        assert updated.error_code == ErrorCode.MAX_ATTEMPTS_EXCEEDED.value
+        assert updated.attempts == 3
+        assert updated.attempt_token is None
+        assert updated.finished_at is not None
+
+    async def test_begin_or_resume_fails_stale_running_job_at_attempt_ceiling(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """A stale ``running`` job with no attempts left fails instead of reclaiming."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        # Mark the job running with an expired lease so it reads as stale/orphaned.
+        await _update_job(
+            job.id,
+            status="running",
+            attempts=3,
+            max_attempts=3,
+            enqueue_lease_expires_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            running = await session.get(Job, job.id)
+            assert running is not None
+            running.started_at = datetime.now(UTC) - timedelta(hours=1)
+            running.attempt_lease_expires_at = datetime.now(UTC) - timedelta(hours=1)
+            await session.commit()
+
+        lease = await worker_module._begin_or_resume_ingest_job(job.id)
+
+        assert lease is None
+        updated = await _get_job(job.id)
+        assert updated.status == "failed"
+        assert updated.error_code == ErrorCode.MAX_ATTEMPTS_EXCEEDED.value
+        assert updated.attempts == 3
 
     async def test_mark_job_failed_delete_race_delete_wins_without_failed_overwrite(
         self,

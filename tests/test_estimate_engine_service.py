@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from datetime import date
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -232,6 +233,8 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
         engine_input.estimate_job_id,
         "quantity:labour",
     )
+    # quantity_input and assumption snapshots do not persist the source checksum: the
+    # source-fields-by-type DB constraint requires it to be NULL for those entry types.
     assert result.snapshot_entries[0].source_checksum_sha256 is None
     assert result.snapshot_entries[-1].source_checksum_sha256 is None
     assert result.snapshot_entries[-1].currency is None
@@ -457,6 +460,40 @@ def test_compose_estimate_rejects_missing_lineage_and_untrusted_totals() -> None
         compose_estimate(broken_input)
 
     assert exc_info.value.reason == "missing_lineage"
+
+
+def test_compose_estimate_rejects_tax_rate_above_one() -> None:
+    """A tax_rate above 1 is a fat-fingered percentage and must be rejected."""
+    broken_input = dataclasses.replace(_valid_engine_input(), tax_rate=Decimal("20"))
+
+    with pytest.raises(EstimateEngineError) as exc_info:
+        compose_estimate(broken_input)
+
+    assert exc_info.value.reason == "tax_rate_out_of_range"
+
+
+def test_compose_estimate_rejects_money_formula_rounding_finer_than_money_scale() -> None:
+    """A money formula that rounds to >2dp would be double-rounded by the money step."""
+    engine_input = _valid_engine_input()
+    sub_penny_definition = dataclasses.replace(
+        _formula_definition(),
+        rounding=RoundingSpec(scale=3, mode="ROUND_HALF_UP"),
+    )
+    broken_input = dataclasses.replace(
+        engine_input,
+        formula_entries=(
+            dataclasses.replace(
+                engine_input.formula_entries[0],
+                definition=sub_penny_definition,
+                source_checksum_sha256=sub_penny_definition.checksum,
+            ),
+        ),
+    )
+
+    with pytest.raises(EstimateEngineError) as exc_info:
+        compose_estimate(broken_input)
+
+    assert exc_info.value.reason == "unsupported_formula_rounding"
 
 
 def test_compose_estimate_rejects_invalid_checksum() -> None:

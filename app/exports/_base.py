@@ -138,6 +138,19 @@ def normalize_json_value_tree(
     raise unsupported_value(value)
 
 
+def normalize_options(
+    options: Mapping[str, object] | None,
+    *,
+    normalize_value: Callable[[object], JSONValue],
+    normalize_mapping_key: JSONMappingKeyNormalizer,
+) -> dict[str, JSONValue]:
+    """Normalize an export options mapping with module-specific scalar/key rules."""
+
+    if options is None:
+        return {}
+    return {normalize_mapping_key(key): normalize_value(value) for key, value in options.items()}
+
+
 def normalize_datetime(value: datetime) -> str:
     """Normalize datetimes to UTC ISO-8601 with Z suffix."""
 

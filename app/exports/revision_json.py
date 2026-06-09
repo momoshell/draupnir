@@ -17,6 +17,7 @@ from app.exports._base import (
     canonical_json_bytes,
     normalize_datetime,
     normalize_json_value_tree,
+    normalize_options,
 )
 from app.models.drawing_revision import DrawingRevision
 from app.models.revision_materialization import (
@@ -212,12 +213,11 @@ def _manifest_counts(manifest: RevisionEntityManifest) -> dict[str, int]:
 
 
 def _normalize_options(options: Mapping[str, object] | None) -> dict[str, JSONValue]:
-    if options is None:
-        return {}
-
-    return {
-        _normalize_mapping_key(key): _normalize_json_value(value) for key, value in options.items()
-    }
+    return normalize_options(
+        options,
+        normalize_value=_normalize_json_value,
+        normalize_mapping_key=_normalize_mapping_key,
+    )
 
 
 def _canonical_json_bytes(payload: Mapping[str, object]) -> bytes:

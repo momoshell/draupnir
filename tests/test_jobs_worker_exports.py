@@ -897,6 +897,53 @@ async def test_process_export_job_honors_cancel_before_finalization(
     assert (await _get_job_events(export_job_id))[-1].data_json == {"status": "cancelled"}
 
 
+async def test_process_export_job_honors_cancel_requested_before_compute(
+    async_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel requested after the attempt is claimed short-circuits before render."""
+    lineage = await _create_export_test_lineage(async_client)
+    export_job_id = await _create_export_job(
+        lineage=lineage,
+        export_kind="revision_json",
+        export_format="json",
+        media_type="application/json",
+        options_json={"include_manifest": True},
+    )
+
+    original_begin = worker_module._begin_or_resume_registered_job
+
+    async def _begin_then_request_cancel(
+        job_id: uuid.UUID,
+        *,
+        process_name: str,
+    ) -> Any:
+        lease = await original_begin(job_id, process_name=process_name)
+        if lease is not None:
+            await _update_job(job_id, cancel_requested=True)
+        return lease
+
+    async def _fail_if_compute_starts(
+        job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> Any:
+        raise AssertionError("export compute must not start once cancel is requested")
+
+    monkeypatch.setattr(
+        worker_module, "_begin_or_resume_registered_job", _begin_then_request_cancel
+    )
+    monkeypatch.setattr(worker_module, "_build_export_execution_input", _fail_if_compute_starts)
+
+    await worker_module.process_export_job(export_job_id)
+
+    job = await _get_job(export_job_id)
+    assert job.status == "cancelled"
+    assert job.error_code == ErrorCode.JOB_CANCELLED.value
+    assert await _get_generated_artifacts_for_job(export_job_id) == []
+    assert (await _get_job_events(export_job_id))[-1].data_json == {"status": "cancelled"}
+
+
 async def test_process_export_job_revision_drift_fails_without_artifact(
     async_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

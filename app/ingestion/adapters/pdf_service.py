@@ -26,6 +26,7 @@ from app.ingestion.contracts import (
     AdapterUnavailableError,
     AvailabilityReason,
     IngestionAdapter,
+    InputFamily,
     ProbeKind,
     ProbeObservation,
     ProbeStatus,
@@ -35,6 +36,16 @@ from app.ingestion.registry import evaluate_availability, get_descriptor_by_key
 _DESCRIPTOR_KEY = "pdf_intake_service"
 _PROBE_NAME = "pdf-intake-service"
 _INGEST_PATH = "/v1/ingest"
+
+# Wire vocabulary the remote service dispatches on. These string values are the
+# boundary contract and MUST stay in sync with ``SUPPORTED_MODES`` in
+# ``services/pdf-intake/app/main.py``; the core ``InputFamily`` names (``pdf_vector``
+# /``pdf_raster``) are deliberately mapped to the shorter wire modes here rather than
+# leaked over the boundary. See ADR 0010.
+WIRE_MODE_BY_INPUT_FAMILY: dict[InputFamily, str] = {
+    InputFamily.PDF_VECTOR: "vector",
+    InputFamily.PDF_RASTER: "raster",
+}
 
 
 class PdfIntakeServiceAdapter(IngestionAdapter):
@@ -93,6 +104,13 @@ class PdfIntakeServiceAdapter(IngestionAdapter):
                 detail="PDF intake service URL is not configured (PDF_INTAKE_SERVICE_URL).",
             )
 
+        wire_mode = WIRE_MODE_BY_INPUT_FAMILY.get(source.input_family)
+        if wire_mode is None:
+            # The runner must only route PDF families here; anything else is a bug.
+            raise RuntimeError(
+                f"PDF intake service cannot handle input family '{source.input_family.value}'."
+            )
+
         content = await asyncio.to_thread(source.file_path.read_bytes)
         files = {
             "file": (
@@ -101,7 +119,7 @@ class PdfIntakeServiceAdapter(IngestionAdapter):
                 source.media_type or "application/pdf",
             )
         }
-        data = {"mode": source.input_family.value}
+        data = {"mode": wire_mode}
 
         # Honor the runner-provided request budget when present.
         timeout_seconds = settings.pdf_intake_service_timeout_seconds
@@ -128,7 +146,10 @@ class PdfIntakeServiceAdapter(IngestionAdapter):
                 AvailabilityReason.DISABLED_BY_CONFIG,
                 detail="PDF intake service does not yet implement remote extraction.",
             )
-        if response.status_code >= httpx.codes.BAD_REQUEST:
+        if not response.is_success:
+            # Anything outside 2xx (including unexpected 3xx redirects, which httpx
+            # does not follow by default and usually signal a misconfigured URL) is a
+            # failure, not a benign "not wired yet" outcome.
             raise RuntimeError(f"PDF intake service returned HTTP {response.status_code}.")
 
         # Real result handling is deferred; a 2xx today still means the boundary

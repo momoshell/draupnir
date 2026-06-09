@@ -1209,6 +1209,7 @@ codes:
   apply/request/finalization time
 - `NORMALIZED_ENTITIES_NOT_MATERIALIZED` - revision exists but revision-scoped normalized entity rows have not been materialized yet
 - `JOB_CANCELLED` - cancelled by user before completion
+- `MAX_ATTEMPTS_EXCEEDED` - job exhausted its retry budget without reaching a terminal state
 - `INTERNAL_ERROR` - unhandled exception or internal publish/worker failure
 
 New codes require a docs change in this file.

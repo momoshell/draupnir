@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     max_upload_mb: int = 200
     libredwg_max_output_mb: int = 32
     idempotency_key_hash_secret: str | None = None
+    # How long an in-progress idempotency reservation may sit before an identical retry
+    # is allowed to take it over (the original request crashed before completing).
+    idempotency_in_progress_ttl_seconds: int = 900
     storage_local_root: str = Field(
         default="var/uploads",
         validation_alias=AliasChoices("storage_local_root", "upload_storage_root"),
