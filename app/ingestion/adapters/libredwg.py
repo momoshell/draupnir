@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import resource
 import shutil
 import tempfile
@@ -107,16 +108,61 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
         "MLINESTYLE",
         "OBJECT_PTR",
         "PLOTSETTINGS",
+        "RASTERVARIABLES",
+        "SCALE",
         "STYLE",
+        "SUN",
         "TABLESTYLE",
         "UCS",
         "VIEW",
+        "VIEWPORT",
         "VISUALSTYLE",
         "VPORT",
         "XDICTIONARY",
         "XRECORD",
     }
 )
+
+
+def _is_non_drawable_object_type(record_type: str) -> bool:
+    """Return whether a record type is a non-drawable OBJECTS-section record.
+
+    These have no geometry (control/dictionary tables, viewports, scales, …) and
+    must not become canonical ``unknown`` entities; emitting them inflates the
+    entity count and drags the mixed-outcome confidence score (#386). The
+    ``*_CONTROL`` table containers (LAYER_CONTROL, STYLE_CONTROL, …) are matched
+    by suffix so the set need not enumerate every one.
+    """
+    return record_type in _NON_DRAWABLE_OBJECT_TYPES or record_type.endswith("_CONTROL")
+
+
+# dwgread (LibreDWG) prints source parse failures to stderr as ``ERROR: <detail>``
+# lines (e.g. ``ERROR: Invalid MTEXT.class_version 256`` on AutoCAD 2018+ MTEXT).
+# These are otherwise only visible in the raw stderr excerpt; we group them into a
+# counted warning. Digit runs are collapsed so the same failure across records folds
+# into one signature.
+_PARSE_ERROR_LINE_RE = re.compile(r"^\s*ERROR\b[:\s]*(?P<body>.*\S)\s*$", re.IGNORECASE)
+_PARSE_ERROR_NUMBER_RE = re.compile(r"\d+")
+_MAX_PARSE_ERROR_SIGNATURES = 10
+
+
+def _count_source_parse_errors(stderr_text: str) -> dict[str, int]:
+    """Group dwgread stderr ``ERROR:`` lines into per-signature counts.
+
+    Operates on the already path-sanitized stderr capture, so signatures never
+    carry source/temp paths.
+    """
+    counts: dict[str, int] = {}
+    for line in stderr_text.splitlines():
+        match = _PARSE_ERROR_LINE_RE.match(line)
+        if match is None:
+            continue
+        signature = _PARSE_ERROR_NUMBER_RE.sub("#", match.group("body")).strip()
+        if not signature:
+            continue
+        counts[signature] = counts.get(signature, 0) + 1
+    return counts
+
 
 _JSONDict = dict[str, JSONValue]
 
@@ -749,6 +795,7 @@ def _build_canonical_output(
     guarded_insert_handles: set[str] = set()
     guard_reasons: set[str] = set()
     drawable_candidate_count = 0
+    skipped_non_drawable_count = 0
     units = _resolve_units(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
     block_header_names = _build_block_header_name_map(records)
@@ -783,7 +830,11 @@ def _build_canonical_output(
         record_type = _extract_record_type(record)
         if record_type is None:
             continue
-        if record_type in _NON_DRAWABLE_OBJECT_TYPES:
+        if _is_non_drawable_object_type(record_type):
+            # Non-drawable OBJECTS-section records carry no geometry; skip them so they
+            # neither become canonical unknown entities nor count toward the
+            # mixed-outcome confidence penalty (#386).
+            skipped_non_drawable_count += 1
             continue
         # Block-definition geometry is emitted only through INSERT materialization, never as a
         # free top-level entity.
@@ -947,6 +998,7 @@ def _build_canonical_output(
             "materialized_inserts": materialized_insert_count,
             "materialized_block_children": materialized_child_count,
             "block_materialization_guarded": block_materialization_guarded_count,
+            "skipped_non_drawable": skipped_non_drawable_count,
         },
         "units": _units_summary(units),
     }
@@ -968,6 +1020,23 @@ def _build_canonical_output(
     warnings: list[AdapterWarning] = []
     if not units.confirmed:
         warnings.append(_units_unconfirmed_warning())
+    parse_error_counts = _count_source_parse_errors(run_result.stderr.text)
+    if parse_error_counts:
+        ranked = sorted(parse_error_counts.items(), key=lambda item: (-item[1], item[0]))
+        warnings.append(
+            AdapterWarning(
+                code="libredwg.source_parse_errors",
+                message=(
+                    "dwgread reported source parse errors; affected records may be "
+                    "missing or degraded."
+                ),
+                details={
+                    "count": sum(parse_error_counts.values()),
+                    "types": dict(ranked[:_MAX_PARSE_ERROR_SIGNATURES]),
+                    "stderr_truncated": run_result.stderr.truncated,
+                },
+            )
+        )
     if unsupported_drawable_count > 0:
         warnings.append(
             AdapterWarning(
@@ -1195,6 +1264,7 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "materialized_inserts",
         "materialized_block_children",
         "block_materialization_guarded",
+        "skipped_non_drawable",
     ):
         value = _mapping_get(counts, key)
         if isinstance(value, int) and not isinstance(value, bool):
@@ -1964,7 +2034,7 @@ def _build_block_definition_map(
         if header_key not in children:
             return
         child_type = _extract_record_type(child)
-        if child_type is None or child_type in _NON_DRAWABLE_OBJECT_TYPES:
+        if child_type is None or _is_non_drawable_object_type(child_type):
             return
         if id(child) in seen_child_ids[header_key]:
             return
@@ -2010,7 +2080,7 @@ def _build_block_definition_map(
         if record_type == "ENDBLK":
             current_header_key = None
             continue
-        if record_type is None or record_type in _NON_DRAWABLE_OBJECT_TYPES:
+        if record_type is None or _is_non_drawable_object_type(record_type):
             continue
         if current_header_key is not None:
             _attach(current_header_key, record)
@@ -2736,7 +2806,7 @@ def _extract_record_type_from_current_mapping(record: Mapping[str, Any]) -> str 
             return None
         return _normalize_record_type_token(fallback_type)
 
-    if legacy_type_upper in _NON_DRAWABLE_OBJECT_TYPES:
+    if _is_non_drawable_object_type(legacy_type_upper):
         fallback_type = _first_string_from_mapping_by_priority(
             record,
             "object_type",
@@ -2747,9 +2817,8 @@ def _extract_record_type_from_current_mapping(record: Mapping[str, Any]) -> str 
         )
         if fallback_type is not None:
             fallback_type_upper = _normalize_record_type_token(fallback_type)
-            if (
-                fallback_type_upper is not None
-                and fallback_type_upper not in _NON_DRAWABLE_OBJECT_TYPES
+            if fallback_type_upper is not None and not _is_non_drawable_object_type(
+                fallback_type_upper
             ):
                 return fallback_type_upper
 
@@ -2775,7 +2844,7 @@ def _extract_record_type_from_nested_wrappers(
         nested_record = cast(Mapping[str, Any], nested_value)
         nested_record_type = _extract_record_type_from_current_mapping(nested_record)
         if nested_record_type is not None:
-            if nested_record_type in _NON_DRAWABLE_OBJECT_TYPES:
+            if _is_non_drawable_object_type(nested_record_type):
                 continue
             return nested_record_type
 

@@ -125,6 +125,7 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("materialized_inserts", 0)
     merged_counts.setdefault("materialized_block_children", 0)
     merged_counts.setdefault("block_materialization_guarded", 0)
+    merged_counts.setdefault("skipped_non_drawable", 0)
     return merged_counts
 
 
@@ -3095,6 +3096,8 @@ async def test_libredwg_adapter_sets_non_placeholder_empty_reason_without_candid
             "supported_text": 0,
             "unsupported_drawables": 0,
             "malformed_drawables": 0,
+            # The DICTIONARY container and LAYER record are non-drawable and skipped.
+            "skipped_non_drawable": 2,
         }
     )
     assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
@@ -3666,6 +3669,8 @@ async def test_libredwg_adapter_captures_supported_insert_as_block_reference(
             "unsupported_drawables": 0,
             "malformed_drawables": 0,
             "block_references": 1,
+            # The BLOCK_HEADER table record is non-drawable and skipped.
+            "skipped_non_drawable": 1,
         }
     )
 
@@ -4501,3 +4506,92 @@ async def test_libredwg_adapter_does_not_double_emit_block_definition_geometry(
     # emitted as a standalone top-level entity.
     assert entity_ids == ["libredwg-line-ml", "libredwg-insert-in", "libredwg-line-in-bl"]
     assert "libredwg-line-bl" not in entity_ids
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_skips_non_drawable_objects_section_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-drawable OBJECTS records must not leak in as unknown entities (#386)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {"type": "VIEWPORT", "handle": "V1"},
+                {"type": "SCALE", "handle": "S1"},
+                {"type": "SUN", "handle": "SU"},
+                {"type": "RASTERVARIABLES", "handle": "R1"},
+                {"type": "LAYER_CONTROL", "handle": "LC"},
+                {"type": "STYLE_CONTROL", "handle": "SC"},
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    # Only the LINE survives; none of the non-drawable records become unknown entities.
+    assert [entity["entity_type"] for entity in entities] == ["line"]
+    counts = cast(Mapping[str, int], result.canonical["metadata"]["entity_counts"])
+    assert counts["skipped_non_drawable"] == 6
+    assert counts["drawable_candidates"] == 1
+    assert counts["unsupported_drawables"] == 0
+    # No unsupported-drawable penalty/warning is raised for the skipped records.
+    assert "libredwg.unsupported_drawable_record" not in [w.code for w in result.warnings]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_surfaces_dwgread_parse_errors_as_counted_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dwgread stderr parse errors should surface as a counted warning (#386)."""
+    stderr_text = (
+        "ERROR: Invalid MTEXT.class_version 256\n"
+        "ERROR: Invalid MTEXT.class_version 256\n"
+        "ERROR: Invalid MTEXT.class_version 257\n"
+        "ERROR: Unknown class FOO\n"
+        "Some unrelated informational line\n"
+    )
+    process = _FakeProcess(complete_with=0)
+    _install_fake_subprocess(
+        monkeypatch,
+        process=process,
+        output_text=json.dumps(
+            {
+                "HEADER": {"INSUNITS": 4},
+                "OBJECTS": [
+                    {
+                        "type": "LINE",
+                        "handle": "1A",
+                        "layer": "Walls",
+                        "start": {"x": 0, "y": 0, "z": 0},
+                        "end": {"x": 5, "y": 0, "z": 0},
+                    }
+                ],
+            }
+        ),
+        stderr_text=stderr_text,
+    )
+    monkeypatch.setattr(adapter_module, "_binary_path", lambda: "/opt/homebrew/bin/dwgread")
+
+    result = await adapter_module.create_adapter().ingest(
+        _build_source(),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=0.5)),
+    )
+
+    parse_warnings = [w for w in result.warnings if w.code == "libredwg.source_parse_errors"]
+    assert len(parse_warnings) == 1
+    details = cast(Mapping[str, Any], parse_warnings[0].details)
+    # Digit runs collapse so 256/257 fold into one signature; the info line is ignored.
+    assert details["count"] == 4
+    assert details["types"] == {
+        "Invalid MTEXT.class_version #": 3,
+        "Unknown class FOO": 1,
+    }
+    assert details["stderr_truncated"] is False
