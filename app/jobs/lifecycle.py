@@ -31,6 +31,17 @@ class _StaleJobAttemptError(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class _RevisionConflictError(Exception):
+    """Raised when a persisted ingest/reprocess revision base is invalid or stale."""
+
+    message: str
+    details: dict[str, Any]
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True, slots=True)
 class _JobAttemptLease:
     """Persisted ownership token for a claimed job attempt."""
 
