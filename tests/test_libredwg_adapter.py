@@ -136,12 +136,6 @@ _HATCH_SQUARE_POINTS = (
     {"x": 0.0, "y": 3.0, "z": 0.0},
 )
 
-_HATCH_TRIANGLE_POINTS = (
-    {"x": 0.0, "y": 0.0, "z": 0.0},
-    {"x": 2.0, "y": 0.0, "z": 0.0},
-    {"x": 0.0, "y": 2.0, "z": 0.0},
-)
-
 
 def _hatch_line_edges(count: int) -> list[dict[str, object]]:
     return [
@@ -1915,13 +1909,15 @@ async def test_libredwg_adapter_maps_supported_hatch_entities_into_canonical_pay
         "min": {"x": 0.0, "y": 0.0, "z": 0.0},
         "max": {"x": 4.0, "y": 3.0, "z": 0.0},
     }
+    _hatch_square_loop = (
+        {"x": 4.0, "y": 0.0, "z": 0.0},
+        {"x": 4.0, "y": 3.0, "z": 0.0},
+        {"x": 0.0, "y": 3.0, "z": 0.0},
+        {"x": 0.0, "y": 0.0, "z": 0.0},
+    )
     assert entity["geometry"] == {
-        "vertices": (
-            {"x": 4.0, "y": 0.0, "z": 0.0},
-            {"x": 4.0, "y": 3.0, "z": 0.0},
-            {"x": 0.0, "y": 3.0, "z": 0.0},
-            {"x": 0.0, "y": 0.0, "z": 0.0},
-        ),
+        "vertices": _hatch_square_loop,
+        "boundary_loops": (_hatch_square_loop,),
         "closed": True,
         "bbox": {
             "min": {"x": 0.0, "y": 0.0, "z": 0.0},
@@ -1931,6 +1927,8 @@ async def test_libredwg_adapter_maps_supported_hatch_entities_into_canonical_pay
         "geometry_summary": {
             "kind": "hatch",
             "vertex_count": 4,
+            "loop_count": 1,
+            "fill_type": "solid",
             "closed": True,
             "area": 12.0,
             "perimeter": 14.0,
@@ -1939,6 +1937,7 @@ async def test_libredwg_adapter_maps_supported_hatch_entities_into_canonical_pay
     assert entity["properties"] == {
         "source_type": "HATCH",
         "source_handle": "20",
+        "fill_type": "solid",
         "quantity_hints": {"length": 14.0, "area": 12.0, "count": 1.0},
         "adapter_native": {
             "libredwg": {
@@ -2107,11 +2106,14 @@ async def test_libredwg_adapter_maps_point_and_vertex_hatch_variants_into_canoni
     assert entity["geometry"]["geometry_summary"] == {
         "kind": "hatch",
         "vertex_count": 4,
+        "loop_count": 1,
+        "fill_type": "solid",
         "closed": True,
         "area": 12.0,
         "perimeter": 14.0,
     }
     assert entity["geometry"]["vertices"] == _HATCH_SQUARE_POINTS
+    assert entity["geometry"]["boundary_loops"] == (_HATCH_SQUARE_POINTS,)
     assert entity["vertices"] == _HATCH_SQUARE_POINTS
     assert entity["closed"] is True
     assert entity["area"] == 12.0
@@ -2232,23 +2234,6 @@ async def test_libredwg_adapter_dedupes_consecutive_hatch_boundary_vertices(
                 ]
             },
             "41",
-        ),
-        (
-            {
-                "OBJECTS": [
-                    {
-                        "type": "HATCH",
-                        "handle": "42",
-                        "layout": "Sheet-H3",
-                        "layer": "Ambiguous",
-                        "boundary_loops": [
-                            {"points": _HATCH_SQUARE_POINTS},
-                            {"points": _HATCH_TRIANGLE_POINTS},
-                        ],
-                    }
-                ]
-            },
-            "42",
         ),
         (
             {
@@ -2464,9 +2449,10 @@ async def test_libredwg_adapter_degrades_oversized_hatch_geometry_to_unknown(
 
 
 @pytest.mark.asyncio
-async def test_libredwg_adapter_degrades_unsupported_hatch_geometry_to_unknown(
+async def test_libredwg_adapter_maps_multi_loop_hatch_with_holes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A hatch with an outer boundary and an inner hole maps; area is outer minus hole."""
     process = _FakeProcess(complete_with=0)
     _install_fake_subprocess(
         monkeypatch,
@@ -2478,16 +2464,20 @@ async def test_libredwg_adapter_degrades_unsupported_hatch_geometry_to_unknown(
                         "type": "HATCH",
                         "handle": "21",
                         "layout": "Sheet-H1",
-                        "layer": "Unsupported",
+                        "layer": "Filled",
                         "block": "Hatch-Block",
                         "boundary_loops": [
-                            {"points": [{"x": 0, "y": 0}, {"x": 2, "y": 0}, {"x": 0, "y": 2}]},
                             {
+                                "flags": 1,
+                                "points": [{"x": 0, "y": 0}, {"x": 2, "y": 0}, {"x": 0, "y": 2}],
+                            },
+                            {
+                                "flags": 16,
                                 "points": [
                                     {"x": 0.5, "y": 0.5},
                                     {"x": 1, "y": 0.5},
                                     {"x": 0.5, "y": 1},
-                                ]
+                                ],
                             },
                         ],
                     },
@@ -2505,27 +2495,53 @@ async def test_libredwg_adapter_degrades_unsupported_hatch_geometry_to_unknown(
     entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
     assert len(entities) == 1
     entity = entities[0]
+    assert entity["entity_id"] == "libredwg-hatch-21"
+    assert entity["entity_type"] == "hatch"
+    assert entity["geometry"]["geometry_summary"]["loop_count"] == 2
+    assert entity["geometry"]["geometry_summary"]["fill_type"] == "solid"
+    assert len(entity["geometry"]["boundary_loops"]) == 2
+    # Outer triangle area 2.0 minus inner-hole triangle area 0.125.
+    assert entity["area"] == pytest.approx(1.875)
+    assert entity["properties"]["quantity_hints"]["area"] == pytest.approx(1.875)
+    assert [warning.code for warning in result.warnings] == ["libredwg.units_unconfirmed"]
 
-    assert entity["entity_id"] == "libredwg-unknown-21"
-    assert entity["entity_type"] == "unknown"
-    assert entity["geometry"]["status"] == "absent"
-    assert entity["geometry"]["reason"] == "unsupported_hatch_geometry"
-    assert entity["geometry"]["geometry_summary"] == {
-        "kind": "unknown",
-        "source_type": "HATCH",
-        "reason": "unsupported_hatch_geometry",
-    }
-    assert entity["geometry_reason"] == "unsupported_hatch_geometry"
-    assert entity["unknown_reason"] == "unsupported_hatch_geometry"
-    assert entity["confidence"] == {
-        "score": adapter_module._UNKNOWN_ENTITY_CONFIDENCE_SCORE,
-        "review_required": True,
-        "basis": "unsupported_hatch_geometry",
-    }
-    assert [warning.code for warning in result.warnings] == [
-        "libredwg.units_unconfirmed",
-        "libredwg.unsupported_hatch_geometry",
-    ]
+    diagnostic_details = cast(Mapping[str, object], result.diagnostics[0].details)
+    counts = cast(Mapping[str, int], diagnostic_details["entity_counts"])
+    assert counts["supported_geometry"] == 1
+    assert counts["unsupported_hatches"] == 0
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_maps_non_solid_pattern_hatch_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pattern (non-solid) fills map via their boundary geometry, tagged fill_type (#385)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "2E",
+                    "layer": "Patterned",
+                    "solid": False,
+                    "boundary_loops": [{"points": list(_HATCH_SQUARE_POINTS)}],
+                }
+            ],
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "hatch"
+    assert entity["properties"]["fill_type"] == "pattern"
+    assert entity["geometry"]["geometry_summary"]["fill_type"] == "pattern"
+    assert "libredwg.unsupported_hatch_geometry" not in [w.code for w in result.warnings]
+    counts = cast(Mapping[str, int], result.canonical["metadata"]["entity_counts"])
+    assert counts["supported_geometry"] == 1
+    assert counts["unsupported_hatches"] == 0
 
 
 @pytest.mark.asyncio
@@ -2700,22 +2716,6 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
             "malformed_hatch_geometry",
             "HATCH",
             ("libredwg.units_unconfirmed", "libredwg.malformed_hatch_geometry"),
-        ),
-        (
-            {
-                "OBJECTS": [
-                    {
-                        "type": "HATCH",
-                        "handle": "20E",
-                        "layer": "Patterned",
-                        "solid": False,
-                        "boundary_loops": [{"points": list(_HATCH_SQUARE_POINTS)}],
-                    }
-                ]
-            },
-            "unsupported_hatch_geometry",
-            "HATCH",
-            ("libredwg.units_unconfirmed", "libredwg.unsupported_hatch_geometry"),
         ),
         (
             {
