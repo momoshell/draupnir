@@ -20,6 +20,13 @@ from app.estimating.engine.errors import EstimateEngineError
 from app.estimating.engine.service import compose_estimate as real_compose_estimate
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.jobs.estimate_mapping import (
+    _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
+    _ESTIMATE_WORKER_MAPPING_VERSION,
+    _build_estimate_job_input_error,
+    _build_estimate_worker_mapping_v1,
+    _EstimateJobInputError,
+)
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -512,7 +519,7 @@ def _estimate_catalog_ref_stub(
     selection_key: str,
     line_key: str,
     ref_order: int,
-    worker_mapping_version: str | None = worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+    worker_mapping_version: str | None = _ESTIMATE_WORKER_MAPPING_VERSION,
     description: str | None = None,
     quantity_entry_key: str | None = None,
     catalog_entry_key: str | None = None,
@@ -560,14 +567,14 @@ def _estimate_catalog_ref_stub(
 
 
 def _assert_estimate_mapping_invalid(
-    exc_info: pytest.ExceptionInfo[worker_module._EstimateJobInputError],
+    exc_info: pytest.ExceptionInfo[_EstimateJobInputError],
     *,
     reason: str,
 ) -> None:
     """Assert deterministic sanitized estimate mapping failures."""
     error = exc_info.value
     assert error.error_code == ErrorCode.INPUT_INVALID
-    assert error.message == worker_module._ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
+    assert error.message == _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
     assert error.details is not None
     assert error.details["reason"] == reason
 
@@ -940,7 +947,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000201"),
                     "catalog_checksum_sha256": "1" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -954,7 +961,7 @@ class TestJobsWorkerEstimate:
                     "formula_definition_id": uuid.UUID("00000000-0000-0000-0000-000000000202"),
                     "catalog_checksum_sha256": "2" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-formula",
                         "line_type": "formula",
                         "description": "Waste allowance",
@@ -968,7 +975,7 @@ class TestJobsWorkerEstimate:
                     "material_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000203"),
                     "catalog_checksum_sha256": "3" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-material",
                         "line_type": "material",
                         "description": "Paint gallon",
@@ -1117,7 +1124,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000231"),
                     "catalog_checksum_sha256": "7" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1207,7 +1214,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000236"),
                     "catalog_checksum_sha256": "c" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1298,7 +1305,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000234"),
                     "catalog_checksum_sha256": "a" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1470,7 +1477,7 @@ class TestJobsWorkerEstimate:
         estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert updated_job.error_message == worker_module._ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
+        assert updated_job.error_message == _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
         assert estimate_versions == []
 
         response = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
@@ -1516,7 +1523,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000221"),
                     "catalog_checksum_sha256": "5" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1557,7 +1564,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000222"),
                     "catalog_checksum_sha256": "6" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1597,7 +1604,7 @@ class TestJobsWorkerEstimate:
         estimate_versions = await _get_estimate_versions_for_job(engine_invalid_job.id)
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert updated_job.error_message == worker_module._ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
+        assert updated_job.error_message == _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
         assert estimate_versions == []
 
         response = await async_client.get(f"/v1/jobs/{engine_invalid_job.id}/events")
@@ -1642,7 +1649,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000241"),
                     "catalog_checksum_sha256": "d" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate-a",
                         "line_type": "rate",
                         "description": "Paint labor A",
@@ -1657,7 +1664,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000242"),
                     "catalog_checksum_sha256": "e" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate-b",
                         "line_type": "rate",
                         "description": "Paint labor B",
@@ -1705,7 +1712,7 @@ class TestJobsWorkerEstimate:
         estimate_versions = await _get_estimate_versions_for_job(estimate_job.id)
         assert updated_job.status == "failed"
         assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert updated_job.error_message == worker_module._ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
+        assert updated_job.error_message == _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE
         assert estimate_versions == []
 
         response = await async_client.get(f"/v1/jobs/{estimate_job.id}/events")
@@ -1750,7 +1757,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000232"),
                     "catalog_checksum_sha256": "8" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1842,7 +1849,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000234"),
                     "catalog_checksum_sha256": "a" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -1876,9 +1883,7 @@ class TestJobsWorkerEstimate:
             engine_input = await original_build_execution_input(job_id, attempt_token=attempt_token)
             await _update_job(job_id, cancel_requested=True)
             if failure_mode == "mapping":
-                raise worker_module._build_estimate_job_input_error(
-                    "missing_worker_mapping_version"
-                )
+                raise _build_estimate_job_input_error("missing_worker_mapping_version")
             return engine_input
 
         def _raise_engine_input_invalid(_: Any) -> Any:
@@ -1948,7 +1953,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000233"),
                     "catalog_checksum_sha256": "9" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -2063,7 +2068,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000235"),
                     "catalog_checksum_sha256": "b" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -2164,7 +2169,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": uuid.UUID("00000000-0000-0000-0000-000000000239"),
                     "catalog_checksum_sha256": "f" * 64,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "line-rate",
                         "line_type": "rate",
                         "description": "Paint labor",
@@ -2261,7 +2266,7 @@ class TestJobsWorkerEstimate:
                     "rate_catalog_entry_id": original_rate_id,
                     "catalog_checksum_sha256": original_checksum,
                     "selection_context_json": {
-                        "worker_mapping_version": worker_module._ESTIMATE_WORKER_MAPPING_VERSION,
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
                         "line_key": "historical-rate-line",
                         "line_type": "rate",
                         "description": "Historical paint labor",
@@ -2433,7 +2438,7 @@ class TestJobsWorkerEstimate:
             ),
         ]
 
-        assembly = worker_module._build_estimate_worker_mapping_v1(catalog_refs)
+        assembly = _build_estimate_worker_mapping_v1(catalog_refs)
 
         assert [line.line_key for line in assembly.lines] == [
             "line-material",
@@ -2529,8 +2534,8 @@ class TestJobsWorkerEstimate:
         """Estimate mapping helper should reject invalid contract inputs before output assembly."""
         _ = self
 
-        with pytest.raises(worker_module._EstimateJobInputError) as exc_info:
-            worker_module._build_estimate_worker_mapping_v1(catalog_refs)
+        with pytest.raises(_EstimateJobInputError) as exc_info:
+            _build_estimate_worker_mapping_v1(catalog_refs)
 
         _assert_estimate_mapping_invalid(exc_info, reason=reason)
 
