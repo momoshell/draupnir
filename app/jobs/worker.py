@@ -220,6 +220,7 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
     "reason",
+    "detail",
     "stage",
     "detected_format",
     "media_type",
@@ -4109,18 +4110,12 @@ async def _handle_ingest_runner_error(
         )
         return
 
-    runner_error_details = (
-        _runner_error_log_fields(exc)
-        if exc.details.get("reason") == "output_cap_exceeded"
-        else None
-    )
-
     await _mark_job_failed(
         job_id,
         error_message=exc.message,
         error_code=exc.error_code,
         attempt_token=attempt_token,
-        error_details=runner_error_details,
+        error_details=_runner_error_log_fields(exc),
     )
     logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
 

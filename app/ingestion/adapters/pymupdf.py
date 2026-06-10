@@ -81,6 +81,9 @@ class PyMuPDFLicenseError(PermissionError):
 class PyMuPDFExtractionLimitError(RuntimeError):
     """Sanitized extraction budget/cap failure."""
 
+    #: Coarse, content-free token surfaced to the runner/job for diagnosis.
+    failure_reason = "extraction_limit"
+
 
 class PyMuPDFNonFiniteValueError(ValueError):
     """Raised when parser output contains a non-finite number."""

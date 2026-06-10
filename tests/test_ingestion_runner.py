@@ -1935,7 +1935,11 @@ async def test_run_ingestion_keeps_pymupdf_cap_failure_without_raster_fallback(
     error = exc_info.value
     assert error.error_code is ErrorCode.ADAPTER_FAILED
     assert error.failure_kind.value == "failed"
-    assert error.details == {"adapter_key": "pymupdf"}
+    assert error.details == {
+        "adapter_key": "pymupdf",
+        "reason": "extraction_limit",
+        "detail": "PyMuPDF extraction exceeded entity limit.",
+    }
     assert imported_modules == ["app.ingestion.adapters.pymupdf"]
 
 
