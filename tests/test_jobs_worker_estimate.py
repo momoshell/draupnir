@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 import app.db.session as session_module
+import app.jobs.estimate_assembly as estimate_assembly_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.estimating.engine.errors import EstimateEngineError
@@ -1045,7 +1046,7 @@ class TestJobsWorkerEstimate:
         monkeypatch.setattr(worker_module, "resolve_material", _resolve_material)
         monkeypatch.setattr(worker_module, "resolve_formula", _resolve_formula)
         monkeypatch.setattr(
-            worker_module,
+            estimate_assembly_module,
             "formula_definition_from_selected_formula",
             lambda _: fake_formula_definition,
         )
