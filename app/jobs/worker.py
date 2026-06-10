@@ -82,6 +82,11 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import runner as job_runner
+from app.jobs.conflict_diagnostics import (
+    _build_changeset_apply_conflict_details,
+    _build_quantity_conflict_summaries,
+    _quantity_gate_details,
+)
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
 from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
@@ -195,11 +200,6 @@ _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE = (
 )
 _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE = "Estimate job input mapping is invalid."
 _ESTIMATE_WORKER_MAPPING_VERSION = "estimate-line-v1"
-_QUANTITY_CONFLICT_SUMMARY_LIMIT = 5
-_QUANTITY_CONFLICT_ENTITY_ID_LIMIT = 10
-_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT = 10
-_QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT = 3
-_QUANTITY_CONFLICT_TEXT_LIMIT = 200
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -3673,22 +3673,6 @@ async def _finalize_ingest_job(
     return True
 
 
-def _quantity_gate_details(
-    *,
-    drawing_revision_id: UUID,
-    review_state: str,
-    validation_status: str,
-    quantity_gate: str,
-) -> dict[str, Any]:
-    """Build stable structured metadata for quantity gate failures."""
-    return {
-        "drawing_revision_id": str(drawing_revision_id),
-        "review_state": review_state,
-        "validation_status": validation_status,
-        "quantity_gate": quantity_gate,
-    }
-
-
 def _manifest_entity_count(manifest: RevisionEntityManifest) -> int | None:
     """Return the expected entity count when recorded on the manifest."""
     raw_count = (
@@ -3773,68 +3757,6 @@ def _quantity_item_type_label(quantity_type: str | None, context: Any) -> str:
         return normalized_quantity_type
 
     return f"{normalized_quantity_type}:{serialized_context}"
-
-
-def _bounded_conflict_text(value: Any) -> str | None:
-    """Return a bounded string payload for persisted conflict metadata."""
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if not normalized:
-        return None
-    return normalized[:_QUANTITY_CONFLICT_TEXT_LIMIT]
-
-
-def _bounded_conflict_json(value: Any, *, depth: int = 0) -> Any:
-    """Bound persisted conflict details to stable JSON-safe payloads."""
-    if value is None or isinstance(value, bool | int | float):
-        return value
-    if isinstance(value, str):
-        return value[:_QUANTITY_CONFLICT_TEXT_LIMIT]
-    if depth >= _QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT:
-        return _bounded_conflict_text(value)
-    if isinstance(value, dict):
-        bounded: dict[str, Any] = {}
-        for key, nested_value in list(value.items())[:_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT]:
-            normalized_key = _bounded_conflict_text(key)
-            if normalized_key is None:
-                continue
-            bounded[normalized_key] = _bounded_conflict_json(nested_value, depth=depth + 1)
-        return bounded
-    if isinstance(value, list | tuple):
-        return [
-            _bounded_conflict_json(item, depth=depth + 1)
-            for item in list(value)[:_QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT]
-        ]
-    return _bounded_conflict_text(value)
-
-
-def _bounded_conflict_entity_ids(entity_ids: Any) -> list[str]:
-    """Copy contributor conflict entity ids into a bounded JSON-safe list."""
-    if not isinstance(entity_ids, tuple | list):
-        return []
-
-    bounded_ids: list[str] = []
-    for entity_id in entity_ids[:_QUANTITY_CONFLICT_ENTITY_ID_LIMIT]:
-        normalized = _bounded_conflict_text(entity_id)
-        if normalized is not None:
-            bounded_ids.append(normalized)
-    return bounded_ids
-
-
-def _build_quantity_conflict_summaries(conflicts: Sequence[Any]) -> list[dict[str, Any]]:
-    """Build bounded persisted summaries for deterministic quantity conflicts."""
-    summaries: list[dict[str, Any]] = []
-    for conflict in conflicts[:_QUANTITY_CONFLICT_SUMMARY_LIMIT]:
-        summaries.append(
-            {
-                "dedup_key": _bounded_conflict_text(getattr(conflict, "dedup_key", None)),
-                "entity_ids": _bounded_conflict_entity_ids(getattr(conflict, "entity_ids", ())),
-                "reason": _bounded_conflict_text(getattr(conflict, "reason", None)),
-                "details": _bounded_conflict_json(getattr(conflict, "details", None)),
-            }
-        )
-    return summaries
 
 
 def _build_quantity_items(
@@ -6051,35 +5973,6 @@ async def _mark_changeset_apply_job_failed_for_input_error(
         error_code=exc.error_code.value,
         **(failure_details or {}),
     )
-
-
-def _build_changeset_apply_conflict_details(
-    result: ChangeSetApplyConflict,
-) -> dict[str, Any]:
-    """Convert a stale apply conflict into the shared job failure detail shape."""
-    return {
-        "change_set_id": str(result.details.change_set_id),
-        "base_revision_id": str(result.details.base_revision_id),
-        "base_revision_sequence": result.details.base_revision_sequence,
-        "current_revision_id": str(result.details.current_revision_id),
-        "current_revision_sequence": result.details.current_revision_sequence,
-        "conflicting_targets": [
-            {
-                "operation_id": str(target.operation_id),
-                "sequence_index": target.sequence_index,
-                "operation_type": target.operation_type,
-                "target_revision_entity_id": (
-                    str(target.target_revision_entity_id)
-                    if target.target_revision_entity_id is not None
-                    else None
-                ),
-                "entity_id": target.entity_id,
-                "expected_source_identity": target.expected_source_identity,
-                "expected_source_hash": target.expected_source_hash,
-            }
-            for target in result.details.conflicting_targets
-        ],
-    }
 
 
 def _build_changeset_apply_error_details(result: ChangeSetApplyError) -> dict[str, Any]:
