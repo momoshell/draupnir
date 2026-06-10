@@ -57,6 +57,7 @@ _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 _MAX_HATCH_BOUNDARY_COMPONENTS = 512
+_MAX_HATCH_LOOPS = 256
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
 _LINE_ENTITY_CONFIDENCE_SCORE = 0.72
 _TEXT_ENTITY_CONFIDENCE_SCORE = 0.72
@@ -247,6 +248,15 @@ class _HatchBuildResult:
 @dataclass(frozen=True, slots=True)
 class _HatchVerticesResult:
     vertices: tuple[tuple[float, float, float], ...] | None
+    reason: str | None = None
+    malformed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HatchLoopsResult:
+    """One or more straight-edged closed boundary loops extracted from a HATCH."""
+
+    loops: tuple[tuple[tuple[float, float, float], ...], ...] | None
     reason: str | None = None
     malformed: bool = False
 
@@ -1064,8 +1074,8 @@ def _build_canonical_output(
             AdapterWarning(
                 code="libredwg.unsupported_hatch_geometry",
                 message=(
-                    "LibreDWG emitted HATCH records outside the supported straight "
-                    "single-loop subset."
+                    "LibreDWG emitted HATCH records outside the supported straight-edged "
+                    "closed-loop subset."
                 ),
                 details={
                     "count": unsupported_hatch_count,
@@ -1904,32 +1914,61 @@ def _build_lwpolyline_entity(
 
 
 def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _HatchBuildResult:
-    vertices_result = _extract_hatch_vertices(record)
-    if vertices_result.reason is not None:
+    loops_result = _extract_hatch_vertices(record)
+    if loops_result.reason is not None:
         return _HatchBuildResult(
             None,
-            reason=vertices_result.reason,
-            malformed=vertices_result.malformed,
+            reason=loops_result.reason,
+            malformed=loops_result.malformed,
         )
 
-    vertices = cast(tuple[tuple[float, float, float], ...], vertices_result.vertices)
+    loops = cast(tuple[tuple[tuple[float, float, float], ...], ...], loops_result.loops)
     if units.scale != 1.0:
-        vertices = tuple(_scale_point(vertex, units.scale) for vertex in vertices)
-    bbox = _bbox_from_points(vertices)
+        loops = tuple(tuple(_scale_point(vertex, units.scale) for vertex in loop) for loop in loops)
+
+    all_vertices = tuple(vertex for loop in loops for vertex in loop)
+    bbox = _bbox_from_points(all_vertices)
     if bbox is None:
         return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
 
-    perimeter = _polyline_length(vertices, closed=True)
-    area = _polygon_area(vertices)
-    if perimeter is None or area is None or not _floats_are_finite(perimeter, area) or area <= 0.0:
+    loop_areas: list[float] = []
+    perimeter = 0.0
+    for loop in loops:
+        loop_perimeter = _polyline_length(loop, closed=True)
+        loop_area = _polygon_area(loop)
+        if (
+            loop_perimeter is None
+            or loop_area is None
+            or not _floats_are_finite(loop_perimeter, loop_area)
+            or loop_area <= 0.0
+        ):
+            return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
+        loop_areas.append(loop_area)
+        perimeter += loop_perimeter
+    if not _floats_are_finite(perimeter):
         return _HatchBuildResult(None, reason="malformed_hatch_geometry", malformed=True)
 
-    vertex_json = tuple(_point_json(vertex) for vertex in vertices)
+    # Treat the largest loop as the outer boundary and the rest as holes; the filled
+    # area is outer minus holes. Fall back to the outer area when the loops are not
+    # simply nested (holes total >= outer) since orientation is not guaranteed.
+    outer_index = max(range(len(loop_areas)), key=loop_areas.__getitem__)
+    outer_area = loop_areas[outer_index]
+    holes_area = sum(loop_areas) - outer_area
+    area = outer_area - holes_area
+    if area <= 0.0:
+        area = outer_area
+
+    outer_loop = loops[outer_index]
+    boundary_loops_json = tuple(tuple(_point_json(vertex) for vertex in loop) for loop in loops)
+    vertex_json = tuple(_point_json(vertex) for vertex in outer_loop)
+    fill_type = "pattern" if _hatch_is_non_solid_fill(record) else "solid"
     kind = "hatch"
     closed = True
     geometry_summary: _JSONDict = {
         "kind": kind,
-        "vertex_count": len(vertices),
+        "vertex_count": len(all_vertices),
+        "loop_count": len(loops),
+        "fill_type": fill_type,
         "closed": closed,
         "area": area,
         "perimeter": perimeter,
@@ -1946,6 +1985,7 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
             },
             geometry={
                 "vertices": vertex_json,
+                "boundary_loops": boundary_loops_json,
                 "closed": closed,
                 "bbox": bbox,
                 "units": _units_label(units),
@@ -1953,6 +1993,7 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
             },
             properties={
                 "source_type": "HATCH",
+                "fill_type": fill_type,
                 "quantity_hints": {
                     "length": perimeter,
                     "area": area,
@@ -1964,9 +2005,11 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
             extra_fields={
                 "kind": kind,
                 "vertices": vertex_json,
+                "boundary_loops": boundary_loops_json,
                 "closed": closed,
                 "area": area,
                 "perimeter": perimeter,
+                "fill_type": fill_type,
             },
         )
     )
@@ -3205,55 +3248,81 @@ def _coerce_lwpolyline_vertex(value: Any) -> tuple[float, float, float] | None:
     return _coerce_point(value)
 
 
-def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchVerticesResult:
-    if _hatch_is_non_solid_fill(record):
-        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchLoopsResult:
+    """Extract every straight-edged closed boundary loop from a HATCH record.
 
+    Both solid and non-solid (pattern) fills are mapped: only the boundary
+    geometry matters for canonical quantities, so the fill pattern itself is
+    recorded as a property rather than gating the entity (#385).
+    """
     if _record_has_any_key(record, "boundary_loops", "boundaryloops", "loops"):
-        return _extract_hatch_vertices_from_loops(
+        return _extract_hatch_loops(
             _first_value(record, "boundary_loops", "boundaryloops", "loops"),
             owner=record,
         )
 
     if _record_has_any_key(record, "vertices", "points"):
-        return _extract_hatch_vertices_from_points(
-            _first_value(record, "vertices", "points"),
-            owner=record,
+        return _single_loop_result(
+            _extract_hatch_vertices_from_points(
+                _first_value(record, "vertices", "points"),
+                owner=record,
+            )
         )
 
     if _record_has_any_key(record, "edges", "boundary_edges", "boundaryedges"):
-        return _extract_hatch_vertices_from_edges(
-            _first_value(record, "edges", "boundary_edges", "boundaryedges")
+        return _single_loop_result(
+            _extract_hatch_vertices_from_edges(
+                _first_value(record, "edges", "boundary_edges", "boundaryedges")
+            )
         )
 
-    return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+    return _HatchLoopsResult(None, reason="unsupported_hatch_geometry")
 
 
-def _extract_hatch_vertices_from_loops(
+def _single_loop_result(ring: _HatchVerticesResult) -> _HatchLoopsResult:
+    if ring.vertices is None:
+        return _HatchLoopsResult(None, reason=ring.reason, malformed=ring.malformed)
+    return _HatchLoopsResult((ring.vertices,))
+
+
+def _extract_hatch_loops(
     raw_loops: Any,
     *,
-    owner: Mapping[str, Any] | None = None,
-) -> _HatchVerticesResult:
+    owner: Mapping[str, Any],
+) -> _HatchLoopsResult:
     if not isinstance(raw_loops, (list, tuple)):
-        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
-    if len(raw_loops) != 1:
-        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+        return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if not raw_loops:
+        return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_loops) > _MAX_HATCH_LOOPS:
+        return _HatchLoopsResult(None, reason="unsupported_hatch_geometry")
 
-    loop = raw_loops[0]
+    loops: list[tuple[tuple[float, float, float], ...]] = []
+    for loop in raw_loops:
+        ring = _extract_single_hatch_loop(loop, owner=owner)
+        if ring.vertices is None:
+            # Any structurally broken loop poisons the whole hatch; report the most
+            # severe reason (malformed over merely unsupported).
+            return _HatchLoopsResult(None, reason=ring.reason, malformed=ring.malformed)
+        loops.append(ring.vertices)
+    return _HatchLoopsResult(tuple(loops))
+
+
+def _extract_single_hatch_loop(
+    loop: Any,
+    *,
+    owner: Mapping[str, Any],
+) -> _HatchVerticesResult:
     if not isinstance(loop, Mapping):
         return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
     if _hatch_loop_flags_are_ambiguous(loop):
         return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
     if _record_has_any_key(loop, "vertices", "points"):
         raw_vertices = _first_value(loop, "vertices", "points")
-        if owner is not None:
-            boundary_validation = _validate_hatch_point_boundary(owner, raw_vertices)
-            if boundary_validation is not None:
-                return boundary_validation
-        return _extract_hatch_vertices_from_points(
-            raw_vertices,
-            owner=loop,
-        )
+        boundary_validation = _validate_hatch_point_boundary(owner, raw_vertices)
+        if boundary_validation is not None:
+            return boundary_validation
+        return _extract_hatch_vertices_from_points(raw_vertices, owner=loop)
     if _record_has_any_key(loop, "edges", "boundary_edges", "boundaryedges"):
         return _extract_hatch_vertices_from_edges(
             _first_value(loop, "edges", "boundary_edges", "boundaryedges")
@@ -3356,10 +3425,22 @@ def _hatch_loop_flags_are_ambiguous(loop: Mapping[str, Any]) -> bool:
     if isinstance(raw_flags, (int, float)):
         if not math.isfinite(float(raw_flags)) or not float(raw_flags).is_integer():
             return True
-        return int(raw_flags) not in {0, 1}
+        # Accept the defined AutoCAD boundary-path-type bitfield
+        # (external=1, polyline=2, derived=4, textbox=8, outermost=16). These are
+        # advisory — the actual boundary geometry is validated independently — so
+        # only negative or out-of-range (garbage) values are treated as ambiguous.
+        return not 0 <= int(raw_flags) <= 0b11111
     if isinstance(raw_flags, str):
         normalized = _normalize_lookup_key(raw_flags)
-        return normalized not in {"0", "1", "default", "external", "polyline"}
+        return normalized not in {
+            "0",
+            "1",
+            "default",
+            "external",
+            "polyline",
+            "derived",
+            "outermost",
+        }
     return True
 
 
