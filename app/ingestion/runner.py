@@ -83,6 +83,24 @@ def _build_output_cap_error_details(adapter_key: str, exc: Exception) -> dict[st
     return details
 
 
+def _structured_adapter_failure_details(adapter_key: str, exc: Exception) -> dict[str, Any] | None:
+    """Carry an adapter's sanitized failure reason/detail into the job, if present.
+
+    Adapters expose a coarse, content-free ``failure_reason`` token on their
+    sanitized exceptions (e.g. ``"extraction_limit"``); the exception message is
+    already sanitized, so it is safe to surface as ``detail``.
+    """
+    failure_reason = getattr(exc, "failure_reason", None)
+    if not isinstance(failure_reason, str) or not failure_reason:
+        return None
+
+    return {
+        "adapter_key": adapter_key,
+        "reason": failure_reason,
+        "detail": str(exc),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class IngestionRunRequest:
     """Immutable inputs required to run an adapter-backed ingest attempt."""
@@ -341,7 +359,8 @@ async def _execute_adapter(
             error_code=ErrorCode.ADAPTER_FAILED,
             failure_kind=AdapterFailureKind.FAILED,
             message="Adapter execution failed.",
-            details={"adapter_key": adapter_key},
+            details=_structured_adapter_failure_details(adapter_key, exc)
+            or {"adapter_key": adapter_key},
         ) from exc
 
 

@@ -229,6 +229,60 @@ class TestJobsWorkerIngest:
             )
         ]
 
+    async def test_process_ingest_job_persists_adapter_failure_reason_detail(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An adapter's sanitized failure reason/detail should reach the persisted job."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _fail_run_ingestion(_: IngestionRunRequest) -> IngestFinalizationPayload:
+            raise IngestionRunnerError(
+                error_code=ErrorCode.ADAPTER_FAILED,
+                failure_kind=AdapterFailureKind.FAILED,
+                message="Adapter execution failed.",
+                details={
+                    "adapter_key": "pymupdf",
+                    "reason": "extraction_limit",
+                    "detail": "PyMuPDF extraction exceeded page drawing limit.",
+                },
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _fail_run_ingestion)
+
+        with pytest.raises(IngestionRunnerError, match="Adapter execution failed"):
+            await worker_module.process_ingest_job(job.id)
+
+        updated_job = await _get_job(job.id)
+        assert updated_job.status == "failed"
+        assert updated_job.error_code == ErrorCode.ADAPTER_FAILED.value
+
+        response = await async_client.get(f"/v1/jobs/{job.id}/events")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["items"][-1]["data_json"] == {
+            "status": "failed",
+            "error_code": ErrorCode.ADAPTER_FAILED.value,
+            "error_message": "Adapter execution failed.",
+            "details": {
+                "error_code": ErrorCode.ADAPTER_FAILED.value,
+                "failure_kind": AdapterFailureKind.FAILED.value,
+                "error_message": "Adapter execution failed.",
+                "adapter_key": "pymupdf",
+                "reason": "extraction_limit",
+                "detail": "PyMuPDF extraction exceeded page drawing limit.",
+            },
+        }
+
     async def test_process_ingest_job_persists_sanitized_real_runner_storage_failure(
         self,
         async_client: httpx.AsyncClient,
@@ -281,6 +335,14 @@ class TestJobsWorkerIngest:
             "status": "failed",
             "error_code": ErrorCode.STORAGE_FAILED.value,
             "error_message": "Failed to read original source from storage.",
+            "details": {
+                "error_code": ErrorCode.STORAGE_FAILED.value,
+                "failure_kind": AdapterFailureKind.FAILED.value,
+                "error_message": "Failed to read original source from storage.",
+                "adapter_key": "pymupdf",
+                "input_family": "pdf_vector",
+                "reason": "not_found",
+            },
         }
         assert secret_storage_uri not in str(data["items"][-1]["data_json"])
         assert secret_storage_uri not in str(logger_error_calls)
@@ -356,6 +418,14 @@ class TestJobsWorkerIngest:
             "status": "failed",
             "error_code": ErrorCode.STORAGE_FAILED.value,
             "error_message": "Failed to stage original source.",
+            "details": {
+                "error_code": ErrorCode.STORAGE_FAILED.value,
+                "failure_kind": AdapterFailureKind.FAILED.value,
+                "error_message": "Failed to stage original source.",
+                "adapter_key": "pymupdf",
+                "input_family": "pdf_vector",
+                "reason": "stage_failed",
+            },
         }
         assert secret_temp_marker not in str(data["items"][-1]["data_json"])
         assert secret_temp_marker not in str(logger_error_calls)
@@ -830,6 +900,11 @@ class TestJobsWorkerIngest:
             "status": "failed",
             "error_code": ErrorCode.ADAPTER_FAILED.value,
             "error_message": "Adapter execution failed.",
+            "details": {
+                "error_code": ErrorCode.ADAPTER_FAILED.value,
+                "failure_kind": AdapterFailureKind.FAILED.value,
+                "error_message": "Adapter execution failed.",
+            },
         }
         assert "super-secret adapter detail" not in str(data["items"][3]["data_json"])
         assert data["next_cursor"] is None
