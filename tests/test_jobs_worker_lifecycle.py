@@ -239,6 +239,7 @@ async def test_process_ingest_job_wrapper_late_binds_registered_callables(
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
     ) -> IngestFinalizationPayload:
         observed_calls.append(("execute", received_job_id, attempt_token))
         return payload
@@ -247,6 +248,7 @@ async def test_process_ingest_job_wrapper_late_binds_registered_callables(
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
         payload: IngestFinalizationPayload,
     ) -> bool:
         observed_calls.append(("finalize", received_job_id, attempt_token, payload))
@@ -298,6 +300,7 @@ async def test_process_export_job_wrapper_late_binds_registered_callables(
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
     ) -> worker_module._RegisteredJobAttemptResult:
         observed_calls.append(("execute", received_job_id, attempt_token))
         return worker_module._RegisteredJobAttemptResult(
@@ -308,6 +311,7 @@ async def test_process_export_job_wrapper_late_binds_registered_callables(
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
         execution: str,
         rendered: str,
     ) -> bool:
@@ -356,6 +360,7 @@ async def test_process_changeset_apply_job_wrapper_late_binds_registered_callabl
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
     ) -> worker_module._RegisteredJobAttemptResult:
         observed_calls.append(("execute", received_job_id, attempt_token))
         return worker_module._RegisteredJobAttemptResult(
@@ -366,6 +371,7 @@ async def test_process_changeset_apply_job_wrapper_late_binds_registered_callabl
         received_job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: object,
         apply_result: str,
     ) -> bool:
         observed_calls.append(("finalize", received_job_id, attempt_token, apply_result))
@@ -1028,6 +1034,7 @@ class TestJobsWorkerLifecycle:
             worker_module._finalize_ingest_job(
                 job.id,
                 attempt_token=lease.token,
+                deps=worker_module.default_worker_deps(),
                 payload=payload,
             )
         )
@@ -1279,6 +1286,7 @@ class TestJobsWorkerLifecycle:
         finalized = await worker_module._finalize_ingest_job(
             job.id,
             attempt_token=old_attempt_token,
+            deps=worker_module.default_worker_deps(),
             payload=_build_fake_ingest_payload(finalize_request),
         )
 
@@ -1682,6 +1690,7 @@ class TestJobsWorkerLifecycle:
         finalized = await worker_module._finalize_ingest_job(
             job.id,
             attempt_token=lease.token,
+            deps=worker_module.default_worker_deps(),
             payload=_build_fake_ingest_payload(finalize_request),
         )
 

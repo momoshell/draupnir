@@ -35,6 +35,7 @@ from app.jobs import worker as worker_module
 from app.jobs.revision_materialization import (
     _build_changeset_revision_materialization_rows,
 )
+from app.jobs.worker_deps import WorkerDeps
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import (
     CadChangeOperation,
@@ -1343,6 +1344,7 @@ async def test_execute_changeset_apply_job_attempt_returns_success_for_finalizat
         result = await worker_module._execute_changeset_apply_job_attempt(
             job.id,
             attempt_token=attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
     finally:
         await session.close()
@@ -1634,6 +1636,7 @@ async def test_finalize_changeset_apply_job_revision_conflict() -> None:
         result = await worker_module._execute_changeset_apply_job_attempt(
             job.id,
             attempt_token=attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
     finally:
         await session.close()
@@ -1651,6 +1654,7 @@ async def test_finalize_changeset_apply_job_revision_conflict() -> None:
         await worker_module._finalize_changeset_apply_job(
             job.id,
             attempt_token=attempt_token,
+            deps=worker_module.default_worker_deps(),
             apply_result=apply_result,
         )
 
@@ -1690,8 +1694,9 @@ async def test_process_changeset_apply_job_finalization_conflict() -> None:
         job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
+        deps: WorkerDeps,
     ) -> worker_module._RegisteredJobAttemptResult | None:
-        result = await real_execute(job_id, attempt_token=attempt_token)
+        result = await real_execute(job_id, attempt_token=attempt_token, deps=deps)
         assert result is not None
         await _append_competing_revision(seeded=seeded)
         return result
@@ -1751,6 +1756,7 @@ async def test_finalize_changeset_apply_job_cancellation_before_output_creates_n
         result = await worker_module._execute_changeset_apply_job_attempt(
             job.id,
             attempt_token=attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
     finally:
         await session.close()
@@ -1773,6 +1779,7 @@ async def test_finalize_changeset_apply_job_cancellation_before_output_creates_n
     finalized = await worker_module._finalize_changeset_apply_job(
         job.id,
         attempt_token=attempt_token,
+        deps=worker_module.default_worker_deps(),
         apply_result=apply_result,
     )
 
@@ -1813,6 +1820,7 @@ async def test_finalize_changeset_apply_job_stale_attempt_creates_no_revision() 
         result = await worker_module._execute_changeset_apply_job_attempt(
             job.id,
             attempt_token=stale_attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
     finally:
         await session.close()
@@ -1836,6 +1844,7 @@ async def test_finalize_changeset_apply_job_stale_attempt_creates_no_revision() 
     finalized = await worker_module._finalize_changeset_apply_job(
         job.id,
         attempt_token=stale_attempt_token,
+        deps=worker_module.default_worker_deps(),
         apply_result=apply_result,
     )
 

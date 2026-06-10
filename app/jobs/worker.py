@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Callable, Coroutine, Sequence
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
@@ -105,6 +105,7 @@ from app.jobs.revision_materialization import (
     _build_revision_materialization_rows,
     _order_revision_entity_insert_rows,
 )
+from app.jobs.worker_deps import WorkerDeps
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
 from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
@@ -913,6 +914,34 @@ _get_job_for_update_with_metadata = job_lifecycle._get_job_for_update_with_metad
 _get_source_file = job_lifecycle._get_source_file
 
 
+def default_worker_deps() -> WorkerDeps:
+    """Snapshot the current worker collaborators for one job flow.
+
+    Reads worker.py's module globals at call time, so a test that monkeypatches
+    e.g. ``worker_module.resolve_rate`` before starting a job flow is honored —
+    and the extracted assembly/finalizers reach the patched collaborator through
+    ``deps`` rather than their own module namespace (issue #387).
+    """
+    return WorkerDeps(
+        resolve_rate=resolve_rate,
+        resolve_material=resolve_material,
+        resolve_formula=resolve_formula,
+        get_storage=get_storage,
+        emit_job_event=emit_job_event,
+        get_project=_get_project,
+        get_job_lock_bootstrap=_get_job_lock_bootstrap,
+    )
+
+
+def worker_deps(**overrides: Any) -> WorkerDeps:
+    """Build a WorkerDeps from the current defaults with explicit overrides.
+
+    Preferred over monkeypatching ``worker`` module globals in tests:
+    ``process_estimate_job(job_id, deps=worker_deps(resolve_rate=fake))``.
+    """
+    return replace(default_worker_deps(), **overrides)
+
+
 async def _lock_job_source_for_terminal_mutation(
     session: AsyncSession,
     job_id: UUID,
@@ -1367,6 +1396,7 @@ async def _build_estimate_engine_input(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> EstimateEngineInput:
     """Load deterministic engine inputs for a claimed persisted estimate job."""
     session_maker = get_session_maker()
@@ -1572,7 +1602,7 @@ async def _build_estimate_engine_input(
             if line.ref_type == "rate":
                 assert line.rate_catalog_entry_id is not None
                 try:
-                    matched_rate = await resolve_rate(
+                    matched_rate = await deps.resolve_rate(
                         session,
                         ref=CatalogRateRef(
                             id=line.rate_catalog_entry_id,
@@ -1629,7 +1659,7 @@ async def _build_estimate_engine_input(
             if line.ref_type == "material":
                 assert line.material_catalog_entry_id is not None
                 try:
-                    matched_material = await resolve_material(
+                    matched_material = await deps.resolve_material(
                         session,
                         ref=CatalogMaterialRef(
                             id=line.material_catalog_entry_id,
@@ -1684,7 +1714,7 @@ async def _build_estimate_engine_input(
 
             assert line.formula_definition_id is not None
             try:
-                selected_formula = await resolve_formula(
+                selected_formula = await deps.resolve_formula(
                     session,
                     ref=CatalogFormulaRef(
                         id=line.formula_definition_id,
@@ -2090,6 +2120,7 @@ async def _finalize_ingest_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
     payload: IngestFinalizationPayload,
 ) -> bool:
     """Atomically publish durable ingest outputs and terminal job success."""
@@ -2098,11 +2129,11 @@ async def _finalize_ingest_job(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        bootstrap = await _get_job_lock_bootstrap(session, job_id)
+        bootstrap = await deps.get_job_lock_bootstrap(session, job_id)
         if bootstrap is None:
             raise LookupError(f"Job with identifier '{job_id}' not found")
 
-        project = await _get_project(session, bootstrap.project_id, for_update=True)
+        project = await deps.get_project(session, bootstrap.project_id, for_update=True)
         if project is None:
             raise LookupError(
                 f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
@@ -2135,7 +2166,7 @@ async def _finalize_ingest_job(
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="warning",
                 message="Job cancelled",
@@ -2247,7 +2278,7 @@ async def _finalize_ingest_job(
             predecessor_revision_id=predecessor_revision_id,
             adapter_run_output_id=adapter_run_output_id,
         )
-        storage = get_storage()
+        storage = deps.get_storage()
         written_storage_objects: list[tuple[str, str]] = []
         commit_started = False
 
@@ -2360,7 +2391,7 @@ async def _finalize_ingest_job(
             job.error_code = None
             job.error_message = None
             _clear_job_attempt_lease(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="info",
                 message="Job succeeded",
@@ -2888,6 +2919,7 @@ async def _finalize_export_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
     execution: _ExportExecutionInput,
     rendered: ExportArtifact,
 ) -> bool:
@@ -2919,7 +2951,7 @@ async def _finalize_export_job(
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="warning",
                 message="Job cancelled",
@@ -2982,7 +3014,7 @@ async def _finalize_export_job(
             job=job,
             execution=execution,
         )
-        storage = get_storage()
+        storage = deps.get_storage()
         written_storage_objects: list[tuple[str, str]] = []
         commit_started = False
 
@@ -3027,7 +3059,7 @@ async def _finalize_export_job(
             job.error_code = None
             job.error_message = None
             _clear_job_attempt_lease(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="info",
                 message="Job succeeded",
@@ -3173,6 +3205,7 @@ async def _finalize_quantity_takeoff_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
     execution: _QuantityTakeoffExecutionInput,
     result: QuantityEngineResult,
 ) -> bool:
@@ -3206,7 +3239,7 @@ async def _finalize_quantity_takeoff_job(
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="warning",
                 message="Job cancelled",
@@ -3291,7 +3324,7 @@ async def _finalize_quantity_takeoff_job(
         job.error_code = None
         job.error_message = None
         _clear_job_attempt_lease(job)
-        await emit_job_event(
+        await deps.emit_job_event(
             job.id,
             level="info",
             message="Job succeeded",
@@ -3314,6 +3347,7 @@ async def _finalize_estimate_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
     output: EstimateEngineOutput,
 ) -> bool:
     """Atomically publish estimate rows and terminal job success."""
@@ -3347,7 +3381,7 @@ async def _finalize_estimate_job(
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="warning",
                 message="Job cancelled",
@@ -3416,7 +3450,7 @@ async def _finalize_estimate_job(
         job.error_code = None
         job.error_message = None
         _clear_job_attempt_lease(job)
-        await emit_job_event(
+        await deps.emit_job_event(
             job.id,
             level="info",
             message="Job succeeded",
@@ -4061,8 +4095,10 @@ async def _execute_ingest_job_attempt(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> IngestFinalizationPayload:
     """Build inputs, run ingestion, and drain progress/cancellation monitors."""
+    _ = deps  # uniform dispatch contract; ingest execution has no injected collaborators
     request = await _build_ingestion_run_request(job_id, attempt_token=attempt_token)
     progress_bridge = _JobProgressEventBridge(job_id, attempt_token=attempt_token)
     cancellation = _PersistedJobCancellationHandle()
@@ -4141,7 +4177,9 @@ def _resolve_registered_job_callable(name: str) -> Any:
     return resolved
 
 
-async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSpec) -> None:
+async def _process_registered_job(
+    job_id: UUID, *, spec: _RegisteredJobProcessSpec, deps: WorkerDeps
+) -> None:
     """Run one registered persisted worker job through the shared execution shell."""
     _ensure_worker_database_configured()
 
@@ -4168,7 +4206,7 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
     finalize_job = cast(Any, _resolve_registered_job_callable(finalize_name))
 
     try:
-        execution_result = await execute_job(job_id, attempt_token=lease.token)
+        execution_result = await execute_job(job_id, attempt_token=lease.token, deps=deps)
     except _InactiveSourceError:
         if spec.inactive_source_log_event is None:
             raise
@@ -4272,6 +4310,7 @@ async def _process_registered_job(job_id: UUID, *, spec: _RegisteredJobProcessSp
         finalized = await finalize_job(
             job_id,
             attempt_token=lease.token,
+            deps=deps,
             **finalize_kwargs,
         )
     except asyncio.CancelledError:
@@ -4324,8 +4363,10 @@ async def _execute_quantity_takeoff_job_attempt(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> _RegisteredJobAttemptResult | None:
     """Build quantity inputs, compute deterministic outputs, and defer finalization."""
+    _ = deps  # uniform dispatch contract; no injected collaborators in this stage
     execution = await _build_quantity_takeoff_execution_input(job_id, attempt_token=attempt_token)
     if execution.quantity_gate in {"review_gated", "blocked"}:
         error_details = _quantity_gate_details(
@@ -4379,9 +4420,12 @@ async def _execute_estimate_job_attempt(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> _RegisteredJobAttemptResult:
     """Build deterministic estimate inputs and defer output persistence."""
-    engine_input = await _build_estimate_engine_input(job_id, attempt_token=attempt_token)
+    engine_input = await _build_estimate_engine_input(
+        job_id, attempt_token=attempt_token, deps=deps
+    )
     try:
         estimate_output = compose_estimate(engine_input)
     except EstimateEngineError as exc:
@@ -4407,8 +4451,10 @@ async def _execute_export_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> _RegisteredJobAttemptResult:
     """Build export inputs, render deterministic bytes, and defer finalization."""
+    _ = deps  # uniform dispatch contract; no injected collaborators in this stage
     execution = await _build_export_execution_input(job_id, attempt_token=attempt_token)
     session_maker = get_session_maker()
     if session_maker is None:
@@ -4660,8 +4706,10 @@ async def _execute_changeset_apply_job_attempt(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
 ) -> _RegisteredJobAttemptResult | None:
     """Load immutable apply input, re-run apply loading, and defer success finalization."""
+    _ = deps  # uniform dispatch contract; no injected collaborators in this stage
     session_maker = get_session_maker()
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
@@ -4719,6 +4767,7 @@ async def _finalize_changeset_apply_job(
     job_id: UUID,
     *,
     attempt_token: UUID,
+    deps: WorkerDeps,
     apply_result: ChangeSetApplySuccess,
 ) -> bool:
     """Atomically publish a changeset-origin revision and terminal job success."""
@@ -4749,7 +4798,7 @@ async def _finalize_changeset_apply_job(
 
         if job.cancel_requested:
             _finalize_job_cancelled(job)
-            await emit_job_event(
+            await deps.emit_job_event(
                 job.id,
                 level="warning",
                 message="Job cancelled",
@@ -4945,7 +4994,7 @@ async def _finalize_changeset_apply_job(
         job.error_code = None
         job.error_message = None
         _clear_job_attempt_lease(job)
-        await emit_job_event(
+        await deps.emit_job_event(
             job.id,
             level="info",
             message="Job succeeded",
@@ -4963,9 +5012,11 @@ async def _finalize_changeset_apply_job(
     return True
 
 
-async def process_ingest_job(job_id: UUID) -> None:
+async def process_ingest_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
     """Load a persisted ingest job, run ingestion, and persist state transitions."""
-    await _process_registered_job(job_id, spec=_INGEST_PROCESS_SPEC)
+    await _process_registered_job(
+        job_id, spec=_INGEST_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
 
 
 async def recover_incomplete_jobs() -> list[UUID]:
@@ -5082,9 +5133,11 @@ def enqueue_ingest_job(job_id: UUID) -> None:
     )
 
 
-async def process_quantity_takeoff_job(job_id: UUID) -> None:
+async def process_quantity_takeoff_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
     """Load a persisted quantity takeoff job and atomically persist its result."""
-    await _process_registered_job(job_id, spec=_QUANTITY_TAKEOFF_PROCESS_SPEC)
+    await _process_registered_job(
+        job_id, spec=_QUANTITY_TAKEOFF_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
 
 
 @celery_app.task(
@@ -5108,9 +5161,11 @@ def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
     )
 
 
-async def process_estimate_job(job_id: UUID) -> None:
+async def process_estimate_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
     """Load a persisted estimate job and assemble deterministic engine inputs."""
-    await _process_registered_job(job_id, spec=_ESTIMATE_PROCESS_SPEC)
+    await _process_registered_job(
+        job_id, spec=_ESTIMATE_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
 
 
 @celery_app.task(
@@ -5134,14 +5189,18 @@ def enqueue_estimate_job(job_id: UUID) -> None:
     )
 
 
-async def process_export_job(job_id: UUID) -> None:
+async def process_export_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
     """Load a persisted export job and atomically persist its generated artifact."""
-    await _process_registered_job(job_id, spec=_EXPORT_PROCESS_SPEC)
+    await _process_registered_job(
+        job_id, spec=_EXPORT_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
 
 
-async def process_changeset_apply_job(job_id: UUID) -> None:
+async def process_changeset_apply_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
     """Load a persisted changeset apply job through the shared worker shell."""
-    await _process_registered_job(job_id, spec=_CHANGESET_APPLY_PROCESS_SPEC)
+    await _process_registered_job(
+        job_id, spec=_CHANGESET_APPLY_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
 
 
 @celery_app.task(

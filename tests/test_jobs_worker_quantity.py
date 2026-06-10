@@ -2047,6 +2047,7 @@ class TestJobsWorkerQuantity:
             job_id_value: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: object,
         ) -> Any:
             calls.append(("execute", job_id_value, attempt_token))
             return worker_module._RegisteredJobAttemptResult(
@@ -2057,6 +2058,7 @@ class TestJobsWorkerQuantity:
             job_id_value: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: object,
             execution: str,
             result: str,
         ) -> bool:
