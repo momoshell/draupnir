@@ -27,6 +27,7 @@ from app.jobs.estimate_mapping import (
     _build_estimate_worker_mapping_v1,
     _EstimateJobInputError,
 )
+from app.jobs.worker_deps import WorkerDeps
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -1787,8 +1788,11 @@ class TestJobsWorkerEstimate:
             job_id: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: WorkerDeps,
         ) -> Any:
-            engine_input = await original_build_execution_input(job_id, attempt_token=attempt_token)
+            engine_input = await original_build_execution_input(
+                job_id, attempt_token=attempt_token, deps=deps
+            )
             await _update_job(job_id, cancel_requested=True)
             return engine_input
 
@@ -1879,8 +1883,11 @@ class TestJobsWorkerEstimate:
             job_id: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: WorkerDeps,
         ) -> Any:
-            engine_input = await original_build_execution_input(job_id, attempt_token=attempt_token)
+            engine_input = await original_build_execution_input(
+                job_id, attempt_token=attempt_token, deps=deps
+            )
             await _update_job(job_id, cancel_requested=True)
             if failure_mode == "mapping":
                 raise _build_estimate_job_input_error("missing_worker_mapping_version")
@@ -2004,15 +2011,18 @@ class TestJobsWorkerEstimate:
         engine_input = await worker_module._build_estimate_engine_input(
             estimate_job.id,
             attempt_token=duplicate_attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
         finalized = await worker_module._finalize_estimate_job(
             estimate_job.id,
             attempt_token=duplicate_attempt_token,
+            deps=worker_module.default_worker_deps(),
             output=real_compose_estimate(engine_input),
         )
         finalized_repeat = await worker_module._finalize_estimate_job(
             estimate_job.id,
             attempt_token=duplicate_attempt_token,
+            deps=worker_module.default_worker_deps(),
             output=real_compose_estimate(engine_input),
         )
 
@@ -2099,6 +2109,7 @@ class TestJobsWorkerEstimate:
         engine_input = await worker_module._build_estimate_engine_input(
             estimate_job.id,
             attempt_token=stale_lease.token,
+            deps=worker_module.default_worker_deps(),
         )
         estimate_output = real_compose_estimate(engine_input)
 
@@ -2122,6 +2133,7 @@ class TestJobsWorkerEstimate:
         finalized = await worker_module._finalize_estimate_job(
             estimate_job.id,
             attempt_token=stale_lease.token,
+            deps=worker_module.default_worker_deps(),
             output=estimate_output,
         )
 
@@ -2371,6 +2383,7 @@ class TestJobsWorkerEstimate:
         replay_input = await worker_module._build_estimate_engine_input(
             estimate_job.id,
             attempt_token=replay_attempt_token,
+            deps=worker_module.default_worker_deps(),
         )
         replay_output = real_compose_estimate(replay_input)
         replay_version_kwargs = replay_output.estimate_version_model_kwargs()
@@ -2385,6 +2398,7 @@ class TestJobsWorkerEstimate:
         finalized_again = await worker_module._finalize_estimate_job(
             estimate_job.id,
             attempt_token=replay_attempt_token,
+            deps=worker_module.default_worker_deps(),
             output=replay_output,
         )
         assert finalized_again is False
@@ -2616,6 +2630,7 @@ class TestJobsWorkerEstimate:
             job_id_value: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: object,
         ) -> Any:
             calls.append(("execute", job_id_value, attempt_token))
             return worker_module._RegisteredJobAttemptResult(finalize_kwargs={"output": "output"})
@@ -2624,6 +2639,7 @@ class TestJobsWorkerEstimate:
             job_id_value: uuid.UUID,
             *,
             attempt_token: uuid.UUID,
+            deps: object,
             output: str,
         ) -> bool:
             calls.append(("finalize", job_id_value, attempt_token, output))
