@@ -49,10 +49,10 @@ _RUNTIME_MODULE = "fitz"
 _SCHEMA_VERSION = "0.1"
 _DEFAULT_LAYER_NAME = "default"
 _VECTOR_CONFIDENCE_SCORE = 0.75
+# Confidence for a partial extraction that hit a configurable complexity cap and
+# was truncated; lowered (and still review-gated) to flag the missing geometry.
+_DEGRADED_CONFIDENCE_SCORE = 0.4
 _MAX_PAGES = 256
-_MAX_ENTITIES = 20_000
-_MAX_DRAWINGS_PER_PAGE = 5_000
-_MAX_TOTAL_DRAWINGS = 20_000
 _MAX_PATH_ITEMS_PER_DRAWING = 10_000
 _MAX_POINTS_PER_ENTITY = 5_000
 _MAX_TEXT_BLOCKS = 10_000
@@ -85,8 +85,35 @@ class PyMuPDFExtractionLimitError(RuntimeError):
     failure_reason = "extraction_limit"
 
 
+class _EntityBudgetError(PyMuPDFExtractionLimitError):
+    """Internal signal that the configurable entity cap was reached.
+
+    Caught inside page extraction to degrade to a partial result; unlike the
+    per-element guards (path-item/point limits), it never escapes as a failure.
+    """
+
+
 class PyMuPDFNonFiniteValueError(ValueError):
     """Raised when parser output contains a non-finite number."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtractionLimits:
+    """Configurable complexity caps; exceeding one degrades, not fails."""
+
+    max_drawings_per_page: int
+    max_total_drawings: int
+    max_entities: int
+
+    @classmethod
+    def from_settings(cls) -> _ExtractionLimits:
+        from app.core.config import settings
+
+        return cls(
+            max_drawings_per_page=settings.pymupdf_max_drawings_per_page,
+            max_total_drawings=settings.pymupdf_max_total_drawings,
+            max_entities=settings.pymupdf_max_entities,
+        )
 
 
 @dataclass(frozen=True)
@@ -110,6 +137,7 @@ class _ProcessExtractionRequest:
     file_path: str
     upload_format: str
     timeout_seconds: float | None
+    limits: _ExtractionLimits
 
 
 @dataclass(slots=True)
@@ -217,6 +245,7 @@ class PyMuPDFAdapter(IngestionAdapter):
         metadata = cast(dict[str, JSONValue], canonical["metadata"])
         page_count = int(cast(int, metadata["page_count"]))
         text_block_count = len(cast(tuple[object, ...], metadata["text_blocks"]))
+        truncated = "complexity_truncation" in metadata
 
         return AdapterResult(
             canonical=canonical,
@@ -233,9 +262,13 @@ class PyMuPDFAdapter(IngestionAdapter):
                 ),
             ),
             confidence=ConfidenceSummary(
-                score=_VECTOR_CONFIDENCE_SCORE,
+                score=_DEGRADED_CONFIDENCE_SCORE if truncated else _VECTOR_CONFIDENCE_SCORE,
                 review_required=True,
-                basis="vector_pdf_unconfirmed_scale",
+                basis=(
+                    "vector_pdf_complexity_truncated"
+                    if truncated
+                    else "vector_pdf_unconfirmed_scale"
+                ),
             ),
             warnings=tuple(warnings),
             diagnostics=(
@@ -330,6 +363,7 @@ def _extract_document_canonical(
     source: AdapterSource,
     options: AdapterExecutionOptions,
     budget: _ExtractionBudget,
+    limits: _ExtractionLimits,
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
     entities: list[dict[str, JSONValue]] = []
     layouts: list[dict[str, JSONValue]] = []
@@ -338,6 +372,8 @@ def _extract_document_canonical(
     layer_names: list[str] = [_DEFAULT_LAYER_NAME]
     text_bytes = 0
     total_drawings = 0
+    dropped_drawings = 0
+    entities_truncated = False
 
     page_count = int(getattr(document, "page_count", 0))
     if page_count > _MAX_PAGES:
@@ -364,18 +400,24 @@ def _extract_document_canonical(
         budget.checkpoint(options)
         drawings = cast(list[dict[str, Any]], page.get_drawings())
         budget.checkpoint(options)
-        _enforce_drawings_limit(drawings, total_drawings=total_drawings)
-        total_drawings += len(drawings)
-        page_entities, page_warnings, page_layers = _extract_page_entities(
+        # Degrade instead of failing: truncate to the configurable per-page and
+        # cumulative drawing caps, recording how much geometry was dropped.
+        kept = min(len(drawings), limits.max_drawings_per_page)
+        kept = min(kept, max(0, limits.max_total_drawings - total_drawings))
+        dropped_drawings += len(drawings) - kept
+        drawings = drawings[:kept]
+        total_drawings += kept
+        page_entities, page_warnings, page_layers, page_entities_truncated = _extract_page_entities(
             drawings,
             page_number=page_number,
             layout_name=layout_name,
             options=options,
             budget=budget,
-            entity_limit=_MAX_ENTITIES - len(entities),
+            entity_limit=limits.max_entities - len(entities),
         )
         entities.extend(page_entities)
         warnings.extend(page_warnings)
+        entities_truncated = entities_truncated or page_entities_truncated
         for layer_name in page_layers:
             if layer_name not in layer_names:
                 layer_names.append(layer_name)
@@ -411,6 +453,26 @@ def _extract_document_canonical(
     if not entities:
         metadata["empty_entities_reason"] = "no_vector_entities_detected"
 
+    if dropped_drawings > 0 or entities_truncated:
+        truncation: dict[str, JSONValue] = {
+            "dropped_drawings": dropped_drawings,
+            "entities_truncated": entities_truncated,
+            "max_drawings_per_page": limits.max_drawings_per_page,
+            "max_total_drawings": limits.max_total_drawings,
+            "max_entities": limits.max_entities,
+        }
+        metadata["complexity_truncation"] = truncation
+        warnings.append(
+            AdapterWarning(
+                code="pymupdf.extraction_truncated",
+                message=(
+                    "PyMuPDF extraction exceeded a complexity cap; the result is "
+                    "partial and gated for review."
+                ),
+                details=truncation,
+            )
+        )
+
     return {
         "schema_version": _SCHEMA_VERSION,
         "canonical_entity_schema_version": _SCHEMA_VERSION,
@@ -438,14 +500,45 @@ def _extract_page_entities(
     options: AdapterExecutionOptions,
     budget: _ExtractionBudget,
     entity_limit: int,
-) -> tuple[list[dict[str, JSONValue]], list[AdapterWarning], list[str]]:
+) -> tuple[list[dict[str, JSONValue]], list[AdapterWarning], list[str], bool]:
+    """Extract a page's entities, degrading to a partial result at the entity cap.
+
+    Returns the accumulated entities/warnings/layers plus a flag indicating the
+    configurable entity cap was reached and emission stopped early.
+    """
     entities: list[dict[str, JSONValue]] = []
     warnings: list[AdapterWarning] = []
     layer_names: list[str] = []
+    truncated = False
+    try:
+        _populate_page_entities(
+            drawings,
+            entities=entities,
+            warnings=warnings,
+            layer_names=layer_names,
+            page_number=page_number,
+            layout_name=layout_name,
+            options=options,
+            budget=budget,
+            entity_limit=entity_limit,
+        )
+    except _EntityBudgetError:
+        truncated = True
+    return entities, warnings, layer_names, truncated
 
-    if entity_limit < 0:
-        raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded entity limit.")
 
+def _populate_page_entities(
+    drawings: list[dict[str, Any]],
+    *,
+    entities: list[dict[str, JSONValue]],
+    warnings: list[AdapterWarning],
+    layer_names: list[str],
+    page_number: int,
+    layout_name: str,
+    options: AdapterExecutionOptions,
+    budget: _ExtractionBudget,
+    entity_limit: int,
+) -> None:
     for drawing_index, drawing in enumerate(drawings):
         budget.checkpoint(options)
         layer_name = _layer_name(drawing.get("layer"))
@@ -675,8 +768,6 @@ def _extract_page_entities(
         )
         if warning is not None:
             warnings.append(warning)
-
-    return entities, warnings, layer_names
 
 
 def _extract_text_blocks(
@@ -1356,6 +1447,7 @@ async def _extract_with_process(
             file_path=str(source.file_path),
             upload_format=source.upload_format.value,
             timeout_seconds=options.timeout.seconds if options.timeout is not None else None,
+            limits=_ExtractionLimits.from_settings(),
         )
     )
     try:
@@ -1473,6 +1565,7 @@ def _extract_in_child_process(request: _ProcessExtractionRequest) -> dict[str, A
             source=source,
             options=options,
             budget=budget,
+            limits=request.limits,
         )
     except TimeoutError:
         return {
@@ -1555,16 +1648,8 @@ def _append_entity(
     entity_limit: int,
 ) -> None:
     if len(entities) >= entity_limit:
-        raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded entity limit.")
+        raise _EntityBudgetError("PyMuPDF extraction reached the entity cap.")
     entities.append(entity)
-
-
-def _enforce_drawings_limit(drawings: list[dict[str, Any]], *, total_drawings: int) -> None:
-    drawing_count = len(drawings)
-    if drawing_count > _MAX_DRAWINGS_PER_PAGE:
-        raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded page drawing limit.")
-    if total_drawings + drawing_count > _MAX_TOTAL_DRAWINGS:
-        raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded total drawing limit.")
 
 
 def _enforce_path_item_limit(items: Any) -> None:
