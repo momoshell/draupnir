@@ -32,6 +32,9 @@ from app.cad.changeset import (
 from app.cad.changeset.apply import ALLOWED_LAYER_KEYS
 from app.core.errors import ErrorCode
 from app.jobs import worker as worker_module
+from app.jobs.revision_materialization import (
+    _build_changeset_revision_materialization_rows,
+)
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import (
     CadChangeOperation,
@@ -874,7 +877,7 @@ def test_build_changeset_revision_materialization_rows_copies_base_rows_and_rema
         ),
     )
 
-    rows = worker_module._build_changeset_revision_materialization_rows(
+    rows = _build_changeset_revision_materialization_rows(
         apply_result,
         base_manifest=base_manifest,
         base_layouts=(base_layout,),
