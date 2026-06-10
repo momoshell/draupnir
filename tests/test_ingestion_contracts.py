@@ -247,6 +247,7 @@ async def _ingest_fake_document(
     timeout: AdapterTimeout | None = None,
     cancellation: Any = None,
     perf_values: list[float] | None = None,
+    limits: Any = None,
 ) -> AdapterResult:
     source_path = tmp_path / "vector.pdf"
     source_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
@@ -268,6 +269,7 @@ async def _ingest_fake_document(
                 source=source,
                 options=options,
                 budget=budget,
+                limits=limits or pymupdf_adapter._ExtractionLimits.from_settings(),
             )
         finally:
             pymupdf_adapter._close_document(document)
@@ -1647,8 +1649,15 @@ async def test_pymupdf_ingest_enforces_page_cap(
     assert str(exc_info.value) == "PyMuPDF extraction exceeded page limit."
 
 
+def _truncation_warning(result: AdapterResult) -> AdapterWarning | None:
+    return next(
+        (w for w in result.warnings if w.code == "pymupdf.extraction_truncated"),
+        None,
+    )
+
+
 @pytest.mark.asyncio
-async def test_pymupdf_ingest_enforces_entity_cap(
+async def test_pymupdf_ingest_degrades_at_entity_cap(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1663,16 +1672,29 @@ async def test_pymupdf_ingest_enforces_entity_cap(
         "color": (0.1, 0.2, 0.3),
     }
     document = _FakeDocument([_FakePage(drawings=[drawing_one, drawing_two])])
-    monkeypatch.setattr(pymupdf_adapter, "_MAX_ENTITIES", 1)
+    limits = pymupdf_adapter._ExtractionLimits(
+        max_drawings_per_page=64_000,
+        max_total_drawings=250_000,
+        max_entities=1,
+    )
 
-    with pytest.raises(pymupdf_adapter.PyMuPDFExtractionLimitError) as exc_info:
-        await _ingest_fake_document(monkeypatch, tmp_path, document)
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document, limits=limits)
 
-    assert str(exc_info.value) == "PyMuPDF extraction exceeded entity limit."
+    # Partial, not failed: the first entity survives, the overflow is dropped.
+    assert len(cast(tuple[Any, ...], result.canonical["entities"])) == 1
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["complexity_truncation"]["entities_truncated"] is True
+    assert result.confidence is not None
+    assert result.confidence.score == pymupdf_adapter._DEGRADED_CONFIDENCE_SCORE
+    assert result.confidence.review_required is True
+    assert result.confidence.basis == "vector_pdf_complexity_truncated"
+    warning = _truncation_warning(result)
+    assert warning is not None
+    assert cast(dict[str, Any], warning.details)["max_entities"] == 1
 
 
 @pytest.mark.asyncio
-async def test_pymupdf_ingest_enforces_page_and_total_drawings_caps(
+async def test_pymupdf_ingest_degrades_at_page_and_total_drawings_caps(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1682,24 +1704,75 @@ async def test_pymupdf_ingest_enforces_page_and_total_drawings_caps(
         "color": (0.1, 0.2, 0.3),
     }
 
-    monkeypatch.setattr(pymupdf_adapter, "_MAX_DRAWINGS_PER_PAGE", 1)
-    with pytest.raises(pymupdf_adapter.PyMuPDFExtractionLimitError) as page_exc_info:
-        await _ingest_fake_document(
-            monkeypatch,
-            tmp_path,
-            _FakeDocument([_FakePage(drawings=[drawing, drawing])]),
-        )
-    assert str(page_exc_info.value) == "PyMuPDF extraction exceeded page drawing limit."
+    page_result = await _ingest_fake_document(
+        monkeypatch,
+        tmp_path,
+        _FakeDocument([_FakePage(drawings=[drawing, drawing])]),
+        limits=pymupdf_adapter._ExtractionLimits(
+            max_drawings_per_page=1,
+            max_total_drawings=250_000,
+            max_entities=250_000,
+        ),
+    )
+    page_metadata = cast(dict[str, Any], page_result.canonical["metadata"])
+    assert page_metadata["complexity_truncation"]["dropped_drawings"] == 1
+    assert len(cast(tuple[Any, ...], page_result.canonical["entities"])) == 1
+    assert _truncation_warning(page_result) is not None
 
-    monkeypatch.setattr(pymupdf_adapter, "_MAX_DRAWINGS_PER_PAGE", 10)
-    monkeypatch.setattr(pymupdf_adapter, "_MAX_TOTAL_DRAWINGS", 1)
-    with pytest.raises(pymupdf_adapter.PyMuPDFExtractionLimitError) as total_exc_info:
-        await _ingest_fake_document(
-            monkeypatch,
-            tmp_path,
-            _FakeDocument([_FakePage(drawings=[drawing]), _FakePage(drawings=[drawing])]),
-        )
-    assert str(total_exc_info.value) == "PyMuPDF extraction exceeded total drawing limit."
+    total_result = await _ingest_fake_document(
+        monkeypatch,
+        tmp_path,
+        _FakeDocument([_FakePage(drawings=[drawing]), _FakePage(drawings=[drawing])]),
+        limits=pymupdf_adapter._ExtractionLimits(
+            max_drawings_per_page=10,
+            max_total_drawings=1,
+            max_entities=250_000,
+        ),
+    )
+    total_metadata = cast(dict[str, Any], total_result.canonical["metadata"])
+    # First page's single drawing fits the cumulative cap; the second page is dropped.
+    assert total_metadata["complexity_truncation"]["dropped_drawings"] == 1
+    assert len(cast(tuple[Any, ...], total_result.canonical["entities"])) == 1
+    assert _truncation_warning(total_result) is not None
+
+
+def test_pymupdf_extraction_limits_resolve_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "pymupdf_max_drawings_per_page", 11)
+    monkeypatch.setattr(settings, "pymupdf_max_total_drawings", 22)
+    monkeypatch.setattr(settings, "pymupdf_max_entities", 33)
+
+    limits = pymupdf_adapter._ExtractionLimits.from_settings()
+
+    assert limits.max_drawings_per_page == 11
+    assert limits.max_total_drawings == 22
+    assert limits.max_entities == 33
+
+
+@pytest.mark.asyncio
+async def test_pymupdf_ingest_degrades_when_settings_lower_drawings_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "pymupdf_max_drawings_per_page", 1)
+    drawing = {
+        "items": (("l", _FakePoint(0.0, 0.0), _FakePoint(10.0, 0.0)),),
+        "width": 1.0,
+        "color": (0.1, 0.2, 0.3),
+    }
+    document = _FakeDocument([_FakePage(drawings=[drawing, drawing])])
+
+    # No explicit limits => the helper resolves them from settings.
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document)
+
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["complexity_truncation"]["dropped_drawings"] == 1
+    assert _truncation_warning(result) is not None
 
 
 @pytest.mark.asyncio
@@ -2373,12 +2446,20 @@ async def test_pymupdf_ingest_unsupported_path_unknown_entity_counts_toward_enti
             )
         ]
     )
-    monkeypatch.setattr(pymupdf_adapter, "_MAX_ENTITIES", 1)
+    limits = pymupdf_adapter._ExtractionLimits(
+        max_drawings_per_page=64_000,
+        max_total_drawings=250_000,
+        max_entities=1,
+    )
 
-    with pytest.raises(pymupdf_adapter.PyMuPDFExtractionLimitError) as exc_info:
-        await _ingest_fake_document(monkeypatch, tmp_path, document)
+    result = await _ingest_fake_document(monkeypatch, tmp_path, document, limits=limits)
 
-    assert str(exc_info.value) == "PyMuPDF extraction exceeded entity limit."
+    # The line entity fills the cap, so the unsupported-path unknown entity is
+    # dropped and the extraction degrades to a partial, review-gated result.
+    assert len(cast(tuple[Any, ...], result.canonical["entities"])) == 1
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["complexity_truncation"]["entities_truncated"] is True
+    assert _truncation_warning(result) is not None
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
 """Application configuration via pydantic-settings."""
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app import __version__
@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # Application settings
     max_upload_mb: int = 200
     libredwg_max_output_mb: int = 32
+    # PyMuPDF vector extraction complexity caps. Sized well above real dense CAD
+    # sheets (~16.5k path objects / single A0 page) but bounded to cap memory. On
+    # exceeding a cap the adapter degrades to a partial, review-gated result with a
+    # warning rather than failing the job. See issue #383.
+    pymupdf_max_drawings_per_page: int = 64_000
+    pymupdf_max_total_drawings: int = 250_000
+    pymupdf_max_entities: int = 250_000
     idempotency_key_hash_secret: str | None = None
     # How long an in-progress idempotency reservation may sit before an identical retry
     # is allowed to take it over (the original request crashed before completing).
@@ -64,6 +71,17 @@ class Settings(BaseSettings):
     def validate_libredwg_max_output_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
+        return value
+
+    @field_validator(
+        "pymupdf_max_drawings_per_page",
+        "pymupdf_max_total_drawings",
+        "pymupdf_max_entities",
+    )
+    @classmethod
+    def validate_pymupdf_complexity_caps(cls, value: int, info: ValidationInfo) -> int:
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be positive")
         return value
 
     @field_validator("pdf_intake_service_timeout_seconds")
