@@ -724,5 +724,13 @@ def _order_revision_entity_insert_rows(rows: list[dict[str, Any]]) -> list[dict[
     if len(ordered_rows) == len(rows):
         return ordered_rows
 
+    # Any rows left unprocessed form a parent_entity_row_id cycle (every acyclic row is
+    # reachable from a parentless root via Kahn's algorithm). Inserting them in arbitrary
+    # order would violate the self-referential, non-deferrable FK with an opaque
+    # IntegrityError; surface the cycle members explicitly instead.
     ordered_row_ids = {row["id"] for row in ordered_rows}
-    return [*ordered_rows, *[row for row in rows if row["id"] not in ordered_row_ids]]
+    cyclic_ids = [str(row["id"]) for row in rows if row["id"] not in ordered_row_ids]
+    raise ValueError(
+        "Revision entities have a cyclic parent_entity_row_id dependency and cannot be "
+        f"ordered for insert ({len(cyclic_ids)} involved): {cyclic_ids[:10]}"
+    )

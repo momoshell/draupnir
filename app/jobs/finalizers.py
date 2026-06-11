@@ -685,6 +685,15 @@ async def _finalize_ingest_job(
                 },
                 session=session,
             )
+            # commit_started is set BEFORE commit() deliberately: once a commit is
+            # attempted its outcome is ambiguous (e.g. the connection can drop after the
+            # server commits but before we get the ack), so we must NOT delete the
+            # immutable storage artifact — a committed row may reference it, and deleting
+            # it would corrupt that row. We therefore only clean up when the commit
+            # definitely did not start. This trades a bounded orphaned-artifact leak on
+            # commit failure (storage keys are per-attempt UUIDs, so a retry writes a
+            # fresh key) for never orphaning a committed row's bytes. Reclaiming those
+            # rare orphans is a storage-GC concern, not a reorder of these lines.
             commit_started = True
             await session.commit()
         except asyncio.CancelledError:
@@ -997,6 +1006,15 @@ async def _finalize_export_job(
                 session=session,
             )
             await session.flush()
+            # commit_started is set BEFORE commit() deliberately: once a commit is
+            # attempted its outcome is ambiguous (e.g. the connection can drop after the
+            # server commits but before we get the ack), so we must NOT delete the
+            # immutable storage artifact — a committed row may reference it, and deleting
+            # it would corrupt that row. We therefore only clean up when the commit
+            # definitely did not start. This trades a bounded orphaned-artifact leak on
+            # commit failure (storage keys are per-attempt UUIDs, so a retry writes a
+            # fresh key) for never orphaning a committed row's bytes. Reclaiming those
+            # rare orphans is a storage-GC concern, not a reorder of these lines.
             commit_started = True
             await session.commit()
         except asyncio.CancelledError:
