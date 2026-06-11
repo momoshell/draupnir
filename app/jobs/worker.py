@@ -2003,7 +2003,20 @@ async def publish_job_enqueue_intent(
         else:
             _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
 
-        await _mark_job_enqueue_published(job_id, lease_token=claimed_intent.lease.token)
+        published = await _mark_job_enqueue_published(
+            job_id, lease_token=claimed_intent.lease.token
+        )
+        if not published:
+            # The broker publish already succeeded; the enqueue intent is at-least-once and
+            # job execution is idempotent, so we still report success. But the PUBLISHED
+            # transition was skipped because another owner reclaimed the lease (or the status
+            # moved off PUBLISHING) between claim and mark — surface that race for observability.
+            logger.warning(
+                "job_enqueue_publish_mark_skipped",
+                job_id=str(job_id),
+                job_type=claimed_intent.job_type,
+                reason="stale_enqueue_lease",
+            )
         return True
     except Exception:
         if not suppress_exceptions:
