@@ -7,6 +7,7 @@ from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from app.jobs.estimate_assembly import _build_estimate_assumption_entries
 from app.jobs.estimate_mapping import (
@@ -14,6 +15,7 @@ from app.jobs.estimate_mapping import (
     _EstimateWorkerLineInput,
     _resolve_formula_binding_snapshot_key,
 )
+from app.schemas.estimate import EstimateVersionCreateRequest
 
 
 def _sort_orders() -> Callable[[], int]:
@@ -117,3 +119,39 @@ def test_resolve_binding_rejects_unknown_assumption(contract_kind: str) -> None:
             material_entry_keys=set(),
             assumption_entry_keys={"assumption:markup"},
         )
+
+
+def test_request_accepts_valid_assumption_inputs() -> None:
+    request = EstimateVersionCreateRequest(
+        assumptions={
+            "tax_rate": "0.20",
+            "inputs": {
+                "markup": {"kind": "scalar", "amount": "0.15"},
+                "mobilization": {"kind": "money", "amount": "500.00"},
+            },
+        }
+    )
+    assert request.assumptions["inputs"]["markup"]["kind"] == "scalar"
+
+
+def test_request_accepts_missing_inputs_key() -> None:
+    assert EstimateVersionCreateRequest(assumptions={"tax_rate": "0.20"}).assumptions == {
+        "tax_rate": "0.20"
+    }
+
+
+@pytest.mark.parametrize(
+    "assumptions",
+    [
+        {"inputs": "not-a-mapping"},
+        {"inputs": {"x": "not-an-object"}},
+        {"inputs": {"x": {"kind": "bogus", "amount": "1"}}},
+        {"inputs": {"x": {"kind": "money", "amount": "not-a-number"}}},
+        {"inputs": {"x": {"kind": "money", "amount": "-1.00"}}},
+        {"inputs": {"x": {"kind": "money", "amount": "1.00", "currency": "USD"}}},
+        {"inputs": {"x": {"kind": "scalar", "amount": True}}},
+    ],
+)
+def test_request_rejects_malformed_assumption_inputs(assumptions: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        EstimateVersionCreateRequest(assumptions=assumptions)
