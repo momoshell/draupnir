@@ -29,7 +29,6 @@ from app.cad.changeset import (
     ChangeSetApplySuccess,
     load_and_apply_change_set,
 )
-from app.core.clock import utcnow as _clock_utcnow
 from app.core.config import settings
 from app.core.errors import ErrorCode
 from app.core.logging import get_logger
@@ -80,6 +79,12 @@ from app.jobs.estimate_assembly import (
 from app.jobs.estimate_mapping import (
     _ESTIMATE_JOB_INPUT_INVALID_ERROR_MESSAGE,
     _EstimateJobInputError,
+)
+from app.jobs.execution_inputs import (
+    _ExportExecutionInput as _ExportExecutionInput,
+)
+from app.jobs.execution_inputs import (
+    _QuantityTakeoffExecutionInput as _QuantityTakeoffExecutionInput,
 )
 from app.jobs.report_lineage import (
     _build_changeset_validation_report_json,
@@ -150,7 +155,7 @@ logger = get_logger(__name__)
 _RECOVERABLE_INGEST_JOB_TYPES = job_runner.INGEST_WORKER_JOB_TYPES
 _RECOVERABLE_ENQUEUE_JOB_TYPES = job_runner.RECOVERABLE_ENQUEUE_JOB_TYPES
 _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = job_runner.JOB_TYPES_WITHOUT_ENQUEUE_PUBLISHER
-_TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
+_TERMINAL_JOB_STATUSES = job_lifecycle._TERMINAL_JOB_STATUSES
 _ENQUEUE_STATUS_PENDING = "pending"
 _ENQUEUE_STATUS_PUBLISHING = "publishing"
 _ENQUEUE_STATUS_PUBLISHED = "published"
@@ -451,21 +456,6 @@ _CHANGESET_APPLY_PROCESS_SPEC = _RegisteredJobProcessSpec(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class _ExportExecutionInput:
-    """Resolved persisted inputs for a supported export job."""
-
-    drawing_revision_id: UUID
-    export_kind: str
-    export_format: str
-    media_type: str
-    artifact_name: str
-    options_json: dict[str, Any]
-    changeset_id: UUID | None = None
-    quantity_takeoff_id: UUID | None = None
-    estimate_version_id: UUID | None = None
-
-
 _ExportRenderFn = Callable[
     [AsyncSession, _ExportExecutionInput],
     Coroutine[Any, Any, ExportArtifact],
@@ -694,18 +684,6 @@ class _ClaimedJobEnqueueIntent:
     attempts: int
 
 
-@dataclass(frozen=True, slots=True)
-class _QuantityTakeoffExecutionInput:
-    """Loaded immutable quantity takeoff execution inputs."""
-
-    drawing_revision_id: UUID
-    review_state: str
-    validation_status: str
-    quantity_gate: str
-    gate: RevisionGateMetadata
-    entities: list[RevisionEntityInput]
-
-
 _JobLockBootstrap = job_lifecycle._JobLockBootstrap
 _LockedJobSource = job_lifecycle._LockedJobSource
 
@@ -792,9 +770,7 @@ celery_app.conf.update(
 celery_app.autodiscover_tasks(["app.jobs"], force=True)
 
 
-def _utcnow() -> datetime:
-    """Return a timezone-aware UTC timestamp."""
-    return _clock_utcnow()
+_utcnow = job_lifecycle._utcnow
 
 
 def _get_worker_loop_runner() -> asyncio.Runner:
@@ -827,10 +803,7 @@ def _run_worker_loop[WorkerLoopResultT](
 atexit.register(_close_worker_loop_runner)
 
 
-def _clear_job_attempt_lease(job: Job) -> None:
-    """Clear persisted ownership fencing for a job attempt."""
-    job.attempt_token = None
-    job.attempt_lease_expires_at = None
+_clear_job_attempt_lease = job_lifecycle._clear_job_attempt_lease
 
 
 def _clear_enqueue_intent_lease(job: Job) -> None:
