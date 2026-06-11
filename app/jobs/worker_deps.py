@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from app.estimating.catalog.contracts import CatalogMaterialMatch, CatalogRateMatch
     from app.estimating.catalog.selection import SelectedFormula
     from app.jobs.lifecycle import _JobLockBootstrap, _LockedJobSource
+    from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
     from app.models.job import Job
     from app.models.project import Project
     from app.storage import Storage
@@ -44,3 +45,4 @@ class WorkerDeps:
     lock_job_source: Callable[..., Awaitable[_LockedJobSource]]
     finalize_job_cancelled: Callable[[Job], None]
     cancel_job_for_inactive_source: Callable[..., Awaitable[bool]]
+    load_changeset_apply_job_input: Callable[..., Awaitable[ChangeSetApplyJobInput | None]]
