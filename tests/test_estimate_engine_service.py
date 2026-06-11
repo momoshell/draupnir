@@ -709,3 +709,87 @@ def test_compose_estimate_rejects_adjustments_without_exactly_one_anchor(
         compose_estimate(broken_input)
 
     assert exc_info.value.reason == "invalid_adjustment_anchor"
+
+
+def test_compose_estimate_resolves_scalar_and_money_formula_inputs() -> None:
+    """Formula inputs of kind money + scalar resolve from named assumption entries."""
+    scalar_contract = ValueContract(kind="scalar")
+    formula = FormulaDefinition(
+        formula_id="formula.scaled_cost",
+        name="Scaled cost",
+        version=1,
+        checksum="e" * 64,
+        output_key="estimate.scaled_cost",
+        output_contract=MONEY_GBP,
+        declared_inputs=(
+            FormulaInputDefinition(name="base", contract=MONEY_GBP),
+            FormulaInputDefinition(name="divisor", contract=scalar_contract),
+        ),
+        expression=FormulaNode(
+            kind="divide",
+            args=(
+                FormulaNode(kind="input", name="base"),
+                FormulaNode(kind="input", name="divisor"),
+            ),
+        ),
+        rounding=RoundingSpec(scale=2, mode="ROUND_HALF_UP"),
+    )
+    engine_input = EstimateEngineInput(
+        estimate_job_id=UUID("11111111-1111-1111-1111-111111111111"),
+        project_id=UUID("22222222-2222-2222-2222-222222222222"),
+        file_id=UUID("33333333-3333-3333-3333-333333333333"),
+        drawing_revision_id=UUID("44444444-4444-4444-4444-444444444444"),
+        quantity_takeoff_id=UUID("55555555-5555-5555-5555-555555555555"),
+        source_job_id=UUID("66666666-6666-6666-6666-666666666666"),
+        quantity_gate="allowed",
+        trusted_totals=True,
+        tax_rate=Decimal("0"),
+        assumption_entries=(
+            EstimateAssumptionEntryInput(
+                entry_key="assumption:base_cost",
+                entry_label="base_cost",
+                sort_order=1,
+                source_checksum_sha256="2" * 64,
+                amount=Decimal("10.00"),
+                kind="money",
+            ),
+            EstimateAssumptionEntryInput(
+                entry_key="assumption:divisor",
+                entry_label="divisor",
+                sort_order=2,
+                source_checksum_sha256="3" * 64,
+                amount=Decimal("4"),
+                kind="scalar",
+            ),
+        ),
+        formula_entries=(
+            EstimateFormulaEntryInput(
+                entry_key="formula:scaled_cost",
+                entry_label="Scaled cost",
+                sort_order=3,
+                source_formula_id=uuid4(),
+                source_checksum_sha256=formula.checksum,
+                definition=formula,
+            ),
+        ),
+        line_inputs=(
+            EstimateLineInputSpec(
+                line_key="line:formula",
+                line_type="formula",
+                description="Scaled cost",
+                formula_entry_key="formula:scaled_cost",
+                formula_inputs={
+                    "base": "assumption:base_cost",
+                    "divisor": "assumption:divisor",
+                },
+            ),
+        ),
+    )
+
+    output = compose_estimate(engine_input)
+
+    formula_line = next(line for line in output.line_items if line.line_key == "line:formula")
+    # money 10.00 / scalar 4 = 2.50 money
+    assert formula_line.subtotal_amount == Decimal("2.50")
+    snapshot_keys = {entry.entry_key for entry in output.snapshot_entries}
+    assert {"assumption:base_cost", "assumption:divisor"} <= snapshot_keys

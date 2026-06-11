@@ -395,8 +395,22 @@ def _resolve_formula_binding_snapshot_key(
     quantity_entry_keys: set[str],
     rate_entry_keys: set[str],
     material_entry_keys: set[str],
+    assumption_entry_keys: set[str],
 ) -> str:
     """Resolve one persisted formula-binding token into an engine snapshot entry key."""
+    # Scalar/money inputs bind to a named assumption value (assumptions_json["inputs"]);
+    # the token is the assumption name, the snapshot entry key is "assumption:<name>".
+    if contract_kind in ("scalar", "money"):
+        assumption_entry_key = f"assumption:{token}"
+        if assumption_entry_key in assumption_entry_keys:
+            return assumption_entry_key
+        raise _build_estimate_job_input_error(
+            "invalid_formula_input_binding",
+            ref_type=line.ref_type,
+            selection_key=line.selection_key,
+            line_key=line.line_key,
+            extra_details={"binding": token, "contract_kind": contract_kind},
+        )
     if contract_kind == "quantity" and token in quantity_entry_keys:
         return token
     if contract_kind == "rate" and token in rate_entry_keys | material_entry_keys:
