@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from app.estimating.catalog.contracts import CatalogMaterialMatch, CatalogRateMatch
     from app.estimating.catalog.selection import SelectedFormula
-    from app.jobs.lifecycle import _JobLockBootstrap
+    from app.jobs.lifecycle import _JobLockBootstrap, _LockedJobSource
+    from app.models.job import Job
     from app.models.project import Project
     from app.storage import Storage
 
@@ -40,3 +41,6 @@ class WorkerDeps:
     emit_job_event: Callable[..., Awaitable[bool]]
     get_project: Callable[..., Awaitable[Project | None]]
     get_job_lock_bootstrap: Callable[..., Awaitable[_JobLockBootstrap | None]]
+    lock_job_source: Callable[..., Awaitable[_LockedJobSource]]
+    finalize_job_cancelled: Callable[[Job], None]
+    cancel_job_for_inactive_source: Callable[..., Awaitable[bool]]
