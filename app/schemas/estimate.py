@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -62,6 +62,39 @@ class EstimateVersionCreateRequest(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("catalog_refs", "refs", "line_refs"),
     )
+
+    @field_validator("assumptions")
+    @classmethod
+    def _validate_assumption_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Validate named scalar/money assumption inputs up front (422, not a job failure).
+
+        Each ``assumptions.inputs[name]`` must be ``{"kind": "scalar"|"money", "amount": <num>}``
+        with a nonnegative finite amount; money inputs must be GBP. The worker re-validates,
+        but rejecting malformed inputs at request time gives clients an immediate error.
+        """
+        raw_inputs = value.get("inputs")
+        if raw_inputs is None:
+            return value
+        if not isinstance(raw_inputs, dict):
+            raise ValueError("assumptions.inputs must be an object mapping names to values")
+        for name, spec in raw_inputs.items():
+            if not isinstance(spec, dict):
+                raise ValueError(f"assumption input '{name}' must be an object")
+            kind = spec.get("kind")
+            if kind not in ("scalar", "money"):
+                raise ValueError(f"assumption input '{name}' kind must be 'scalar' or 'money'")
+            amount = spec.get("amount")
+            if isinstance(amount, bool):
+                raise ValueError(f"assumption input '{name}' amount must be a number")
+            try:
+                parsed_amount = Decimal(str(amount))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise ValueError(f"assumption input '{name}' amount must be a number") from exc
+            if not parsed_amount.is_finite() or parsed_amount < 0:
+                raise ValueError(f"assumption input '{name}' amount must be a nonnegative number")
+            if kind == "money" and spec.get("currency", "GBP") != "GBP":
+                raise ValueError(f"assumption input '{name}' currency must be 'GBP'")
+        return value
 
     @model_validator(mode="before")
     @classmethod
