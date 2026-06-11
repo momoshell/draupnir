@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 from sqlalchemy import select
+from structlog.testing import capture_logs
 
 import app.api.v1.files as files_api
 import app.db.session as session_module
@@ -434,6 +435,92 @@ def test_enqueue_backoff_seconds_is_capped_exponential() -> None:
     )
     # Large attempt counts saturate at the cap rather than growing without bound.
     assert worker_module._enqueue_backoff_seconds(50) == worker_module._ENQUEUE_BACKOFF_MAX_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_publish_job_enqueue_intent_warns_when_published_mark_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skipped PUBLISHED mark (stale lease) is surfaced but still reports success.
+
+    The broker publish has already happened by the time we mark PUBLISHED, and the enqueue
+    intent is at-least-once with idempotent execution — so when the mark is skipped because
+    another owner reclaimed the lease, the function still returns True. The race must not be
+    silent, though: it should emit ``job_enqueue_publish_mark_skipped``.
+    """
+    job_id = uuid.uuid4()
+    claimed = worker_module._ClaimedJobEnqueueIntent(
+        lease=worker_module._EnqueueIntentLease(
+            token=uuid.uuid4(),
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        ),
+        job_type=JobType.INGEST.value,
+        attempts=1,
+    )
+
+    async def _fake_claim(received_job_id: uuid.UUID) -> worker_module._ClaimedJobEnqueueIntent:
+        assert received_job_id == job_id
+        return claimed
+
+    async def _fake_mark_skipped(received_job_id: uuid.UUID, *, lease_token: uuid.UUID) -> bool:
+        assert received_job_id == job_id
+        assert lease_token == claimed.lease.token
+        return False
+
+    monkeypatch.setattr(worker_module, "_claim_job_enqueue_intent", _fake_claim)
+    monkeypatch.setattr(worker_module, "_mark_job_enqueue_published", _fake_mark_skipped)
+
+    published_calls: list[uuid.UUID] = []
+
+    with capture_logs() as logs:
+        result = await worker_module.publish_job_enqueue_intent(
+            job_id,
+            publisher=published_calls.append,
+        )
+
+    assert result is True
+    assert published_calls == [job_id]
+    skipped_events = [
+        entry for entry in logs if entry["event"] == "job_enqueue_publish_mark_skipped"
+    ]
+    assert len(skipped_events) == 1
+    assert skipped_events[0]["log_level"] == "warning"
+    assert skipped_events[0]["reason"] == "stale_enqueue_lease"
+    assert skipped_events[0]["job_id"] == str(job_id)
+
+
+@pytest.mark.asyncio
+async def test_publish_job_enqueue_intent_silent_when_published_mark_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The happy path marks PUBLISHED and emits no skip warning."""
+    job_id = uuid.uuid4()
+    claimed = worker_module._ClaimedJobEnqueueIntent(
+        lease=worker_module._EnqueueIntentLease(
+            token=uuid.uuid4(),
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        ),
+        job_type=JobType.INGEST.value,
+        attempts=1,
+    )
+
+    async def _fake_claim(received_job_id: uuid.UUID) -> worker_module._ClaimedJobEnqueueIntent:
+        return claimed
+
+    async def _fake_mark_ok(received_job_id: uuid.UUID, *, lease_token: uuid.UUID) -> bool:
+        return True
+
+    monkeypatch.setattr(worker_module, "_claim_job_enqueue_intent", _fake_claim)
+    monkeypatch.setattr(worker_module, "_mark_job_enqueue_published", _fake_mark_ok)
+
+    with capture_logs() as logs:
+        result = await worker_module.publish_job_enqueue_intent(
+            job_id,
+            publisher=lambda _job_id: None,
+        )
+
+    assert result is True
+    assert not [entry for entry in logs if entry["event"] == "job_enqueue_publish_mark_skipped"]
 
 
 @pytest.mark.usefixtures(fake_ingestion_runner.__name__)
