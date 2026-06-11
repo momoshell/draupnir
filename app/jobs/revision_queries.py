@@ -12,7 +12,9 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.jobs.lifecycle import _RevisionConflictError
 from app.models.drawing_revision import DrawingRevision
+from app.models.job import Job, JobType
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntity,
@@ -164,6 +166,30 @@ async def _get_revision_entities_for_revision(
         .order_by(RevisionEntity.sequence_index.asc(), RevisionEntity.id.asc())
     )
     return list(result.scalars().all())
+
+
+def _assert_job_base_revision_invariants(job: Job) -> None:
+    """Reject persisted jobs whose job_type/base_revision_id pairing is invalid."""
+
+    if job.job_type == JobType.INGEST.value:
+        if job.base_revision_id is not None:
+            raise ValueError("Initial ingest job cannot retain a base revision")
+        return
+
+    if job.job_type == JobType.REPROCESS.value:
+        if job.base_revision_id is None:
+            raise _RevisionConflictError(
+                message="Reprocess job is missing its finalized base revision.",
+                details={
+                    "base_revision_id": None,
+                    "base_revision_sequence": None,
+                    "current_revision_id": None,
+                    "current_revision_sequence": None,
+                },
+            )
+        return
+
+    raise ValueError(f"Unsupported ingest job type '{job.job_type}'")
 
 
 def _revision_reference(

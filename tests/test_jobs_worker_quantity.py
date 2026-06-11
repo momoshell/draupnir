@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 import app.db.session as session_module
+import app.jobs.finalizers as finalizers_module
 import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
@@ -1612,7 +1613,7 @@ class TestJobsWorkerQuantity:
 
         monkeypatch.setattr(worker_module, "run_ingestion", _run_quantity_ready_ingestion)
         _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
-        monkeypatch.setattr(worker_module, "_build_quantity_items", _invalid_quantity_items)
+        monkeypatch.setattr(finalizers_module, "_build_quantity_items", _invalid_quantity_items)
 
         with pytest.raises(IntegrityError):
             await worker_module.process_quantity_takeoff_job(quantity_job.id)

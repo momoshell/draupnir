@@ -22,7 +22,8 @@ from app.core.config import settings
 from app.core.middleware import REQUEST_ID_PATTERN
 from app.db.session import AsyncSessionLocal
 from app.ingestion.finalization import IngestFinalizationPayload
-from app.jobs.worker import _INITIAL_INGEST_REVISION_KIND, process_ingest_job
+from app.jobs.finalizers import _INITIAL_INGEST_REVISION_KIND
+from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.validation_report import ValidationReport
