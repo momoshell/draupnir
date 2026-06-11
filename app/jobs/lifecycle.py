@@ -79,6 +79,9 @@ class _BeginOrResumeLogKeys:
     cancelled: str
 
 
+_TERMINAL_JOB_STATUSES = {"failed", "succeeded", "cancelled"}
+
+
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return _clock_utcnow()
