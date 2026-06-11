@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
@@ -23,6 +24,7 @@ from app.estimating.catalog import CatalogFormulaRef, CatalogMaterialRef, Catalo
 from app.estimating.catalog.selection import CatalogSelectionError
 from app.estimating.engine import formula_definition_from_selected_formula
 from app.estimating.engine.contracts import (
+    EstimateAssumptionEntryInput,
     EstimateEngineInput,
     EstimateFormulaEntryInput,
     EstimateLineInputSpec,
@@ -86,6 +88,70 @@ def _estimate_tax_rate(assumptions_json: dict[str, Any]) -> Decimal:
             extra_details={"field": "tax_rate"},
         )
     return tax_rate
+
+
+def _build_estimate_assumption_entries(
+    assumptions_json: dict[str, Any],
+    *,
+    next_sort_order: Callable[[], int],
+) -> list[EstimateAssumptionEntryInput]:
+    """Build deterministic assumption snapshot entries from ``assumptions_json["inputs"]``.
+
+    Named assumption values are the source for formula ``scalar``/``money`` declared
+    inputs; each becomes a snapshot entry keyed ``assumption:<name>`` that the engine
+    resolves to a scalar/money ``FormulaValue``. Sorted by name for determinism.
+    """
+    raw_inputs = assumptions_json.get("inputs", {})
+    if not isinstance(raw_inputs, dict):
+        raise _build_estimate_job_input_error(
+            "invalid_assumption_inputs",
+            extra_details={"field": "assumptions.inputs"},
+        )
+
+    entries: list[EstimateAssumptionEntryInput] = []
+    for name in sorted(raw_inputs):
+        spec = raw_inputs[name]
+        if not isinstance(spec, dict):
+            raise _build_estimate_job_input_error(
+                "invalid_assumption_input",
+                extra_details={"assumption": name},
+            )
+        kind = spec.get("kind")
+        if kind not in ("scalar", "money"):
+            raise _build_estimate_job_input_error(
+                "invalid_assumption_input_kind",
+                extra_details={"assumption": name, "kind": kind},
+            )
+        amount = _estimate_decimal(
+            spec.get("amount"),
+            reason="invalid_assumption_amount",
+            extra_details={"assumption": name},
+        )
+        if amount < 0:
+            raise _build_estimate_job_input_error(
+                "invalid_assumption_amount",
+                extra_details={"assumption": name},
+            )
+        if kind == "money" and spec.get("currency", "GBP") != "GBP":
+            raise _build_estimate_job_input_error(
+                "unsupported_assumption_currency",
+                extra_details={"assumption": name, "currency": spec.get("currency")},
+            )
+        payload: dict[str, Any] = {"kind": kind, "amount": str(amount)}
+        if kind == "money":
+            payload["currency"] = "GBP"
+        entries.append(
+            EstimateAssumptionEntryInput(
+                entry_key=f"assumption:{name}",
+                entry_label=name,
+                sort_order=next_sort_order(),
+                source_checksum_sha256=_estimate_input_checksum(payload),
+                amount=amount,
+                source_payload=payload,
+                kind=cast(Any, kind),
+            )
+        )
+    return entries
 
 
 async def _build_estimate_engine_input(
@@ -251,6 +317,11 @@ async def _build_estimate_engine_input(
 
         lines_by_key = {line.line_key: line for line in assembly.lines}
         quantity_entry_keys = {entry.entry_key for entry in quantity_entries}
+        assumption_entries = _build_estimate_assumption_entries(
+            estimate_input.assumptions_json,
+            next_sort_order=_next_snapshot_sort_order,
+        )
+        assumption_entry_keys = {entry.entry_key for entry in assumption_entries}
         rate_entry_keys = {
             line.catalog_entry_key
             for line in assembly.lines
@@ -485,6 +556,7 @@ async def _build_estimate_engine_input(
                     quantity_entry_keys=quantity_entry_keys,
                     rate_entry_keys=rate_entry_keys,
                     material_entry_keys=material_entry_keys,
+                    assumption_entry_keys=assumption_entry_keys,
                 )
                 for declared_input in formula_definition.declared_inputs
             }
@@ -513,5 +585,6 @@ async def _build_estimate_engine_input(
             rate_entries=tuple(rate_entries),
             material_entries=tuple(material_entries),
             formula_entries=tuple(formula_entries),
+            assumption_entries=tuple(assumption_entries),
             line_inputs=tuple(line_inputs),
         )

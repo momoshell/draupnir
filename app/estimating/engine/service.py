@@ -105,10 +105,18 @@ def compose_estimate(engine_input: EstimateEngineInput) -> EstimateEngineOutput:
         snapshot = _build_assumption_snapshot(engine_input, assumption_entry)
         snapshot_entries.append(snapshot)
         _register_snapshot(snapshot_keys, snapshot)
+        # Contract is driven by the input's kind, not the persisted entry: assumption
+        # rows store currency NULL, but a money formula input requires currency="GBP",
+        # and a scalar input requires a unitless scalar contract.
+        assumption_contract = (
+            ValueContract(kind="scalar")
+            if assumption_entry.kind == "scalar"
+            else ValueContract(kind="money", currency=assumption_entry.currency)
+        )
         snapshot_values[assumption_entry.entry_key] = _SnapshotValue(
             snapshot=snapshot,
             amount=snapshot.money_amount or Decimal("0"),
-            contract=ValueContract(kind="money", currency=snapshot.currency),
+            contract=assumption_contract,
             value_type="assumption",
         )
 
@@ -356,14 +364,16 @@ def _build_assumption_snapshot(
     _validate_entry_key(assumption_entry.entry_key)
     _validate_non_empty_text("entry_label", assumption_entry.entry_label)
     _validate_checksum(assumption_entry.source_checksum_sha256)
-    if assumption_entry.currency != "GBP":
+    # Scalar assumptions are unitless (no currency); only money assumptions are
+    # currency-constrained.
+    if assumption_entry.kind == "money" and assumption_entry.currency != "GBP":
         raise_input_invalid(
             reason="unsupported_currency",
             message="estimate engine supports GBP only",
         )
     if assumption_entry.amount < 0:
         raise_input_invalid(
-            reason="negative_money",
+            reason="negative_assumption_amount",
             message="assumption amounts must be nonnegative",
         )
     return EstimateSnapshotEntrySpec(

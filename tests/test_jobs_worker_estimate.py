@@ -1090,6 +1090,117 @@ class TestJobsWorkerEstimate:
         )
         assert engine_input.line_inputs[2].formula_inputs == {"rate_input": "rate:paint-labor"}
 
+    async def test_process_estimate_job_binds_scalar_and_money_formula_inputs_to_assumptions(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Formula scalar/money inputs resolve from named assumptions through assembly."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            quantity_takeoff,
+            _,
+            estimate_job,
+        ) = await _create_ready_estimate_execution_job(async_client, monkeypatch)
+
+        await _persist_estimate_job_input(
+            estimate_job=estimate_job,
+            quantity_takeoff=quantity_takeoff,
+            assumptions_json={
+                "tax_rate": "0",
+                "inputs": {
+                    "markup": {"kind": "scalar", "amount": "0.15"},
+                    "mobilization": {"kind": "money", "amount": "500.00"},
+                },
+            },
+            catalog_refs=[
+                {
+                    "ref_type": "formula",
+                    "selection_key": "scaled-cost",
+                    "ref_order": 10,
+                    "formula_definition_id": uuid.UUID("00000000-0000-0000-0000-000000000202"),
+                    "catalog_checksum_sha256": "2" * 64,
+                    "selection_context_json": {
+                        "worker_mapping_version": _ESTIMATE_WORKER_MAPPING_VERSION,
+                        "line_key": "line-formula",
+                        "line_type": "formula",
+                        "description": "Scaled cost",
+                        "formula_inputs": {
+                            "bindings": {"markup_in": "markup", "base_in": "mobilization"},
+                        },
+                    },
+                },
+            ],
+        )
+
+        fake_formula_definition = types.SimpleNamespace(
+            declared_inputs=(
+                types.SimpleNamespace(
+                    name="markup_in",
+                    contract=types.SimpleNamespace(kind="scalar"),
+                ),
+                types.SimpleNamespace(
+                    name="base_in",
+                    contract=types.SimpleNamespace(kind="money"),
+                ),
+            ),
+        )
+        captured_engine_inputs: list[Any] = []
+
+        async def _resolve_formula(*args: Any, **kwargs: Any) -> Any:
+            _ = (args, kwargs)
+            return types.SimpleNamespace(
+                definition_id=uuid.UUID("00000000-0000-0000-0000-000000000202"),
+                checksum_sha256="2" * 64,
+                formula_id="scaled-cost",
+                version=1,
+            )
+
+        def _compose_estimate(engine_input: Any) -> Any:
+            captured_engine_inputs.append(engine_input)
+            return types.SimpleNamespace()
+
+        async def _skip_finalize(*args: Any, **kwargs: Any) -> bool:
+            _ = (args, kwargs)
+            return False
+
+        monkeypatch.setattr(worker_module, "resolve_formula", _resolve_formula)
+        monkeypatch.setattr(
+            estimate_assembly_module,
+            "formula_definition_from_selected_formula",
+            lambda _: fake_formula_definition,
+        )
+        monkeypatch.setattr(worker_module, "compose_estimate", _compose_estimate)
+        monkeypatch.setattr(worker_module, "_finalize_estimate_job", _skip_finalize)
+
+        await worker_module.process_estimate_job(estimate_job.id)
+
+        assert len(captured_engine_inputs) == 1
+        engine_input = captured_engine_inputs[0]
+        assumptions = {entry.entry_key: entry for entry in engine_input.assumption_entries}
+        assert set(assumptions) == {"assumption:markup", "assumption:mobilization"}
+        assert assumptions["assumption:markup"].kind == "scalar"
+        assert assumptions["assumption:markup"].amount == Decimal("0.15")
+        assert assumptions["assumption:mobilization"].kind == "money"
+        assert assumptions["assumption:mobilization"].amount == Decimal("500.00")
+        formula_line = next(
+            line for line in engine_input.line_inputs if line.line_key == "line-formula"
+        )
+        assert formula_line.formula_inputs == {
+            "markup_in": "assumption:markup",
+            "base_in": "assumption:mobilization",
+        }
+
     async def test_process_estimate_job_persists_expected_output_atomically(
         self,
         async_client: httpx.AsyncClient,

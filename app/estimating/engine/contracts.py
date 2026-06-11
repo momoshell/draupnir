@@ -259,6 +259,10 @@ class EstimateAssumptionEntryInput:
     amount: Decimal
     source_payload: dict[str, JSONValue] = field(default_factory=dict)
     currency: EstimateCurrency = "GBP"
+    # "money" assumptions carry a GBP amount; "scalar" assumptions are unitless
+    # multipliers/constants (no currency). Drives the snapshot ValueContract so the
+    # engine can satisfy money/scalar formula inputs (see _build_assumption_snapshot).
+    kind: Literal["money", "scalar"] = "money"
 
 
 @dataclass(frozen=True, slots=True)
