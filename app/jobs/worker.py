@@ -8,7 +8,7 @@ import hashlib
 import inspect
 import threading
 import uuid
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -67,7 +67,6 @@ from app.jobs.conflict_diagnostics import (
     _build_quantity_conflict_summaries,
     _quantity_gate_details,
 )
-from app.jobs.db_write import _bulk_insert_model_rows
 from app.jobs.estimate_assembly import (
     _build_estimate_engine_input as _build_estimate_engine_input,
 )
@@ -82,6 +81,9 @@ from app.jobs.execution_inputs import (
     _QuantityTakeoffExecutionInput as _QuantityTakeoffExecutionInput,
 )
 from app.jobs.finalizers import (
+    _finalize_changeset_apply_job as _finalize_changeset_apply_job,
+)
+from app.jobs.finalizers import (
     _finalize_estimate_job as _finalize_estimate_job,
 )
 from app.jobs.finalizers import (
@@ -92,13 +94,6 @@ from app.jobs.finalizers import (
 )
 from app.jobs.finalizers import (
     _finalize_quantity_takeoff_job as _finalize_quantity_takeoff_job,
-)
-from app.jobs.report_lineage import (
-    _build_changeset_validation_report_json,
-)
-from app.jobs.revision_materialization import (
-    _build_changeset_revision_materialization_rows,
-    _order_revision_entity_insert_rows,
 )
 from app.jobs.revision_queries import _assert_job_base_revision_invariants
 from app.jobs.revision_queries import (
@@ -138,15 +133,11 @@ from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
 from app.models.extraction_profile import ExtractionProfile
-from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.quantity_takeoff import QuantityTakeoff
 from app.models.revision_materialization import (
-    RevisionBlock,
     RevisionEntity,
     RevisionEntityManifest,
-    RevisionLayer,
-    RevisionLayout,
 )
 from app.models.validation_report import ValidationReport
 from app.storage import get_storage
@@ -908,6 +899,7 @@ def default_worker_deps() -> WorkerDeps:
         lock_job_source=_lock_job_source_for_terminal_mutation,
         finalize_job_cancelled=_finalize_job_cancelled,
         cancel_job_for_inactive_source=_cancel_job_for_inactive_source,
+        load_changeset_apply_job_input=_load_changeset_apply_job_input_if_valid,
     )
 
 
@@ -933,18 +925,6 @@ async def _lock_job_source_for_terminal_mutation(
         get_job_for_update_with_metadata_func=_get_job_for_update_with_metadata,
         get_source_file_func=_get_source_file,
     )
-
-
-async def _get_existing_drawing_revision(
-    session: AsyncSession,
-    *,
-    source_job_id: UUID,
-) -> DrawingRevision | None:
-    """Load an existing committed drawing revision for a job."""
-    result = await session.execute(
-        select(DrawingRevision).where(DrawingRevision.source_job_id == source_job_id)
-    )
-    return result.scalar_one_or_none()
 
 
 async def _get_extraction_profile(
@@ -973,77 +953,6 @@ async def _get_drawing_revision_for_changeset(
         .limit(1)
     )
     return result.scalar_one_or_none()
-
-
-async def _persist_changeset_revision_materialization(
-    session: AsyncSession,
-    *,
-    job: Job,
-    source_file: File,
-    drawing_revision_id: UUID,
-    apply_result: ChangeSetApplySuccess,
-    base_manifest: RevisionEntityManifest,
-    base_layouts: Sequence[RevisionLayout],
-    base_layers: Sequence[RevisionLayer],
-    base_blocks: Sequence[RevisionBlock],
-) -> UUID:
-    """Persist changeset-origin revision materialization with null ingest lineage fields."""
-    materialization_rows = _build_changeset_revision_materialization_rows(
-        apply_result,
-        base_manifest=base_manifest,
-        base_layouts=base_layouts,
-        base_layers=base_layers,
-        base_blocks=base_blocks,
-    )
-    manifest_id = uuid.uuid4()
-    base_row = {
-        "project_id": job.project_id,
-        "source_file_id": source_file.id,
-        "extraction_profile_id": None,
-        "source_job_id": job.id,
-        "drawing_revision_id": drawing_revision_id,
-        "adapter_run_output_id": None,
-        "canonical_entity_schema_version": base_manifest.canonical_entity_schema_version,
-    }
-
-    session.add(
-        RevisionEntityManifest(
-            id=manifest_id,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            extraction_profile_id=None,
-            source_job_id=job.id,
-            drawing_revision_id=drawing_revision_id,
-            adapter_run_output_id=None,
-            canonical_entity_schema_version=base_manifest.canonical_entity_schema_version,
-            counts_json=materialization_rows.counts_json,
-        )
-    )
-
-    await _bulk_insert_model_rows(
-        session,
-        RevisionLayout,
-        [{**base_row, **row} for row in materialization_rows.layouts],
-    )
-    await _bulk_insert_model_rows(
-        session,
-        RevisionLayer,
-        [{**base_row, **row} for row in materialization_rows.layers],
-    )
-    await _bulk_insert_model_rows(
-        session,
-        RevisionBlock,
-        [{**base_row, **row} for row in materialization_rows.blocks],
-    )
-    await _bulk_insert_model_rows(
-        session,
-        RevisionEntity,
-        _order_revision_entity_insert_rows(
-            [{**base_row, **row} for row in materialization_rows.entities]
-        ),
-    )
-
-    return manifest_id
 
 
 def _get_enqueue_job_error_message(job_type: str) -> str:
@@ -2899,255 +2808,6 @@ async def _execute_changeset_apply_job_attempt(
 
     assert isinstance(apply_result, ChangeSetApplySuccess)
     return _RegisteredJobAttemptResult(finalize_kwargs={"apply_result": apply_result})
-
-
-async def _finalize_changeset_apply_job(
-    job_id: UUID,
-    *,
-    attempt_token: UUID,
-    deps: WorkerDeps,
-    apply_result: ChangeSetApplySuccess,
-) -> bool:
-    """Atomically publish a changeset-origin revision and terminal job success."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
-        job = locked_source.job
-        source_file = locked_source.source_file
-
-        if job.status in _TERMINAL_JOB_STATUSES:
-            logger.info(
-                "changeset_apply_job_completion_skipped_terminal_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            logger.info(
-                "changeset_apply_job_completion_skipped_stale_attempt",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        if job.cancel_requested:
-            _finalize_job_cancelled(job)
-            await deps.emit_job_event(
-                job.id,
-                level="warning",
-                message="Job cancelled",
-                data_json={"status": "cancelled"},
-                session=session,
-            )
-            await session.commit()
-            logger.info("changeset_apply_job_cancelled", job_id=str(job_id))
-            return False
-
-        if job.status != "running":
-            logger.info(
-                "changeset_apply_job_completion_skipped_non_running_status",
-                job_id=str(job_id),
-                status=job.status,
-            )
-            return False
-
-        if (
-            locked_source.project.deleted_at is not None
-            or source_file is None
-            or source_file.deleted_at is not None
-        ):
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-                attempt_token=attempt_token,
-            )
-            logger.info("changeset_apply_job_cancelled_inactive_source", job_id=str(job_id))
-            return False
-
-        if job.base_revision_id != apply_result.base_revision.revision_id:
-            raise _RevisionConflictError(
-                message="Changeset apply base revision changed before finalization.",
-                details={
-                    "base_revision_id": (
-                        str(job.base_revision_id) if job.base_revision_id is not None else None
-                    ),
-                    "apply_result_base_revision_id": str(apply_result.base_revision.revision_id),
-                },
-            )
-
-        existing_revision = await _get_existing_drawing_revision(session, source_job_id=job.id)
-        if existing_revision is not None:
-            logger.info(
-                "changeset_apply_job_completion_skipped_existing_revision",
-                job_id=str(job_id),
-                drawing_revision_id=str(existing_revision.id),
-            )
-            return False
-
-        current_revision = await _get_latest_drawing_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-        )
-        if (
-            current_revision is None
-            or current_revision.id != apply_result.current_revision.revision_id
-        ):
-            base_revision = await _get_drawing_revision(
-                session,
-                revision_id=apply_result.base_revision.revision_id,
-            )
-            raise _RevisionConflictError(
-                message="Changeset apply base revision became stale before finalization.",
-                details={
-                    **_build_revision_conflict_details(
-                        base_revision=base_revision,
-                        current_revision=current_revision,
-                    ),
-                    "change_set_id": str(apply_result.change_set_id),
-                },
-            )
-
-        validation_report = await _get_validation_report_for_revision(
-            session,
-            project_id=job.project_id,
-            drawing_revision_id=current_revision.id,
-        )
-        if validation_report is None:
-            raise RuntimeError("Changeset apply base revision is missing its validation report.")
-
-        apply_input = await _load_changeset_apply_job_input_if_valid(session, job=job)
-
-        base_manifest = await _get_revision_entity_manifest_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            drawing_revision_id=current_revision.id,
-        )
-        if base_manifest is None:
-            raise RuntimeError("Changeset apply base revision is missing normalized entities.")
-
-        base_layouts = await _get_revision_layouts_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            drawing_revision_id=current_revision.id,
-        )
-        base_layers = await _get_revision_layers_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            drawing_revision_id=current_revision.id,
-        )
-        base_blocks = await _get_revision_blocks_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            drawing_revision_id=current_revision.id,
-        )
-
-        change_set = await session.get(CadChangeSet, apply_result.change_set_id)
-        if change_set is None:
-            raise RuntimeError("Changeset apply change set no longer exists.")
-        if (
-            change_set.project_id != job.project_id
-            or change_set.base_revision_id != apply_result.base_revision.revision_id
-        ):
-            raise ValueError("Changeset apply change set lineage does not match the source job")
-
-        drawing_revision_id = uuid.uuid4()
-        validation_report_id = uuid.uuid4()
-        finished_at = _utcnow()
-        drawing_revision = DrawingRevision(
-            id=drawing_revision_id,
-            project_id=job.project_id,
-            source_file_id=source_file.id,
-            extraction_profile_id=None,
-            source_job_id=job.id,
-            adapter_run_output_id=None,
-            changeset_id=apply_result.change_set_id,
-            predecessor_revision_id=current_revision.id,
-            revision_sequence=current_revision.revision_sequence + 1,
-            revision_kind="changeset",
-            review_state=validation_report.review_state,
-            canonical_entity_schema_version=base_manifest.canonical_entity_schema_version,
-            confidence_score=validation_report.effective_confidence,
-        )
-
-        session.add(drawing_revision)
-        await session.flush()
-
-        session.add(
-            ValidationReport(
-                id=validation_report_id,
-                project_id=job.project_id,
-                drawing_revision_id=drawing_revision_id,
-                source_job_id=job.id,
-                validation_report_schema_version=validation_report.validation_report_schema_version,
-                canonical_entity_schema_version=validation_report.canonical_entity_schema_version,
-                validation_status=validation_report.validation_status,
-                review_state=validation_report.review_state,
-                quantity_gate=validation_report.quantity_gate,
-                effective_confidence=validation_report.effective_confidence,
-                validator_name=validation_report.validator_name,
-                validator_version=validation_report.validator_version,
-                report_json=_build_changeset_validation_report_json(
-                    validation_report,
-                    change_set_id=apply_result.change_set_id,
-                    drawing_revision_id=drawing_revision_id,
-                    predecessor_revision_id=current_revision.id,
-                    pinned_validation_result_id=(
-                        apply_input.latest_validation_result_id if apply_input is not None else None
-                    ),
-                    pinned_validation_status=(
-                        apply_input.latest_validation_status if apply_input is not None else None
-                    ),
-                    source_job_id=job.id,
-                    validation_report_id=validation_report_id,
-                    generated_at=finished_at,
-                ),
-                generated_at=finished_at,
-            )
-        )
-        await _persist_changeset_revision_materialization(
-            session,
-            job=job,
-            source_file=source_file,
-            drawing_revision_id=drawing_revision_id,
-            apply_result=apply_result,
-            base_manifest=base_manifest,
-            base_layouts=base_layouts,
-            base_layers=base_layers,
-            base_blocks=base_blocks,
-        )
-
-        change_set.status = "applied"
-        job.status = "succeeded"
-        job.finished_at = finished_at
-        job.error_code = None
-        job.error_message = None
-        _clear_job_attempt_lease(job)
-        await deps.emit_job_event(
-            job.id,
-            level="info",
-            message="Job succeeded",
-            data_json={
-                "status": "succeeded",
-                "attempts": job.attempts,
-                "drawing_revision_id": str(drawing_revision_id),
-                "validation_report_id": str(validation_report_id),
-                "change_set_id": str(apply_result.change_set_id),
-            },
-            session=session,
-        )
-        await session.commit()
-
-    return True
 
 
 async def process_ingest_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
