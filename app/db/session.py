@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator
 
+from fastapi import HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import settings
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -92,7 +95,14 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
     if session_maker is None:
         logger.warning("database_session_unavailable", msg="Cannot create database session")
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=create_error_response(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Database is not configured. Set DATABASE_URL environment variable.",
+                details=None,
+            ),
+        )
 
     session = session_maker()
 
