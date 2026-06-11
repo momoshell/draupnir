@@ -2610,7 +2610,11 @@ def _build_insert_entity(
         block_definitions=block_definitions,
         parent_insert_handle=source_handle,
         parent_entity_id=cast(str, entity["entity_id"]),
-        parent_entity_ref=_source_locator(record, record_type="INSERT"),
+        # parent_entity_ref must equal the parent INSERT's entity_id: revision
+        # materialization resolves the child->parent FK by matching parent_entity_ref
+        # against entity_id (app/jobs/revision_materialization.py). Using the source
+        # locator here silently left every materialized block child orphaned.
+        parent_entity_ref=cast(str, entity["entity_id"]),
         depth=0,
         ancestor_block_handles=frozenset({block_definition.handle}),
         results=children,
