@@ -92,6 +92,36 @@ from app.jobs.revision_materialization import (
     _build_revision_materialization_rows,
     _order_revision_entity_insert_rows,
 )
+from app.jobs.revision_queries import (
+    _build_revision_conflict_details as _build_revision_conflict_details,
+)
+from app.jobs.revision_queries import (
+    _get_drawing_revision as _get_drawing_revision,
+)
+from app.jobs.revision_queries import (
+    _get_latest_drawing_revision as _get_latest_drawing_revision,
+)
+from app.jobs.revision_queries import (
+    _get_revision_blocks_for_revision as _get_revision_blocks_for_revision,
+)
+from app.jobs.revision_queries import (
+    _get_revision_entities_for_revision as _get_revision_entities_for_revision,
+)
+from app.jobs.revision_queries import (
+    _get_revision_entity_manifest_for_revision as _get_revision_entity_manifest_for_revision,
+)
+from app.jobs.revision_queries import (
+    _get_revision_layers_for_revision as _get_revision_layers_for_revision,
+)
+from app.jobs.revision_queries import (
+    _get_revision_layouts_for_revision as _get_revision_layouts_for_revision,
+)
+from app.jobs.revision_queries import (
+    _get_validation_report_for_revision as _get_validation_report_for_revision,
+)
+from app.jobs.revision_queries import (
+    _revision_reference as _revision_reference,
+)
 from app.jobs.worker_deps import WorkerDeps
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
@@ -1000,35 +1030,6 @@ async def _get_existing_generated_artifact(
     return result.scalar_one_or_none()
 
 
-async def _get_latest_drawing_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-) -> DrawingRevision | None:
-    """Load the latest drawing revision for a source file."""
-    result = await session.execute(
-        select(DrawingRevision)
-        .where(
-            (DrawingRevision.project_id == project_id)
-            & (DrawingRevision.source_file_id == source_file_id)
-        )
-        .order_by(DrawingRevision.revision_sequence.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
-async def _get_drawing_revision(
-    session: AsyncSession,
-    *,
-    revision_id: UUID,
-) -> DrawingRevision | None:
-    """Load a drawing revision row by identifier."""
-
-    return await session.get(DrawingRevision, revision_id)
-
-
 async def _get_extraction_profile(
     session: AsyncSession,
     *,
@@ -1055,120 +1056,6 @@ async def _get_drawing_revision_for_changeset(
         .limit(1)
     )
     return result.scalar_one_or_none()
-
-
-async def _get_validation_report_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    drawing_revision_id: UUID,
-) -> ValidationReport | None:
-    """Load the canonical validation report for a drawing revision."""
-    result = await session.execute(
-        select(ValidationReport).where(
-            (ValidationReport.project_id == project_id)
-            & (ValidationReport.drawing_revision_id == drawing_revision_id)
-        )
-    )
-    return result.scalar_one_or_none()
-
-
-async def _get_revision_layouts_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-    drawing_revision_id: UUID,
-) -> list[RevisionLayout]:
-    """Load deterministic layout rows for a drawing revision."""
-    result = await session.execute(
-        select(RevisionLayout)
-        .where(
-            (RevisionLayout.project_id == project_id)
-            & (RevisionLayout.source_file_id == source_file_id)
-            & (RevisionLayout.drawing_revision_id == drawing_revision_id)
-        )
-        .order_by(RevisionLayout.sequence_index.asc(), RevisionLayout.id.asc())
-    )
-    return list(result.scalars().all())
-
-
-async def _get_revision_layers_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-    drawing_revision_id: UUID,
-) -> list[RevisionLayer]:
-    """Load deterministic layer rows for a drawing revision."""
-    result = await session.execute(
-        select(RevisionLayer)
-        .where(
-            (RevisionLayer.project_id == project_id)
-            & (RevisionLayer.source_file_id == source_file_id)
-            & (RevisionLayer.drawing_revision_id == drawing_revision_id)
-        )
-        .order_by(RevisionLayer.sequence_index.asc(), RevisionLayer.id.asc())
-    )
-    return list(result.scalars().all())
-
-
-async def _get_revision_blocks_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-    drawing_revision_id: UUID,
-) -> list[RevisionBlock]:
-    """Load deterministic block rows for a drawing revision."""
-    result = await session.execute(
-        select(RevisionBlock)
-        .where(
-            (RevisionBlock.project_id == project_id)
-            & (RevisionBlock.source_file_id == source_file_id)
-            & (RevisionBlock.drawing_revision_id == drawing_revision_id)
-        )
-        .order_by(RevisionBlock.sequence_index.asc(), RevisionBlock.id.asc())
-    )
-    return list(result.scalars().all())
-
-
-async def _get_revision_entity_manifest_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-    drawing_revision_id: UUID,
-) -> RevisionEntityManifest | None:
-    """Load the revision entity manifest for a drawing revision."""
-    result = await session.execute(
-        select(RevisionEntityManifest).where(
-            (RevisionEntityManifest.project_id == project_id)
-            & (RevisionEntityManifest.source_file_id == source_file_id)
-            & (RevisionEntityManifest.drawing_revision_id == drawing_revision_id)
-        )
-    )
-    return result.scalar_one_or_none()
-
-
-async def _get_revision_entities_for_revision(
-    session: AsyncSession,
-    *,
-    project_id: UUID,
-    source_file_id: UUID,
-    drawing_revision_id: UUID,
-) -> list[RevisionEntity]:
-    """Load deterministic materialized entities for a drawing revision."""
-    result = await session.execute(
-        select(RevisionEntity)
-        .where(
-            (RevisionEntity.project_id == project_id)
-            & (RevisionEntity.source_file_id == source_file_id)
-            & (RevisionEntity.drawing_revision_id == drawing_revision_id)
-        )
-        .order_by(RevisionEntity.sequence_index.asc(), RevisionEntity.id.asc())
-    )
-    return list(result.scalars().all())
 
 
 def _expected_revision_kind_for_job(job: Job) -> str:
@@ -1203,34 +1090,6 @@ def _assert_job_base_revision_invariants(job: Job) -> None:
         return
 
     raise ValueError(f"Unsupported ingest job type '{job.job_type}'")
-
-
-def _revision_reference(
-    revision: DrawingRevision | None,
-) -> tuple[str | None, int | None]:
-    """Return stable revision identifier/sequence details for conflict payloads."""
-
-    if revision is None:
-        return None, None
-
-    return str(revision.id), revision.revision_sequence
-
-
-def _build_revision_conflict_details(
-    *,
-    base_revision: DrawingRevision | None,
-    current_revision: DrawingRevision | None,
-) -> dict[str, str | int | None]:
-    """Build structured stale-base details for durable job events."""
-
-    base_revision_id, base_revision_sequence = _revision_reference(base_revision)
-    current_revision_id, current_revision_sequence = _revision_reference(current_revision)
-    return {
-        "base_revision_id": base_revision_id,
-        "base_revision_sequence": base_revision_sequence,
-        "current_revision_id": current_revision_id,
-        "current_revision_sequence": current_revision_sequence,
-    }
 
 
 async def _resolve_finalization_predecessor_revision(
