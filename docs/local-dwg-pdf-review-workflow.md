@@ -21,11 +21,11 @@ If you need a committed fixture or a manifest entry for a proprietary sample, st
 ## Before you start
 
 1. Copy the sample into a local-only location outside git, or into an ignored scratch location you will not commit.
-2. If you need local vector PDF support, enable PyMuPDF intentionally before any Compose rebuild/start rather than assuming the default Compose bundle includes it:
-   - Host install: sync either the full `ingestion` extra or the narrower `pdf-vector` extra.
+2. If you need local vector PDF support, prefer the narrower `pdf-vector` extra before reaching for the full `ingestion` bundle, and do it before any Compose rebuild/start rather than assuming the default Compose bundle includes it:
+   - Host install: sync `pdf-vector` for vector-only work, or `ingestion` only when you also need raster dependencies.
    - Compose rebuild/start: set both `DRAUPNIR_UV_EXTRAS` and the needed license probe values before `docker compose build` or `make up`.
    - Licensing: PyMuPDF is covered by the ADR-0007 AGPL/commercial caveat, so set the approval probe only after your deployment review.
-3. If you need local raster PDF support, install the full `ingestion` extra so the raster pipeline dependencies are present. `vtracer` is required; `tesseract` is optional/degraded and should be interpreted through capability reporting rather than assumed.
+3. If you need local raster PDF support, install the full `ingestion` extra so the raster pipeline dependencies are present. Do not expect `pdf-vector` alone to cover raster mode. `vtracer` is required; `tesseract` is optional/degraded and should be interpreted through capability reporting rather than assumed.
 4. If you are testing DWG extraction, make sure the required local license probe value is also present in your session.
 5. If you need both DWG and vector PDF review in the same session, use a comma-separated `DRAUPNIR_APPROVED_LICENSE_PROBES` value so one probe does not overwrite the other:
    ```bash
@@ -65,20 +65,20 @@ If you need a committed fixture or a manifest entry for a proprietary sample, st
 
 ### Host and Compose enablement notes
 
-- Host-side vector PDF review requires the PyMuPDF-backed adapter to be installed via `uv sync --locked --extra db --extra jobs --extra ingestion` or the narrower `uv sync --locked --extra db --extra jobs --extra pdf-vector` path.
+- Host-side vector PDF review should normally use the narrower path: `uv sync --locked --extra db --extra jobs --extra pdf-vector`. Use `uv sync --locked --extra db --extra jobs --extra ingestion` instead when the same local environment also needs raster PDF dependencies.
 - Host-side raster PDF review requires the full ingestion extra: `uv sync --locked --extra db --extra jobs --extra ingestion`. The raster path requires `vtracer`; `tesseract` is optional/degraded and may surface through capability reporting when absent.
-- Default Compose stays DXF-only. To rebuild with vector PDF support, export the env vars before build/start:
+- Default Compose stays DXF-only. For vector-only PDF review, rebuild with `pdf-vector` rather than the full ingestion bundle. Export the env vars before build/start:
   ```bash
   export DRAUPNIR_UV_EXTRAS="--extra db --extra jobs --extra dxf --extra pdf-vector"
   export DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review
   docker compose build api worker
   docker compose up -d
   ```
-- If the same Compose session needs both vector PDF and DWG review, use:
+- If the same Compose session needs both vector PDF and DWG review, keep the `pdf-vector` extras and use:
   ```bash
   export DRAUPNIR_APPROVED_LICENSE_PROBES=pymupdf-deployment-review,libredwg-distribution-review
   ```
-- Default Compose still does not include PDF support unless you rebuild with the needed extras intentionally.
+- Default Compose still does not include PDF support unless you rebuild with the needed extras intentionally. For raster PDF review in Compose, switch from the narrow `pdf-vector` extras to the full `ingestion` extras.
 
 ### If PDF ingestion is still unavailable
 

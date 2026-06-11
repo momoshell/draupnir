@@ -50,7 +50,8 @@ service.
 
 ## Repository Layout
 
-Planned layout:
+Current layout centers on the API/backend modules under `app/`, supported by
+tests and repo docs:
 
 ```text
 app/
@@ -71,8 +72,7 @@ docs/
 
 ## Development Commands
 
-Application code is not scaffolded yet. When scaffolding is added, update this
-section with exact commands for:
+Keep this section updated with the exact commands used in this repository for:
 
 - dependency installation
 - local development server

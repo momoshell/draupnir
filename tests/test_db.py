@@ -5,12 +5,16 @@ import subprocess
 import sys
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException, status
 from sqlalchemy import text
 
 from app.core.config import settings
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response
 from app.db.session import close_db, get_engine, get_session_maker, init_db
 from tests.conftest import requires_database
 
@@ -191,6 +195,25 @@ class TestAlembicMigrations:
 
 class TestDatabaseDependency:
     """Test FastAPI database dependency."""
+
+    @pytest.mark.asyncio
+    async def test_get_db_raises_http_exception_without_session_maker(self) -> None:
+        """Should raise a standardized HTTPException when DB is unconfigured."""
+        import app.db.session as session_module
+
+        with patch.object(session_module, "get_session_maker", return_value=None):
+            gen = session_module.get_db()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await gen.__anext__()
+
+        assert exc_info.value.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+        detail = cast(dict[str, Any], exc_info.value.detail)
+        assert detail == create_error_response(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="Database is not configured. Set DATABASE_URL environment variable.",
+            details=None,
+        )
 
     @requires_database
     @pytest.mark.asyncio

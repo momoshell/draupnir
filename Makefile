@@ -6,8 +6,6 @@
 #   make lint        — Run ruff linter on app/ and tests/
 #   make typecheck   — Run mypy on app/ and tests/
 #
-# NOTE: app/ and tests/ directories are scaffolded in a later step (#20/#21).
-# Lint and typecheck targets will report "no files found" until then.
 #   make test        — Run full pytest suite
 #   make smoke       — Run fast smoke pytest lane
 #   make integration — Run full DB-backed integration pytest lane
