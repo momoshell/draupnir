@@ -3972,10 +3972,12 @@ async def test_libredwg_adapter_materializes_simple_insert_block_geometry(
     assert child["length"] == pytest.approx(0.002)
     assert child["properties"]["quantity_hints"]["length"] == pytest.approx(0.002)
 
-    # Provenance + identity linkage back to the placing INSERT.
+    # Provenance + identity linkage back to the placing INSERT. parent_entity_ref must
+    # equal the parent INSERT's entity_id so revision materialization resolves the FK
+    # (matching it against entity_id) instead of silently orphaning the child.
     assert child["entity_id"] == "libredwg-line-1a-l1"
     assert child["parent_entity_id"] == "libredwg-insert-1a"
-    assert child["parent_entity_ref"] == "OBJECTS/INSERT/1A"
+    assert child["parent_entity_ref"] == "libredwg-insert-1a"
     child_notes = cast("tuple[str, ...]", child["provenance"]["notes"])
     assert "materialized_from_block" in child_notes
     assert "block:Door-Block" in child_notes
