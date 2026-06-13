@@ -820,6 +820,12 @@ def _build_canonical_output(
     block_header_names = _build_block_header_name_map(records)
     block_definitions = _build_block_definition_map(records)
     block_definition_child_ids = _collect_block_definition_child_ids(block_definitions)
+    # Structured block representation: emit each definition with its child geometry (local
+    # coords) so INSERTs can stay lossless references rather than being flattened. See the
+    # data-platform backlog memory for why this replaces the prior materialization default.
+    block_payloads = _build_block_payloads(
+        block_definitions, units=units, block_header_names=block_header_names
+    )
 
     def _record_entity(entity: _JSONDict) -> None:
         entities.append(entity)
@@ -949,6 +955,9 @@ def _build_canonical_output(
                 block_definitions=block_definitions,
             )
             if insert_result.entity is not None:
+                # Keep the INSERT as a lossless block reference (block_ref + transform). Block
+                # geometry is emitted once via the block-definition payloads instead of being
+                # flattened per placement, so device instances stay countable by type.
                 _record_entity(insert_result.entity)
                 block_reference_count += 1
                 handle = cast(str | None, insert_result.entity.get("source_entity_handle"))
@@ -960,25 +969,6 @@ def _build_canonical_output(
                         unsupported_transform_handles.add(handle)
                     if insert_result.reason is not None:
                         unsupported_transform_reasons.add(insert_result.reason)
-                elif insert_result.materialized:
-                    materialized_insert_count += 1
-                    if handle is not None:
-                        materialized_insert_handles.add(handle)
-                    for child_entity in insert_result.materialized_children:
-                        _record_entity(child_entity)
-                        materialized_child_count += 1
-                        _count_supported_child(child_entity)
-                elif insert_result.unmaterialized_child_reason is not None:
-                    # A supported transform we could not faithfully materialize (guard trip or an
-                    # unmaterializable child): route through the review-gating channel so the
-                    # block-transform-validity hint stays unset rather than falsely reporting pass.
-                    block_materialization_guarded_count += 1
-                    unsupported_transform_count += 1
-                    guard_reasons.add(insert_result.unmaterialized_child_reason)
-                    unsupported_transform_reasons.add(insert_result.unmaterialized_child_reason)
-                    if handle is not None:
-                        guarded_insert_handles.add(handle)
-                        unsupported_transform_handles.add(handle)
                 continue
 
             malformed_insert_count += 1
@@ -1222,7 +1212,7 @@ def _build_canonical_output(
         },
         "layouts": tuple({"name": layout_name} for layout_name in sorted(layouts_seen)),
         "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
-        "blocks": tuple({"name": block_name} for block_name in sorted(blocks_seen)),
+        "blocks": tuple(_finalize_block_payloads(block_payloads, blocks_seen)),
         "entities": tuple(entities),
         "xrefs": (),
         "metadata": metadata,
@@ -2066,17 +2056,22 @@ def _build_block_definition_map(
     header_names: dict[str, str | None] = {}
     name_to_header: dict[str, str] = {}
     for record in records:
-        handle = _extract_handle(record)
+        # Key by the absolute handle value so handle *references* (which dwgread encodes as
+        # ``[code, size, value, absolute]`` arrays) match the owning record. Comparing the raw
+        # stringified arrays never matches (a ref's code differs from the object's), which is why
+        # block children were previously never associated. _handle_abs_key also accepts the string
+        # / mapping handle shapes used by synthetic fixtures.
+        handle = _handle_abs_key(record.get("handle"))
         if handle is not None:
-            handle_index.setdefault(handle.lower(), record)
+            handle_index.setdefault(handle, record)
         if _extract_record_type(record) != "BLOCK_HEADER" or handle is None:
             continue
         name = _first_string(record, "name", "block_name")
         if _is_layout_block_header_name(name):
             continue
-        header_names[handle.lower()] = name
+        header_names[handle] = name
         if name is not None:
-            name_to_header.setdefault(name.lower(), handle.lower())
+            name_to_header.setdefault(name.lower(), handle)
 
     children: dict[str, list[Mapping[str, Any]]] = {key: [] for key in header_names}
     seen_child_ids: dict[str, set[int]] = {key: set() for key in header_names}
@@ -2103,10 +2098,10 @@ def _build_block_definition_map(
         )
         if isinstance(explicit, (list, tuple)):
             for element in explicit:
-                ref = _coerce_handle_ref(element)
+                ref = _handle_abs_key(element)
                 if ref is None:
                     continue
-                child = handle_index.get(ref.lower())
+                child = handle_index.get(ref)
                 if child is not None:
                     _attach(header_key, child)
 
@@ -2115,8 +2110,8 @@ def _build_block_definition_map(
     for record in records:
         record_type = _extract_record_type(record)
         if record_type == "BLOCK":
-            ref = _coerce_handle_ref(_first_value(record, "block_header", "block_record", "owner"))
-            block_header_key: str | None = ref.lower() if ref is not None else None
+            ref = _handle_abs_key(_first_value(record, "block_header", "block_record", "owner"))
+            block_header_key: str | None = ref if ref is not None else None
             if block_header_key is None or block_header_key not in header_names:
                 block_name = _first_string(record, "name", "block_name")
                 block_header_key = name_to_header.get(block_name.lower()) if block_name else None
@@ -2139,9 +2134,9 @@ def _build_block_definition_map(
         # Only genuine ownership fields back-reference the owning BLOCK_HEADER. An INSERT's
         # ``block_header``/``block_record`` point at the block it *places*, not its owner, so they
         # must not be consulted here (otherwise an INSERT would attach to its own target block).
-        owner_ref = _coerce_handle_ref(_first_value(record, "owner", "ownerhandle", "owner_handle"))
-        if owner_ref is not None and owner_ref.lower() in header_names:
-            _attach(owner_ref.lower(), record)
+        owner_ref = _handle_abs_key(_first_value(record, "owner", "ownerhandle", "owner_handle"))
+        if owner_ref is not None and owner_ref in header_names:
+            _attach(owner_ref, record)
 
     return {
         header_key: _BlockDefinition(
@@ -2159,11 +2154,9 @@ def _resolve_referenced_block_definition(
 ) -> _BlockDefinition | None:
     """Resolve the block definition an INSERT places (parallels block-name resolution)."""
 
-    ref = _coerce_handle_ref(
-        _first_value(record, "block_header", "block_record", "block_record_ref")
-    )
+    ref = _handle_abs_key(_first_value(record, "block_header", "block_record", "block_record_ref"))
     if ref is not None:
-        definition = block_definitions.get(ref.lower())
+        definition = block_definitions.get(ref)
         if definition is not None:
             return definition
     direct = _first_string(record, "block_header_name", "ref_block", "name")
@@ -2187,6 +2180,128 @@ def _collect_block_definition_child_ids(
     return frozenset(
         id(child) for definition in block_definitions.values() for child in definition.child_records
     )
+
+
+def _map_block_child_entity(
+    record: Mapping[str, Any],
+    *,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+    block_definitions: Mapping[str, _BlockDefinition],
+) -> _JSONDict:
+    """Map one block-definition child record to a canonical entity, in local block coordinates.
+
+    Mirrors the top-level record dispatch but always yields an entity (an ``unknown`` placeholder
+    for malformed/unsupported records) so a block definition never silently drops child geometry.
+    A nested INSERT is kept as a block reference, not expanded — block structure is preserved.
+    """
+
+    record_type = _extract_record_type(record)
+    if record_type == "LINE":
+        entity = _build_line_entity(record, units=units)
+        reason = "malformed_line_geometry"
+    elif record_type == "CIRCLE":
+        entity = _build_circle_entity(record, units=units)
+        reason = "malformed_circle_geometry"
+    elif record_type == "ARC":
+        entity = _build_arc_entity(record, units=units)
+        reason = "malformed_arc_geometry"
+    elif record_type == "LWPOLYLINE":
+        entity = _build_lwpolyline_entity(record, units=units)
+        reason = "malformed_lwpolyline_geometry"
+    elif record_type == "MTEXT":
+        return _build_text_entity(record, units=units)
+    elif record_type == "HATCH":
+        hatch_result = _build_hatch_entity(record, units=units)
+        if hatch_result.entity is not None:
+            return hatch_result.entity
+        return _build_unknown_entity(
+            record, reason=hatch_result.reason or "unsupported_hatch_record", units=units
+        )
+    elif record_type == "INSERT":
+        insert_result = _build_insert_entity(
+            record,
+            units=units,
+            block_header_names=block_header_names,
+            block_definitions=block_definitions,
+        )
+        if insert_result.entity is not None:
+            return insert_result.entity
+        return _build_unknown_entity(
+            record, reason=insert_result.reason or "malformed_insert_record", units=units
+        )
+    else:
+        return _build_unknown_entity(record, reason="unsupported_drawable_record", units=units)
+
+    if entity is not None:
+        return entity
+    return _build_unknown_entity(record, reason=reason, units=units)
+
+
+def _build_block_payloads(
+    block_definitions: Mapping[str, _BlockDefinition],
+    *,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+) -> list[_JSONDict]:
+    """Emit each block definition as a canonical block payload carrying its child geometry.
+
+    Block child entities are stored in the block's local coordinate space; INSERT entities place
+    them into the drawing with their own transform. Preserving definitions (rather than flattening
+    every placement) keeps device instances countable by type and the geometry lossless, and maps
+    directly onto DXF/IFC's native block/instance model.
+    """
+
+    payloads: list[_JSONDict] = []
+    for definition in block_definitions.values():
+        if definition.name is None:
+            continue
+        child_entities: tuple[_JSONDict, ...] = tuple(
+            _map_block_child_entity(
+                child,
+                units=units,
+                block_header_names=block_header_names,
+                block_definitions=block_definitions,
+            )
+            for child in definition.child_records
+        )
+        payloads.append(
+            {
+                "name": definition.name,
+                "block_ref": definition.name,
+                "block_handle": definition.handle,
+                "base_point": _point_json(definition.base_point),
+                "entities": child_entities,
+            }
+        )
+    payloads.sort(key=lambda p: (cast(str, p["name"]), cast(str, p["block_handle"])))
+    return payloads
+
+
+def _finalize_block_payloads(
+    block_payloads: list[_JSONDict], referenced_names: set[str]
+) -> list[_JSONDict]:
+    """Combine defined-block payloads with referenced-but-undefined blocks (e.g. xrefs).
+
+    A block an INSERT references but whose definition is absent locally (external reference, or a
+    name-only fixture) is surfaced as a geometry-less payload so the reference is never lost.
+    """
+
+    defined = {cast(str, payload["name"]) for payload in block_payloads}
+    referenced_only: list[_JSONDict] = [
+        {
+            "name": name,
+            "block_ref": name,
+            "block_handle": None,
+            "base_point": _point_json((0.0, 0.0, 0.0)),
+            "entities": (),
+        }
+        for name in sorted(referenced_names)
+        if name not in defined
+    ]
+    combined: list[_JSONDict] = [*block_payloads, *referenced_only]
+    combined.sort(key=lambda p: cast(str, p["name"]))
+    return combined
 
 
 def _coerce_handle_ref(value: Any) -> str | None:
@@ -2964,10 +3079,14 @@ def _handle_abs_key(value: Any) -> str | None:
         last = value[-1]
         if isinstance(last, int) and not isinstance(last, bool):
             return str(last)
-        return None
+        return _handle_abs_key(last)
     if isinstance(value, str):
         sanitized = _sanitize_string_value(value)
         return sanitized.lower() if sanitized is not None else None
+    if isinstance(value, Mapping):
+        # Mapping-form references (e.g. {"handle": "B1"}) — resolve the first identity field.
+        inner = _mapping_get(value, "handle", "absolute_ref", "ref", "value", "code")
+        return _handle_abs_key(inner) if inner is not None else None
     return None
 
 
