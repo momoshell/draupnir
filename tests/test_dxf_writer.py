@@ -196,7 +196,7 @@ def test_write_canonical_dxf_rejects_non_model_layouts() -> None:
 def test_write_canonical_dxf_rejects_unsupported_entity_types() -> None:
     payload = _base_payload()
     payload["entities"][0]["payload"] = {
-        "entity_type": "arc",
+        "entity_type": "spline",
         "geometry": {"start": [0, 0], "end": [1, 1]},
     }
 
@@ -232,14 +232,120 @@ def test_write_canonical_dxf_rejects_missing_layer_references_except_zero() -> N
     assert exc_info.value.code == "UNKNOWN_LAYER"
 
 
-def test_write_canonical_dxf_rejects_block_refs() -> None:
+def test_write_canonical_dxf_allows_block_ref_metadata_on_non_insert_entity() -> None:
+    # A block_ref on a non-INSERT entity is owner metadata; the entity still emits normally
+    # (block references are now supported via INSERT, not rejected outright).
     payload = _base_payload()
     payload["entities"][0]["payload"]["block_ref"] = "block-1"
 
-    with pytest.raises(DxfWriteError) as exc_info:
-        write_canonical_dxf(payload)
+    doc = _parse_dxf(payload)
+    assert [entity.dxftype() for entity in doc.modelspace()] == ["LINE", "LINE", "LWPOLYLINE"]
 
-    assert exc_info.value.code == "UNSUPPORTED_ENTITY_TYPE"
+
+def test_write_canonical_dxf_emits_arc_circle_text() -> None:
+    payload = _base_payload()
+    payload["entities"] = [
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-0",
+            "payload": {
+                "entity_type": "circle",
+                "geometry": {"center": {"x": 1, "y": 2}, "radius": 0.5},
+            },
+        },
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-0",
+            "payload": {
+                "entity_type": "arc",
+                "geometry": {
+                    "center": {"x": 0, "y": 0},
+                    "radius": 1.0,
+                    "start_angle_degrees": 0.0,
+                    "end_angle_degrees": 90.0,
+                },
+            },
+        },
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-a",
+            "payload": {
+                "entity_type": "text",
+                "geometry": {"insertion": {"x": 3, "y": 4}, "text": "SD-01"},
+            },
+        },
+    ]
+
+    doc = _parse_dxf(payload)
+    msp = doc.modelspace()
+    assert [entity.dxftype() for entity in msp] == ["CIRCLE", "ARC", "TEXT"]
+    circle, arc, text = list(msp)
+    assert circle.dxf.radius == pytest.approx(0.5)
+    assert (circle.dxf.center.x, circle.dxf.center.y) == pytest.approx((1.0, 2.0))
+    assert arc.dxf.start_angle == pytest.approx(0.0)
+    assert arc.dxf.end_angle == pytest.approx(90.0)
+    assert text.dxf.text == "SD-01"
+
+
+def test_write_canonical_dxf_emits_block_definitions_and_insert_references() -> None:
+    payload = _base_payload()
+    payload["blocks"] = [
+        {
+            "name": "SMOKE-DETECTOR",
+            "block_ref": "SMOKE-DETECTOR",
+            "base_point": {"x": 0, "y": 0, "z": 0},
+            "entities": [
+                {
+                    "layer_ref": "layer-0",
+                    "payload": {
+                        "entity_type": "circle",
+                        "geometry": {"center": {"x": 0, "y": 0}, "radius": 0.1},
+                    },
+                }
+            ],
+        }
+    ]
+    # Two placements of the detector block at different positions.
+    payload["entities"] = [
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-0",
+            "payload": {
+                "entity_type": "insert",
+                "block_ref": "SMOKE-DETECTOR",
+                "transform": {
+                    "insertion_point": {"x": 5, "y": 6},
+                    "scale": {"x": 1, "y": 1, "z": 1},
+                    "rotation_degrees": 0.0,
+                },
+            },
+        },
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-0",
+            "payload": {
+                "entity_type": "insert",
+                "block_ref": "SMOKE-DETECTOR",
+                "transform": {
+                    "insertion_point": {"x": 10, "y": 12},
+                    "scale": {"x": 2, "y": 2, "z": 2},
+                    "rotation_degrees": 90.0,
+                },
+            },
+        },
+    ]
+
+    doc = _parse_dxf(payload)
+    # The block definition exists and carries its child geometry.
+    assert "SMOKE-DETECTOR" in doc.blocks
+    block_types = [entity.dxftype() for entity in doc.blocks.get("SMOKE-DETECTOR")]
+    assert block_types == ["CIRCLE"]
+    # Both placements emit as INSERT references to the block, not flattened geometry.
+    inserts = [entity for entity in doc.modelspace() if entity.dxftype() == "INSERT"]
+    assert [insert.dxf.name for insert in inserts] == ["SMOKE-DETECTOR", "SMOKE-DETECTOR"]
+    assert (inserts[0].dxf.insert.x, inserts[0].dxf.insert.y) == pytest.approx((5.0, 6.0))
+    assert inserts[1].dxf.xscale == pytest.approx(2.0)
+    assert inserts[1].dxf.rotation == pytest.approx(90.0)
 
 
 def test_write_canonical_dxf_allows_null_block_ref_in_revision_json_entity() -> None:

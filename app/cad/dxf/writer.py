@@ -68,6 +68,17 @@ _POLYLINE_ENTITY_TYPES = {
     "polyline2dp",
     "lw-polyline",
 }
+_ARC_ENTITY_TYPES = {"arc", "arcs"}
+_CIRCLE_ENTITY_TYPES = {"circle", "circles"}
+_TEXT_ENTITY_TYPES = {"text", "mtext"}
+_INSERT_ENTITY_TYPES = {"insert", "block_reference", "blockreference"}
+# Geometry-less placeholders the adapter emits for records it could not map (e.g. unsupported
+# HATCH/LWPOLYLINE). They carry no geometry, so they are skipped on export and reported as a
+# diagnostic rather than aborting the whole render.
+_SKIP_ENTITY_TYPES = {"unknown"}
+# Fallback TEXT height (meters) when the canonical payload carries no height; placement and
+# content are what matter for the round-trip, exact height is a fidelity follow-up.
+_DEFAULT_TEXT_HEIGHT = 2.5
 
 _LAYER_NAME_RE = re.compile(r'^[^\\/:*?"<>;|,`~\[\]]{1,255}$')
 
@@ -94,6 +105,15 @@ class _ResolvedEntity:
     layout_ref: Any
     layer_ref: Any
     path: str
+    block_ref: Any = None
+    transform: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class _BlockRecord:
+    name: str
+    base_point: Any
+    entities: list[Any]
 
 
 def write_canonical_dxf(
@@ -110,9 +130,26 @@ def write_canonical_dxf(
     layout_by_id, layout_by_name = _index_layout_records(layouts)
 
     layers = _extract_layer_records(payload)
-    layer_by_id, layer_by_name = _index_layer_records(layers)
 
     entities = _extract_entities(payload)
+    blocks = _extract_block_records(payload)
+    # Resolve block child entities up front so their layers can be declared alongside the
+    # top-level layer table (block children are not surfaced in the canonical layer list).
+    resolved_blocks = [
+        (
+            block,
+            [
+                _resolve_entity_payload(
+                    entity=child, entity_path=f"blocks[{block.name}].entities[{child_index}]"
+                )
+                for child_index, child in enumerate(block.entities, start=1)
+            ],
+        )
+        for block in blocks
+    ]
+    layers = _augment_layers_with_referenced(layers, resolved_blocks)
+    layer_by_id, layer_by_name = _index_layer_records(layers)
+
     unit_spec = _resolve_unit(payload, write_options, entities=entities)
     default_layout = _resolve_default_model_layout(layouts)
 
@@ -122,9 +159,35 @@ def write_canonical_dxf(
         _declare_layers(doc=doc, layers=layers)
         msp = doc.modelspace()
 
+        skipped = 0
+
+        # Create all BLOCK definitions first (so INSERT references resolve), then populate them.
+        block_layouts = {
+            block.name: doc.blocks.new(name=block.name) for block, _ in resolved_blocks
+        }
+        for block, children in resolved_blocks:
+            block_layout = block_layouts[block.name]
+            for child in children:
+                if child.entity_type.lower().strip() in _SKIP_ENTITY_TYPES:
+                    skipped += 1
+                    continue
+                child_layer = _resolve_entity_layer(
+                    resolved=child, layer_by_id=layer_by_id, layer_by_name=layer_by_name
+                )
+                _write_entity(
+                    target=block_layout,
+                    resolved=child,
+                    unit_spec=unit_spec,
+                    layer_name=child_layer,
+                )
+
         for index, raw_entity in enumerate(entities, start=1):
             entity_path = f"entities[{index}]"
             resolved = _resolve_entity_payload(entity=raw_entity, entity_path=entity_path)
+
+            if resolved.entity_type.lower().strip() in _SKIP_ENTITY_TYPES:
+                skipped += 1
+                continue
 
             _resolve_entity_layout(
                 layout_ref=resolved.layout_ref,
@@ -141,7 +204,7 @@ def write_canonical_dxf(
             )
 
             _write_entity(
-                msp=msp,
+                target=msp,
                 resolved=resolved,
                 unit_spec=unit_spec,
                 layer_name=layer_name,
@@ -150,10 +213,13 @@ def write_canonical_dxf(
         _normalize_required_class_order(doc)
         buffer = io.StringIO()
         doc.write(buffer)
+    diagnostics: tuple[dict[str, Any], ...] = (
+        ({"code": "skipped_unsupported_entities", "count": skipped},) if skipped else ()
+    )
     return DxfWriteResult(
         content=buffer.getvalue().encode("utf-8"),
         warnings=(),
-        diagnostics=(),
+        diagnostics=diagnostics,
     )
 
 
@@ -288,7 +354,9 @@ def _resolve_unit_from_entity_geometry_units(entities: Sequence[Any]) -> UnitSpe
 
 
 def _reject_unsupported_top_level_sections(payload: Mapping[str, Any]) -> None:
-    for field_name in ("blocks", "xrefs"):
+    # Blocks are now emitted as a BLOCK table with INSERT references; only xrefs remain
+    # unsupported (external references need resolution beyond a single drawing).
+    for field_name in ("xrefs",):
         if not _has_non_empty_value(payload.get(field_name)):
             continue
 
@@ -391,6 +459,70 @@ def _extract_entities(payload: Mapping[str, Any]) -> list[Any]:
         )
 
     return list(entities)
+
+
+def _extract_block_records(payload: Mapping[str, Any]) -> list[_BlockRecord]:
+    raw_blocks = payload.get("blocks")
+    if raw_blocks is None:
+        return []
+    if not isinstance(raw_blocks, (list, tuple)):
+        raise DxfWriteError(
+            code="UNSUPPORTED_ENTITY_TYPE",
+            message="blocks must be a list",
+            details={"path": "blocks", "type": type(raw_blocks).__name__},
+        )
+
+    records: list[_BlockRecord] = []
+    for index, raw_block in enumerate(raw_blocks, start=1):
+        block = _coerce_mapping(raw_block, field_path=f"blocks[{index}]")
+        name = _coerce_required_text(
+            block.get("name") or block.get("block_ref"),
+            field_path=f"blocks[{index}].name",
+            error_code="UNSUPPORTED_ENTITY_TYPE",
+        )
+        raw_entities = block.get("entities")
+        entities = list(raw_entities) if isinstance(raw_entities, (list, tuple)) else []
+        records.append(
+            _BlockRecord(name=name, base_point=block.get("base_point"), entities=entities)
+        )
+    return records
+
+
+def _layer_ref_text(layer_ref: Any) -> str | None:
+    if isinstance(layer_ref, str):
+        return layer_ref.strip() or None
+    if isinstance(layer_ref, Mapping):
+        for key in ("name", "layer", "id", "layer_id"):
+            value = layer_ref.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _augment_layers_with_referenced(
+    layers: list[_LayerRecord], resolved_blocks: list[tuple[_BlockRecord, list[_ResolvedEntity]]]
+) -> list[_LayerRecord]:
+    """Declare any layer referenced by a block child that isn't already in the layer table.
+
+    The canonical layer list is built from top-level entities only, so block-owned geometry can
+    reference layers absent from it; those must still be declared for the DXF to be valid.
+    """
+
+    by_id, by_name = _index_layer_records(layers)
+    declared = {layer.name.lower() for layer in layers}
+    augmented = list(layers)
+    for _block, children in resolved_blocks:
+        for child in children:
+            ref = _layer_ref_text(child.layer_ref)
+            if ref is None or ref == "0":
+                continue
+            # Skip refs that already resolve by id or name; only a genuinely undeclared layer
+            # (a name absent from the top-level table) needs a new record.
+            if ref in by_id or ref.lower() in by_name or ref.lower() in declared:
+                continue
+            augmented.append(_LayerRecord(layer_id=None, name=ref, source="block_child"))
+            declared.add(ref.lower())
+    return augmented
 
 
 def _coerce_layout_or_layer_row(row: Any, *, row_path: str) -> dict[str, Any]:
@@ -522,23 +654,18 @@ def _resolve_entity_payload(*, entity: Any, entity_path: str) -> _ResolvedEntity
         or merged.get("layerRef")
     )
 
-    for source, source_path in (
-        (merged, entity_path),
-        (properties, f"{entity_path}.properties"),
-    ):
-        for key in ("block_ref", "blockRef", "block_id", "blockId"):
-            if key not in source:
-                continue
-            if not _has_non_empty_value(source.get(key)):
-                continue
-
-            raise DxfWriteError(
-                code="UNSUPPORTED_ENTITY_TYPE",
-                message="Block references are not supported",
-                details={"path": f"{source_path}.{key}"},
-            )
+    block_ref = (
+        merged.get("block_ref")
+        or merged.get("blockRef")
+        or merged.get("block_name")
+        or properties.get("block_ref")
+        or properties.get("blockRef")
+    )
 
     geometry = merged.get("geometry") if merged.get("geometry") is not None else {}
+    transform = merged.get("transform")
+    if transform is None and isinstance(geometry, Mapping):
+        transform = geometry.get("transform")
 
     return _ResolvedEntity(
         entity_type=entity_type,
@@ -547,6 +674,8 @@ def _resolve_entity_payload(*, entity: Any, entity_path: str) -> _ResolvedEntity
         layout_ref=layout_ref,
         layer_ref=layer_ref,
         path=entity_path,
+        block_ref=block_ref,
+        transform=transform,
     )
 
 
@@ -734,8 +863,10 @@ def _resolve_entity_layer(
 
 
 def _write_entity(
-    *, msp: Any, resolved: _ResolvedEntity, unit_spec: UnitSpec, layer_name: str
+    *, target: Any, resolved: _ResolvedEntity, unit_spec: UnitSpec, layer_name: str
 ) -> None:
+    """Emit one canonical entity into ``target`` (a modelspace or a block layout)."""
+
     entity_type = resolved.entity_type.lower().strip()
 
     if entity_type in _LINE_ENTITY_TYPES:
@@ -744,7 +875,7 @@ def _write_entity(
             entity_path=resolved.path,
             unit_spec=unit_spec,
         )
-        msp.add_line(start=start, end=end, dxfattribs={"layer": layer_name})
+        target.add_line(start=start, end=end, dxfattribs={"layer": layer_name})
         return
 
     if entity_type in _POLYLINE_ENTITY_TYPES:
@@ -766,7 +897,54 @@ def _write_entity(
             field_path=f"{resolved.path}.properties.closed",
         )
 
-        msp.add_lwpolyline(points, dxfattribs={"layer": layer_name}, close=closed)
+        target.add_lwpolyline(points, dxfattribs={"layer": layer_name}, close=closed)
+        return
+
+    if entity_type in _CIRCLE_ENTITY_TYPES:
+        center, radius = _extract_circle_geometry(
+            geometry=resolved.geometry, entity_path=resolved.path, unit_spec=unit_spec
+        )
+        target.add_circle(center=center, radius=radius, dxfattribs={"layer": layer_name})
+        return
+
+    if entity_type in _ARC_ENTITY_TYPES:
+        center, radius, start_angle, end_angle = _extract_arc_geometry(
+            geometry=resolved.geometry, entity_path=resolved.path, unit_spec=unit_spec
+        )
+        target.add_arc(
+            center=center,
+            radius=radius,
+            start_angle=start_angle,
+            end_angle=end_angle,
+            dxfattribs={"layer": layer_name},
+        )
+        return
+
+    if entity_type in _TEXT_ENTITY_TYPES:
+        insertion, content = _extract_text_geometry(
+            geometry=resolved.geometry, entity_path=resolved.path, unit_spec=unit_spec
+        )
+        text_entity = target.add_text(
+            content,
+            dxfattribs={"layer": layer_name, "height": _DEFAULT_TEXT_HEIGHT},
+        )
+        text_entity.set_placement((insertion[0], insertion[1]))
+        return
+
+    if entity_type in _INSERT_ENTITY_TYPES:
+        block_name, insertion, xscale, yscale, rotation = _extract_insert_placement(
+            resolved=resolved, unit_spec=unit_spec
+        )
+        target.add_blockref(
+            block_name,
+            (insertion[0], insertion[1]),
+            dxfattribs={
+                "layer": layer_name,
+                "xscale": xscale,
+                "yscale": yscale,
+                "rotation": rotation,
+            },
+        )
         return
 
     raise DxfWriteError(
@@ -774,6 +952,116 @@ def _write_entity(
         message=f"Unsupported entity type '{resolved.entity_type}'",
         details={"path": resolved.path, "entity_type": resolved.entity_type},
     )
+
+
+def _extract_circle_geometry(
+    *, geometry: Any, entity_path: str, unit_spec: UnitSpec
+) -> tuple[tuple[float, float, float], float]:
+    if not isinstance(geometry, Mapping) or geometry.get("center") is None:
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Circle geometry requires a center at {entity_path}",
+            details={"path": entity_path},
+        )
+    center = _coerce_point(
+        geometry["center"], field_path=f"{entity_path}.geometry.center", scale=unit_spec.meter_scale
+    )
+    radius = _coerce_real_number(
+        geometry.get("radius"),
+        field_path=f"{entity_path}.geometry.radius",
+        scale=unit_spec.meter_scale,
+    )
+    return center, radius
+
+
+def _extract_arc_geometry(
+    *, geometry: Any, entity_path: str, unit_spec: UnitSpec
+) -> tuple[tuple[float, float, float], float, float, float]:
+    if not isinstance(geometry, Mapping) or geometry.get("center") is None:
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Arc geometry requires a center at {entity_path}",
+            details={"path": entity_path},
+        )
+    center = _coerce_point(
+        geometry["center"], field_path=f"{entity_path}.geometry.center", scale=unit_spec.meter_scale
+    )
+    radius = _coerce_real_number(
+        geometry.get("radius"),
+        field_path=f"{entity_path}.geometry.radius",
+        scale=unit_spec.meter_scale,
+    )
+    start_angle = _coerce_real_number(
+        geometry.get("start_angle_degrees"),
+        field_path=f"{entity_path}.geometry.start_angle_degrees",
+        scale=1.0,
+    )
+    end_angle = _coerce_real_number(
+        geometry.get("end_angle_degrees"),
+        field_path=f"{entity_path}.geometry.end_angle_degrees",
+        scale=1.0,
+    )
+    return center, radius, start_angle, end_angle
+
+
+def _extract_text_geometry(
+    *, geometry: Any, entity_path: str, unit_spec: UnitSpec
+) -> tuple[tuple[float, float, float], str]:
+    if not isinstance(geometry, Mapping):
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Text geometry must be an object at {entity_path}",
+            details={"path": entity_path},
+        )
+    insertion_raw = geometry.get("insertion") or geometry.get("insert")
+    if insertion_raw is None:
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Text geometry requires an insertion point at {entity_path}",
+            details={"path": entity_path},
+        )
+    insertion = _coerce_point(
+        insertion_raw, field_path=f"{entity_path}.geometry.insertion", scale=unit_spec.meter_scale
+    )
+    content = geometry.get("text")
+    text = content if isinstance(content, str) else ""
+    return insertion, text
+
+
+def _extract_insert_placement(
+    *, resolved: _ResolvedEntity, unit_spec: UnitSpec
+) -> tuple[str, tuple[float, float, float], float, float, float]:
+    block_name = _coerce_required_text(
+        resolved.block_ref,
+        field_path=f"{resolved.path}.block_ref",
+        error_code="UNSUPPORTED_ENTITY_TYPE",
+    )
+    transform = resolved.transform if isinstance(resolved.transform, Mapping) else {}
+    insertion_raw = transform.get("insertion_point") or transform.get("insertion") or {}
+    insertion = _coerce_point(
+        insertion_raw,
+        field_path=f"{resolved.path}.transform.insertion_point",
+        scale=unit_spec.meter_scale,
+    )
+    scale_raw = transform.get("scale")
+    scale = scale_raw if isinstance(scale_raw, Mapping) else {}
+    xscale = _coerce_optional_scale(scale.get("x"), field_path=f"{resolved.path}.transform.scale.x")
+    yscale = _coerce_optional_scale(scale.get("y"), field_path=f"{resolved.path}.transform.scale.y")
+    rotation_raw = transform.get("rotation_degrees")
+    rotation = (
+        _coerce_real_number(
+            rotation_raw, field_path=f"{resolved.path}.transform.rotation", scale=1.0
+        )
+        if rotation_raw is not None
+        else 0.0
+    )
+    return block_name, insertion, xscale, yscale, rotation
+
+
+def _coerce_optional_scale(value: Any, *, field_path: str) -> float:
+    if value is None:
+        return 1.0
+    return _coerce_real_number(value, field_path=field_path, scale=1.0)
 
 
 def _is_supported_layout_name(name: str) -> bool:
