@@ -20,6 +20,7 @@ from ._types import ValidationOutcome
 from ._utils import (
     _adapter_warning_message,
     _adapter_warning_target_ref,
+    _build_coverage,
     _build_summary,
     _confidence_score,
     _json_compatible,
@@ -221,6 +222,7 @@ def build_validation_outcome(
         "confidence": confidence_json,
         "provenance": _json_compatible(result.provenance),
         "summary": _build_summary(canonical_json=canonical_json, checks=checks, findings=findings),
+        "coverage": _build_coverage(canonical_json),
         "checks": checks,
         "findings": findings,
         "adapter_warnings": adapter_warnings_json,

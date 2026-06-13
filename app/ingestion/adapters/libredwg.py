@@ -9,7 +9,7 @@ import re
 import resource
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -84,7 +84,11 @@ _LAYOUT_BLOCK_HEADER_NAME_PREFIXES = (
 )
 _DEFAULT_LAYOUT_NAME = "Model"
 _WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
-_SUPPORTED_LWPOLYLINE_FLAG_MASK = 0b1
+# Bits that mark an LWPOLYLINE closed: DXF-70 style (1, used by synthetic fixtures) and LibreDWG
+# JSON style (0x200, emitted by dwgread). Other flag bits (plinegen, vertexids, R2010 markers)
+# are benign for geometry and must not cause a reject — bulge/width support is gated separately
+# on the actual vertex data, not on the flag.
+_LWPOLYLINE_CLOSED_FLAG_BITS = 0b1 | 0x200
 _SUPPORTED_ARC_ANGLE_UNIT_TOKENS = frozenset({"deg", "degree", "degrees"})
 _SUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"ccw", "counterclockwise"})
 _UNSUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"cw", "clockwise"})
@@ -97,8 +101,10 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
         "ENDBLK",
         "CLASS",
         "DBPLACEHOLDER",
+        "DETAILVIEWSTYLE",
         "DICTIONARY",
         "DICTIONARYVAR",
+        "DICTIONARYWDFLT",
         "DIMSTYLE",
         "GROUP",
         "LAYOUT",
@@ -106,11 +112,15 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
         "LAYER_INDEX",
         "LTYPE",
         "MATERIAL",
+        "MLEADERSTYLE",
         "MLINESTYLE",
         "OBJECT_PTR",
+        "PLACEHOLDER",
         "PLOTSETTINGS",
         "RASTERVARIABLES",
         "SCALE",
+        "SECTIONVIEWSTYLE",
+        "SORTENTSTABLE",
         "STYLE",
         "SUN",
         "TABLESTYLE",
@@ -808,9 +818,18 @@ def _build_canonical_output(
     skipped_non_drawable_count = 0
     units = _resolve_units(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
+    # Resolve handle-referenced layer / block names onto records before mapping so the
+    # canonical entities, layer table, and block table all carry real names (#layers/blocks).
+    _resolve_handle_named_refs(records)
     block_header_names = _build_block_header_name_map(records)
     block_definitions = _build_block_definition_map(records)
     block_definition_child_ids = _collect_block_definition_child_ids(block_definitions)
+    # Structured block representation: emit each definition with its child geometry (local
+    # coords) so INSERTs can stay lossless references rather than being flattened. See the
+    # data-platform backlog memory for why this replaces the prior materialization default.
+    block_payloads = _build_block_payloads(
+        block_definitions, units=units, block_header_names=block_header_names
+    )
 
     def _record_entity(entity: _JSONDict) -> None:
         entities.append(entity)
@@ -940,6 +959,9 @@ def _build_canonical_output(
                 block_definitions=block_definitions,
             )
             if insert_result.entity is not None:
+                # Keep the INSERT as a lossless block reference (block_ref + transform). Block
+                # geometry is emitted once via the block-definition payloads instead of being
+                # flattened per placement, so device instances stay countable by type.
                 _record_entity(insert_result.entity)
                 block_reference_count += 1
                 handle = cast(str | None, insert_result.entity.get("source_entity_handle"))
@@ -951,25 +973,6 @@ def _build_canonical_output(
                         unsupported_transform_handles.add(handle)
                     if insert_result.reason is not None:
                         unsupported_transform_reasons.add(insert_result.reason)
-                elif insert_result.materialized:
-                    materialized_insert_count += 1
-                    if handle is not None:
-                        materialized_insert_handles.add(handle)
-                    for child_entity in insert_result.materialized_children:
-                        _record_entity(child_entity)
-                        materialized_child_count += 1
-                        _count_supported_child(child_entity)
-                elif insert_result.unmaterialized_child_reason is not None:
-                    # A supported transform we could not faithfully materialize (guard trip or an
-                    # unmaterializable child): route through the review-gating channel so the
-                    # block-transform-validity hint stays unset rather than falsely reporting pass.
-                    block_materialization_guarded_count += 1
-                    unsupported_transform_count += 1
-                    guard_reasons.add(insert_result.unmaterialized_child_reason)
-                    unsupported_transform_reasons.add(insert_result.unmaterialized_child_reason)
-                    if handle is not None:
-                        guarded_insert_handles.add(handle)
-                        unsupported_transform_handles.add(handle)
                 continue
 
             malformed_insert_count += 1
@@ -1213,7 +1216,7 @@ def _build_canonical_output(
         },
         "layouts": tuple({"name": layout_name} for layout_name in sorted(layouts_seen)),
         "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
-        "blocks": tuple({"name": block_name} for block_name in sorted(blocks_seen)),
+        "blocks": tuple(_finalize_block_payloads(block_payloads, blocks_seen)),
         "entities": tuple(entities),
         "xrefs": (),
         "metadata": metadata,
@@ -2057,17 +2060,22 @@ def _build_block_definition_map(
     header_names: dict[str, str | None] = {}
     name_to_header: dict[str, str] = {}
     for record in records:
-        handle = _extract_handle(record)
+        # Key by the absolute handle value so handle *references* (which dwgread encodes as
+        # ``[code, size, value, absolute]`` arrays) match the owning record. Comparing the raw
+        # stringified arrays never matches (a ref's code differs from the object's), which is why
+        # block children were previously never associated. _handle_abs_key also accepts the string
+        # / mapping handle shapes used by synthetic fixtures.
+        handle = _handle_abs_key(record.get("handle"))
         if handle is not None:
-            handle_index.setdefault(handle.lower(), record)
+            handle_index.setdefault(handle, record)
         if _extract_record_type(record) != "BLOCK_HEADER" or handle is None:
             continue
         name = _first_string(record, "name", "block_name")
         if _is_layout_block_header_name(name):
             continue
-        header_names[handle.lower()] = name
+        header_names[handle] = name
         if name is not None:
-            name_to_header.setdefault(name.lower(), handle.lower())
+            name_to_header.setdefault(name.lower(), handle)
 
     children: dict[str, list[Mapping[str, Any]]] = {key: [] for key in header_names}
     seen_child_ids: dict[str, set[int]] = {key: set() for key in header_names}
@@ -2094,10 +2102,10 @@ def _build_block_definition_map(
         )
         if isinstance(explicit, (list, tuple)):
             for element in explicit:
-                ref = _coerce_handle_ref(element)
+                ref = _handle_abs_key(element)
                 if ref is None:
                     continue
-                child = handle_index.get(ref.lower())
+                child = handle_index.get(ref)
                 if child is not None:
                     _attach(header_key, child)
 
@@ -2106,8 +2114,8 @@ def _build_block_definition_map(
     for record in records:
         record_type = _extract_record_type(record)
         if record_type == "BLOCK":
-            ref = _coerce_handle_ref(_first_value(record, "block_header", "block_record", "owner"))
-            block_header_key: str | None = ref.lower() if ref is not None else None
+            ref = _handle_abs_key(_first_value(record, "block_header", "block_record", "owner"))
+            block_header_key: str | None = ref if ref is not None else None
             if block_header_key is None or block_header_key not in header_names:
                 block_name = _first_string(record, "name", "block_name")
                 block_header_key = name_to_header.get(block_name.lower()) if block_name else None
@@ -2130,9 +2138,9 @@ def _build_block_definition_map(
         # Only genuine ownership fields back-reference the owning BLOCK_HEADER. An INSERT's
         # ``block_header``/``block_record`` point at the block it *places*, not its owner, so they
         # must not be consulted here (otherwise an INSERT would attach to its own target block).
-        owner_ref = _coerce_handle_ref(_first_value(record, "owner", "ownerhandle", "owner_handle"))
-        if owner_ref is not None and owner_ref.lower() in header_names:
-            _attach(owner_ref.lower(), record)
+        owner_ref = _handle_abs_key(_first_value(record, "owner", "ownerhandle", "owner_handle"))
+        if owner_ref is not None and owner_ref in header_names:
+            _attach(owner_ref, record)
 
     return {
         header_key: _BlockDefinition(
@@ -2150,11 +2158,9 @@ def _resolve_referenced_block_definition(
 ) -> _BlockDefinition | None:
     """Resolve the block definition an INSERT places (parallels block-name resolution)."""
 
-    ref = _coerce_handle_ref(
-        _first_value(record, "block_header", "block_record", "block_record_ref")
-    )
+    ref = _handle_abs_key(_first_value(record, "block_header", "block_record", "block_record_ref"))
     if ref is not None:
-        definition = block_definitions.get(ref.lower())
+        definition = block_definitions.get(ref)
         if definition is not None:
             return definition
     direct = _first_string(record, "block_header_name", "ref_block", "name")
@@ -2178,6 +2184,128 @@ def _collect_block_definition_child_ids(
     return frozenset(
         id(child) for definition in block_definitions.values() for child in definition.child_records
     )
+
+
+def _map_block_child_entity(
+    record: Mapping[str, Any],
+    *,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+    block_definitions: Mapping[str, _BlockDefinition],
+) -> _JSONDict:
+    """Map one block-definition child record to a canonical entity, in local block coordinates.
+
+    Mirrors the top-level record dispatch but always yields an entity (an ``unknown`` placeholder
+    for malformed/unsupported records) so a block definition never silently drops child geometry.
+    A nested INSERT is kept as a block reference, not expanded — block structure is preserved.
+    """
+
+    record_type = _extract_record_type(record)
+    if record_type == "LINE":
+        entity = _build_line_entity(record, units=units)
+        reason = "malformed_line_geometry"
+    elif record_type == "CIRCLE":
+        entity = _build_circle_entity(record, units=units)
+        reason = "malformed_circle_geometry"
+    elif record_type == "ARC":
+        entity = _build_arc_entity(record, units=units)
+        reason = "malformed_arc_geometry"
+    elif record_type == "LWPOLYLINE":
+        entity = _build_lwpolyline_entity(record, units=units)
+        reason = "malformed_lwpolyline_geometry"
+    elif record_type == "MTEXT":
+        return _build_text_entity(record, units=units)
+    elif record_type == "HATCH":
+        hatch_result = _build_hatch_entity(record, units=units)
+        if hatch_result.entity is not None:
+            return hatch_result.entity
+        return _build_unknown_entity(
+            record, reason=hatch_result.reason or "unsupported_hatch_record", units=units
+        )
+    elif record_type == "INSERT":
+        insert_result = _build_insert_entity(
+            record,
+            units=units,
+            block_header_names=block_header_names,
+            block_definitions=block_definitions,
+        )
+        if insert_result.entity is not None:
+            return insert_result.entity
+        return _build_unknown_entity(
+            record, reason=insert_result.reason or "malformed_insert_record", units=units
+        )
+    else:
+        return _build_unknown_entity(record, reason="unsupported_drawable_record", units=units)
+
+    if entity is not None:
+        return entity
+    return _build_unknown_entity(record, reason=reason, units=units)
+
+
+def _build_block_payloads(
+    block_definitions: Mapping[str, _BlockDefinition],
+    *,
+    units: _UnitsResolution,
+    block_header_names: Mapping[str, str],
+) -> list[_JSONDict]:
+    """Emit each block definition as a canonical block payload carrying its child geometry.
+
+    Block child entities are stored in the block's local coordinate space; INSERT entities place
+    them into the drawing with their own transform. Preserving definitions (rather than flattening
+    every placement) keeps device instances countable by type and the geometry lossless, and maps
+    directly onto DXF/IFC's native block/instance model.
+    """
+
+    payloads: list[_JSONDict] = []
+    for definition in block_definitions.values():
+        if definition.name is None:
+            continue
+        child_entities: tuple[_JSONDict, ...] = tuple(
+            _map_block_child_entity(
+                child,
+                units=units,
+                block_header_names=block_header_names,
+                block_definitions=block_definitions,
+            )
+            for child in definition.child_records
+        )
+        payloads.append(
+            {
+                "name": definition.name,
+                "block_ref": definition.name,
+                "block_handle": definition.handle,
+                "base_point": _point_json(definition.base_point),
+                "entities": child_entities,
+            }
+        )
+    payloads.sort(key=lambda p: (cast(str, p["name"]), cast(str, p["block_handle"])))
+    return payloads
+
+
+def _finalize_block_payloads(
+    block_payloads: list[_JSONDict], referenced_names: set[str]
+) -> list[_JSONDict]:
+    """Combine defined-block payloads with referenced-but-undefined blocks (e.g. xrefs).
+
+    A block an INSERT references but whose definition is absent locally (external reference, or a
+    name-only fixture) is surfaced as a geometry-less payload so the reference is never lost.
+    """
+
+    defined = {cast(str, payload["name"]) for payload in block_payloads}
+    referenced_only: list[_JSONDict] = [
+        {
+            "name": name,
+            "block_ref": name,
+            "block_handle": None,
+            "base_point": _point_json((0.0, 0.0, 0.0)),
+            "entities": (),
+        }
+        for name in sorted(referenced_names)
+        if name not in defined
+    ]
+    combined: list[_JSONDict] = [*block_payloads, *referenced_only]
+    combined.sort(key=lambda p: cast(str, p["name"]))
+    return combined
 
 
 def _coerce_handle_ref(value: Any) -> str | None:
@@ -2936,6 +3064,90 @@ def _extract_layer_name(record: Mapping[str, Any]) -> str | None:
     return _first_string(record, "layer", "layer_name", "owner_layer")
 
 
+def _handle_abs_key(value: Any) -> str | None:
+    """Return the absolute handle value of a dwgread handle / handle-reference array.
+
+    dwgread encodes handles as ``[code, size, value, (absolute)]`` integer arrays. The
+    absolute referenced handle is the final element for both an object's own handle
+    (``[0, 1, 137]`` -> 137) and the soft/hard references an entity carries (a LINE's
+    ``layer`` ``[5, 1, 137, 137]`` or an INSERT's ``block_header`` ``[5, 1, 129, 129]``).
+    Keying maps by this integer lets a reference resolve to its owning object regardless
+    of the differing reference code, which a stringified-array comparison cannot do.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (list, tuple)) and value:
+        last = value[-1]
+        if isinstance(last, int) and not isinstance(last, bool):
+            return str(last)
+        return _handle_abs_key(last)
+    if isinstance(value, str):
+        sanitized = _sanitize_string_value(value)
+        return sanitized.lower() if sanitized is not None else None
+    if isinstance(value, Mapping):
+        # Mapping-form references (e.g. {"handle": "B1"}) — resolve the first identity field.
+        inner = _mapping_get(value, "handle", "absolute_ref", "ref", "value", "code")
+        return _handle_abs_key(inner) if inner is not None else None
+    return None
+
+
+def _resolve_handle_named_refs(records: tuple[Mapping[str, Any], ...]) -> None:
+    """Stamp resolved ``layer_name`` / ``block_header_name`` onto drawable records.
+
+    dwgread emits an entity's ``layer`` (and an INSERT's ``block_header``) as a handle
+    *reference*, not a name, so the entity mappers — which look for a string name — find
+    nothing and the canonical output loses all layer/block identity. Here we resolve those
+    references against the LAYER and BLOCK_HEADER object tables (by absolute handle value)
+    and write the resolved name back onto the record under the string keys the existing
+    mappers already consult as fallbacks (``layer_name`` for ``_extract_layer_name``;
+    ``block_header_name`` for ``_resolve_referenced_block_name``). This keeps the fix to a
+    single pre-pass with no mapper-signature churn. Records are the ephemeral per-ingest
+    dwgread dicts, so in-place mutation is safe and contained.
+    """
+
+    layer_names: dict[str, str] = {}
+    block_names: dict[str, str] = {}
+    for record in records:
+        record_type = _extract_record_type(record)
+        if record_type == "LAYER":
+            key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name")
+            if key is not None and name is not None:
+                layer_names[key] = name
+        elif record_type == "BLOCK_HEADER":
+            key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name", "block_name")
+            if key is not None and name is not None:
+                block_names[key] = name
+
+    if not layer_names and not block_names:
+        return
+
+    for record in records:
+        if not isinstance(record, MutableMapping):
+            continue
+        if layer_names and _extract_layer_name(record) is None:
+            key = _handle_abs_key(record.get("layer"))
+            resolved = layer_names.get(key) if key is not None else None
+            if resolved is not None:
+                # Replace the raw ``layer`` handle reference with the resolved name in place:
+                # ``_extract_layer_name`` reads the ``layer`` key first and returns it only when
+                # it is a string, so stamping a sibling key would be shadowed by the handle array.
+                record["layer"] = resolved
+        if (
+            block_names
+            and _extract_record_type(record) == "INSERT"
+            and _first_string(record, "block_header_name") is None
+        ):
+            key = _handle_abs_key(record.get("block_header"))
+            resolved = block_names.get(key) if key is not None else None
+            if resolved is not None:
+                record["block_header_name"] = resolved
+
+
 def _extract_layout_name(record: Mapping[str, Any]) -> str | None:
     return _first_string(record, "layout", "layout_name", "owner_layout") or _DEFAULT_LAYOUT_NAME
 
@@ -3166,10 +3378,10 @@ def _extract_closed(record: Mapping[str, Any]) -> bool | None:
     if flags_value is None or not math.isfinite(flags_value) or not flags_value.is_integer():
         return None
     flags = int(flags_value)
-    if flags < 0 or flags & ~_SUPPORTED_LWPOLYLINE_FLAG_MASK:
+    if flags < 0:
         return None
 
-    flags_closed = bool(flags & _SUPPORTED_LWPOLYLINE_FLAG_MASK)
+    flags_closed = bool(flags & _LWPOLYLINE_CLOSED_FLAG_BITS)
     if coerced_closed is not None and coerced_closed != flags_closed:
         return None
     return coerced_closed if coerced_closed is not None else flags_closed
@@ -3259,6 +3471,11 @@ def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchLoopsResult:
     geometry matters for canonical quantities, so the fill pattern itself is
     recorded as a property rather than gating the entity (#385).
     """
+    if _record_has_any_key(record, "paths"):
+        # dwgread emits the boundary as ``paths`` -> ``segs`` (curve_type 1 = straight,
+        # 2 = circular arc). This is the real on-disk shape; arcs are tessellated.
+        return _extract_hatch_paths(_first_value(record, "paths"))
+
     if _record_has_any_key(record, "boundary_loops", "boundaryloops", "loops"):
         return _extract_hatch_loops(
             _first_value(record, "boundary_loops", "boundaryloops", "loops"),
@@ -3381,6 +3598,106 @@ def _extract_hatch_vertices_from_edges(raw_edges: Any) -> _HatchVerticesResult:
     if normalized_vertices is None:
         return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
     return _HatchVerticesResult(normalized_vertices)
+
+
+def _extract_hatch_paths(raw_paths: Any) -> _HatchLoopsResult:
+    """Extract boundary loops from the dwgread HATCH ``paths`` / ``segs`` structure.
+
+    Each path's ``segs`` are emitted in connected boundary order, so the ring is built directly
+    by walking them (no re-chaining). Straight segs (``curve_type`` 1) contribute their two
+    endpoints; circular-arc segs (``curve_type`` 2) are tessellated into short chords. Elliptical
+    (3) and spline (4) segs are not supported yet and leave the hatch review-gated.
+    """
+
+    if not isinstance(raw_paths, (list, tuple)) or not raw_paths:
+        return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_paths) > _MAX_HATCH_LOOPS:
+        return _HatchLoopsResult(None, reason="unsupported_hatch_geometry")
+
+    loops: list[tuple[tuple[float, float, float], ...]] = []
+    for path in raw_paths:
+        if not isinstance(path, Mapping):
+            return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+        ring = _extract_hatch_ring_from_segs(_first_value(path, "segs", "edges"))
+        if ring.vertices is None:
+            return _HatchLoopsResult(None, reason=ring.reason, malformed=ring.malformed)
+        loops.append(ring.vertices)
+    return _HatchLoopsResult(tuple(loops))
+
+
+def _extract_hatch_ring_from_segs(raw_segs: Any) -> _HatchVerticesResult:
+    if not isinstance(raw_segs, (list, tuple)) or not raw_segs:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_segs) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    ring: list[tuple[float, float, float]] = []
+    for seg in raw_segs:
+        points = _hatch_seg_points(seg)
+        if points is None:
+            return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+        if isinstance(points, str):
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+        for point in points:
+            if ring and _points_match(ring[-1], point):
+                continue
+            ring.append(point)
+        if len(ring) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    normalized = _normalize_hatch_vertices(tuple(ring))
+    if normalized is None:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    return _HatchVerticesResult(normalized)
+
+
+def _hatch_seg_points(seg: Any) -> list[tuple[float, float, float]] | str | None:
+    if not isinstance(seg, Mapping):
+        return None
+    curve_type = seg.get("curve_type")
+    if curve_type == 2:
+        return _tessellate_hatch_arc_seg(seg)
+    if curve_type in (1, None):
+        start = _extract_point(seg, prefixes=("first_endpoint", "start", "start_point", "point1"))
+        end = _extract_point(seg, prefixes=("second_endpoint", "end", "end_point", "point2"))
+        if start is None or end is None:
+            return None
+        if not _point_is_finite(start) or not _point_is_finite(end):
+            return None
+        if start[2] != 0.0 or end[2] != 0.0:
+            return None
+        return [(start[0], start[1], 0.0), (end[0], end[1], 0.0)]
+    # curve_type 3 (ellipse) / 4 (spline) / unknown — not tessellated yet.
+    return "unsupported"
+
+
+def _tessellate_hatch_arc_seg(seg: Mapping[str, Any]) -> list[tuple[float, float, float]] | None:
+    center = _extract_point(seg, prefixes=("center", "center_point", "centerpoint"))
+    radius = _extract_positive_float(seg, "radius")
+    start_angle = _coerce_float(_first_value(seg, "start_angle", "startangle"))
+    end_angle = _coerce_float(_first_value(seg, "end_angle", "endangle"))
+    if center is None or radius is None or start_angle is None or end_angle is None:
+        return None
+    if not _point_is_finite(center) or not _floats_are_finite(radius, start_angle, end_angle):
+        return None
+
+    # dwgread HATCH arc angles are radians. Sweep direction follows ``is_ccw``.
+    two_pi = 2.0 * math.pi
+    if bool(_first_value(seg, "is_ccw", "ccw")):
+        sweep = (end_angle - start_angle) % two_pi or two_pi
+    else:
+        sweep = -((start_angle - end_angle) % two_pi) or -two_pi
+
+    steps = max(2, math.ceil(abs(sweep) / (math.pi / 18.0)))  # ~10 degrees per chord
+    points: list[tuple[float, float, float]] = []
+    for index in range(steps + 1):
+        angle = start_angle + sweep * (index / steps)
+        x = center[0] + radius * math.cos(angle)
+        y = center[1] + radius * math.sin(angle)
+        if not _floats_are_finite(x, y):
+            return None
+        points.append((x, y, 0.0))
+    return points
 
 
 def _validate_hatch_point_boundary(

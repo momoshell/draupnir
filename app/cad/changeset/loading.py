@@ -27,7 +27,6 @@ from app.models.cad_changeset import (
 from app.models.drawing_revision import DrawingRevision
 from app.models.revision_materialization import RevisionEntity
 
-_APPROVED_CHANGE_SET_STATUS = "approved"
 _VALID_CHANGE_SET_VALIDATION_STATUSES = frozenset({"valid", "valid_with_warnings"})
 
 
@@ -53,7 +52,10 @@ async def load_change_set_apply_input(
     """Load persisted changeset state into the pure apply contract."""
 
     change_set = await _load_change_set(session, project_id=project_id, change_set_id=change_set_id)
-    _require_approved_change_set(change_set)
+    # No separate human-approval gate: a changeset whose latest validation is valid (or
+    # valid_with_warnings) is apply-ready. The prior `approved`-status requirement had no
+    # API transition to satisfy it, so it only blocked the export path. Validation remains
+    # the sole guard.
     await _require_latest_valid_validation(
         session,
         project_id=project_id,
@@ -151,13 +153,6 @@ async def _load_change_set(
     if change_set is None:
         raise ChangeSetApplyLoadError(f"Changeset {change_set_id} was not found.")
     return change_set
-
-
-def _require_approved_change_set(change_set: CadChangeSet) -> None:
-    if _normalize_status(change_set.status) != _APPROVED_CHANGE_SET_STATUS:
-        raise ChangeSetApplyLoadError(
-            f"Changeset {change_set.id} must be approved before apply loading."
-        )
 
 
 async def _require_latest_valid_validation(

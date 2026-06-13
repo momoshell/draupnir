@@ -38,6 +38,9 @@
 # =============================================================================
 
 UV_SYNC_ARGS = --extra db --extra jobs --extra ingestion --extra dev --extra test
+# Compose CLI used by the docker-compose targets. Override for Podman, e.g.
+#   make up COMPOSE="podman compose"
+COMPOSE ?= docker compose
 PRE_PUSH_HOOK = .git/hooks/pre-push
 PRE_PUSH_HOOK_VERSION = v1
 PROFILE_INTEGRATION_MARKER ?= $(PYTEST_INTEGRATION_EXPRESSION)
@@ -110,25 +113,25 @@ hooks:
 # Docker Compose targets
 # ---------------------------------------------------------------------------
 up:
-	docker compose up -d
+	$(COMPOSE) up -d
 
 down:
-	docker compose down
+	$(COMPOSE) down
 
 logs:
-	docker compose logs -f
+	$(COMPOSE) logs -f
 
 ps:
-	docker compose ps
+	$(COMPOSE) ps
 
 shell-api:
-	docker compose exec api bash
+	$(COMPOSE) exec api bash
 
 shell-worker:
-	docker compose exec worker bash
+	$(COMPOSE) exec worker bash
 
 migrate:
-	docker compose exec api alembic upgrade head
+	$(COMPOSE) exec api alembic upgrade head
 
 integration-db-api:
 	uv run alembic upgrade head

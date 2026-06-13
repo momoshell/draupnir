@@ -325,13 +325,14 @@ async def test_render_revised_dxf_export_maps_unexpected_adapter_contract_failur
 async def test_render_revised_dxf_export_wraps_unsupported_writer_payload(
     db_session: AsyncSession,
 ) -> None:
+    # Blocks + INSERTs are now supported; a genuinely unsupported entity type (spline) still
+    # surfaces from the writer and is wrapped as a RevisedDxfExportError.
     seeded = await _seed_revision_fixture(
         db_session,
-        blocks=({"block_ref": "Block-A", "sequence_index": 0, "payload": {"name": "Block-A"}},),
         entities=(
             {
-                "entity_id": "line-a",
-                "entity_type": "line",
+                "entity_id": "spline-a",
+                "entity_type": "spline",
                 "entity_schema_version": "1.0",
                 "sequence_index": 0,
                 "layout_ref": "Model",
@@ -343,7 +344,7 @@ async def test_render_revised_dxf_export_wraps_unsupported_writer_payload(
                 },
                 "properties": {},
                 "canonical_entity": {
-                    "entity_type": "line",
+                    "entity_type": "spline",
                     "geometry": {
                         "start": {"x": 0.0, "y": 0.0},
                         "end": {"x": 2.0, "y": 0.0},
@@ -359,11 +360,9 @@ async def test_render_revised_dxf_export_wraps_unsupported_writer_payload(
         await render_revised_dxf_export(db_session, seeded.revision.id)
 
     assert exc_info.value.code == "UNSUPPORTED_ENTITY_TYPE"
-    assert exc_info.value.details == {
-        "adapter_key": "ezdxf_writer",
-        "output_format": "revised_dxf",
-        "path": "blocks",
-    }
+    assert exc_info.value.details["adapter_key"] == "ezdxf_writer"
+    assert exc_info.value.details["output_format"] == "revised_dxf"
+    assert exc_info.value.details["entity_type"] == "spline"
 
 
 async def _seed_revision_fixture(
