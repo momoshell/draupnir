@@ -9,7 +9,7 @@ import re
 import resource
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -97,8 +97,10 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
         "ENDBLK",
         "CLASS",
         "DBPLACEHOLDER",
+        "DETAILVIEWSTYLE",
         "DICTIONARY",
         "DICTIONARYVAR",
+        "DICTIONARYWDFLT",
         "DIMSTYLE",
         "GROUP",
         "LAYOUT",
@@ -106,11 +108,15 @@ _NON_DRAWABLE_OBJECT_TYPES = frozenset(
         "LAYER_INDEX",
         "LTYPE",
         "MATERIAL",
+        "MLEADERSTYLE",
         "MLINESTYLE",
         "OBJECT_PTR",
+        "PLACEHOLDER",
         "PLOTSETTINGS",
         "RASTERVARIABLES",
         "SCALE",
+        "SECTIONVIEWSTYLE",
+        "SORTENTSTABLE",
         "STYLE",
         "SUN",
         "TABLESTYLE",
@@ -808,6 +814,9 @@ def _build_canonical_output(
     skipped_non_drawable_count = 0
     units = _resolve_units(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
+    # Resolve handle-referenced layer / block names onto records before mapping so the
+    # canonical entities, layer table, and block table all carry real names (#layers/blocks).
+    _resolve_handle_named_refs(records)
     block_header_names = _build_block_header_name_map(records)
     block_definitions = _build_block_definition_map(records)
     block_definition_child_ids = _collect_block_definition_child_ids(block_definitions)
@@ -2934,6 +2943,86 @@ def _extract_handle(record: Mapping[str, Any]) -> str | None:
 
 def _extract_layer_name(record: Mapping[str, Any]) -> str | None:
     return _first_string(record, "layer", "layer_name", "owner_layer")
+
+
+def _handle_abs_key(value: Any) -> str | None:
+    """Return the absolute handle value of a dwgread handle / handle-reference array.
+
+    dwgread encodes handles as ``[code, size, value, (absolute)]`` integer arrays. The
+    absolute referenced handle is the final element for both an object's own handle
+    (``[0, 1, 137]`` -> 137) and the soft/hard references an entity carries (a LINE's
+    ``layer`` ``[5, 1, 137, 137]`` or an INSERT's ``block_header`` ``[5, 1, 129, 129]``).
+    Keying maps by this integer lets a reference resolve to its owning object regardless
+    of the differing reference code, which a stringified-array comparison cannot do.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (list, tuple)) and value:
+        last = value[-1]
+        if isinstance(last, int) and not isinstance(last, bool):
+            return str(last)
+        return None
+    if isinstance(value, str):
+        sanitized = _sanitize_string_value(value)
+        return sanitized.lower() if sanitized is not None else None
+    return None
+
+
+def _resolve_handle_named_refs(records: tuple[Mapping[str, Any], ...]) -> None:
+    """Stamp resolved ``layer_name`` / ``block_header_name`` onto drawable records.
+
+    dwgread emits an entity's ``layer`` (and an INSERT's ``block_header``) as a handle
+    *reference*, not a name, so the entity mappers — which look for a string name — find
+    nothing and the canonical output loses all layer/block identity. Here we resolve those
+    references against the LAYER and BLOCK_HEADER object tables (by absolute handle value)
+    and write the resolved name back onto the record under the string keys the existing
+    mappers already consult as fallbacks (``layer_name`` for ``_extract_layer_name``;
+    ``block_header_name`` for ``_resolve_referenced_block_name``). This keeps the fix to a
+    single pre-pass with no mapper-signature churn. Records are the ephemeral per-ingest
+    dwgread dicts, so in-place mutation is safe and contained.
+    """
+
+    layer_names: dict[str, str] = {}
+    block_names: dict[str, str] = {}
+    for record in records:
+        record_type = _extract_record_type(record)
+        if record_type == "LAYER":
+            key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name")
+            if key is not None and name is not None:
+                layer_names[key] = name
+        elif record_type == "BLOCK_HEADER":
+            key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name", "block_name")
+            if key is not None and name is not None:
+                block_names[key] = name
+
+    if not layer_names and not block_names:
+        return
+
+    for record in records:
+        if not isinstance(record, MutableMapping):
+            continue
+        if layer_names and _extract_layer_name(record) is None:
+            key = _handle_abs_key(record.get("layer"))
+            resolved = layer_names.get(key) if key is not None else None
+            if resolved is not None:
+                # Replace the raw ``layer`` handle reference with the resolved name in place:
+                # ``_extract_layer_name`` reads the ``layer`` key first and returns it only when
+                # it is a string, so stamping a sibling key would be shadowed by the handle array.
+                record["layer"] = resolved
+        if (
+            block_names
+            and _extract_record_type(record) == "INSERT"
+            and _first_string(record, "block_header_name") is None
+        ):
+            key = _handle_abs_key(record.get("block_header"))
+            resolved = block_names.get(key) if key is not None else None
+            if resolved is not None:
+                record["block_header_name"] = resolved
 
 
 def _extract_layout_name(record: Mapping[str, Any]) -> str | None:
