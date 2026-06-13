@@ -122,9 +122,6 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("block_references", 0)
     merged_counts.setdefault("unsupported_block_transforms", 0)
     merged_counts.setdefault("malformed_inserts", 0)
-    merged_counts.setdefault("materialized_inserts", 0)
-    merged_counts.setdefault("materialized_block_children", 0)
-    merged_counts.setdefault("block_materialization_guarded", 0)
     merged_counts.setdefault("skipped_non_drawable", 0)
     return merged_counts
 
@@ -3978,11 +3975,11 @@ async def test_libredwg_adapter_block_reference_passes_shared_contract_harness(
 
 
 @pytest.mark.asyncio
-async def test_libredwg_adapter_unsupported_transform_never_materializes(
+async def test_libredwg_adapter_unsupported_transform_insert_stays_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Regression of #361: a non-uniform scale stays review-gated and materializes nothing, and the
-    # block-definition child is not leaked as a standalone top-level entity.
+    # Regression of #361: a non-uniform scale INSERT stays a review-gated reference, and the
+    # block-definition child lives in the block payload — never leaked as a top-level entity.
     result = await _ingest_output_payload(
         monkeypatch,
         {
@@ -4010,9 +4007,10 @@ async def test_libredwg_adapter_unsupported_transform_never_materializes(
     entity = _single_entity(result)
     assert entity["entity_type"] == "insert"
     assert entity["transform_supported"] is False
-    counts = cast(Mapping[str, int], result.diagnostics[0].details["entity_counts"])
-    assert counts["materialized_inserts"] == 0
-    assert counts["materialized_block_children"] == 0
+    # The block-definition child stays inside the block payload, not at the top level.
+    blocks = cast(list[dict[str, Any]], result.canonical["blocks"])
+    block = next(b for b in blocks if b["name"] == "Skewed-Block")
+    assert [child["entity_id"] for child in block["entities"]] == ["libredwg-line-l1"]
 
 
 @pytest.mark.asyncio
