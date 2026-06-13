@@ -1205,3 +1205,33 @@ def test_build_validation_outcome_fails_block_reference_with_invalid_hint() -> N
 
     assert checks_by_key["block_transform_validity"]["status"] == "fail"
     assert outcome.quantity_gate == "blocked"
+
+
+def test_build_validation_outcome_includes_extraction_coverage() -> None:
+    canonical = _build_complete_canonical(
+        entities=(
+            {"kind": "line", "layer": "A-WALL", "start": {"x": 0, "y": 0}, "end": {"x": 1, "y": 0}},
+            {
+                "kind": "unknown",
+                "layer": "A-WALL",
+                "geometry": {"geometry_summary": {"reason": "unsupported_hatch_record"}},
+            },
+        ),
+    )
+
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.95),
+        generated_at=_GENERATED_AT,
+    )
+
+    coverage = outcome.report_json["coverage"]
+    assert coverage["entities"]["total"] == 2
+    assert coverage["entities"]["mapped"] == 1
+    assert coverage["entities"]["unmapped"] == 1
+    assert coverage["entities"]["mapped_ratio"] == 0.5
+    assert coverage["entities"]["by_type"] == {"line": 1, "unknown": 1}
+    assert coverage["unmapped_by_reason"] == {"unsupported_hatch_record": 1}
+    assert coverage["layers"]["count"] == 1

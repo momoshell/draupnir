@@ -157,6 +157,90 @@ def _sequence_length(value: Any) -> int:
     return 0
 
 
+def _build_coverage(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
+    """Honest extraction-coverage metrics for the validation report.
+
+    Reports what was actually extracted (mapped vs. unmapped geometry, by type and by reason;
+    layer/block resolution; review-flagged entities) so progress is measurable and downstream
+    consumers (and AI agents) get an explicit, non-gating provenance signal — distinct from the
+    coarse confidence score. Computed from the canonical payload; no ground truth required.
+    """
+
+    raw_entities = canonical_json.get("entities")
+    entities = list(raw_entities) if isinstance(raw_entities, (list, tuple)) else []
+
+    by_type: dict[str, int] = {}
+    unmapped_by_reason: dict[str, int] = {}
+    entities_with_layer_ref = 0
+    review_flagged = 0
+    for entity in entities:
+        if not isinstance(entity, Mapping):
+            continue
+        entity_type = str(
+            entity.get("entity_type") or entity.get("type") or entity.get("kind") or "unknown"
+        )
+        by_type[entity_type] = by_type.get(entity_type, 0) + 1
+        if entity.get("layer_ref"):
+            entities_with_layer_ref += 1
+        confidence = entity.get("confidence")
+        if isinstance(confidence, Mapping) and confidence.get("review_required"):
+            review_flagged += 1
+        if entity_type == "unknown":
+            geometry = entity.get("geometry")
+            summary = geometry.get("geometry_summary") if isinstance(geometry, Mapping) else None
+            reason = None
+            if isinstance(summary, Mapping):
+                reason = summary.get("reason") or summary.get("source_type")
+            reason_key = str(reason or "unspecified")
+            unmapped_by_reason[reason_key] = unmapped_by_reason.get(reason_key, 0) + 1
+
+    total = len(entities)
+    unmapped = by_type.get("unknown", 0)
+    mapped = total - unmapped
+
+    raw_blocks = canonical_json.get("blocks")
+    blocks = list(raw_blocks) if isinstance(raw_blocks, (list, tuple)) else []
+    block_child_geometry = 0
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            continue
+        children = block.get("entities")
+        if isinstance(children, (list, tuple)):
+            block_child_geometry += len(children)
+
+    coverage: dict[str, Any] = {
+        "schema_version": "0.1",
+        "entities": {
+            "total": total,
+            "mapped": mapped,
+            "unmapped": unmapped,
+            "mapped_ratio": round(mapped / total, 4) if total else 0.0,
+            "by_type": dict(sorted(by_type.items())),
+        },
+        "unmapped_by_reason": dict(sorted(unmapped_by_reason.items())),
+        "layers": {
+            "count": _sequence_length(canonical_json.get("layers")),
+            "entities_with_layer_ref": entities_with_layer_ref,
+        },
+        "blocks": {
+            "count": len(blocks),
+            "child_geometry_count": block_child_geometry,
+        },
+        "review_flagged_entities": review_flagged,
+    }
+
+    metadata = canonical_json.get("metadata")
+    adapter_counts = metadata.get("entity_counts") if isinstance(metadata, Mapping) else None
+    if isinstance(adapter_counts, Mapping):
+        coverage["adapter_counts"] = {
+            str(key): int(value)
+            for key, value in adapter_counts.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+
+    return coverage
+
+
 def _confidence_score(result: AdapterResult) -> float:
     if result.confidence is None or result.confidence.score is None:
         return 0.0
