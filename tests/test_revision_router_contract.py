@@ -365,6 +365,23 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/devices",
+            "list_revision_devices",
+            "list_revision_devices",
+            "RevisionDeviceListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("query", "device_layer", False, None, None, None, None),
+                ("query", "tag_layer", False, None, None, None, None),
+                ("query", "max_tag_distance", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",

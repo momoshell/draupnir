@@ -8,6 +8,9 @@ from app.api.v1.revision_routes.adapter_outputs import (
 from app.api.v1.revision_routes.changesets import (
     changesets_router,
 )
+from app.api.v1.revision_routes.devices import (
+    devices_router,
+)
 from app.api.v1.revision_routes.estimates import (
     estimates_router,
 )
@@ -39,6 +42,7 @@ revisions_router.include_router(adapter_outputs_router)
 revisions_router.include_router(changesets_router)
 revisions_router.include_router(generated_artifacts_router)
 revisions_router.include_router(materialization_router)
+revisions_router.include_router(devices_router)
 revisions_router.include_router(quantity_takeoffs_router)
 revisions_router.include_router(estimates_router)
 revisions_router.include_router(exports_router)
