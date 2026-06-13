@@ -527,12 +527,12 @@ Phase 8 export kinds and boundaries:
 
 | Export kind | Format | Lineage anchor | Trust gate | Pure-service owner | Worker-finalization owner | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| Revision JSON | JSON | revision | finalized revision; preserve upstream review/provisional metadata | #251 | #254 | planned |
-| Quantity CSV | CSV | quantity takeoff | trusted allowed takeoff only | #252 | #254 | planned |
-| Estimate CSV | CSV | estimate version | finalized estimate from trusted allowed takeoff | #252 | #254 | planned |
-| Estimate/report PDF | PDF | estimate version | finalized estimate from trusted allowed takeoff | #255 (after #249) | #256 | planned |
+| Revision JSON | JSON | revision | finalized revision; preserve upstream review/provisional metadata | #251 | #254 | implemented |
+| Quantity CSV | CSV | quantity takeoff | trusted allowed takeoff only | #252 | #254 | implemented |
+| Estimate CSV | CSV | estimate version | finalized estimate from trusted allowed takeoff | #252 | #254 | implemented |
+| Estimate/report PDF | PDF | estimate version | finalized estimate from trusted allowed takeoff | #255 (after #249) | #256 | implemented |
 | Debug overlay | SVG/PNG/PDF | source file, drawing revision, job, generator options, optional entity/takeoff/predecessor refs | debug/review use only; existing behavior with no new Phase 8 endpoint owner | none | none | existing |
-| DXF revised drawing | DXF | revision changeset/export context | validated edit/export flow required | none | none | deferred |
+| DXF revised drawing | DXF | revision changeset/export context | validated edit/export flow required | #258 | #254 | implemented for changeset-origin revisions |
 
 Shared export semantics across all kinds:
 
@@ -543,8 +543,9 @@ Shared export semantics across all kinds:
 - #249 owns only the PDF ADR decision, #250 owns export job type/input
   persistence, and #253 owns create-endpoint/schema/idempotency work shared
   across the MVP export kinds above.
-- Phase 8 does not assign an implementation owner for DXF revised drawing
-  export; that contract remains deferred.
+- Revised-DXF export is no longer phase-deferred: the current implementation is
+  scoped to changeset-origin revisions and follows the dedicated renderer/API
+  contract from #258.
 
 Append-only versus mutable record rules:
 

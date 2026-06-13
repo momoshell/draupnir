@@ -1006,8 +1006,7 @@ regenerating the same logical export.
 Phase 8 export contract narrows this further:
 
 - MVP export kinds are fixed to: `revision_json`, `quantity_csv`,
-  `estimate_csv`, `estimate_pdf`, `debug_overlay`, and a later
-  `revised_dxf` contract that stays deferred for now.
+  `estimate_csv`, `estimate_pdf`, `debug_overlay`, and `revised_dxf`.
 - Export remains one job type, `export`, across all artifact kinds.
 - One export job commits at most one visible artifact row/object. Bundles or
   multi-file payloads are post-MVP.
@@ -1027,12 +1026,12 @@ Phase 8 export contract narrows this further:
 
 | Export kind | MVP format | Required lineage refs | Trust gate | Pure-service owner | Worker-finalization owner | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| `revision_json` | JSON | `source_file_id`, `drawing_revision_id`, `job_id` | finalized revision required; may reflect provisional/review metadata but not hide it | #251 | #254 | planned |
-| `quantity_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `job_id` | trusted takeoff only (`quantity_gate = allowed`) | #252 | #254 | planned |
-| `estimate_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #252 | #254 | planned |
-| `estimate_pdf` | PDF | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #255 (after #249) | #256 | planned |
+| `revision_json` | JSON | `source_file_id`, `drawing_revision_id`, `job_id` | finalized revision required; may reflect provisional/review metadata but not hide it | #251 | #254 | implemented |
+| `quantity_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `job_id` | trusted takeoff only (`quantity_gate = allowed`) | #252 | #254 | implemented |
+| `estimate_csv` | CSV | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #252 | #254 | implemented |
+| `estimate_pdf` | PDF | `source_file_id`, `drawing_revision_id`, `quantity_takeoff_id`, `estimate_id`, `job_id` | finalized estimate only; estimate must derive from trusted allowed takeoff | #255 (after #249) | #256 | implemented |
 | `debug_overlay` | SVG, PNG, or PDF | `source_file_id`, `drawing_revision_id`, `job_id`, generator options, optional entity/takeoff/predecessor refs | review/debug artifact; not a trusted-estimation substitute; existing behavior with no new Phase 8 endpoint owner | none | none | existing |
-| `revised_dxf` | DXF | would require `source_file_id`, `drawing_revision_id`, `changeset_id`, `job_id` | requires validated revision-edit/export path | none | none | deferred |
+| `revised_dxf` | DXF | `source_file_id`, `drawing_revision_id`, `changeset_id`, `job_id` | requires a changeset-origin revision plus validated revision-edit/export path | #258 | #254 | implemented for changeset-origin revisions |
 
 Downstream export issue boundaries for this phase are:
 
@@ -1045,9 +1044,11 @@ Downstream export issue boundaries for this phase are:
 - #255 pure PDF generation after #249
 - #256 PDF worker finalization
 - #257 end-to-end export smoke coverage
+- #258 revised-DXF create API, renderer, and worker wiring for changeset-origin revisions
 
-DXF revised drawing export is explicitly deferred in this phase and currently
-has no owning issue in the Phase 8 implementation split.
+Revised-DXF export is implemented for changeset-origin revisions only. It is
+not a general source-revision export path and still depends on the validated
+changeset/revision-edit flow described elsewhere in this TRD.
 
 Minimum artifact lineage fields:
 

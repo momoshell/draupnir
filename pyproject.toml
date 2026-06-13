@@ -68,19 +68,19 @@ dependencies = [
 
 # ---------------------------------------------------------------------------
 # Optional dependency groups
-# Local development sync: uv sync --extra db --extra jobs --extra dev --extra test
+# Local development sync: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
 # ---------------------------------------------------------------------------
 [project.optional-dependencies]
 
-# Database layer — SQLAlchemy 2.x, Alembic migrations, Postgres drivers
+# Database layer — async SQLAlchemy 2.x, Alembic migrations, Postgres drivers
 db = [
     "sqlalchemy[asyncio]>=2.0",
     "alembic>=1.13",
-    "asyncpg>=0.29",          # async Postgres driver (for later async migration)
-    "psycopg2-binary>=2.9",   # sync Postgres driver (MVP)
+    "asyncpg>=0.29",          # async Postgres driver used by the app/runtime
+    "psycopg2-binary>=2.9",   # sync Postgres driver for tooling/compat paths
 ]
 
-# Background job processing — Celery + Redis result backend
+# Background job processing — Celery with RabbitMQ/AMQP broker support
 jobs = [
     "celery>=5.3",
     "celery-stubs>=0.1",  # Type stubs for celery

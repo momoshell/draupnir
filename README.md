@@ -442,8 +442,8 @@ Save the returned export job ID and poll `GET /v1/jobs/{job_id}` to completion.
 curl -sS "$BASE_URL/v1/revisions/$REVISION_ID/generated-artifacts"
 ```
 
-Use artifact endpoints for metadata and lineage. They do not expose raw bytes or
-download URLs.
+Use artifact list responses for metadata and lineage. Download raw bytes through
+`GET /v1/generated-artifacts/{artifact_id}/download`.
 
 ### Health and capabilities
 
@@ -511,9 +511,11 @@ download URLs.
 
 - Export kinds currently include `revision_json`, `quantity_csv`,
   `estimate_csv`, `estimate_pdf`, and `revised_dxf`.
-- Generated artifact routes expose metadata and lineage, not raw artifact bytes
-  or presigned download URLs.
-- Consumers should treat artifact metadata as the API contract available today.
+- Revision-scoped generated artifact routes expose metadata and lineage.
+- Raw artifact bytes are available only from the explicit download route:
+  `GET /v1/generated-artifacts/{artifact_id}/download`.
+- Consumers should use revision-scoped artifact routes to discover artifacts,
+  then call the download route when they need file bytes.
 
 ### Changesets
 
