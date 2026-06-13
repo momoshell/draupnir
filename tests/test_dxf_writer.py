@@ -287,6 +287,29 @@ def test_write_canonical_dxf_emits_arc_circle_text() -> None:
     assert text.dxf.text == "SD-01"
 
 
+def test_write_canonical_dxf_emits_hatch_from_boundary_loops() -> None:
+    payload = _base_payload()
+    payload["entities"] = [
+        {
+            "layout_ref": "layout-model",
+            "layer_ref": "layer-0",
+            "payload": {
+                "entity_type": "hatch",
+                "geometry": {
+                    "boundary_loops": [
+                        [{"x": 0, "y": 0}, {"x": 2, "y": 0}, {"x": 2, "y": 2}, {"x": 0, "y": 2}]
+                    ],
+                },
+            },
+        }
+    ]
+
+    doc = _parse_dxf(payload)
+    hatches = [entity for entity in doc.modelspace() if entity.dxftype() == "HATCH"]
+    assert len(hatches) == 1
+    assert len(cast(Any, hatches[0]).paths) == 1
+
+
 def test_write_canonical_dxf_emits_block_definitions_and_insert_references() -> None:
     payload = _base_payload()
     payload["blocks"] = [

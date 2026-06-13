@@ -72,6 +72,7 @@ _ARC_ENTITY_TYPES = {"arc", "arcs"}
 _CIRCLE_ENTITY_TYPES = {"circle", "circles"}
 _TEXT_ENTITY_TYPES = {"text", "mtext"}
 _INSERT_ENTITY_TYPES = {"insert", "block_reference", "blockreference"}
+_HATCH_ENTITY_TYPES = {"hatch"}
 # Geometry-less placeholders the adapter emits for records it could not map (e.g. unsupported
 # HATCH/LWPOLYLINE). They carry no geometry, so they are skipped on export and reported as a
 # diagnostic rather than aborting the whole render.
@@ -931,6 +932,16 @@ def _write_entity(
         text_entity.set_placement((insertion[0], insertion[1]))
         return
 
+    if entity_type in _HATCH_ENTITY_TYPES:
+        loops = _extract_hatch_boundary_loops(
+            geometry=resolved.geometry, entity_path=resolved.path, unit_spec=unit_spec
+        )
+        hatch = target.add_hatch(dxfattribs={"layer": layer_name})
+        hatch.set_solid_fill()
+        for loop in loops:
+            hatch.paths.add_polyline_path(loop, is_closed=True)
+        return
+
     if entity_type in _INSERT_ENTITY_TYPES:
         block_name, insertion, xscale, yscale, rotation = _extract_insert_placement(
             resolved=resolved, unit_spec=unit_spec
@@ -1026,6 +1037,46 @@ def _extract_text_geometry(
     content = geometry.get("text")
     text = content if isinstance(content, str) else ""
     return insertion, text
+
+
+def _extract_hatch_boundary_loops(
+    *, geometry: Any, entity_path: str, unit_spec: UnitSpec
+) -> list[list[tuple[float, float]]]:
+    if not isinstance(geometry, Mapping):
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Hatch geometry must be an object at {entity_path}",
+            details={"path": entity_path},
+        )
+    raw_loops = geometry.get("boundary_loops")
+    if not isinstance(raw_loops, (list, tuple)) or not raw_loops:
+        vertices = geometry.get("vertices")
+        raw_loops = (vertices,) if isinstance(vertices, (list, tuple)) and vertices else None
+    if not raw_loops:
+        raise DxfWriteError(
+            code="UNSUPPORTED_GEOMETRY",
+            message=f"Hatch geometry requires boundary loops at {entity_path}",
+            details={"path": entity_path},
+        )
+
+    loops: list[list[tuple[float, float]]] = []
+    for loop_index, raw_loop in enumerate(raw_loops, start=1):
+        if not isinstance(raw_loop, (list, tuple)) or len(raw_loop) < 3:
+            raise DxfWriteError(
+                code="UNSUPPORTED_GEOMETRY",
+                message=f"Hatch boundary loop requires at least 3 points at {entity_path}",
+                details={"path": f"{entity_path}.geometry.boundary_loops[{loop_index}]"},
+            )
+        loop_points: list[tuple[float, float]] = []
+        for point_index, raw_point in enumerate(raw_loop, start=1):
+            point = _coerce_point(
+                raw_point,
+                field_path=f"{entity_path}.geometry.boundary_loops[{loop_index}][{point_index}]",
+                scale=unit_spec.meter_scale,
+            )
+            loop_points.append((point[0], point[1]))
+        loops.append(loop_points)
+    return loops
 
 
 def _extract_insert_placement(

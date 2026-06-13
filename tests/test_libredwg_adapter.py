@@ -1485,6 +1485,41 @@ async def test_libredwg_adapter_maps_lwpolyline_entities_into_canonical_payload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag", "expected_closed"),
+    [
+        (0x200, True),  # LibreDWG closed bit
+        (0x300, True),  # LibreDWG closed (0x200) + a benign bit (0x100)
+        (0x100, False),  # benign bit only -> open, not rejected
+        (128, False),  # plinegen (benign) -> open, not rejected
+    ],
+)
+async def test_libredwg_adapter_maps_lwpolyline_flag_bits(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: int,
+    expected_closed: bool,
+) -> None:
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "LWPOLYLINE",
+                    "handle": "1A",
+                    "layer": "0",
+                    "flag": flag,
+                    "points": [[0, 0], [1, 0], [1, 1]],
+                }
+            ]
+        },
+    )
+
+    entity = _single_entity(result)
+    assert entity["entity_type"] == "polyline"
+    assert entity["geometry"]["closed"] is expected_closed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("closed_value", ["unknown", 2])
 async def test_libredwg_adapter_rejects_invalid_lwpolyline_closed_values(
     monkeypatch: pytest.MonkeyPatch,
@@ -2910,25 +2945,6 @@ async def test_libredwg_adapter_degrades_malformed_line_geometry_to_unknown(
                         "handle": "24",
                         "layer": "Broken",
                         "const_width": 0.5,
-                        "vertices": [
-                            {"x": 0, "y": 0},
-                            {"x": 1, "y": 1},
-                        ],
-                    }
-                ]
-            },
-            "malformed_lwpolyline_geometry",
-            "LWPOLYLINE",
-            ("libredwg.units_unconfirmed", "libredwg.malformed_drawable_record"),
-        ),
-        (
-            {
-                "OBJECTS": [
-                    {
-                        "type": "LWPOLYLINE",
-                        "handle": "24B",
-                        "layer": "Broken",
-                        "flags": 128,
                         "vertices": [
                             {"x": 0, "y": 0},
                             {"x": 1, "y": 1},

@@ -84,7 +84,11 @@ _LAYOUT_BLOCK_HEADER_NAME_PREFIXES = (
 )
 _DEFAULT_LAYOUT_NAME = "Model"
 _WRAPPER_KEYS = ("object", "entity", "record", "data", "payload", "value")
-_SUPPORTED_LWPOLYLINE_FLAG_MASK = 0b1
+# Bits that mark an LWPOLYLINE closed: DXF-70 style (1, used by synthetic fixtures) and LibreDWG
+# JSON style (0x200, emitted by dwgread). Other flag bits (plinegen, vertexids, R2010 markers)
+# are benign for geometry and must not cause a reject — bulge/width support is gated separately
+# on the actual vertex data, not on the flag.
+_LWPOLYLINE_CLOSED_FLAG_BITS = 0b1 | 0x200
 _SUPPORTED_ARC_ANGLE_UNIT_TOKENS = frozenset({"deg", "degree", "degrees"})
 _SUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"ccw", "counterclockwise"})
 _UNSUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"cw", "clockwise"})
@@ -3374,10 +3378,10 @@ def _extract_closed(record: Mapping[str, Any]) -> bool | None:
     if flags_value is None or not math.isfinite(flags_value) or not flags_value.is_integer():
         return None
     flags = int(flags_value)
-    if flags < 0 or flags & ~_SUPPORTED_LWPOLYLINE_FLAG_MASK:
+    if flags < 0:
         return None
 
-    flags_closed = bool(flags & _SUPPORTED_LWPOLYLINE_FLAG_MASK)
+    flags_closed = bool(flags & _LWPOLYLINE_CLOSED_FLAG_BITS)
     if coerced_closed is not None and coerced_closed != flags_closed:
         return None
     return coerced_closed if coerced_closed is not None else flags_closed
@@ -3467,6 +3471,11 @@ def _extract_hatch_vertices(record: Mapping[str, Any]) -> _HatchLoopsResult:
     geometry matters for canonical quantities, so the fill pattern itself is
     recorded as a property rather than gating the entity (#385).
     """
+    if _record_has_any_key(record, "paths"):
+        # dwgread emits the boundary as ``paths`` -> ``segs`` (curve_type 1 = straight,
+        # 2 = circular arc). This is the real on-disk shape; arcs are tessellated.
+        return _extract_hatch_paths(_first_value(record, "paths"))
+
     if _record_has_any_key(record, "boundary_loops", "boundaryloops", "loops"):
         return _extract_hatch_loops(
             _first_value(record, "boundary_loops", "boundaryloops", "loops"),
@@ -3589,6 +3598,106 @@ def _extract_hatch_vertices_from_edges(raw_edges: Any) -> _HatchVerticesResult:
     if normalized_vertices is None:
         return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
     return _HatchVerticesResult(normalized_vertices)
+
+
+def _extract_hatch_paths(raw_paths: Any) -> _HatchLoopsResult:
+    """Extract boundary loops from the dwgread HATCH ``paths`` / ``segs`` structure.
+
+    Each path's ``segs`` are emitted in connected boundary order, so the ring is built directly
+    by walking them (no re-chaining). Straight segs (``curve_type`` 1) contribute their two
+    endpoints; circular-arc segs (``curve_type`` 2) are tessellated into short chords. Elliptical
+    (3) and spline (4) segs are not supported yet and leave the hatch review-gated.
+    """
+
+    if not isinstance(raw_paths, (list, tuple)) or not raw_paths:
+        return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_paths) > _MAX_HATCH_LOOPS:
+        return _HatchLoopsResult(None, reason="unsupported_hatch_geometry")
+
+    loops: list[tuple[tuple[float, float, float], ...]] = []
+    for path in raw_paths:
+        if not isinstance(path, Mapping):
+            return _HatchLoopsResult(None, reason="malformed_hatch_geometry", malformed=True)
+        ring = _extract_hatch_ring_from_segs(_first_value(path, "segs", "edges"))
+        if ring.vertices is None:
+            return _HatchLoopsResult(None, reason=ring.reason, malformed=ring.malformed)
+        loops.append(ring.vertices)
+    return _HatchLoopsResult(tuple(loops))
+
+
+def _extract_hatch_ring_from_segs(raw_segs: Any) -> _HatchVerticesResult:
+    if not isinstance(raw_segs, (list, tuple)) or not raw_segs:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    if len(raw_segs) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+        return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    ring: list[tuple[float, float, float]] = []
+    for seg in raw_segs:
+        points = _hatch_seg_points(seg)
+        if points is None:
+            return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+        if isinstance(points, str):
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+        for point in points:
+            if ring and _points_match(ring[-1], point):
+                continue
+            ring.append(point)
+        if len(ring) > _MAX_HATCH_BOUNDARY_COMPONENTS:
+            return _HatchVerticesResult(None, reason="unsupported_hatch_geometry")
+
+    normalized = _normalize_hatch_vertices(tuple(ring))
+    if normalized is None:
+        return _HatchVerticesResult(None, reason="malformed_hatch_geometry", malformed=True)
+    return _HatchVerticesResult(normalized)
+
+
+def _hatch_seg_points(seg: Any) -> list[tuple[float, float, float]] | str | None:
+    if not isinstance(seg, Mapping):
+        return None
+    curve_type = seg.get("curve_type")
+    if curve_type == 2:
+        return _tessellate_hatch_arc_seg(seg)
+    if curve_type in (1, None):
+        start = _extract_point(seg, prefixes=("first_endpoint", "start", "start_point", "point1"))
+        end = _extract_point(seg, prefixes=("second_endpoint", "end", "end_point", "point2"))
+        if start is None or end is None:
+            return None
+        if not _point_is_finite(start) or not _point_is_finite(end):
+            return None
+        if start[2] != 0.0 or end[2] != 0.0:
+            return None
+        return [(start[0], start[1], 0.0), (end[0], end[1], 0.0)]
+    # curve_type 3 (ellipse) / 4 (spline) / unknown — not tessellated yet.
+    return "unsupported"
+
+
+def _tessellate_hatch_arc_seg(seg: Mapping[str, Any]) -> list[tuple[float, float, float]] | None:
+    center = _extract_point(seg, prefixes=("center", "center_point", "centerpoint"))
+    radius = _extract_positive_float(seg, "radius")
+    start_angle = _coerce_float(_first_value(seg, "start_angle", "startangle"))
+    end_angle = _coerce_float(_first_value(seg, "end_angle", "endangle"))
+    if center is None or radius is None or start_angle is None or end_angle is None:
+        return None
+    if not _point_is_finite(center) or not _floats_are_finite(radius, start_angle, end_angle):
+        return None
+
+    # dwgread HATCH arc angles are radians. Sweep direction follows ``is_ccw``.
+    two_pi = 2.0 * math.pi
+    if bool(_first_value(seg, "is_ccw", "ccw")):
+        sweep = (end_angle - start_angle) % two_pi or two_pi
+    else:
+        sweep = -((start_angle - end_angle) % two_pi) or -two_pi
+
+    steps = max(2, math.ceil(abs(sweep) / (math.pi / 18.0)))  # ~10 degrees per chord
+    points: list[tuple[float, float, float]] = []
+    for index in range(steps + 1):
+        angle = start_angle + sweep * (index / steps)
+        x = center[0] + radius * math.cos(angle)
+        y = center[1] + radius * math.sin(angle)
+        if not _floats_are_finite(x, y):
+            return None
+        points.append((x, y, 0.0))
+    return points
 
 
 def _validate_hatch_point_boundary(
