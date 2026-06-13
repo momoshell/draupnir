@@ -262,6 +262,84 @@ class TestRevisionMaterializationApi:
         assert paper_item["layout_ref"] == "Paper"
         assert paper_item["source_identity"] == "entity-source-paper"
 
+    async def test_devices_endpoint_returns_schedule_and_tag_association(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """/devices returns the fixture schedule plus nearest-tag association for INSERTs."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        def _device(entity_id: str, source: str, x: float, y: float) -> dict[str, Any]:
+            entity = _build_contract_entity(
+                entity_id=entity_id,
+                entity_type="insert",
+                layout_ref="Model",
+                layer_ref="F810A",
+                block_ref="Smoke-Detector",
+                source_id=source,
+            )
+            entity["geometry_json"] = {"transform": {"insertion_point": {"x": x, "y": y, "z": 0.0}}}
+            return entity
+
+        def _tag(entity_id: str, source: str, x: float, y: float, text: str) -> dict[str, Any]:
+            entity = _build_contract_entity(
+                entity_id=entity_id,
+                entity_type="text",
+                layout_ref="Model",
+                layer_ref="Fire Alarm Device Tags",
+                source_id=source,
+            )
+            entity["geometry_json"] = {"insertion": {"x": x, "y": y, "z": 0.0}, "text": text}
+            return entity
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layers=[
+                    {"layer_ref": "F810A", "name": "F810A"},
+                    {"layer_ref": "Fire Alarm Device Tags", "name": "Fire Alarm Device Tags"},
+                ],
+                blocks=[{"block_ref": "Smoke-Detector", "name": "Smoke-Detector"}],
+                entities=[
+                    _device("dev-1", "src-dev-1", 0.0, 0.0),
+                    _device("dev-2", "src-dev-2", 10.0, 0.0),
+                    _tag("tag-1", "src-tag-1", 0.5, 0.0, "SD-01"),
+                    _tag("tag-2", "src-tag-2", 9.5, 0.0, "SD-02"),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+
+        _outputs, drawing_revisions, _reports, _artifacts = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        response = await async_client.get(
+            f"/v1/revisions/{revision_id}/devices",
+            params={"tag_layer": "Fire Alarm Device Tags", "max_tag_distance": 2.0},
+        )
+        assert response.status_code == 200
+        body = response.json()
+
+        assert body["schedule"] == [{"block_ref": "Smoke-Detector", "count": 2}]
+        devices = {item["entity_id"]: item for item in body["items"]}
+        assert devices["dev-1"]["tag"]["text"] == "SD-01"
+        assert devices["dev-1"]["tag"]["distance"] == pytest.approx(0.5)
+        assert devices["dev-2"]["tag"]["text"] == "SD-02"
+        assert body["association"]["max_tag_distance"] == 2.0
+
     async def test_materialization_manifest_serializes_null_origin_ids(
         self,
         async_client: httpx.AsyncClient,
