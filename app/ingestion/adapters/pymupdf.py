@@ -10,7 +10,8 @@ import json
 import math
 import multiprocessing
 import os
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
@@ -450,12 +451,7 @@ def _extract_document_canonical(
         "geometry_mode": "vector",
         "page_count": page_count,
         "default_layer": _DEFAULT_LAYER_NAME,
-        "pdf_scale": {
-            "status": "unconfirmed",
-            "coordinate_space": "pdf_page_space_unrotated",
-            "unit": "point",
-            "real_world_units": False,
-        },
+        "pdf_scale": _derive_pdf_scale(text_blocks),
         "paper_sizes": tuple(paper_sizes),
         "text_blocks": tuple(text_blocks),
     }
@@ -1957,6 +1953,145 @@ def _paper_size(*, width_pt: float, height_pt: float, page_number: int) -> dict[
         "height_mm": height_mm,
         "name": _match_sheet_size(width_mm, height_mm),
     }
+
+
+# Scale ratio like "1:50". Time-safe: the look-arounds reject digits/colons on either side, so a
+# timestamp ("17:52:20") does not match. Architectural scales (one side == 1) are required, which
+# also rules out incidental "N:M" tokens.
+_SCALE_RATIO_RE = re.compile(r"(?<![\d:])(\d{1,4})\s*:\s*(\d{1,4})(?![\d:])")
+_SCALE_LABEL_RE = re.compile(r"(?i)\bscale\b")
+_DO_NOT_SCALE_RE = re.compile(r"(?i)do\s+not\s+scale")
+# Anchor the plan unit on "DIMENSIONS ... IN <unit>" so the "LEVELS ARE IN METRES" datum note is
+# not mistaken for the plan unit.
+_DIMENSION_UNIT_RE = re.compile(
+    r"(?i)\bdimensions?\b[^.]{0,40}?\bin\b\s+(millimet\w*|centimet\w*|met\w*|mm|cm|m)\b"
+)
+_REAL_UNIT_PER_MM = {"millimeter": 1.0, "centimeter": 0.1, "meter": 0.001}
+
+
+def _normalize_real_unit(token: str) -> str | None:
+    normalized = token.strip().lower()
+    if normalized.startswith("milli") or normalized == "mm":
+        return "millimeter"
+    if normalized.startswith("centi") or normalized == "cm":
+        return "centimeter"
+    if normalized.startswith("met") or normalized == "m":
+        return "meter"
+    return None
+
+
+def _text_block_center(bbox: Any) -> tuple[float, float] | None:
+    if not isinstance(bbox, Mapping):
+        return None
+    try:
+        x = (float(bbox["x_min"]) + float(bbox["x_max"])) / 2
+        y = (float(bbox["y_min"]) + float(bbox["y_max"])) / 2
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (x, y)
+
+
+def _parse_scale_ratio(
+    text_blocks: Sequence[Mapping[str, Any]],
+) -> tuple[int, int, str, str] | None:
+    """Return (numerator, denominator, source_text, confidence) for the drawing scale, if found.
+
+    Only architectural ratios (one side == 1) are accepted. When a "Scale" label is present the
+    nearest candidate is chosen and confidence is "high"; otherwise "medium".
+    """
+
+    candidates: list[tuple[int, int, Mapping[str, Any]]] = []
+    label_blocks: list[Mapping[str, Any]] = []
+    for block in text_blocks:
+        text = str(block.get("text") or "")
+        if _SCALE_LABEL_RE.search(text):
+            label_blocks.append(block)
+        for match in _SCALE_RATIO_RE.finditer(text):
+            numerator, denominator = int(match.group(1)), int(match.group(2))
+            if numerator >= 1 and denominator >= 1 and (numerator == 1 or denominator == 1):
+                candidates.append((numerator, denominator, block))
+
+    if not candidates:
+        return None
+
+    confidence = "medium"
+    if label_blocks:
+        confidence = "high"
+
+        def _distance_to_label(candidate: tuple[int, int, Mapping[str, Any]]) -> float:
+            center = _text_block_center(candidate[2].get("bbox"))
+            if center is None:
+                return math.inf
+            best = math.inf
+            for label in label_blocks:
+                label_center = _text_block_center(label.get("bbox"))
+                if label_center is not None:
+                    best = min(best, math.dist(center, label_center))
+            return best
+
+        candidates.sort(key=_distance_to_label)
+
+    numerator, denominator, block = candidates[0]
+    return numerator, denominator, str(block.get("text") or ""), confidence
+
+
+def _parse_real_world_unit(
+    text_blocks: Sequence[Mapping[str, Any]],
+) -> tuple[str, str] | None:
+    for block in text_blocks:
+        text = str(block.get("text") or "")
+        match = _DIMENSION_UNIT_RE.search(text)
+        if match is not None:
+            unit = _normalize_real_unit(match.group(1))
+            if unit is not None:
+                return unit, text
+    return None
+
+
+def _derive_pdf_scale(text_blocks: Sequence[Mapping[str, Any]]) -> dict[str, JSONValue]:
+    """Derive real-world scale/units from title-block/notes text.
+
+    Geometry stays in PDF points; this records the ratio, real-world unit, and a point->real
+    transform factor so consumers can convert without duplicating geometry. Degrades to
+    ``status: unconfirmed`` when no confident scale is found.
+    """
+
+    scale: dict[str, JSONValue] = {
+        "status": "unconfirmed",
+        "coordinate_space": "pdf_page_space_unrotated",
+        "unit": "point",
+        "real_world_units": False,
+    }
+
+    if any(_DO_NOT_SCALE_RE.search(str(block.get("text") or "")) for block in text_blocks):
+        scale["caveats"] = ("do_not_scale",)
+
+    ratio = _parse_scale_ratio(text_blocks)
+    if ratio is not None:
+        numerator, denominator, ratio_source, confidence = ratio
+        scale["scale_ratio"] = {
+            "numerator": numerator,
+            "denominator": denominator,
+            "text": f"{numerator}:{denominator}",
+        }
+        scale["scale_ratio_source"] = ratio_source
+        scale["confidence"] = confidence
+
+    unit_result = _parse_real_world_unit(text_blocks)
+    if unit_result is not None:
+        scale["real_world_unit"] = unit_result[0]
+        scale["real_world_unit_source"] = unit_result[1]
+
+    if ratio is not None and unit_result is not None:
+        numerator, denominator, _, _ = ratio
+        unit = unit_result[0]
+        points_to_mm = _MM_PER_INCH / _POINTS_PER_INCH
+        points_to_real = points_to_mm * (denominator / numerator) * _REAL_UNIT_PER_MM[unit]
+        scale["points_to_real"] = _round_float(points_to_real)
+        scale["real_world_units"] = True
+        scale["status"] = "derived_from_text"
+
+    return scale
 
 
 def _rect_tuple(value: Any) -> tuple[float, float, float, float]:

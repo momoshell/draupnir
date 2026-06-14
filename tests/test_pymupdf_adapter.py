@@ -208,3 +208,72 @@ def test_paper_size_from_a0_mediabox_points() -> None:
     assert paper["page_number"] == 1
     assert paper["width_mm"] == 1188.974
     assert paper["height_mm"] == 840.994
+
+
+def _block(text: str, bbox: dict[str, float] | None = None) -> dict[str, object]:
+    return {"text": text, "bbox": bbox or {"x_min": 0.0, "y_min": 0.0, "x_max": 1.0, "y_max": 1.0}}
+
+
+def test_parse_scale_ratio_prefers_architectural_and_ignores_timestamps() -> None:
+    blocks = [
+        _block(
+            "Project No:\nScale (@ A0):\nDrawn:",
+            {"x_min": 3058, "y_min": 2262, "x_max": 3285, "y_max": 2273},
+        ),
+        _block(
+            "1620014784\n28/01/25\nHK\n1:50",
+            {"x_min": 3065, "y_min": 2272, "x_max": 3295, "y_max": 2290},
+        ),
+        _block("28/03/2025 17:52:20"),  # timestamp must not be read as a scale
+    ]
+    result = pdf_adapter._parse_scale_ratio(blocks)
+    assert result is not None
+    numerator, denominator, _source, confidence = result
+    assert (numerator, denominator) == (1, 50)
+    assert confidence == "high"  # a "Scale" label is present
+
+
+def test_parse_scale_ratio_none_when_only_timestamp() -> None:
+    assert pdf_adapter._parse_scale_ratio([_block("28/03/2025 17:52:20")]) is None
+    assert pdf_adapter._parse_scale_ratio([_block("no ratios here")]) is None
+
+
+def test_parse_scale_ratio_medium_confidence_without_label() -> None:
+    result = pdf_adapter._parse_scale_ratio([_block("drawn at 1:100 nominal")])
+    assert result is not None
+    assert (result[0], result[1]) == (1, 100)
+    assert result[3] == "medium"
+
+
+def test_parse_real_world_unit_anchors_on_dimensions_not_levels() -> None:
+    assert pdf_adapter._parse_real_world_unit(
+        [_block("ALL DIMENSIONS ARE IN MILLIMETRES U.N.O.")]
+    ) == ("millimeter", "ALL DIMENSIONS ARE IN MILLIMETRES U.N.O.")
+    # "LEVELS ARE IN METRES" (datum) must not be taken as the plan unit.
+    assert (
+        pdf_adapter._parse_real_world_unit([_block("ALL LEVELS ARE IN METRES ABOVE DATUM")]) is None
+    )
+    assert pdf_adapter._parse_real_world_unit([_block("nothing relevant")]) is None
+
+
+def test_derive_pdf_scale_full_title_block() -> None:
+    blocks = [
+        _block("DO NOT SCALE FROM THIS DRAWING."),
+        _block("ALL DIMENSIONS ARE IN MILLIMETRES U.N.O."),
+        _block("Scale (@ A0):", {"x_min": 3058, "y_min": 2262, "x_max": 3285, "y_max": 2273}),
+        _block("HK\n1:50", {"x_min": 3065, "y_min": 2272, "x_max": 3295, "y_max": 2290}),
+    ]
+    scale = pdf_adapter._derive_pdf_scale(blocks)
+    assert scale["status"] == "derived_from_text"
+    assert scale["real_world_units"] is True
+    assert scale["real_world_unit"] == "millimeter"
+    assert scale["scale_ratio"] == {"numerator": 1, "denominator": 50, "text": "1:50"}
+    assert scale["points_to_real"] == 17.638889  # 25.4/72 * 50
+    assert scale["caveats"] == ("do_not_scale",)
+
+
+def test_derive_pdf_scale_unconfirmed_when_no_scale_text() -> None:
+    scale = pdf_adapter._derive_pdf_scale([_block("just a label")])
+    assert scale["status"] == "unconfirmed"
+    assert scale["real_world_units"] is False
+    assert "scale_ratio" not in scale
