@@ -71,3 +71,59 @@ def test_segment_legend_rows_without_notes_keeps_whole_legend() -> None:
 
 def test_segment_legend_rows_returns_empty_without_header() -> None:
     assert segment_legend_rows([_block("DC", 105.0, 40.0)]) == []
+
+
+def _row(texts: list[str], y: float) -> Any:
+    from app.interpretation.legend import LegendRow
+
+    return LegendRow(texts=tuple(texts), bbox=(100.0, y, 300.0, y + 12.0), block_indices=())
+
+
+def test_build_symbol_dictionary_pairs_same_row_abbreviation_and_description() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary([_row(["S", "STATIC DOME CAMERA"], 10.0)])
+    assert result["S"].type_name == "STATIC DOME CAMERA"
+
+
+def test_build_symbol_dictionary_splits_combined_block() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary([_row(["ACP\nACCESS CONTROL PANEL"], 10.0)])
+    assert result["ACP"].type_name == "ACCESS CONTROL PANEL"
+
+
+def test_build_symbol_dictionary_handles_abbreviation_on_last_line() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary([_row(["STATIC FISHEYE CAMERA\nCEILING\nF"], 10.0)])
+    assert "F" in result
+    assert "FISHEYE" in result["F"].type_name
+
+
+def test_build_symbol_dictionary_pairs_adjacent_split_rows() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary([_row(["NC"], 10.0), _row(["NURSE CALL BUTTON"], 24.0)])
+    assert result["NC"].type_name == "NURSE CALL BUTTON"
+
+
+def test_build_symbol_dictionary_excludes_notes_and_iconless_rows() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary(
+        [
+            _row(["NOTE:\nall dimensions in mm"], 10.0),
+            _row(["WALL MOUNTED PRESENCE DETECTOR"], 40.0),
+        ]
+    )
+    assert result == {}
+
+
+def test_build_symbol_dictionary_first_occurrence_wins_on_duplicate() -> None:
+    from app.interpretation.legend import build_symbol_dictionary
+
+    result = build_symbol_dictionary(
+        [_row(["DC", "DOOR CONTACT"], 10.0), _row(["DC\nDRUG CABINET"], 80.0)]
+    )
+    assert result["DC"].type_name == "DOOR CONTACT"

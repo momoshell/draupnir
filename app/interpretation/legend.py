@@ -34,6 +34,16 @@ _MIN_COLUMN_GAP = 1.0
 # median block height.
 _ROW_GAP_RATIO = 0.6
 
+# A legend abbreviation is a short, all-caps token: 1-4 chars with an optional "-X" suffix
+# (e.g. DC, P, S, F, L, I, SEC, ACP, NCP, INT, NC, NC-H, EB, R). Descriptions are longer or
+# multi-word, so they never match.
+_ABBREVIATION_RE = re.compile(r"^[A-Z][A-Z0-9]{0,3}(?:-[A-Z0-9]{1,3})?$")
+# Legend-area annotations that are not device entries.
+_NON_ENTRY_PREFIX_RE = re.compile(r"(?i)^\s*note\b")
+# Maximum vertical gap (as a multiple of a row's height) for pairing a stand-alone abbreviation
+# row with a stand-alone description row.
+_PAIR_ADJACENCY_ROWS = 2.5
+
 
 @dataclass(frozen=True, slots=True)
 class LegendRow:
@@ -42,6 +52,15 @@ class LegendRow:
     texts: tuple[str, ...]
     bbox: tuple[float, float, float, float]  # (x_min, y_min, x_max, y_max)
     block_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolEntry:
+    """A legend symbol: its abbreviation, the device type it denotes, and its row bounding box."""
+
+    abbreviation: str
+    type_name: str
+    bbox: tuple[float, float, float, float]
 
 
 def _bbox_of(block: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
@@ -181,4 +200,106 @@ def _build_row(
             max(item[2][3] for item in ordered),
         ),
         block_indices=tuple(item[0] for item in ordered),
+    )
+
+
+def build_symbol_dictionary(rows: Sequence[LegendRow]) -> dict[str, SymbolEntry]:
+    """Pair each legend row's abbreviation with its device description.
+
+    The abbreviation appears in several shapes: a separate span, the first line of a combined
+    block, the last line of a block, or its own row adjacent to a description-only row. This
+    resolves all of those into ``{abbreviation -> SymbolEntry}``. Rows with no abbreviation (icon
+    only) and NOTE annotations are skipped. First occurrence wins on duplicate abbreviations.
+
+    Icon-template capture (for matching untagged body symbols) is intentionally out of scope here.
+    """
+
+    parsed = [_parse_row(row) for row in rows]
+    paired = _pair_split_rows(parsed)
+
+    dictionary: dict[str, SymbolEntry] = {}
+    for abbreviation, type_name, bbox in paired:
+        if abbreviation is None or not type_name:
+            continue
+        if abbreviation not in dictionary:  # first occurrence wins (e.g. a reused abbreviation)
+            dictionary[abbreviation] = SymbolEntry(
+                abbreviation=abbreviation,
+                type_name=type_name,
+                bbox=bbox,
+            )
+    return dictionary
+
+
+def _parse_row(
+    row: LegendRow,
+) -> tuple[str | None, str, tuple[float, float, float, float]]:
+    """Return (abbreviation|None, description, bbox) for a row."""
+
+    lines = [
+        line.strip()
+        for text in row.texts
+        for line in text.split("\n")
+        if line.strip() and not _NON_ENTRY_PREFIX_RE.match(line)
+    ]
+    abbreviation: str | None = None
+    description_lines: list[str] = []
+    for line in lines:
+        if abbreviation is None and _ABBREVIATION_RE.match(line):
+            abbreviation = line
+        else:
+            description_lines.append(line)
+
+    description = re.sub(r"\s+", " ", " ".join(description_lines)).strip()
+    return abbreviation, description, row.bbox
+
+
+def _pair_split_rows(
+    parsed: Sequence[tuple[str | None, str, tuple[float, float, float, float]]],
+) -> list[tuple[str | None, str, tuple[float, float, float, float]]]:
+    """Pair a stand-alone abbreviation row with an adjacent stand-alone description row."""
+
+    result: list[tuple[str | None, str, tuple[float, float, float, float]]] = []
+    pending: tuple[str, tuple[float, float, float, float]] | None = None
+    for abbreviation, description, bbox in parsed:
+        if abbreviation is not None and not description:
+            pending = (abbreviation, bbox)  # abbreviation awaiting its description
+            continue
+        if abbreviation is None and description and pending is not None:
+            pending_abbr, pending_bbox = pending
+            if _rows_adjacent(pending_bbox, bbox):
+                merged = _union_bbox(pending_bbox, bbox)
+                result.append((pending_abbr, description, merged))
+                pending = None
+                continue
+            result.append((pending_abbr, "", pending_bbox))  # orphan abbreviation
+            pending = None
+        elif pending is not None:
+            result.append((pending[0], "", pending[1]))  # orphan abbreviation
+            pending = None
+        result.append((abbreviation, description, bbox))
+
+    if pending is not None:
+        result.append((pending[0], "", pending[1]))
+    return result
+
+
+def _rows_adjacent(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> bool:
+    height = max(first[3] - first[1], second[3] - second[1], 1.0)
+    first_center = (first[1] + first[3]) / 2
+    second_center = (second[1] + second[3]) / 2
+    return abs(second_center - first_center) <= height * _PAIR_ADJACENCY_ROWS
+
+
+def _union_bbox(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return (
+        min(first[0], second[0]),
+        min(first[1], second[1]),
+        max(first[2], second[2]),
+        max(first[3], second[3]),
     )
