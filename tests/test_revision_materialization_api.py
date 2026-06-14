@@ -18,6 +18,7 @@ from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
 from app.models.drawing_revision import DrawingRevision
+from app.models.revision_materialization import RevisionLayer
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import (
@@ -1066,6 +1067,96 @@ class TestRevisionMaterializationApi:
         assert all(item["type_name"] == "STATIC DOME CAMERA" for item in body["items"])
         assert body["summary"]["total_devices"] == 2
         assert body["summary"]["legend_size"] >= 1
+
+    async def test_layer_roles_endpoint_classifies_pen_layers(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """/layer-roles derives semantic roles for pen-signature layers."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        adapter_output_id = uuid.uuid4()
+        revision_id = uuid.uuid4()
+        assert job.extraction_profile_id is not None
+
+        pens = ["pen-eaeaea-w0.51", "pen-000000-w0.71", "pen-00ff00-w1.42", "default"]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                AdapterRunOutput(
+                    id=adapter_output_id,
+                    project_id=job.project_id,
+                    source_file_id=job.file_id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_key=_FAKE_RUNNER_ADAPTER_KEY,
+                    adapter_version=_FAKE_RUNNER_ADAPTER_VERSION,
+                    input_family="pdf_vector",
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    canonical_json={"layouts": [], "layers": [], "blocks": [], "entities": []},
+                    provenance_json={"adapter": {"key": _FAKE_RUNNER_ADAPTER_KEY}},
+                    confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                    warnings_json=[],
+                    diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
+                    result_checksum_sha256="0" * 64,
+                )
+            )
+            session.add(
+                DrawingRevision(
+                    id=revision_id,
+                    project_id=job.project_id,
+                    source_file_id=job.file_id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_run_output_id=adapter_output_id,
+                    predecessor_revision_id=None,
+                    revision_sequence=1,
+                    revision_kind="ingest",
+                    review_state=_FAKE_RUNNER_REVIEW_STATE,
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                )
+            )
+            for index, name in enumerate(pens):
+                session.add(
+                    RevisionLayer(
+                        id=uuid.uuid4(),
+                        project_id=job.project_id,
+                        source_file_id=job.file_id,
+                        extraction_profile_id=job.extraction_profile_id,
+                        source_job_id=job.id,
+                        drawing_revision_id=revision_id,
+                        adapter_run_output_id=adapter_output_id,
+                        canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        sequence_index=index,
+                        payload_json={"name": name},
+                        layer_ref=name,
+                    )
+                )
+            await session.commit()
+
+        response = await async_client.get(f"/v1/revisions/{revision_id}/layer-roles")
+        assert response.status_code == 200
+        body = response.json()
+        roles = {item["name"]: item["role"] for item in body["items"]}
+        assert roles == {
+            "pen-eaeaea-w0.51": "background",
+            "pen-000000-w0.71": "foreground",
+            "pen-00ff00-w1.42": "services",
+            "default": "unknown",
+        }
+        assert body["rule_version"] == "1"
+        assert body["summary"]["counts"]["services"] == 1
 
     async def test_materialization_endpoints_return_409_when_manifest_missing(
         self,
