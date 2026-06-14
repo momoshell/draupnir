@@ -8,7 +8,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.cad.dxf.units import UNITLESS, UnitSpec, resolve_unit
@@ -157,6 +157,12 @@ def write_canonical_dxf(
     layer_by_id, layer_by_name = _index_layer_records(layers)
 
     unit_spec = _resolve_unit(payload, write_options, entities=entities)
+    coordinate_scale = _resolve_coordinate_scale(payload)
+    if coordinate_scale != 1.0:
+        # Fold the per-drawing coordinate scale into meter_scale so every coordinate (which is
+        # already multiplied by meter_scale) is transformed in one place. $INSUNITS is unchanged
+        # (it labels the unit; the scale converts the source magnitudes into that unit).
+        unit_spec = replace(unit_spec, meter_scale=unit_spec.meter_scale * coordinate_scale)
     default_layout = _resolve_default_model_layout(layouts)
 
     with _fixed_ezdxf_metadata():
@@ -302,6 +308,32 @@ def _resolve_unit(
         return _resolve_named_unit(token, unit_path="canonical.units")
 
     return _resolve_unit_from_entity_geometry_units(entities)
+
+
+def _resolve_coordinate_scale(payload: Mapping[str, Any]) -> float:
+    """Return the optional per-drawing coordinate multiplier (default 1.0).
+
+    Used to convert source-space coordinates (e.g. PDF points) into the declared unit at
+    export time, without duplicating geometry.
+    """
+
+    raw = payload.get("coordinate_scale")
+    if raw is None:
+        return 1.0
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise DxfWriteError(
+            code="INVALID_COORDINATE",
+            message="coordinate_scale must be a positive number",
+            details={"path": "coordinate_scale", "value": raw},
+        )
+    scale = float(raw)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise DxfWriteError(
+            code="INVALID_COORDINATE",
+            message="coordinate_scale must be a positive, finite number",
+            details={"path": "coordinate_scale", "value": raw},
+        )
+    return scale
 
 
 def _resolve_named_unit(value: str, *, unit_path: str) -> UnitSpec:

@@ -527,3 +527,39 @@ def test_write_canonical_dxf_rejects_nonfinite_coordinates() -> None:
         write_canonical_dxf(payload)
 
     assert exc_info.value.code == "INVALID_COORDINATE"
+
+
+def test_write_canonical_dxf_applies_coordinate_scale_with_real_unit() -> None:
+    # The PDF real-world export (#436) sets units + a per-drawing coordinate_scale; the writer
+    # converts source (point) coordinates into the declared unit and labels INSUNITS.
+    payload = _base_payload()
+    payload.pop("unit")
+    payload["units"] = "mm"
+    payload["coordinate_scale"] = 10.0
+
+    result = write_canonical_dxf(payload)
+
+    assert result.warnings == ()
+    doc = _READ_DXF(io.StringIO(result.content.decode("utf-8")))
+    assert doc.header["$INSUNITS"] == 4  # millimetres
+    first_line = next(iter(doc.modelspace()))
+    # base payload first line is (0,0)->(2,0); scaled x10 => (0,0)->(20,0)
+    assert tuple(first_line.dxf.end) == (20.0, 0.0, 0.0)
+
+
+def test_write_canonical_dxf_coordinate_scale_defaults_to_identity() -> None:
+    payload = _base_payload()
+    payload["coordinate_scale"] = 1.0
+    doc = _parse_dxf(payload)
+    first_line = next(iter(doc.modelspace()))
+    assert tuple(first_line.dxf.end) == (2.0, 0.0, 0.0)  # unchanged
+
+
+def test_write_canonical_dxf_rejects_non_positive_coordinate_scale() -> None:
+    payload = _base_payload()
+    payload["coordinate_scale"] = 0
+
+    with pytest.raises(DxfWriteError) as exc_info:
+        write_canonical_dxf(payload)
+
+    assert exc_info.value.code == "INVALID_COORDINATE"
