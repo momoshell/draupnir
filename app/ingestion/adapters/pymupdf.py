@@ -1087,21 +1087,24 @@ def _entity_properties(
     closed: bool,
     rect_like: bool,
 ) -> dict[str, JSONValue]:
+    # PyMuPDF emits some path attributes as present-but-None (e.g. ``width`` for fill-only
+    # paths, ``lineCap``/``seqno`` on certain drawings). ``dict.get(key, default)`` returns the
+    # stored None rather than the default in that case, so coerce None to the default explicitly.
     return {
-        "path_type": str(drawing.get("type", "unknown")),
-        "stroke_width": _round_float(float(drawing.get("width", 0.0))),
+        "path_type": str(drawing.get("type") or "unknown"),
+        "stroke_width": _round_float(float(drawing.get("width") or 0.0)),
         "stroke_color_rgb": _color_tuple(drawing.get("color")),
         "stroke_opacity": _optional_float(drawing.get("stroke_opacity")),
         "fill_color_rgb": _color_tuple(drawing.get("fill")),
         "fill_opacity": _optional_float(drawing.get("fill_opacity")),
         "line_cap": tuple(
-            int(value) for value in cast(tuple[int, ...], drawing.get("lineCap", ()))
+            int(value) for value in cast(tuple[int, ...], drawing.get("lineCap") or ())
         ),
         "line_join": _optional_float(drawing.get("lineJoin")),
-        "dashes": str(drawing.get("dashes", "")),
+        "dashes": str(drawing.get("dashes") or ""),
         "closed": closed,
         "rect_like": rect_like,
-        "sequence_number": int(drawing.get("seqno", 0)),
+        "sequence_number": int(drawing.get("seqno") or 0),
     }
 
 
@@ -1304,6 +1307,13 @@ def _normalize_source_value(value: Any) -> tuple[JSONValue, bool]:
             "x1": _round_float(float(value.x1)),
             "y1": _round_float(float(value.y1)),
         }, True
+    if _looks_like_quad(value):
+        corners = _quad_corner_points(value)
+        labels = ("ul", "ur", "lr", "ll")
+        return {
+            label: {"x": point[0], "y": point[1]}
+            for label, point in zip(labels, corners, strict=True)
+        }, True
     if isinstance(value, dict):
         normalized: dict[str, JSONValue] = {}
         for key in sorted(value, key=str):
@@ -1338,6 +1348,8 @@ def _bbox_points_from_value(value: Any) -> list[tuple[float, float]]:
             (_round_float(float(value.x0)), _round_float(float(value.y0))),
             (_round_float(float(value.x1)), _round_float(float(value.y1))),
         ]
+    if _looks_like_quad(value):
+        return _quad_corner_points(value)
     if (
         isinstance(value, tuple)
         and len(value) == 2
@@ -1374,6 +1386,20 @@ def _looks_like_point(value: Any) -> bool:
 
 def _looks_like_rect(value: Any) -> bool:
     return all(hasattr(value, attr) for attr in ("x0", "y0", "x1", "y1"))
+
+
+def _looks_like_quad(value: Any) -> bool:
+    # PyMuPDF Quad: four corner Points (ul/ur/ll/lr); emitted for "qu" draw items.
+    return not _looks_like_rect(value) and all(
+        hasattr(value, attr) for attr in ("ul", "ur", "ll", "lr")
+    )
+
+
+def _quad_corner_points(value: Any) -> list[tuple[float, float]]:
+    return [
+        (_round_float(float(corner.x)), _round_float(float(corner.y)))
+        for corner in (value.ul, value.ur, value.lr, value.ll)
+    ]
 
 
 def _line_geometry(
@@ -1442,19 +1468,53 @@ async def _extract_with_process(
     source: AdapterSource,
     options: AdapterExecutionOptions,
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
-    handle = _start_extraction_process(
-        _ProcessExtractionRequest(
-            file_path=str(source.file_path),
-            upload_format=source.upload_format.value,
-            timeout_seconds=options.timeout.seconds if options.timeout is not None else None,
-            limits=_ExtractionLimits.from_settings(),
-        )
+    request = _ProcessExtractionRequest(
+        file_path=str(source.file_path),
+        upload_format=source.upload_format.value,
+        timeout_seconds=options.timeout.seconds if options.timeout is not None else None,
+        limits=_ExtractionLimits.from_settings(),
     )
+    try:
+        handle = _start_extraction_process(request)
+    except (AssertionError, OSError) as exc:
+        # A daemonic parent (e.g. a Celery prefork pool worker) cannot spawn child
+        # processes — multiprocessing raises AssertionError("daemonic processes are not
+        # allowed to have children"). Subprocess isolation is unavailable here, so fall
+        # back to in-process extraction (cooperative budget timeout still applies).
+        return await _extract_in_current_process(request, reason=str(exc) or type(exc).__name__)
     try:
         envelope = await _wait_for_process_envelope(handle, options=options)
     finally:
         handle.close()
     return _decode_process_envelope(envelope)
+
+
+async def _extract_in_current_process(
+    request: _ProcessExtractionRequest,
+    *,
+    reason: str,
+) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
+    """Run extraction in-process when subprocess isolation is unavailable.
+
+    Reuses the exact child-process code path and envelope decoding, so error and
+    warning behaviour is identical to the isolated run. CPU-bound work is offloaded
+    to a worker thread to keep the event loop responsive.
+    """
+
+    envelope = await asyncio.to_thread(_extract_in_child_process, request)
+    canonical, warnings = _decode_process_envelope(envelope)
+    warnings = [
+        AdapterWarning(
+            code="pymupdf_subprocess_isolation_unavailable",
+            message=(
+                "PyMuPDF extraction ran in-process because the worker could not spawn an "
+                "isolated subprocess; crash isolation is degraded for this run."
+            ),
+            details={"reason": reason},
+        ),
+        *warnings,
+    ]
+    return canonical, warnings
 
 
 def _start_extraction_process(request: _ProcessExtractionRequest) -> _ProcessExtractionHandle:
