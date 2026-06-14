@@ -221,6 +221,9 @@ def _build_coverage(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
         "layers": {
             "count": _sequence_length(canonical_json.get("layers")),
             "entities_with_layer_ref": entities_with_layer_ref,
+            # Provenance of the layer set: native ("ocg") vs derived ("pen_signature") vs the
+            # source adapter's own table; present when the adapter records it.
+            "source": canonical_json.get("layer_source"),
         },
         "blocks": {
             "count": len(blocks),

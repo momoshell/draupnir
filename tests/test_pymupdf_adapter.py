@@ -8,7 +8,9 @@ from app.ingestion.adapters import pymupdf as pdf_adapter
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
     AdapterSource,
+    AdapterWarning,
     InputFamily,
+    JSONValue,
     UploadFormat,
 )
 
@@ -104,3 +106,82 @@ async def test_extract_with_process_falls_back_when_spawn_is_blocked(monkeypatch
     )
     assert canonical == {"entities": [], "metadata": {}}
     assert warnings[0].code == "pymupdf_subprocess_isolation_unavailable"
+
+
+def test_pen_signature_layer_name_is_deterministic_and_distinct() -> None:
+    # Same pen -> same name; different colour or width -> different name. Content-derived,
+    # so naming is stable regardless of encounter order. (Issue #413.)
+    black_thin = pdf_adapter._pen_signature_layer_name({"color": (0.0, 0.0, 0.0), "width": 0.51})
+    black_thin_again = pdf_adapter._pen_signature_layer_name(
+        {"color": (0.0, 0.0, 0.0), "width": 0.51}
+    )
+    grey_thin = pdf_adapter._pen_signature_layer_name({"color": (0.92, 0.92, 0.92), "width": 0.51})
+    black_thick = pdf_adapter._pen_signature_layer_name({"color": (0.0, 0.0, 0.0), "width": 1.0})
+
+    assert black_thin == "pen-000000-w0.51"
+    assert black_thin == black_thin_again
+    assert grey_thin == "pen-ebebeb-w0.51"
+    assert black_thick == "pen-000000-w1"
+    assert len({black_thin, grey_thin, black_thick}) == 3
+
+
+def test_pen_signature_layer_name_fill_and_colourless_fallback() -> None:
+    # Fill-only paths (no stroke colour) key off the fill colour; fully colourless paths
+    # fall back to the default layer name.
+    assert (
+        pdf_adapter._pen_signature_layer_name(
+            {"color": None, "fill": (0.0, 1.0, 0.0), "width": 0.7}
+        )
+        == "pen-00ff00-w0.7"
+    )
+    assert (
+        pdf_adapter._pen_signature_layer_name({"color": None, "fill": None, "width": 0.0})
+        == "default-w0"
+    )
+
+
+def test_resolve_drawing_layer_honors_explicit_layer_field() -> None:
+    # An explicit (OCG-style) layer name wins over the pen signature.
+    assert (
+        pdf_adapter._resolve_drawing_layer(
+            {"layer": "E-LITE", "color": (0.0, 0.0, 0.0), "width": 0.5}
+        )
+        == "E-LITE"
+    )
+
+
+def test_populate_page_entities_assigns_pen_signature_layers() -> None:
+    def line(color: object, width: float) -> dict[str, object]:
+        return {
+            "color": color,
+            "width": width,
+            "closePath": False,
+            "items": [("l", _FakePoint(0.0, 0.0), _FakePoint(1.0, 1.0))],
+        }
+
+    drawings = [
+        line((0.0, 0.0, 0.0), 0.5),  # black thin
+        line((0.0, 0.0, 0.0), 0.5),  # same pen -> same layer
+        line((0.92, 0.92, 0.92), 0.5),  # grey -> different layer
+        line((0.0, 0.0, 0.0), 1.0),  # black thick -> different layer
+    ]
+    entities: list[dict[str, JSONValue]] = []
+    warnings: list[AdapterWarning] = []
+    layer_names: list[str] = []
+    budget = pdf_adapter._ExtractionBudget(started_at=0.0, timeout_seconds=None)
+
+    pdf_adapter._populate_page_entities(
+        drawings,
+        entities=entities,
+        warnings=warnings,
+        layer_names=layer_names,
+        page_number=1,
+        layout_name="page-1",
+        options=AdapterExecutionOptions(timeout=None),
+        budget=budget,
+        entity_limit=100,
+    )
+
+    assert set(layer_names) == {"pen-000000-w0.5", "pen-ebebeb-w0.5", "pen-000000-w1"}
+    assert entities, "expected at least one entity"
+    assert all(entity["layer_ref"] in set(layer_names) for entity in entities)

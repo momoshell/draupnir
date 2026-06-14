@@ -485,6 +485,9 @@ def _extract_document_canonical(
         },
         "layouts": tuple(layouts),
         "layers": tuple({"name": layer_name} for layer_name in layer_names),
+        # Layers are derived from each path's pen signature (stroke colour + width); PDFs have
+        # no native layer table. OCG-sourced layers (#414) will set this to "ocg" when present.
+        "layer_source": "pen_signature",
         "blocks": (),
         "entities": tuple(entities),
         "xrefs": (),
@@ -541,7 +544,7 @@ def _populate_page_entities(
 ) -> None:
     for drawing_index, drawing in enumerate(drawings):
         budget.checkpoint(options)
-        layer_name = _layer_name(drawing.get("layer"))
+        layer_name = _resolve_drawing_layer(drawing)
         closed = bool(drawing.get("closePath"))
         items = drawing.get("items", ())
         _enforce_path_item_limit(items)
@@ -1791,10 +1794,62 @@ def _entity_id(*, page_number: int, drawing_index: int, entity_index: int) -> st
     return f"page-{page_number}:drawing-{drawing_index}:entity-{entity_index}"
 
 
-def _layer_name(raw_layer: Any) -> str:
+def _resolve_drawing_layer(drawing: Mapping[str, Any]) -> str:
+    """Return the canonical layer name for a drawing.
+
+    Honors an explicit ``layer`` field when present (the hook for native OCG layers, #414);
+    otherwise derives a deterministic layer from the pen signature.
+    """
+
+    raw_layer = drawing.get("layer")
     if isinstance(raw_layer, str) and raw_layer.strip():
         return raw_layer.strip()
-    return _DEFAULT_LAYER_NAME
+    return _pen_signature_layer_name(drawing)
+
+
+def _pen_signature_layer_name(drawing: Mapping[str, Any]) -> str:
+    """Derive a stable layer name from a drawing's pen signature (stroke colour + width).
+
+    Plotted CAD PDFs encode layer identity in pen colour/weight (CTB/pen tables), so grouping
+    by ``(colour, width)`` is a deterministic, faithful proxy for the original layers. The name
+    is content-derived (not positional), so the same pen always maps to the same layer across
+    runs and drawings. Stroke colour is preferred; fill colour is the fallback for fill-only
+    paths; colourless paths fall back to the default layer name.
+    """
+
+    colour = drawing.get("color")
+    if colour is None:
+        colour = drawing.get("fill")
+    width = _safe_pen_width(drawing.get("width"))
+    hexcode = _rgb_hex(colour)
+    if hexcode is None:
+        return f"{_DEFAULT_LAYER_NAME}-w{width:g}"
+    return f"pen-{hexcode}-w{width:g}"
+
+
+def _safe_pen_width(raw_width: Any) -> float:
+    # Layer naming runs before per-entity sanitization, so it must never raise on a
+    # non-finite/invalid pen width; degrade to 0.0 (the entity build still skips it).
+    try:
+        width = float(raw_width) if raw_width is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(width):
+        return 0.0
+    return _round_float(width)
+
+
+def _rgb_hex(colour: Any) -> str | None:
+    if colour is None:
+        return None
+    try:
+        components = [float(component) for component in colour]
+    except (TypeError, ValueError):
+        return None
+    if len(components) < 3 or not all(math.isfinite(component) for component in components[:3]):
+        return None
+    channels = tuple(max(0, min(255, round(component * 255))) for component in components[:3])
+    return "".join(f"{channel:02x}" for channel in channels)
 
 
 def _point_tuple(raw_point: Any) -> tuple[float, float]:

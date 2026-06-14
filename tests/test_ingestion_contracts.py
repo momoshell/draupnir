@@ -1250,7 +1250,10 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
         },
     )
     layers = cast(tuple[dict[str, str], ...], result.canonical["layers"])
-    assert {layer["name"] for layer in layers} == {"default"}
+    # Layers are derived from the pen signature (stroke colour + width); the seeded "default"
+    # layer remains for colourless fallbacks. (Issue #413.)
+    assert {layer["name"] for layer in layers} == {"default", "pen-000000-w0.5"}
+    assert result.canonical["layer_source"] == "pen_signature"
 
     entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
     assert len(entities) == 1
@@ -1261,11 +1264,11 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
     assert entity["id"] == entity["entity_id"]
     assert entity["kind"] == "polyline"
     assert entity["layout"] == "page-1"
-    assert entity["layer"] == "default"
+    assert entity["layer"] == "pen-000000-w0.5"
     assert entity["drawing_revision_id"] is None
     assert entity["source_file_id"] is None
     assert entity["layout_ref"] == "page-1"
-    assert entity["layer_ref"] == "default"
+    assert entity["layer_ref"] == "pen-000000-w0.5"
     assert entity["block_ref"] is None
     assert entity["parent_entity_ref"] is None
     assert entity["points"] == (
