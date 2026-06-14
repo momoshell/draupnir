@@ -92,8 +92,14 @@ async def render_revised_dxf_export(
     revision_id: UUID,
     *,
     options: Mapping[str, object] | None = None,
+    require_changeset_origin: bool = True,
 ) -> RevisedDxfExportResult:
-    """Render a materialized drawing revision into deterministic DXF bytes."""
+    """Render a materialized drawing revision into deterministic DXF bytes.
+
+    By default this requires a changeset-origin revision (the "revised DXF" export). Set
+    ``require_changeset_origin=False`` to render any active revision, including a base
+    extraction revision (the "base DXF" export) — the rendering is otherwise identical.
+    """
 
     options_snapshot = _normalize_options(options)
 
@@ -104,7 +110,9 @@ async def render_revised_dxf_export(
             message=f"Drawing revision {revision_id} was not found.",
             details={"revision_id": str(revision_id)},
         )
-    if revision.revision_kind != "changeset" or revision.changeset_id is None:
+    if require_changeset_origin and (
+        revision.revision_kind != "changeset" or revision.changeset_id is None
+    ):
         raise RevisedDxfExportError(
             code="INPUT_INVALID",
             message="Revised DXF export requires a changeset-origin drawing revision.",
