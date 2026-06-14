@@ -397,6 +397,18 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/layer-roles",
+            "list_revision_layer_roles",
+            "list_revision_layer_roles",
+            "RevisionLayerRoleListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",

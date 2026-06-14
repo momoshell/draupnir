@@ -1,9 +1,11 @@
 """Device / fixture-schedule interpretation route (tier-3, derived from the canonical model)."""
 
+from collections import Counter
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
@@ -25,9 +27,11 @@ from app.interpretation.devices import (
     load_tag_candidates,
     schedule_from_devices,
 )
+from app.interpretation.layer_roles import RULE_VERSION, classify_layer_role
 from app.interpretation.legend import resolve_legend_devices, schedule_from_legend_devices
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
+from app.models.revision_materialization import RevisionLayer
 from app.schemas.devices import (
     DeviceRead,
     DeviceScheduleEntry,
@@ -36,6 +40,7 @@ from app.schemas.devices import (
     RevisionDeviceListResponse,
     RevisionLegendDeviceListResponse,
 )
+from app.schemas.layer_roles import LayerRoleRead, RevisionLayerRoleListResponse
 from app.schemas.revision import RevisionEntityManifestRead
 
 devices_router = APIRouter()
@@ -162,4 +167,54 @@ async def list_revision_legend_devices(
             "legend_size": len(dictionary),
             "total_devices": len(devices),
         },
+    )
+
+
+@devices_router.get(
+    "/revisions/{revision_id}/layer-roles",
+    response_model=RevisionLayerRoleListResponse,
+)
+async def list_revision_layer_roles(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RevisionLayerRoleListResponse:
+    """Derive a coarse semantic role per layer (background / foreground / services / unknown).
+
+    A deterministic, versioned rule table classifies pen-signature layers by colour lightness and
+    saturation. The role is attached on top of the stable layer identity (it never renames a
+    layer); non-pen layers (DWG / OCG) are reported as ``unknown``.
+    """
+
+    revision = await _get_active_revision(revision_id, db)
+    if revision is None:
+        raise_not_found("Drawing revision", str(revision_id))
+    assert revision is not None
+
+    rows = (
+        await db.scalars(
+            select(RevisionLayer)
+            .where(RevisionLayer.drawing_revision_id == revision_id)
+            .order_by(RevisionLayer.sequence_index.asc(), RevisionLayer.id.asc())
+        )
+    ).all()
+
+    items: list[LayerRoleRead] = []
+    counts: Counter[str] = Counter()
+    for row in rows:
+        name = row.payload_json.get("name") if isinstance(row.payload_json, dict) else None
+        role = classify_layer_role(name if isinstance(name, str) else None)
+        counts[role.role] += 1
+        items.append(
+            LayerRoleRead(
+                layer_ref=row.layer_ref,
+                name=name if isinstance(name, str) else None,
+                role=role.role,
+                basis=role.basis,
+            )
+        )
+
+    return RevisionLayerRoleListResponse(
+        items=items,
+        rule_version=RULE_VERSION,
+        summary={"counts": dict(counts)},
     )
