@@ -976,6 +976,97 @@ class TestRevisionMaterializationApi:
         assert inactive_entity_response.status_code == 404
         assert inactive_entity_response.json() == inactive_response.json()
 
+    async def test_legend_devices_endpoint_returns_schedule_from_legend(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """/legend-devices resolves body tags against the legend into a typed schedule."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        adapter_output_id = uuid.uuid4()
+        revision_id = uuid.uuid4()
+        assert job.extraction_profile_id is not None
+
+        def _tb(text: str, x: float, y: float) -> dict[str, Any]:
+            return {
+                "text": text,
+                "bbox": {"x_min": x, "y_min": y, "x_max": x + 30.0, "y_max": y + 12.0},
+            }
+
+        text_blocks = [
+            _tb("LEGEND", 800.0, 10.0),
+            _tb("S", 805.0, 40.0),
+            _tb("STATIC DOME CAMERA", 840.0, 40.0),
+            _tb("S", 100.0, 300.0),  # body instances
+            _tb("S", 250.0, 500.0),
+        ]
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            session.add(
+                AdapterRunOutput(
+                    id=adapter_output_id,
+                    project_id=job.project_id,
+                    source_file_id=job.file_id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_key=_FAKE_RUNNER_ADAPTER_KEY,
+                    adapter_version=_FAKE_RUNNER_ADAPTER_VERSION,
+                    input_family="pdf_vector",
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    canonical_json={
+                        "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                        "layouts": [],
+                        "layers": [],
+                        "blocks": [],
+                        "entities": [],
+                        "metadata": {"text_blocks": text_blocks},
+                    },
+                    provenance_json={"adapter": {"key": _FAKE_RUNNER_ADAPTER_KEY}},
+                    confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                    warnings_json=[],
+                    diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
+                    result_checksum_sha256="0" * 64,
+                )
+            )
+            session.add(
+                DrawingRevision(
+                    id=revision_id,
+                    project_id=job.project_id,
+                    source_file_id=job.file_id,
+                    extraction_profile_id=job.extraction_profile_id,
+                    source_job_id=job.id,
+                    adapter_run_output_id=adapter_output_id,
+                    predecessor_revision_id=None,
+                    revision_sequence=1,
+                    revision_kind="ingest",
+                    review_state=_FAKE_RUNNER_REVIEW_STATE,
+                    canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
+                )
+            )
+            await session.commit()
+
+        response = await async_client.get(f"/v1/revisions/{revision_id}/legend-devices")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["schedule"] == [
+            {"abbreviation": "S", "type_name": "STATIC DOME CAMERA", "count": 2}
+        ]
+        assert len(body["items"]) == 2
+        assert all(item["type_name"] == "STATIC DOME CAMERA" for item in body["items"])
+        assert body["summary"]["total_devices"] == 2
+        assert body["summary"]["legend_size"] >= 1
+
     async def test_materialization_endpoints_return_409_when_manifest_missing(
         self,
         async_client: httpx.AsyncClient,

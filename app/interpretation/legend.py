@@ -303,3 +303,85 @@ def _union_bbox(
         max(first[2], second[2]),
         max(first[3], second[3]),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class LegendDevice:
+    """A located device resolved from a body tag via the legend dictionary."""
+
+    abbreviation: str
+    type_name: str
+    x: float
+    y: float
+
+
+def resolve_legend_devices(
+    blocks: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, SymbolEntry], list[LegendDevice]]:
+    """Resolve body text tags into located, typed devices via the legend dictionary.
+
+    Builds the legend symbol dictionary (#419 + #420), then scans the drawing body (text outside
+    the legend region) for blocks whose text exactly matches a legend abbreviation, emitting one
+    located device per match. Returns (dictionary, devices).
+    """
+
+    rows = segment_legend_rows(blocks)
+    dictionary = build_symbol_dictionary(rows)
+    if not dictionary:
+        return {}, []
+
+    legend_bbox = _union_bbox_many(row.bbox for row in rows)
+    devices: list[LegendDevice] = []
+    for block in blocks:
+        bbox = _bbox_of(block)
+        text = _text_of(block)
+        if bbox is None or not text:
+            continue
+        if _center_inside(bbox, legend_bbox):
+            continue  # the legend's own abbreviation cells, not body instances
+        entry = dictionary.get(text)
+        if entry is None:
+            continue
+        devices.append(
+            LegendDevice(
+                abbreviation=text,
+                type_name=entry.type_name,
+                x=(bbox[0] + bbox[2]) / 2,
+                y=(bbox[1] + bbox[3]) / 2,
+            )
+        )
+    return dictionary, devices
+
+
+def _union_bbox_many(
+    boxes: Any,
+) -> tuple[float, float, float, float] | None:
+    result: tuple[float, float, float, float] | None = None
+    for box in boxes:
+        result = box if result is None else _union_bbox(result, box)
+    return result
+
+
+def _center_inside(
+    bbox: tuple[float, float, float, float],
+    region: tuple[float, float, float, float] | None,
+) -> bool:
+    if region is None:
+        return False
+    cx = (bbox[0] + bbox[2]) / 2
+    cy = (bbox[1] + bbox[3]) / 2
+    return region[0] <= cx <= region[2] and region[1] <= cy <= region[3]
+
+
+def schedule_from_legend_devices(devices: Sequence[LegendDevice]) -> list[dict[str, Any]]:
+    """Aggregate located devices into a schedule (counts per abbreviation/type), count-desc."""
+
+    counts: dict[tuple[str, str], int] = {}
+    for device in devices:
+        key = (device.abbreviation, device.type_name)
+        counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0][0]))
+    return [
+        {"abbreviation": abbreviation, "type_name": type_name, "count": count}
+        for (abbreviation, type_name), count in ordered
+    ]

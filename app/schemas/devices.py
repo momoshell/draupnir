@@ -53,3 +53,32 @@ class RevisionDeviceListResponse(BaseModel):
     association: dict[str, Any] = Field(
         ..., description="The association parameters used (tag layers, max distance, filters)"
     )
+
+
+class LegendDeviceRead(BaseModel):
+    """A device located in a PDF body and typed via the legend dictionary."""
+
+    abbreviation: str = Field(..., description="Legend tag found in the drawing body")
+    type_name: str = Field(..., description="Device type from the legend description")
+    position: dict[str, float] = Field(..., description="Tag placement (x, y) in page space")
+
+
+class LegendDeviceScheduleEntry(BaseModel):
+    """Count of one device type resolved from the legend."""
+
+    abbreviation: str = Field(..., description="Legend tag")
+    type_name: str = Field(..., description="Device type from the legend description")
+    count: int = Field(..., ge=0, description="Number of located instances of this type")
+
+
+class RevisionLegendDeviceListResponse(BaseModel):
+    """Legend-anchored device schedule for a (vector PDF) revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule: list[LegendDeviceScheduleEntry] = Field(
+        ..., description="Counts per device type, most frequent first"
+    )
+    items: list[LegendDeviceRead] = Field(..., description="Located device instances on this page")
+    next_cursor: str | None = Field(None, description="Opaque cursor for the next page")
+    summary: dict[str, Any] = Field(..., description="Legend size + total located devices")
