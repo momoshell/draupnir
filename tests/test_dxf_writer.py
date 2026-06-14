@@ -178,19 +178,48 @@ def test_write_canonical_dxf_repeat_write_is_byte_stable() -> None:
     assert first_doc.header["$INSUNITS"] == 6
 
 
-def test_write_canonical_dxf_rejects_non_model_layouts() -> None:
+def test_write_canonical_dxf_rejects_multiple_non_model_layouts() -> None:
+    # With more than one layout we must be able to pick the model layout; if none qualifies
+    # the write is ambiguous and still rejected.
     payload = _base_payload()
     payload["layouts"] = [
-        {
-            "layout_ref": "layout-paper",
-            "payload": {"name": "Paper Space"},
-        }
+        {"layout_ref": "layout-paper-1", "payload": {"name": "Paper Space"}},
+        {"layout_ref": "layout-paper-2", "payload": {"name": "Sheet 2"}},
     ]
 
     with pytest.raises(DxfWriteError) as exc_info:
         write_canonical_dxf(payload)
 
     assert exc_info.value.code == "UNSUPPORTED_LAYOUT"
+
+
+def test_write_canonical_dxf_maps_single_non_model_layout_to_modelspace() -> None:
+    # A lone non-model layout (e.g. a PDF page "page-1") maps to modelspace instead of being
+    # rejected; entities referencing it render in modelspace. (Issue #409.)
+    payload = _base_payload()
+    payload["layouts"] = [
+        {"layout_ref": "layout-page", "payload": {"name": "page-1"}},
+    ]
+    for entity in payload["entities"]:
+        entity["layout_ref"] = "layout-page"
+
+    doc = _parse_dxf(payload)
+
+    entities = list(doc.modelspace())
+    assert [entity.dxftype() for entity in entities] == ["LINE", "LINE", "LWPOLYLINE"]
+
+
+def test_write_canonical_dxf_single_layout_accepts_arbitrary_name() -> None:
+    payload = _base_payload()
+    payload["layouts"] = [
+        {"layout_ref": "layout-sheet", "payload": {"name": "Sheet1"}},
+    ]
+    for entity in payload["entities"]:
+        entity["layout_ref"] = "layout-sheet"
+
+    doc = _parse_dxf(payload)
+
+    assert len(list(doc.modelspace())) == 3
 
 
 def test_write_canonical_dxf_rejects_unsupported_entity_types() -> None:

@@ -380,6 +380,12 @@ def _extract_layout_records(payload: Mapping[str, Any]) -> list[_LayoutRecord]:
             details={"path": "layouts", "type": type(raw_layouts).__name__},
         )
 
+    # A single layout (e.g. a PDF page named "page-1", or a lone model layout) maps to
+    # modelspace regardless of its name: _resolve_default_model_layout already returns the
+    # sole layout's name, and every entity is written to modelspace. The strict model-name
+    # allow-list only matters when multiple layouts are present and we must pick the model one.
+    single_layout = len(raw_layouts) == 1
+
     layouts: list[_LayoutRecord] = []
     for index, raw_layout in enumerate(raw_layouts, start=1):
         row_path = f"layouts[{index}]"
@@ -391,7 +397,7 @@ def _extract_layout_records(payload: Mapping[str, Any]) -> list[_LayoutRecord]:
             error_code="UNSUPPORTED_LAYOUT",
         )
 
-        if not _is_supported_layout_name(name):
+        if not single_layout and not _is_supported_layout_name(name):
             raise DxfWriteError(
                 code="UNSUPPORTED_LAYOUT",
                 message=f"Unsupported layout '{name}'",
