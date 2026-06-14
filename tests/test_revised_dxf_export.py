@@ -20,6 +20,7 @@ from app.exports.revised_dxf import (
     REVISED_DXF_EXPORT_MEDIA_TYPE,
     RevisedDxfExportError,
     RevisedDxfExportResult,
+    _load_real_world_scale,
     render_revised_dxf_export,
 )
 from app.ingestion.contracts import (
@@ -224,6 +225,40 @@ async def test_render_revised_dxf_export_rejects_non_changeset_origin_revision(
     }
 
 
+async def test_load_real_world_scale_reads_confident_pdf_scale(
+    db_session: AsyncSession,
+) -> None:
+    seeded = await _seed_revision_fixture(
+        db_session,
+        adapter_metadata={
+            "pdf_scale": {
+                "real_world_units": True,
+                "real_world_unit": "millimeter",
+                "points_to_real": 17.638889,
+            }
+        },
+    )
+
+    scale = await _load_real_world_scale(db_session, seeded.base_revision)
+    assert scale is not None
+    assert scale.unit == "millimeter"
+    assert scale.points_to_real == 17.638889
+
+    # The changeset revision has no adapter run output -> no real-world scale.
+    assert await _load_real_world_scale(db_session, seeded.revision) is None
+
+
+async def test_load_real_world_scale_none_when_scale_unconfirmed(
+    db_session: AsyncSession,
+) -> None:
+    seeded = await _seed_revision_fixture(
+        db_session,
+        adapter_metadata={"pdf_scale": {"real_world_units": False}},
+    )
+
+    assert await _load_real_world_scale(db_session, seeded.base_revision) is None
+
+
 async def test_render_dxf_export_allows_base_revision_when_changeset_not_required(
     db_session: AsyncSession,
 ) -> None:
@@ -387,6 +422,7 @@ async def _seed_revision_fixture(
     *,
     with_manifest: bool = True,
     manifest_counts: Mapping[str, int] | None = None,
+    adapter_metadata: Mapping[str, Any] | None = None,
     layouts: tuple[Mapping[str, Any], ...] = (
         {"layout_ref": "Model", "sequence_index": 0, "payload": {"name": "Model"}},
     ),
@@ -476,7 +512,13 @@ async def _seed_revision_fixture(
         adapter_version="1.0",
         input_family="dxf",
         canonical_entity_schema_version="1.0",
-        canonical_json={"entities": [], "layers": [], "layouts": [], "blocks": []},
+        canonical_json={
+            "entities": [],
+            "layers": [],
+            "layouts": [],
+            "blocks": [],
+            **({"metadata": dict(adapter_metadata)} if adapter_metadata is not None else {}),
+        },
         provenance_json={"adapter": {"key": "tests.fake", "version": "1.0"}},
         confidence_json={"score": 0.875},
         confidence_score=0.875,

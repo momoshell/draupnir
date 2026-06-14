@@ -34,6 +34,7 @@ from app.ingestion.contracts import (
 )
 from app.ingestion.loader import load_export_adapter
 from app.ingestion.selection import select_export_descriptor
+from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
 from app.models.revision_materialization import (
     RevisionBlock,
@@ -148,6 +149,14 @@ async def render_revised_dxf_export(
         blocks=blocks,
         entities=entities,
     )
+
+    real_world_scale = await _load_real_world_scale(db, revision)
+    if real_world_scale is not None:
+        # Apply the extraction-derived real-world scale (#417): convert source-space (e.g. PDF
+        # point) coordinates into the declared real unit and label them, instead of exporting
+        # unitless. Geometry rows stay untouched; the writer applies coordinate_scale.
+        payload["units"] = real_world_scale.unit
+        payload["coordinate_scale"] = real_world_scale.points_to_real
 
     descriptor = _select_export_descriptor()
     adapter = _load_adapter(descriptor)
@@ -366,6 +375,46 @@ def _infer_top_level_units(entities: list[RevisionEntity]) -> dict[str, JSONValu
     if normalized_unit is None:
         return None
     return {"normalized": normalized_unit}
+
+
+@dataclass(frozen=True, slots=True)
+class _RealWorldScale:
+    unit: str
+    points_to_real: float
+
+
+async def _load_real_world_scale(
+    db: AsyncSession,
+    revision: DrawingRevision,
+) -> _RealWorldScale | None:
+    """Return the extraction-derived real-world scale for a revision, if confident.
+
+    Reads ``metadata.pdf_scale`` from the revision's adapter run output (#417). Returns None
+    when there is no adapter output (e.g. changeset revisions) or no confident scale, in which
+    case the export keeps its default (unitless for PDFs) behaviour.
+    """
+
+    if revision.adapter_run_output_id is None:
+        return None
+    output = await db.get(AdapterRunOutput, revision.adapter_run_output_id)
+    if output is None:
+        return None
+
+    metadata = output.canonical_json.get("metadata") if output.canonical_json else None
+    scale = metadata.get("pdf_scale") if isinstance(metadata, Mapping) else None
+    if not isinstance(scale, Mapping) or not scale.get("real_world_units"):
+        return None
+
+    unit = scale.get("real_world_unit")
+    factor = scale.get("points_to_real")
+    if not isinstance(unit, str) or not unit:
+        return None
+    if isinstance(factor, bool) or not isinstance(factor, int | float):
+        return None
+    factor = float(factor)
+    if factor <= 0.0:
+        return None
+    return _RealWorldScale(unit=unit, points_to_real=factor)
 
 
 def _select_export_descriptor() -> AdapterDescriptor:

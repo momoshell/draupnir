@@ -24,6 +24,14 @@ _UNIT_ALIASES: dict[str, UnitSpec] = {
     "meters": UnitSpec(canonical="meter", insunits=6, meter_scale=1.0),
     "metre": UnitSpec(canonical="meter", insunits=6, meter_scale=1.0),
     "metres": UnitSpec(canonical="meter", insunits=6, meter_scale=1.0),
+    # INSUNITS 4 == millimetres. meter_scale 1.0: coordinates are already in the declared unit
+    # ($INSUNITS just labels them); the PDF real-world export pre-scales points to mm via the
+    # canonical "coordinate_scale" field.
+    "mm": UnitSpec(canonical="millimeter", insunits=4, meter_scale=1.0),
+    "millimeter": UnitSpec(canonical="millimeter", insunits=4, meter_scale=1.0),
+    "millimeters": UnitSpec(canonical="millimeter", insunits=4, meter_scale=1.0),
+    "millimetre": UnitSpec(canonical="millimeter", insunits=4, meter_scale=1.0),
+    "millimetres": UnitSpec(canonical="millimeter", insunits=4, meter_scale=1.0),
 }
 
 
