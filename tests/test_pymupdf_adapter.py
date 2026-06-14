@@ -185,3 +185,26 @@ def test_populate_page_entities_assigns_pen_signature_layers() -> None:
     assert set(layer_names) == {"pen-000000-w0.5", "pen-ebebeb-w0.5", "pen-000000-w1"}
     assert entities, "expected at least one entity"
     assert all(entity["layer_ref"] in set(layer_names) for entity in entities)
+
+
+def test_points_to_mm_conversion() -> None:
+    # 72 pt = 1 inch = 25.4 mm
+    assert pdf_adapter._points_to_mm(72.0) == 25.4
+    assert pdf_adapter._points_to_mm(0.0) == 0.0
+
+
+def test_match_sheet_size_is_orientation_agnostic_and_tolerant() -> None:
+    # A0 = 841 x 1189 mm, matched regardless of orientation, within tolerance.
+    assert pdf_adapter._match_sheet_size(1189.0, 841.0) == "A0"
+    assert pdf_adapter._match_sheet_size(840.5, 1188.5) == "A0"  # within 3mm tolerance
+    assert pdf_adapter._match_sheet_size(215.9, 279.4) == "ANSI A (Letter)"
+    assert pdf_adapter._match_sheet_size(210.0, 350.0) is None  # near nothing standard
+
+
+def test_paper_size_from_a0_mediabox_points() -> None:
+    # 680003.pdf MediaBox: 3370.32 x 2383.92 pt == ISO A0.
+    paper = pdf_adapter._paper_size(width_pt=3370.32, height_pt=2383.92, page_number=1)
+    assert paper["name"] == "A0"
+    assert paper["page_number"] == 1
+    assert paper["width_mm"] == 1188.974
+    assert paper["height_mm"] == 840.994

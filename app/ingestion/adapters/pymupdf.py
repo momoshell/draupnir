@@ -367,6 +367,7 @@ def _extract_document_canonical(
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
     entities: list[dict[str, JSONValue]] = []
     layouts: list[dict[str, JSONValue]] = []
+    paper_sizes: list[dict[str, JSONValue]] = []
     text_blocks: list[dict[str, JSONValue]] = []
     warnings: list[AdapterWarning] = []
     layer_names: list[str] = [_DEFAULT_LAYER_NAME]
@@ -395,6 +396,13 @@ def _extract_document_canonical(
                 "rotation": int(getattr(page, "rotation", 0)),
                 "bbox": _bbox_from_rect(page_rect),
             }
+        )
+        paper_sizes.append(
+            _paper_size(
+                width_pt=float(page_rect.width),
+                height_pt=float(page_rect.height),
+                page_number=page_number,
+            )
         )
 
         budget.checkpoint(options)
@@ -448,6 +456,7 @@ def _extract_document_canonical(
             "unit": "point",
             "real_world_units": False,
         },
+        "paper_sizes": tuple(paper_sizes),
         "text_blocks": tuple(text_blocks),
     }
     if not entities:
@@ -1895,6 +1904,58 @@ def _bbox_from_rect(rect: Any) -> dict[str, JSONValue]:
         "y_min": _round_float(float(rect.y0)),
         "x_max": _round_float(float(rect.x1)),
         "y_max": _round_float(float(rect.y1)),
+    }
+
+
+_POINTS_PER_INCH = 72.0
+_MM_PER_INCH = 25.4
+
+# Standard sheet sizes as (short_edge_mm, long_edge_mm); matched orientation-agnostically.
+_STANDARD_SHEET_SIZES: dict[str, tuple[float, float]] = {
+    "A0": (841.0, 1189.0),
+    "A1": (594.0, 841.0),
+    "A2": (420.0, 594.0),
+    "A3": (297.0, 420.0),
+    "A4": (210.0, 297.0),
+    "A5": (148.0, 210.0),
+    "ANSI A (Letter)": (215.9, 279.4),
+    "ANSI Legal": (215.9, 355.6),
+    "ANSI B": (279.4, 431.8),
+    "ANSI C": (431.8, 558.8),
+    "ANSI D": (558.8, 863.6),
+    "ANSI E": (863.6, 1117.6),
+}
+# Tolerance for matching a standard sheet (mm); absorbs rounding and small print margins.
+_SHEET_MATCH_TOLERANCE_MM = 3.0
+
+
+def _points_to_mm(points: float) -> float:
+    return _round_float(points / _POINTS_PER_INCH * _MM_PER_INCH)
+
+
+def _match_sheet_size(width_mm: float, height_mm: float) -> str | None:
+    short_edge, long_edge = sorted((width_mm, height_mm))
+    for name, (std_short, std_long) in _STANDARD_SHEET_SIZES.items():
+        if (
+            abs(short_edge - std_short) <= _SHEET_MATCH_TOLERANCE_MM
+            and abs(long_edge - std_long) <= _SHEET_MATCH_TOLERANCE_MM
+        ):
+            return name
+    return None
+
+
+def _paper_size(*, width_pt: float, height_pt: float, page_number: int) -> dict[str, JSONValue]:
+    """Return deterministic paper-size metadata for a page from its MediaBox dimensions."""
+
+    width_mm = _points_to_mm(width_pt)
+    height_mm = _points_to_mm(height_pt)
+    return {
+        "page_number": page_number,
+        "width_pt": _round_float(width_pt),
+        "height_pt": _round_float(height_pt),
+        "width_mm": width_mm,
+        "height_mm": height_mm,
+        "name": _match_sheet_size(width_mm, height_mm),
     }
 
 

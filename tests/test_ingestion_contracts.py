@@ -1342,6 +1342,17 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
     assert metadata["geometry_mode"] == "vector"
     assert metadata["pdf_scale"]["status"] == "unconfirmed"
     assert metadata["pdf_scale"]["coordinate_space"] == "pdf_page_space_unrotated"
+    # Paper size derived from the page MediaBox; the 100x100pt fixture matches no standard sheet.
+    assert metadata["paper_sizes"] == (
+        {
+            "page_number": 1,
+            "width_pt": 100.0,
+            "height_pt": 100.0,
+            "width_mm": 35.277778,
+            "height_mm": 35.277778,
+            "name": None,
+        },
+    )
     assert metadata["text_blocks"] == (
         {
             "page_number": 1,
