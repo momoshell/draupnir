@@ -127,3 +127,53 @@ def test_build_symbol_dictionary_first_occurrence_wins_on_duplicate() -> None:
         [_row(["DC", "DOOR CONTACT"], 10.0), _row(["DC\nDRUG CABINET"], 80.0)]
     )
     assert result["DC"].type_name == "DOOR CONTACT"
+
+
+def _blk(text: str, x_min: float, y_min: float, *, width: float = 30.0) -> dict[str, Any]:
+    return {
+        "text": text,
+        "bbox": {"x_min": x_min, "y_min": y_min, "x_max": x_min + width, "y_max": y_min + 12.0},
+    }
+
+
+def test_resolve_legend_devices_locates_body_tags() -> None:
+    from app.interpretation.legend import resolve_legend_devices
+
+    blocks = [
+        # legend (top-right)
+        _blk("LEGEND", 800.0, 10.0, width=44.0),
+        _blk("S", 805.0, 40.0, width=10.0),
+        _blk("STATIC DOME CAMERA", 840.0, 40.0, width=120.0),
+        # body instances of the "S" tag, far from the legend
+        _blk("S", 100.0, 300.0, width=10.0),
+        _blk("S", 250.0, 500.0, width=10.0),
+        # an unrelated body label
+        _blk("ROOM 1", 120.0, 320.0, width=60.0),
+    ]
+    dictionary, devices = resolve_legend_devices(blocks)
+
+    assert "S" in dictionary
+    assert len(devices) == 2
+    assert {round(d.x) for d in devices} == {105, 255}
+    assert all(d.type_name == "STATIC DOME CAMERA" for d in devices)
+
+
+def test_resolve_legend_devices_excludes_legend_own_cells() -> None:
+    from app.interpretation.legend import resolve_legend_devices
+
+    # Only the legend's own "S" cell exists; no body instances.
+    blocks = [
+        _blk("LEGEND", 800.0, 10.0, width=44.0),
+        _blk("S", 805.0, 40.0, width=10.0),
+        _blk("STATIC DOME CAMERA", 840.0, 40.0, width=120.0),
+    ]
+    _dictionary, devices = resolve_legend_devices(blocks)
+    assert devices == []
+
+
+def test_resolve_legend_devices_empty_without_legend() -> None:
+    from app.interpretation.legend import resolve_legend_devices
+
+    dictionary, devices = resolve_legend_devices([_blk("S", 100.0, 300.0)])
+    assert dictionary == {}
+    assert devices == []

@@ -383,6 +383,20 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/legend-devices",
+            "list_revision_legend_devices",
+            "list_revision_legend_devices",
+            "RevisionLegendDeviceListResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "limit", False, 50, 1, 200, None),
+                ("query", "cursor", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",
