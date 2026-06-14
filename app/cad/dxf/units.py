@@ -14,6 +14,10 @@ class UnitSpec:
     meter_scale: float
 
 
+#: Spec for geometry whose real-world unit is unknown. INSUNITS 0 == "unitless" in DXF;
+#: meter_scale 1.0 passes coordinates through unchanged (faithful native/paper coordinates).
+UNITLESS = UnitSpec(canonical="unitless", insunits=0, meter_scale=1.0)
+
 _UNIT_ALIASES: dict[str, UnitSpec] = {
     "m": UnitSpec(canonical="meter", insunits=6, meter_scale=1.0),
     "meter": UnitSpec(canonical="meter", insunits=6, meter_scale=1.0),
@@ -40,4 +44,4 @@ def resolve_unit(unit: str | None) -> UnitSpec:
     raise ValueError(f"Unsupported unit {unit!r}")
 
 
-__all__ = ["UnitSpec", "resolve_unit"]
+__all__ = ["UNITLESS", "UnitSpec", "resolve_unit"]

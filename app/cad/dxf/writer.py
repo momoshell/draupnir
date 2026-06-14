@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from app.cad.dxf.units import UnitSpec, resolve_unit
+from app.cad.dxf.units import UNITLESS, UnitSpec, resolve_unit
 
 _ezdxf = __import__("ezdxf")
 new_dxf_document = _ezdxf.new
@@ -59,6 +59,11 @@ _SUPPORTED_LAYOUT_NAMES = {
 
 _LAYOUT_NAME_RE = re.compile(r"^Model Space$", re.IGNORECASE)
 _LAYOUT_FALLBACK_NAME = "Model"
+
+_UNITLESS_UNITS_WARNING = (
+    "Drawing units are unknown; exported as unitless (INSUNITS=0). "
+    "Real-world scale was not applied."
+)
 
 _LINE_ENTITY_TYPES = {"line", "lines"}
 _POLYLINE_ENTITY_TYPES = {
@@ -217,9 +222,10 @@ def write_canonical_dxf(
     diagnostics: tuple[dict[str, Any], ...] = (
         ({"code": "skipped_unsupported_entities", "count": skipped},) if skipped else ()
     )
+    warnings: tuple[str, ...] = (_UNITLESS_UNITS_WARNING,) if unit_spec.insunits == 0 else ()
     return DxfWriteResult(
         content=buffer.getvalue().encode("utf-8"),
-        warnings=(),
+        warnings=warnings,
         diagnostics=diagnostics,
     )
 
@@ -268,36 +274,53 @@ def _coerce_write_options(
     return DxfWriteOptions(unit=options.get("unit"))
 
 
+#: Unit tokens that mean "no real-world unit is known"; these export as unitless
+#: (INSUNITS 0) rather than failing. Vector PDFs carry units like {"normalized": "unknown"}.
+_UNKNOWN_UNIT_TOKENS = frozenset({"", "unknown", "unitless", "none", "null"})
+
+
 def _resolve_unit(
     payload: Mapping[str, Any],
     options: DxfWriteOptions,
     *,
     entities: Sequence[Any],
 ) -> UnitSpec:
-    raw_unit: str | None
-    unit_path = "canonical.unit"
     if options.unit is not None:
-        raw_unit = options.unit
-        unit_path = "options.unit"
-    elif "unit" in payload:
-        raw_unit = _coerce_unit_text(payload.get("unit"), field_path="canonical.unit")
-    elif "units" in payload:
-        raw_unit = _coerce_unit_text(payload.get("units"), field_path="canonical.units")
-        unit_path = "canonical.units"
-    else:
-        raw_unit = None
+        return _resolve_named_unit(options.unit, unit_path="options.unit")
 
-    if raw_unit is None:
-        return _resolve_unit_from_entity_geometry_units(entities)
+    if "unit" in payload:
+        token = _coerce_unit_text(payload.get("unit"), field_path="canonical.unit")
+        if token is not None:
+            return _resolve_named_unit(token, unit_path="canonical.unit")
 
+    if "units" in payload:
+        token = _units_field_token(payload.get("units"), field_path="canonical.units")
+        if token is None or token.strip().lower() in _UNKNOWN_UNIT_TOKENS:
+            # Units are declared but unknown/unitless (e.g. a vector PDF) -> export unitless
+            # rather than failing the whole render. The caller surfaces a caveat warning.
+            return UNITLESS
+        return _resolve_named_unit(token, unit_path="canonical.units")
+
+    return _resolve_unit_from_entity_geometry_units(entities)
+
+
+def _resolve_named_unit(value: str, *, unit_path: str) -> UnitSpec:
     try:
-        return resolve_unit(raw_unit)
+        return resolve_unit(value)
     except ValueError as exc:
         raise DxfWriteError(
             code="UNSUPPORTED_UNITS",
             message="Unsupported drawing unit",
-            details={"path": unit_path, "value": raw_unit},
+            details={"path": unit_path, "value": value},
         ) from exc
+
+
+def _units_field_token(value: Any, *, field_path: str) -> str | None:
+    """Return the unit token from a canonical units field (a string or a {normalized: ...} map)."""
+
+    if isinstance(value, Mapping):
+        return _coerce_unit_text(value.get("normalized"), field_path=f"{field_path}.normalized")
+    return _coerce_unit_text(value, field_path=field_path)
 
 
 def _resolve_unit_from_entity_geometry_units(entities: Sequence[Any]) -> UnitSpec:
