@@ -490,9 +490,9 @@ def _extract_document_canonical(
         },
         "layouts": tuple(layouts),
         "layers": tuple({"name": layer_name} for layer_name in layer_names),
-        # Layers are derived from each path's pen signature (stroke colour + width); PDFs have
-        # no native layer table. OCG-sourced layers (#414) will set this to "ocg" when present.
-        "layer_source": "pen_signature",
+        # Native OCG layers (drawing["layer"]) are honoured before the pen-signature fallback; the
+        # source reflects whichever produced the layer set (ocg when any native layer was used).
+        "layer_source": _layer_source(layer_names),
         "blocks": (),
         "entities": tuple(entities),
         "xrefs": (),
@@ -1802,14 +1802,31 @@ def _entity_id(*, page_number: int, drawing_index: int, entity_index: int) -> st
 def _resolve_drawing_layer(drawing: Mapping[str, Any]) -> str:
     """Return the canonical layer name for a drawing.
 
-    Honors an explicit ``layer`` field when present (the hook for native OCG layers, #414);
-    otherwise derives a deterministic layer from the pen signature.
+    Honors an explicit ``layer`` field when present (native OCG layer, set by PyMuPDF's
+    ``get_drawings``); otherwise derives a deterministic layer from the pen signature.
     """
 
     raw_layer = drawing.get("layer")
     if isinstance(raw_layer, str) and raw_layer.strip():
         return raw_layer.strip()
     return _pen_signature_layer_name(drawing)
+
+
+def _layer_source(layer_names: Sequence[str]) -> str:
+    """Report whether the layer set came from native OCG layers or the pen-signature fallback.
+
+    A layer name that is neither a pen signature (``pen-...``) nor the default fallback can only
+    have come from a path's native OCG ``layer``, so its presence marks the source as OCG-native.
+    """
+
+    for name in layer_names:
+        if (
+            name != _DEFAULT_LAYER_NAME
+            and not name.startswith("pen-")
+            and not name.startswith(f"{_DEFAULT_LAYER_NAME}-w")
+        ):
+            return "ocg"
+    return "pen_signature"
 
 
 def _pen_signature_layer_name(drawing: Mapping[str, Any]) -> str:
