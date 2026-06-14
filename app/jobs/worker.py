@@ -562,6 +562,19 @@ async def _render_revised_dxf_export_artifact(
     )
 
 
+async def _render_dxf_export_artifact(
+    session: AsyncSession,
+    execution: _ExportExecutionInput,
+) -> ExportArtifact:
+    """Render a base-revision DXF export artifact (no changeset required)."""
+    return await render_revised_dxf_export(
+        session,
+        execution.drawing_revision_id,
+        options=execution.options_json,
+        require_changeset_origin=False,
+    )
+
+
 async def _render_quantity_csv_export_artifact(
     session: AsyncSession,
     execution: _ExportExecutionInput,
@@ -633,6 +646,15 @@ _EXPORT_KIND_SPECS: dict[str, _ExportKindSpec] = {
         error_type=RevisedDxfExportError,
         lineage_anchor=_EXPORT_LINEAGE_ANCHOR_CHANGESET,
         error_details_fn=_export_changeset_error_details,
+        error_mapper_fn=_map_revised_dxf_export_error,
+    ),
+    "dxf": _ExportKindSpec(
+        format="dxf",
+        media_type="application/dxf",
+        render_fn=_render_dxf_export_artifact,
+        error_type=RevisedDxfExportError,
+        lineage_anchor=_EXPORT_LINEAGE_ANCHOR_REVISION,
+        error_details_fn=_export_revision_error_details,
         error_mapper_fn=_map_revised_dxf_export_error,
     ),
 }

@@ -224,6 +224,23 @@ async def test_render_revised_dxf_export_rejects_non_changeset_origin_revision(
     }
 
 
+async def test_render_dxf_export_allows_base_revision_when_changeset_not_required(
+    db_session: AsyncSession,
+) -> None:
+    # Base-revision DXF export (#411) renders any active revision: the changeset-origin guard
+    # is bypassed. The fixture seeds materialization rows only for the changeset revision, so a
+    # base render gets past the guard to MANIFEST_NOT_FOUND rather than rejecting on INPUT_INVALID.
+    seeded = await _seed_revision_fixture(db_session)
+
+    with pytest.raises(RevisedDxfExportError) as exc_info:
+        await render_revised_dxf_export(
+            db_session, seeded.base_revision.id, require_changeset_origin=False
+        )
+
+    assert exc_info.value.code != "INPUT_INVALID"
+    assert exc_info.value.code == "MANIFEST_NOT_FOUND"
+
+
 async def test_render_revised_dxf_export_raises_for_missing_materialization_rows(
     db_session: AsyncSession,
 ) -> None:

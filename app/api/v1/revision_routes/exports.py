@@ -431,6 +431,65 @@ async def create_revision_json_export(
 
 
 @exports_router.post(
+    "/revisions/{revision_id}/exports/dxf",
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_dxf_export(
+    revision_id: UUID,
+    request: RevisionJsonExportCreateRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
+) -> Job | Response:
+    """Create a pending DXF export job for the base extraction of any active revision.
+
+    Unlike revised-dxf, this requires no changeset — it renders the revision's canonical
+    geometry directly to the open DXF format.
+    """
+
+    export_kind = ExportKind.DXF
+    path = f"/revisions/{revision_id}/exports/dxf"
+    normalized_body = _build_export_request_body(
+        export_kind,
+        options=request.options,
+    )
+    fingerprint: str | None = None
+    if idempotency_key is not None:
+        fingerprint = _build_idempotency_fingerprint(
+            f"revisions.exports.dxf:{revision_id}",
+            {
+                "revision_id": str(revision_id),
+                "body": normalized_body,
+            },
+        )
+
+    revision: DrawingRevision | None = None
+
+    async def load_before_claim() -> None:
+        nonlocal revision
+        revision = await _get_locked_active_revision_or_404(revision_id, db)
+
+    async def create_export_job() -> Job:
+        assert revision is not None
+        return await _persist_export_job(
+            db,
+            revision,
+            parent_job_id=_parent_job_id_for_revision(revision),
+            export_kind=export_kind,
+            options_json=request.options,
+        )
+
+    return await _create_export_route_job(
+        db,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        path=path,
+        load_before_claim=load_before_claim,
+        create_export_job=create_export_job,
+    )
+
+
+@exports_router.post(
     "/revisions/{revision_id}/exports/revised-dxf",
     response_model=JobRead,
     status_code=status.HTTP_202_ACCEPTED,

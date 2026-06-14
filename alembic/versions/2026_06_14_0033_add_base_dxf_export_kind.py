@@ -1,0 +1,117 @@
+"""Add base DXF export kind contract.
+
+Adds the changeset-free ``dxf`` export kind to the export_job_inputs check constraints
+(format ``dxf`` / media type ``application/dxf`` were already permitted by the revised_dxf
+kind). Mirrors the revised_dxf contract migration.
+
+Revision ID: 2026_06_14_0033
+Revises: 2026_06_08_0032
+Create Date: 2026-06-14 00:33:00.000000
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import sqlalchemy as sa
+
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "2026_06_14_0033"
+down_revision: str | None = "2026_06_08_0032"
+branch_labels: Sequence[str] | None = None
+depends_on: Sequence[str] | None = None
+
+
+def _drop_export_contract_constraints() -> None:
+    for name in (
+        "ck_export_job_inputs_export_kind_valid",
+        "ck_export_job_inputs_kind_format_media_type_matrix",
+        "ck_export_job_inputs_quantity_lineage",
+        "ck_export_job_inputs_estimate_lineage",
+    ):
+        op.drop_constraint(name, "export_job_inputs", type_="check")
+
+
+def _create_export_contract_constraints(*, include_base_dxf: bool) -> None:
+    base_dxf_kind = "'dxf', " if include_base_dxf else ""
+    base_dxf_matrix = (
+        "(export_kind = 'dxf' AND export_format = 'dxf' AND media_type = 'application/dxf') OR "
+        if include_base_dxf
+        else ""
+    )
+    revision_scoped = (
+        "'revision_json', 'dxf', 'revised_dxf'"
+        if include_base_dxf
+        else "'revision_json', 'revised_dxf'"
+    )
+
+    op.create_check_constraint(
+        "ck_export_job_inputs_export_kind_valid",
+        "export_job_inputs",
+        f"export_kind IN ('revision_json', {base_dxf_kind}'revised_dxf', "
+        "'quantity_csv', 'estimate_csv', 'estimate_pdf')",
+    )
+    op.create_check_constraint(
+        "ck_export_job_inputs_kind_format_media_type_matrix",
+        "export_job_inputs",
+        "(export_kind = 'revision_json' AND export_format = 'json' "
+        "AND media_type = 'application/json') OR "
+        f"{base_dxf_matrix}"
+        "(export_kind = 'revised_dxf' AND export_format = 'dxf' "
+        "AND media_type = 'application/dxf') OR "
+        "(export_kind = 'quantity_csv' AND export_format = 'csv' "
+        "AND media_type = 'text/csv') OR "
+        "(export_kind = 'estimate_csv' AND export_format = 'csv' "
+        "AND media_type = 'text/csv') OR "
+        "(export_kind = 'estimate_pdf' AND export_format = 'pdf' "
+        "AND media_type = 'application/pdf')",
+    )
+    op.create_check_constraint(
+        "ck_export_job_inputs_quantity_lineage",
+        "export_job_inputs",
+        "(export_kind = 'quantity_csv' AND quantity_takeoff_id IS NOT NULL "
+        "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
+        "(export_kind IN ('estimate_csv', 'estimate_pdf') AND quantity_takeoff_id IS NOT NULL "
+        "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
+        f"(export_kind IN ({revision_scoped}) AND quantity_takeoff_id IS NULL "
+        "AND quantity_gate IS NULL AND trusted_totals IS NULL)",
+    )
+    op.create_check_constraint(
+        "ck_export_job_inputs_estimate_lineage",
+        "export_job_inputs",
+        "(export_kind IN ('estimate_csv', 'estimate_pdf') "
+        "AND quantity_takeoff_id IS NOT NULL AND estimate_version_id IS NOT NULL) OR "
+        f"(export_kind IN ('quantity_csv', {revision_scoped}) "
+        "AND estimate_version_id IS NULL)",
+    )
+
+
+def _assert_downgrade_safe() -> None:
+    bind = op.get_bind()
+    bind.execute(sa.text("LOCK TABLE export_job_inputs IN ACCESS EXCLUSIVE MODE"))
+
+    base_dxf_row_exists = bind.execute(
+        sa.text(
+            """
+            SELECT 1
+            FROM export_job_inputs
+            WHERE export_kind = 'dxf'
+            LIMIT 1
+            """
+        )
+    ).scalar()
+    if base_dxf_row_exists is not None:
+        raise RuntimeError("Cannot downgrade: persisted dxf export_job_inputs rows present")
+
+
+def upgrade() -> None:
+    _drop_export_contract_constraints()
+    _create_export_contract_constraints(include_base_dxf=True)
+
+
+def downgrade() -> None:
+    _assert_downgrade_safe()
+    _drop_export_contract_constraints()
+    _create_export_contract_constraints(include_base_dxf=False)

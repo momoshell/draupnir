@@ -15,6 +15,7 @@ class ExportKind(StrEnum):
     """Export kind string constants."""
 
     REVISION_JSON = "revision_json"
+    DXF = "dxf"
     REVISED_DXF = "revised_dxf"
     QUANTITY_CSV = "quantity_csv"
     ESTIMATE_CSV = "estimate_csv"
@@ -32,13 +33,18 @@ class ExportFormat(StrEnum):
 
 EXPORT_KIND_MATRIX: dict[ExportKind, tuple[ExportFormat, str]] = {
     ExportKind.REVISION_JSON: (ExportFormat.JSON, "application/json"),
+    ExportKind.DXF: (ExportFormat.DXF, "application/dxf"),
     ExportKind.REVISED_DXF: (ExportFormat.DXF, "application/dxf"),
     ExportKind.QUANTITY_CSV: (ExportFormat.CSV, "text/csv"),
     ExportKind.ESTIMATE_CSV: (ExportFormat.CSV, "text/csv"),
     ExportKind.ESTIMATE_PDF: (ExportFormat.PDF, "application/pdf"),
 }
 ESTIMATE_EXPORT_KINDS = {ExportKind.ESTIMATE_CSV, ExportKind.ESTIMATE_PDF}
-REVISION_SCOPED_EXPORT_KINDS = {ExportKind.REVISION_JSON, ExportKind.REVISED_DXF}
+REVISION_SCOPED_EXPORT_KINDS = {
+    ExportKind.REVISION_JSON,
+    ExportKind.DXF,
+    ExportKind.REVISED_DXF,
+}
 
 
 def _validate_json_safe_option_value(value: Any, *, path: str) -> None:

@@ -84,6 +84,12 @@ EXPORT_CREATE_CASES = [
             "options": {"template": "default", "show_totals": True},
         },
     ),
+    # Appended (not inserted) so existing positional EXPORT_CREATE_CASES[...] references hold.
+    ExportCreateCase(
+        name="dxf",
+        export_kind=ExportKind.DXF,
+        body={"options": {}},
+    ),
 ]
 
 
@@ -295,6 +301,8 @@ async def _seed_export_lineage() -> ExportLineage:
 def _route_path(case: ExportCreateCase, lineage: ExportLineage) -> str:
     if case.export_kind == ExportKind.REVISION_JSON:
         return f"/v1/revisions/{lineage.revision_id}/exports/revision-json"
+    if case.export_kind == ExportKind.DXF:
+        return f"/v1/revisions/{lineage.revision_id}/exports/dxf"
     if case.export_kind == ExportKind.QUANTITY_CSV:
         return (
             f"/v1/revisions/{lineage.revision_id}"
@@ -308,7 +316,7 @@ def _route_path(case: ExportCreateCase, lineage: ExportLineage) -> str:
 
 
 def _expected_parent_job_id(case: ExportCreateCase, lineage: ExportLineage) -> UUID:
-    if case.export_kind == ExportKind.REVISION_JSON:
+    if case.export_kind in (ExportKind.REVISION_JSON, ExportKind.DXF):
         return lineage.revision_source_job_id
     if case.export_kind == ExportKind.QUANTITY_CSV:
         return lineage.takeoff_source_job_id
@@ -578,7 +586,7 @@ async def test_create_export_persists_pending_job_and_input(
         assert export_input.media_type == expected_media_type
         assert export_input.options_json == case.body["options"]
 
-        if case.export_kind == ExportKind.REVISION_JSON:
+        if case.export_kind in (ExportKind.REVISION_JSON, ExportKind.DXF):
             assert export_input.quantity_takeoff_id is None
             assert export_input.quantity_gate is None
             assert export_input.trusted_totals is None
