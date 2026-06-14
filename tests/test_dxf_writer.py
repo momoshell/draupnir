@@ -461,6 +461,48 @@ def test_write_canonical_dxf_rejects_unitless_entity_units_without_top_level_uni
     assert exc_info.value.code == "UNSUPPORTED_UNITS"
 
 
+def test_write_canonical_dxf_unknown_top_level_units_exports_unitless() -> None:
+    # Vector PDFs declare units as {"normalized": "unknown"} — export unitless (INSUNITS=0)
+    # with a caveat instead of failing the render. (Issue #431.)
+    payload = _base_payload()
+    payload.pop("unit")
+    payload["units"] = {"normalized": "unknown"}
+
+    result = write_canonical_dxf(payload)
+
+    assert any("unitless" in warning.lower() for warning in result.warnings)
+    doc = _READ_DXF(io.StringIO(result.content.decode("utf-8")))
+    assert doc.header["$INSUNITS"] == 0
+    assert len(list(doc.modelspace())) == 3
+
+
+def test_write_canonical_dxf_null_top_level_units_exports_unitless() -> None:
+    payload = _base_payload()
+    payload.pop("unit")
+    payload["units"] = None
+
+    result = write_canonical_dxf(payload)
+
+    assert result.warnings == (
+        "Drawing units are unknown; exported as unitless (INSUNITS=0). "
+        "Real-world scale was not applied.",
+    )
+    doc = _READ_DXF(io.StringIO(result.content.decode("utf-8")))
+    assert doc.header["$INSUNITS"] == 0
+
+
+def test_write_canonical_dxf_units_mapping_meters_resolves_without_warning() -> None:
+    payload = _base_payload()
+    payload.pop("unit")
+    payload["units"] = {"normalized": "meters"}
+
+    result = write_canonical_dxf(payload)
+
+    assert result.warnings == ()
+    doc = _READ_DXF(io.StringIO(result.content.decode("utf-8")))
+    assert doc.header["$INSUNITS"] == 6
+
+
 @pytest.mark.parametrize("field_name", ["blocks", "xrefs"])
 def test_write_canonical_dxf_rejects_nonempty_top_level_blocks_and_xrefs(
     field_name: str,
