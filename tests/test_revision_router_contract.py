@@ -377,6 +377,7 @@ def test_revision_router_routes_match_baseline_contract() -> None:
                 ("query", "device_layer", False, None, None, None, None),
                 ("query", "tag_layer", False, None, None, None, None),
                 ("query", "max_tag_distance", False, None, None, None, None),
+                ("query", "max_depth", False, 8, 0, 8, None),
                 ("dependency", "db", None, None, None, None, "get_db"),
             ),
         ),

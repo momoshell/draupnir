@@ -25,11 +25,12 @@ class DeviceRead(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
-    entity_id: str = Field(..., description="Canonical entity id of the device INSERT")
-    sequence_index: int = Field(..., ge=0, description="Zero-based entity position")
+    entity_id: str = Field(..., description="Canonical entity id (nested instances use parent/idx)")
+    sequence_index: int = Field(..., ge=0, description="Top-level INSERT position of this subtree")
+    depth: int = Field(..., ge=0, description="Nesting depth in the block-instance tree (0 = top)")
     block_ref: str | None = Field(None, description="Referenced block (device type)")
     layer_ref: str | None = Field(None, description="Device layer")
-    position: dict[str, float] | None = Field(None, description="Planar placement (x, y)")
+    position: dict[str, float] | None = Field(None, description="World placement (x, y)")
     tag: DeviceTagRead | None = Field(None, description="Nearest associated tag text, if any")
 
 

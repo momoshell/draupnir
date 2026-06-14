@@ -335,10 +335,111 @@ class TestRevisionMaterializationApi:
 
         assert body["schedule"] == [{"block_ref": "Smoke-Detector", "count": 2}]
         devices = {item["entity_id"]: item for item in body["items"]}
+        assert devices["dev-1"]["depth"] == 0
         assert devices["dev-1"]["tag"]["text"] == "SD-01"
         assert devices["dev-1"]["tag"]["distance"] == pytest.approx(0.5)
         assert devices["dev-2"]["tag"]["text"] == "SD-02"
         assert body["association"]["max_tag_distance"] == 2.0
+
+    async def test_devices_endpoint_enumerates_nested_block_instances(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A device nested inside a placed block is enumerated with a composed world position."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        nested_device = {
+            "entity_id": "nested-smoke",
+            "entity_type": "insert",
+            "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            "layer_ref": "F810A",
+            "block_ref": "Smoke-Detector",
+            "geometry": {
+                "transform": {
+                    "insertion_point": {"x": 10.0, "y": 0.0, "z": 0.0},
+                    "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                    "rotation_radians": 0.0,
+                }
+            },
+        }
+
+        root = _build_contract_entity(
+            entity_id="container-root",
+            entity_type="insert",
+            layout_ref="Model",
+            layer_ref="A-CONTAINER",
+            block_ref="Container",
+            source_id="src-root",
+        )
+        root["geometry_json"] = {
+            "transform": {
+                "insertion_point": {"x": 100.0, "y": 0.0, "z": 0.0},
+                "scale": {"x": 1.0, "y": 1.0, "z": 1.0},
+                "rotation_radians": 0.0,
+            }
+        }
+        tag = _build_contract_entity(
+            entity_id="tag-nested",
+            entity_type="text",
+            layout_ref="Model",
+            layer_ref="Fire Alarm Device Tags",
+            source_id="src-tag-nested",
+        )
+        tag["geometry_json"] = {"insertion": {"x": 110.0, "y": 0.0, "z": 0.0}, "text": "SD-NEST"}
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layers=[
+                    {"layer_ref": "A-CONTAINER", "name": "A-CONTAINER"},
+                    {"layer_ref": "F810A", "name": "F810A"},
+                    {"layer_ref": "Fire Alarm Device Tags", "name": "Fire Alarm Device Tags"},
+                ],
+                blocks=[
+                    {
+                        "block_ref": "Container",
+                        "name": "Container",
+                        "base_point": {"x": 0.0, "y": 0.0, "z": 0.0},
+                        "entities": [nested_device],
+                    },
+                    {"block_ref": "Smoke-Detector", "name": "Smoke-Detector"},
+                ],
+                entities=[root, tag],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+
+        _outputs, drawing_revisions, _reports, _artifacts = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        response = await async_client.get(
+            f"/v1/revisions/{revision_id}/devices",
+            params={"tag_layer": "Fire Alarm Device Tags", "max_tag_distance": 1.0},
+        )
+        assert response.status_code == 200
+        body = response.json()
+
+        schedule = {entry["block_ref"]: entry["count"] for entry in body["schedule"]}
+        assert schedule == {"Container": 1, "Smoke-Detector": 1}
+
+        nested = next(item for item in body["items"] if item["block_ref"] == "Smoke-Detector")
+        assert nested["depth"] == 1
+        assert nested["position"]["x"] == pytest.approx(110.0)
+        assert nested["position"]["y"] == pytest.approx(0.0)
+        assert nested["tag"]["text"] == "SD-NEST"
 
     async def test_materialization_manifest_serializes_null_origin_ids(
         self,
