@@ -277,3 +277,42 @@ def test_derive_pdf_scale_unconfirmed_when_no_scale_text() -> None:
     assert scale["status"] == "unconfirmed"
     assert scale["real_world_units"] is False
     assert "scale_ratio" not in scale
+
+
+def test_layer_source_reports_ocg_vs_pen() -> None:
+    assert pdf_adapter._layer_source(["pen-000000-w0.5", "default"]) == "pen_signature"
+    assert pdf_adapter._layer_source(["default-w0"]) == "pen_signature"
+    # A non-pen, non-default layer name can only come from a native OCG layer.
+    assert pdf_adapter._layer_source(["Architecture", "pen-000000-w0.5"]) == "ocg"
+
+
+def test_populate_page_entities_honors_native_ocg_layer() -> None:
+    drawings: list[dict[str, object]] = [
+        {
+            "color": (0.0, 0.0, 0.0),
+            "width": 0.5,
+            "closePath": False,
+            "items": [("l", _FakePoint(0.0, 0.0), _FakePoint(1.0, 1.0))],
+            "layer": "Architecture",  # native OCG layer set by PyMuPDF get_drawings
+        }
+    ]
+    entities: list[dict[str, JSONValue]] = []
+    warnings: list[AdapterWarning] = []
+    layer_names: list[str] = []
+    budget = pdf_adapter._ExtractionBudget(started_at=0.0, timeout_seconds=None)
+
+    pdf_adapter._populate_page_entities(
+        drawings,
+        entities=entities,
+        warnings=warnings,
+        layer_names=layer_names,
+        page_number=1,
+        layout_name="page-1",
+        options=AdapterExecutionOptions(timeout=None),
+        budget=budget,
+        entity_limit=100,
+    )
+
+    assert layer_names == ["Architecture"]
+    assert entities and all(entity["layer_ref"] == "Architecture" for entity in entities)
+    assert pdf_adapter._layer_source(layer_names) == "ocg"
