@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 from types import MappingProxyType
+from typing import Protocol
 
 from .contracts import (
     AdapterAvailability,
@@ -509,3 +510,39 @@ __all__ = [
     "list_descriptors",
     "summarize_probe_requirements",
 ]
+
+
+class DescriptorRegistry(Protocol):
+    """Read interface over the adapter descriptor metadata used by candidate selection.
+
+    The static module registry is the default implementation; tests can inject a fake to vary
+    available adapters without mutating module-global state.
+    """
+
+    def get_descriptor(self, family: InputFamily) -> AdapterDescriptor: ...
+    def descriptors_for_upload_format(
+        self, upload_format: UploadFormat
+    ) -> tuple[AdapterDescriptor, ...]: ...
+    def get_export_descriptor(self, output_format: str) -> AdapterDescriptor: ...
+    def get_export_descriptors(self, output_format: str) -> tuple[AdapterDescriptor, ...]: ...
+
+
+class _StaticDescriptorRegistry:
+    """Default DescriptorRegistry backed by the static module-level descriptor functions."""
+
+    def get_descriptor(self, family: InputFamily) -> AdapterDescriptor:
+        return get_descriptor(family)
+
+    def descriptors_for_upload_format(
+        self, upload_format: UploadFormat
+    ) -> tuple[AdapterDescriptor, ...]:
+        return descriptors_for_upload_format(upload_format)
+
+    def get_export_descriptor(self, output_format: str) -> AdapterDescriptor:
+        return get_export_descriptor(output_format)
+
+    def get_export_descriptors(self, output_format: str) -> tuple[AdapterDescriptor, ...]:
+        return get_export_descriptors(output_format)
+
+
+DEFAULT_DESCRIPTOR_REGISTRY: DescriptorRegistry = _StaticDescriptorRegistry()

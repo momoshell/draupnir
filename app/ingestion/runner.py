@@ -8,11 +8,12 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from app.core.errors import ErrorCode
 from app.ingestion.contracts import (
+    AdapterDescriptor,
     AdapterExecutionOptions,
     AdapterFailureKind,
     AdapterResult,
@@ -165,6 +166,24 @@ class _ExecutionPolicy:
         return AdapterTimeout(seconds=remaining_seconds)
 
 
+class AdapterSelector(Protocol):
+    """Resolves ordered adapter candidates for a source; injectable for tests."""
+
+    def __call__(
+        self,
+        detected_format: str | None,
+        *,
+        media_type: str | None,
+        requested_input_family: InputFamily | None = None,
+    ) -> tuple[AdapterCandidate, ...]: ...
+
+
+class AdapterLoader(Protocol):
+    """Loads a concrete ingestion adapter from a descriptor; injectable for tests."""
+
+    def __call__(self, descriptor: AdapterDescriptor) -> IngestionAdapter: ...
+
+
 async def run_ingestion(
     request: IngestionRunRequest,
     *,
@@ -174,15 +193,24 @@ async def run_ingestion(
     cancellation: CancellationHandle | None = None,
     on_progress: ProgressCallback | None = None,
     generated_at: datetime | None = None,
+    selector: AdapterSelector | None = None,
+    adapter_loader: AdapterLoader | None = None,
 ) -> IngestFinalizationPayload:
-    """Run the first loadable adapter candidate and build a payload."""
+    """Run the first loadable adapter candidate and build a payload.
+
+    ``selector`` and ``adapter_loader`` default to the registry-backed selection and importlib
+    loading; tests can inject fakes to exercise candidate iteration / load-failure handling
+    without touching the global registry or importing real adapter modules.
+    """
+    select_candidates = selector or select_adapter_candidates
+    load = adapter_loader or load_adapter
     policy = _ExecutionPolicy.start(
         timeout=timeout or _DEFAULT_ADAPTER_TIMEOUT,
         cancellation=cancellation,
     )
 
     try:
-        candidates = select_adapter_candidates(
+        candidates = select_candidates(
             request.detected_format,
             media_type=request.media_type,
             requested_input_family=request.requested_input_family,
@@ -202,7 +230,7 @@ async def run_ingestion(
     for candidate in candidates:
         policy.checkpoint(stage="load", adapter_key=candidate.descriptor.key)
         try:
-            adapter = load_adapter(candidate.descriptor)
+            adapter = load(candidate.descriptor)
         except ModuleNotFoundError as exc:
             last_unavailable_error = _adapter_load_error(
                 candidate,
