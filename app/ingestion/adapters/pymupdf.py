@@ -11,7 +11,7 @@ import math
 import multiprocessing
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
@@ -1472,9 +1472,33 @@ def _raise_if_cancelled(options: AdapterExecutionOptions) -> None:
         raise asyncio.CancelledError
 
 
+#: Runs an extraction request out-of-process and returns the result envelope. Raises
+#: AssertionError/OSError when a subprocess cannot be spawned (the caller then falls back to
+#: in-process extraction). Injectable so the spawn-failure/timeout/decode paths are testable
+#: with a fake runner, no real processes.
+SubprocessExtractionRunner = Callable[
+    [_ProcessExtractionRequest, AdapterExecutionOptions], Awaitable[dict[str, Any]]
+]
+
+
+async def _default_subprocess_extraction_runner(
+    request: _ProcessExtractionRequest,
+    options: AdapterExecutionOptions,
+) -> dict[str, Any]:
+    """Spawn a child process to run extraction and return its result envelope."""
+
+    handle = _start_extraction_process(request)
+    try:
+        return await _wait_for_process_envelope(handle, options=options)
+    finally:
+        handle.close()
+
+
 async def _extract_with_process(
     source: AdapterSource,
     options: AdapterExecutionOptions,
+    *,
+    runner: SubprocessExtractionRunner | None = None,
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
     request = _ProcessExtractionRequest(
         file_path=str(source.file_path),
@@ -1482,18 +1506,19 @@ async def _extract_with_process(
         timeout_seconds=options.timeout.seconds if options.timeout is not None else None,
         limits=_ExtractionLimits.from_settings(),
     )
+    run = runner or _default_subprocess_extraction_runner
     try:
-        handle = _start_extraction_process(request)
+        envelope = await run(request, options)
+    except TimeoutError:
+        # TimeoutError is an OSError subclass but signals a wait-phase deadline, not a
+        # spawn failure — it must propagate rather than route to the in-process fallback.
+        raise
     except (AssertionError, OSError) as exc:
         # A daemonic parent (e.g. a Celery prefork pool worker) cannot spawn child
         # processes — multiprocessing raises AssertionError("daemonic processes are not
         # allowed to have children"). Subprocess isolation is unavailable here, so fall
         # back to in-process extraction (cooperative budget timeout still applies).
         return await _extract_in_current_process(request, reason=str(exc) or type(exc).__name__)
-    try:
-        envelope = await _wait_for_process_envelope(handle, options=options)
-    finally:
-        handle.close()
     return _decode_process_envelope(envelope)
 
 
