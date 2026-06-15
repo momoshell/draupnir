@@ -32,6 +32,11 @@ from app.estimating.engine.contracts import (
     EstimateQuantityEntryInput,
     EstimateRateEntryInput,
 )
+from app.jobs.estimate_execution_input import (
+    validate_estimate_input,
+    validate_estimate_job,
+    validate_quantity_takeoff,
+)
 from app.jobs.estimate_mapping import (
     _build_estimate_job_input_error,
     _build_estimate_worker_mapping_v1,
@@ -39,14 +44,9 @@ from app.jobs.estimate_mapping import (
     _EstimateWorkerLineInput,
     _resolve_formula_binding_snapshot_key,
 )
-from app.jobs.lifecycle import (
-    _job_attempt_is_current,
-    _RevisionConflictError,
-    _StaleJobAttemptError,
-)
 from app.jobs.worker_deps import WorkerDeps
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
-from app.models.job import Job, JobType
+from app.models.job import Job
 from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
 
 
@@ -166,61 +166,20 @@ async def _build_estimate_engine_input(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await session.get(Job, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-        if job.job_type != JobType.ESTIMATE.value:
-            raise ValueError(f"Unsupported estimate job type '{job.job_type}'")
-        if job.base_revision_id is None:
-            raise _RevisionConflictError(
-                message="Estimate job is missing its finalized base revision.",
-                details={
-                    "base_revision_id": None,
-                    "current_revision_id": None,
-                },
-            )
-
-        estimate_input = await session.get(EstimateJobInput, job.id)
-        if estimate_input is None:
-            raise _build_estimate_job_input_error("missing_estimate_job_input")
-        if (
-            estimate_input.project_id != job.project_id
-            or estimate_input.source_file_id != job.file_id
-            or estimate_input.drawing_revision_id != job.base_revision_id
-        ):
-            raise _build_estimate_job_input_error(
-                "estimate_input_lineage_mismatch",
-                extra_details={
-                    "drawing_revision_id": str(estimate_input.drawing_revision_id),
-                    "base_revision_id": str(job.base_revision_id),
-                },
-            )
-
-        quantity_takeoff = await session.get(QuantityTakeoff, estimate_input.quantity_takeoff_id)
-        if quantity_takeoff is None:
-            raise _build_estimate_job_input_error(
-                "missing_quantity_takeoff",
-                extra_details={"quantity_takeoff_id": str(estimate_input.quantity_takeoff_id)},
-            )
-        if (
-            quantity_takeoff.project_id != job.project_id
-            or quantity_takeoff.source_file_id != job.file_id
-            or quantity_takeoff.drawing_revision_id != job.base_revision_id
-            or quantity_takeoff.id != estimate_input.quantity_takeoff_id
-            or quantity_takeoff.quantity_gate != estimate_input.quantity_gate
-            or quantity_takeoff.trusted_totals is not estimate_input.trusted_totals
-            or quantity_takeoff.source_job_type != JobType.QUANTITY_TAKEOFF.value
-            or estimate_input.source_job_type != JobType.ESTIMATE.value
-        ):
-            raise _build_estimate_job_input_error(
-                "quantity_takeoff_lineage_mismatch",
-                extra_details={
-                    "quantity_takeoff_id": str(quantity_takeoff.id),
-                    "drawing_revision_id": str(quantity_takeoff.drawing_revision_id),
-                },
-            )
+        job = validate_estimate_job(
+            await session.get(Job, job_id),
+            attempt_token=attempt_token,
+            job_id=job_id,
+        )
+        estimate_input = validate_estimate_input(
+            await session.get(EstimateJobInput, job.id),
+            job=job,
+        )
+        quantity_takeoff = validate_quantity_takeoff(
+            await session.get(QuantityTakeoff, estimate_input.quantity_takeoff_id),
+            estimate_input=estimate_input,
+            job=job,
+        )
 
         catalog_refs_result = await session.execute(
             select(EstimateJobInputCatalogRef)
