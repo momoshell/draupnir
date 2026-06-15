@@ -12,12 +12,14 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.interpretation.loaders import load_revision_entities_by_type
+from app.interpretation.models import EntityRow
 from app.models.revision_materialization import RevisionBlock, RevisionEntity
 
 # Layer-name tokens that, by default, mark a text layer as carrying device tags.
@@ -25,21 +27,6 @@ _DEFAULT_TAG_TOKENS: tuple[str, ...] = ("tag", "device")
 # Guards for the block-instance tree walk (mirror the historical materialization limits).
 _MAX_DEVICE_NESTING_DEPTH = 8
 _MAX_DEVICE_INSTANCES = 20000
-
-
-class _EntityRow(Protocol):
-    """Read-only shape the pure interpretation helpers need (satisfied by RevisionEntity)."""
-
-    @property
-    def entity_id(self) -> str: ...
-    @property
-    def sequence_index(self) -> int: ...
-    @property
-    def block_ref(self) -> str | None: ...
-    @property
-    def layer_ref(self) -> str | None: ...
-    @property
-    def geometry_json(self) -> Mapping[str, Any] | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +90,7 @@ def _point_xy(value: Any) -> tuple[float, float] | None:
     return None
 
 
-def _entity_xy(entity: _EntityRow) -> tuple[float, float] | None:
+def _entity_xy(entity: EntityRow) -> tuple[float, float] | None:
     """Planar (x, y) placement of an INSERT (transform.insertion_point) or text (insertion)."""
 
     geometry = entity.geometry_json or {}
@@ -115,7 +102,7 @@ def _entity_xy(entity: _EntityRow) -> tuple[float, float] | None:
     return _point_xy(geometry.get("insertion") or geometry.get("insert"))
 
 
-def _entity_text(entity: _EntityRow) -> str | None:
+def _entity_text(entity: EntityRow) -> str | None:
     geometry = entity.geometry_json or {}
     text = geometry.get("text")
     return text if isinstance(text, str) and text.strip() else None
@@ -201,16 +188,8 @@ async def enumerate_devices(
 
     block_defs = await _load_block_defs(db, revision_id)
 
-    root_query = select(RevisionEntity).where(
-        RevisionEntity.drawing_revision_id == revision_id,
-        RevisionEntity.entity_type == "insert",
-    )
-    if device_layers:
-        root_query = root_query.where(RevisionEntity.layer_ref.in_(list(device_layers)))
-    roots = (
-        (await db.execute(root_query.order_by(RevisionEntity.sequence_index, RevisionEntity.id)))
-        .scalars()
-        .all()
+    roots = await load_revision_entities_by_type(
+        db, revision_id, ("insert",), layer_refs=device_layers
     )
 
     devices: list[Device] = []
