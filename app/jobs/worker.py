@@ -35,11 +35,6 @@ from app.db.session import get_session_maker
 from app.estimating.catalog.resolver import resolve_formula, resolve_material, resolve_rate
 from app.estimating.engine.errors import EstimateEngineError
 from app.estimating.engine.service import compose_estimate
-from app.estimating.quantities.contracts import (
-    GateStatus,
-    RevisionEntityInput,
-    RevisionGateMetadata,
-)
 from app.estimating.quantities.engine import compute_quantities
 from app.exports._base import ExportArtifact
 from app.exports.csv import (
@@ -119,6 +114,27 @@ from app.jobs.finalizers import (
 )
 from app.jobs.finalizers import (
     _finalize_quantity_takeoff_job as _finalize_quantity_takeoff_job,
+)
+from app.jobs.quantity_execution_input import (
+    _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE as _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,  # noqa: E501
+)
+from app.jobs.quantity_execution_input import (
+    _QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE as _QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE,  # noqa: E501
+)
+from app.jobs.quantity_execution_input import (
+    _build_quantity_gate_metadata as _build_quantity_gate_metadata,
+)
+from app.jobs.quantity_execution_input import (
+    _build_revision_entity_input as _build_revision_entity_input,
+)
+from app.jobs.quantity_execution_input import (
+    _manifest_entity_count as _manifest_entity_count,
+)
+from app.jobs.quantity_execution_input import (
+    _QuantityTakeoffJobError as _QuantityTakeoffJobError,
+)
+from app.jobs.quantity_execution_input import (
+    build_quantity_takeoff_execution_input as build_quantity_takeoff_execution_input,
 )
 from app.jobs.revision_queries import _assert_job_base_revision_invariants
 from app.jobs.revision_queries import (
@@ -242,12 +258,6 @@ _QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE = (
 _QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE = (
     "Quantity takeoff detected conflicting contributor inputs."
 )
-_QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE = (
-    "Quantity takeoff base revision is missing its validation report."
-)
-_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE = (
-    "Quantity takeoff base revision is missing normalized entities."
-)
 _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "adapter_key",
     "input_family",
@@ -306,18 +316,6 @@ class _QueuedJobEvent:
     level: str
     message: str
     data_json: dict[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _QuantityTakeoffJobError(Exception):
-    """Raised for deterministic quantity takeoff failures."""
-
-    error_code: ErrorCode
-    message: str
-    details: dict[str, Any] | None = None
-
-    def __str__(self) -> str:
-        return self.message
 
 
 @dataclass(frozen=True, slots=True)
@@ -1093,45 +1091,6 @@ async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> 
         )
 
 
-def _manifest_entity_count(manifest: RevisionEntityManifest) -> int | None:
-    """Return the expected entity count when recorded on the manifest."""
-    raw_count = (
-        manifest.counts_json.get("entities") if isinstance(manifest.counts_json, dict) else None
-    )
-    return raw_count if isinstance(raw_count, int) else None
-
-
-def _build_quantity_gate_metadata(report: ValidationReport) -> RevisionGateMetadata:
-    """Build quantity engine gate metadata from the persisted validation report."""
-    return RevisionGateMetadata(
-        status=cast(GateStatus, report.quantity_gate),
-        validation_status=report.validation_status,
-        reason=report.review_state if report.quantity_gate in {"review_gated", "blocked"} else None,
-        details={
-            "drawing_revision_id": str(report.drawing_revision_id),
-            "review_state": report.review_state,
-            "effective_confidence": report.effective_confidence,
-        },
-    )
-
-
-def _build_revision_entity_input(entity: RevisionEntity) -> RevisionEntityInput:
-    """Map a materialized revision entity row to the quantity engine contract."""
-    return RevisionEntityInput(
-        entity_id=entity.entity_id,
-        entity_type=entity.entity_type,
-        sequence_index=entity.sequence_index,
-        geometry_json=entity.geometry_json,
-        properties_json=entity.properties_json,
-        provenance_json=entity.provenance_json,
-        canonical_entity_json=(
-            entity.canonical_entity_json if entity.canonical_entity_json is not None else {}
-        ),
-        source_identity=entity.source_identity,
-        source_hash=entity.source_hash,
-    )
-
-
 def _build_export_artifact_name(
     *,
     export_kind: str,
@@ -1230,6 +1189,48 @@ async def _build_export_execution_input(
         )
 
 
+class _SessionQuantityRowLoader:
+    """Session-backed ``QuantityRowLoader`` used by the worker quantity path."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_job(self, job_id: UUID) -> Job | None:
+        return await self._session.get(Job, job_id)
+
+    async def get_drawing_revision(self, revision_id: UUID) -> DrawingRevision | None:
+        return await _get_drawing_revision(self._session, revision_id=revision_id)
+
+    async def get_validation_report(
+        self, *, project_id: UUID, drawing_revision_id: UUID
+    ) -> ValidationReport | None:
+        return await _get_validation_report_for_revision(
+            self._session,
+            project_id=project_id,
+            drawing_revision_id=drawing_revision_id,
+        )
+
+    async def get_entity_manifest(
+        self, *, project_id: UUID, source_file_id: UUID, drawing_revision_id: UUID
+    ) -> RevisionEntityManifest | None:
+        return await _get_revision_entity_manifest_for_revision(
+            self._session,
+            project_id=project_id,
+            source_file_id=source_file_id,
+            drawing_revision_id=drawing_revision_id,
+        )
+
+    async def get_revision_entities(
+        self, *, project_id: UUID, source_file_id: UUID, drawing_revision_id: UUID
+    ) -> list[RevisionEntity]:
+        return await _get_revision_entities_for_revision(
+            self._session,
+            project_id=project_id,
+            source_file_id=source_file_id,
+            drawing_revision_id=drawing_revision_id,
+        )
+
+
 async def _build_quantity_takeoff_execution_input(
     job_id: UUID,
     *,
@@ -1241,97 +1242,10 @@ async def _build_quantity_takeoff_execution_input(
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
     async with session_maker() as session:
-        job = await session.get(Job, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-        if job.job_type != JobType.QUANTITY_TAKEOFF.value:
-            raise ValueError(f"Unsupported quantity takeoff job type '{job.job_type}'")
-        if job.base_revision_id is None:
-            raise _RevisionConflictError(
-                message="Quantity takeoff job is missing its finalized base revision.",
-                details={
-                    "base_revision_id": None,
-                    "current_revision_id": None,
-                },
-            )
-
-        drawing_revision = await _get_drawing_revision(session, revision_id=job.base_revision_id)
-        if drawing_revision is None:
-            raise _RevisionConflictError(
-                message="Quantity takeoff base revision no longer exists.",
-                details={
-                    "base_revision_id": str(job.base_revision_id),
-                    "current_revision_id": None,
-                },
-            )
-        if (
-            drawing_revision.project_id != job.project_id
-            or drawing_revision.source_file_id != job.file_id
-        ):
-            raise ValueError("Quantity takeoff base revision does not belong to the source file")
-
-        report = await _get_validation_report_for_revision(
-            session,
-            project_id=job.project_id,
-            drawing_revision_id=drawing_revision.id,
-        )
-        if report is None:
-            raise _QuantityTakeoffJobError(
-                error_code=ErrorCode.NOT_FOUND,
-                message=_QUANTITY_TAKEOFF_VALIDATION_REPORT_MISSING_ERROR_MESSAGE,
-                details={"drawing_revision_id": str(drawing_revision.id)},
-            )
-
-        if report.quantity_gate in {"review_gated", "blocked"}:
-            return _QuantityTakeoffExecutionInput(
-                drawing_revision_id=drawing_revision.id,
-                review_state=report.review_state,
-                validation_status=report.validation_status,
-                quantity_gate=report.quantity_gate,
-                gate=_build_quantity_gate_metadata(report),
-                entities=[],
-            )
-
-        manifest = await _get_revision_entity_manifest_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=job.file_id,
-            drawing_revision_id=drawing_revision.id,
-        )
-        if manifest is None:
-            raise _QuantityTakeoffJobError(
-                error_code=ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED,
-                message=_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,
-                details={"drawing_revision_id": str(drawing_revision.id)},
-            )
-
-        entities = await _get_revision_entities_for_revision(
-            session,
-            project_id=job.project_id,
-            source_file_id=job.file_id,
-            drawing_revision_id=drawing_revision.id,
-        )
-        expected_entity_count = _manifest_entity_count(manifest)
-        if expected_entity_count is not None and expected_entity_count != len(entities):
-            raise _QuantityTakeoffJobError(
-                error_code=ErrorCode.NORMALIZED_ENTITIES_NOT_MATERIALIZED,
-                message=_QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,
-                details={
-                    "drawing_revision_id": str(drawing_revision.id),
-                    "expected_entities": expected_entity_count,
-                    "loaded_entities": len(entities),
-                },
-            )
-
-        return _QuantityTakeoffExecutionInput(
-            drawing_revision_id=drawing_revision.id,
-            review_state=report.review_state,
-            validation_status=report.validation_status,
-            quantity_gate=report.quantity_gate,
-            gate=_build_quantity_gate_metadata(report),
-            entities=[_build_revision_entity_input(entity) for entity in entities],
+        return await build_quantity_takeoff_execution_input(
+            job_id,
+            attempt_token=attempt_token,
+            loader=_SessionQuantityRowLoader(session),
         )
 
 
