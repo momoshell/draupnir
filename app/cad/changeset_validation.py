@@ -27,6 +27,7 @@ from app.models.cad_changeset import (
     CadChangeSet,
     CadChangeSetValidationResult,
 )
+from app.schemas.changeset import ANNOTATE_ENTITY_OBJECT_KEYS, ANNOTATE_ENTITY_TEXT_KEYS
 
 _ALLOWED_START_STATUSES = frozenset({"proposed", "validation_requested", "validation_failed"})
 _VALIDATED_CHANGE_SET_STATUS = "validated"
@@ -225,15 +226,22 @@ async def _validate_operation(
             state,
         )
         findings.extend(target_findings)
-        annotation = payload.get("annotation")
-        if annotation is None or not isinstance(annotation, (str, Mapping)):
+        annotation_text = _extract_text_reference(payload, keys=ANNOTATE_ENTITY_TEXT_KEYS)
+        annotation_object = any(
+            isinstance(payload.get(key), Mapping) for key in ANNOTATE_ENTITY_OBJECT_KEYS
+        )
+        if annotation_text is None and not annotation_object:
             findings.append(
                 _finding(
                     operation,
                     severity="error",
                     code="invalid_annotation_payload",
-                    message="annotate_entity requires a string or object annotation payload.",
-                    details={"payload_key": "annotation"},
+                    message="annotate_entity requires a non-empty string or object annotation.",
+                    details={
+                        "accepted_keys": list(
+                            ANNOTATE_ENTITY_TEXT_KEYS + ANNOTATE_ENTITY_OBJECT_KEYS
+                        )
+                    },
                 )
             )
         findings.append(

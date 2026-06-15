@@ -27,6 +27,11 @@ _NON_EMPTY_TARGET_OPERATION_TYPES = frozenset(
         "update_property",
     }
 )
+# Accepted payload keys for annotate_entity, shared with the apply-time validator so the create
+# contract and the validator never drift. A non-empty string under a text key, or a JSON object
+# under an object key, is a valid annotation.
+ANNOTATE_ENTITY_TEXT_KEYS = ("annotation", "text", "label", "note")
+ANNOTATE_ENTITY_OBJECT_KEYS = ("annotation", "metadata")
 
 
 def _normalize_optional_text(value: Any) -> str | None:
@@ -229,8 +234,8 @@ class CadChangeOperationCreateRequest(BaseModel):
             _require_payload_keys(
                 self.payload,
                 operation_type=self.operation_type,
-                text_keys=("annotation", "text", "label", "note"),
-                object_keys=("annotation", "metadata"),
+                text_keys=ANNOTATE_ENTITY_TEXT_KEYS,
+                object_keys=ANNOTATE_ENTITY_OBJECT_KEYS,
             )
         elif self.operation_type == "change_layer":
             _require_payload_keys(

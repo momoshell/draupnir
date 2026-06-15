@@ -529,6 +529,46 @@ async def test_validate_change_set_covers_all_operation_types(
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        {"annotation": "Mark for coordination"},
+        {"note": "Mark for coordination"},
+        {"label": "Coordination"},
+        {"text": "See RFI 12"},
+        {"metadata": {"rfi": 12}},
+    ],
+)
+async def test_validate_change_set_accepts_annotation_under_any_supported_key(
+    db_session: AsyncSession,
+    payload: dict[str, Any],
+) -> None:
+    """annotate_entity validates under any key the create contract accepts (#410)."""
+    seed = await _seed_revision(db_session)
+    operation = CadChangeOperationCreate(
+        operation_type="annotate_entity",
+        target_revision_entity_id=seed.revision_entity_row_id,
+        operation_json=_operation_envelope(
+            target={"entity_id": seed.revision_entity_business_id},
+            payload=payload,
+        ),
+    )
+    change_set = await create_change_set(
+        db_session,
+        project_id=seed.project_id,
+        base_revision_id=seed.revision_id,
+        status="proposed",
+        created_by="tester",
+        operations=[operation],
+    )
+
+    validation_result = await validate_change_set(db_session, change_set.id)
+
+    codes = _result_codes(validation_result.result_json)
+    assert "invalid_annotation_payload" not in codes
+    assert validation_result.validation_status == "valid_with_warnings"
+
+
+@pytest.mark.parametrize(
     ("operation_json", "expected_code"),
     [
         (
