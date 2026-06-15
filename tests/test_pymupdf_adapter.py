@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from app.ingestion.adapters import pymupdf as pdf_adapter
 from app.ingestion.contracts import (
@@ -316,3 +319,57 @@ def test_populate_page_entities_honors_native_ocg_layer() -> None:
     assert layer_names == ["Architecture"]
     assert entities and all(entity["layer_ref"] == "Architecture" for entity in entities)
     assert pdf_adapter._layer_source(layer_names) == "ocg"
+
+
+def _pdf_source() -> AdapterSource:
+    # file_path is never read in these tests — the subprocess runner is faked.
+    return AdapterSource(
+        file_path=Path("/tmp/unused.pdf"),
+        upload_format=UploadFormat.PDF,
+        input_family=InputFamily.PDF_VECTOR,
+    )
+
+
+async def test_extract_with_process_decodes_success_envelope_from_runner() -> None:
+    # The SubprocessRunner seam: a fake runner returns an envelope; no real process is spawned.
+    async def _runner(request: Any, options: Any) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "canonical": {"entities": [], "metadata": {}},
+            "warnings": [{"code": "w", "message": "m"}],
+        }
+
+    canonical, warnings = await pdf_adapter._extract_with_process(
+        _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
+    )
+    assert canonical == {"entities": [], "metadata": {}}
+    assert [w.code for w in warnings] == ["w"]
+
+
+async def test_extract_with_process_propagates_error_envelope() -> None:
+    async def _runner(request: Any, options: Any) -> dict[str, Any]:
+        return {"status": "error", "kind": "timeout", "message": "timed out"}
+
+    with pytest.raises(TimeoutError):
+        await pdf_adapter._extract_with_process(
+            _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
+        )
+
+
+async def test_extract_with_process_falls_back_when_runner_cannot_spawn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # A runner that can't spawn (daemonic parent) raises AssertionError -> in-process fallback.
+    async def _runner(request: Any, options: Any) -> dict[str, Any]:
+        raise AssertionError("daemonic processes are not allowed to have children")
+
+    sentinel: tuple[dict[str, JSONValue], list[AdapterWarning]] = ({"entities": ()}, [])
+
+    async def _fake_in_process(request: Any, *, reason: str) -> Any:
+        assert "daemonic" in reason
+        return sentinel
+
+    monkeypatch.setattr(pdf_adapter, "_extract_in_current_process", _fake_in_process)
+
+    result = await pdf_adapter._extract_with_process(
+        _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
+    )
+    assert result is sentinel
