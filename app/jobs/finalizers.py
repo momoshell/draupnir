@@ -1013,9 +1013,7 @@ async def _finalize_quantity_takeoff_job(
         quantity_takeoff_id = quantity_takeoff.id
         quantity_items = rows.items
 
-        session.add(quantity_takeoff)
-        await session.flush()
-        session.add_all(quantity_items)
+        await deps.finalization_persister.persist_quantity_takeoff(session, rows)
 
         job.status = "succeeded"
         job.finished_at = _utcnow()
@@ -1135,11 +1133,7 @@ async def _finalize_estimate_job(
         snapshot_entries = rows.snapshot_entries
         line_items = rows.line_items
 
-        session.add(estimate_version)
-        await session.flush()
-        session.add_all(snapshot_entries)
-        await session.flush()
-        session.add_all(line_items)
+        await deps.finalization_persister.persist_estimate(session, rows)
 
         job.status = "succeeded"
         job.finished_at = _utcnow()
