@@ -101,6 +101,10 @@ from app.jobs.export_execution_input import (
 from app.jobs.export_execution_input import (
     build_export_execution_input as build_export_execution_input,
 )
+from app.jobs.finalization_persister import (
+    DEFAULT_FINALIZATION_PERSISTER,
+    FinalizationPersister,
+)
 from app.jobs.finalizers import (
     _finalize_changeset_apply_job as _finalize_changeset_apply_job,
 )
@@ -907,6 +911,11 @@ _get_job_for_update_with_metadata = job_lifecycle._get_job_for_update_with_metad
 _get_source_file = job_lifecycle._get_source_file
 
 
+# Module-global collaborator default, read by ``default_worker_deps`` so tests can
+# monkeypatch ``worker_module.finalization_persister`` before starting a job flow.
+finalization_persister: FinalizationPersister = DEFAULT_FINALIZATION_PERSISTER
+
+
 def default_worker_deps() -> WorkerDeps:
     """Snapshot the current worker collaborators for one job flow.
 
@@ -927,6 +936,7 @@ def default_worker_deps() -> WorkerDeps:
         finalize_job_cancelled=_finalize_job_cancelled,
         cancel_job_for_inactive_source=_cancel_job_for_inactive_source,
         load_changeset_apply_job_input=_load_changeset_apply_job_input_if_valid,
+        finalization_persister=finalization_persister,
     )
 
 
