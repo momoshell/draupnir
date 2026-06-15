@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -88,21 +88,30 @@ class RevisedDxfExportResult(ExportArtifactWithOptions):
     """Pure rendered revised DXF export artifact metadata."""
 
 
-async def render_revised_dxf_export(
+#: Acquires an available export adapter (+ its descriptor). Injectable so tests can supply a
+#: stub adapter without a real registry/ezdxf; the default uses the registry-backed selection.
+ExportAdapterProvider = Callable[[], tuple[AdapterDescriptor, ExportAdapter]]
+
+
+def _default_export_adapter_provider() -> tuple[AdapterDescriptor, ExportAdapter]:
+    descriptor = _select_export_descriptor()
+    adapter = _load_adapter(descriptor)
+    _require_available(availability=adapter.probe(), descriptor_key=descriptor.key)
+    return descriptor, adapter
+
+
+async def materialize_revision_export_payload(
     db: AsyncSession,
     revision_id: UUID,
     *,
-    options: Mapping[str, object] | None = None,
     require_changeset_origin: bool = True,
-) -> RevisedDxfExportResult:
-    """Render a materialized drawing revision into deterministic DXF bytes.
+) -> dict[str, JSONValue]:
+    """Load + validate a revision and build the export-ready canonical payload (no adapter).
 
-    By default this requires a changeset-origin revision (the "revised DXF" export). Set
-    ``require_changeset_origin=False`` to render any active revision, including a base
-    extraction revision (the "base DXF" export) — the rendering is otherwise identical.
+    Raises ``RevisedDxfExportError`` for a missing/ineligible revision, missing manifest, or a
+    materialization count mismatch. Applies the extraction-derived real-world scale (#417) when
+    present so coordinates are emitted in real units.
     """
-
-    options_snapshot = _normalize_options(options)
 
     revision = await db.get(DrawingRevision, revision_id)
     if revision is None:
@@ -158,10 +167,31 @@ async def render_revised_dxf_export(
         payload["units"] = real_world_scale.unit
         payload["coordinate_scale"] = real_world_scale.points_to_real
 
-    descriptor = _select_export_descriptor()
-    adapter = _load_adapter(descriptor)
-    availability = adapter.probe()
-    _require_available(availability=availability, descriptor_key=descriptor.key)
+    return payload
+
+
+async def render_revised_dxf_export(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    options: Mapping[str, object] | None = None,
+    require_changeset_origin: bool = True,
+    adapter_provider: ExportAdapterProvider | None = None,
+) -> RevisedDxfExportResult:
+    """Render a materialized drawing revision into deterministic DXF bytes.
+
+    By default this requires a changeset-origin revision (the "revised DXF" export). Set
+    ``require_changeset_origin=False`` to render any active revision, including a base
+    extraction revision (the "base DXF" export) — the rendering is otherwise identical.
+    """
+
+    options_snapshot = _normalize_options(options)
+
+    payload = await materialize_revision_export_payload(
+        db, revision_id, require_changeset_origin=require_changeset_origin
+    )
+
+    descriptor, adapter = (adapter_provider or _default_export_adapter_provider)()
 
     try:
         export_result = await adapter.export(

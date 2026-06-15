@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 import pytest_asyncio
@@ -21,12 +21,16 @@ from app.exports.revised_dxf import (
     RevisedDxfExportError,
     RevisedDxfExportResult,
     _load_real_world_scale,
+    _select_export_descriptor,
+    materialize_revision_export_payload,
     render_revised_dxf_export,
 )
 from app.ingestion.contracts import (
     AdapterAvailability,
+    AdapterDescriptor,
     AdapterStatus,
     AvailabilityReason,
+    ExportAdapter,
 )
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
@@ -755,3 +759,29 @@ def _optional_str(value: object) -> str | None:
 
 def _fixture_uuid(name: str) -> uuid.UUID:
     return uuid.uuid5(_FIXTURE_UUID_NAMESPACE, f"revised_dxf_export:{name}")
+
+
+async def test_materialize_revision_export_payload_builds_payload(
+    db_session: AsyncSession,
+) -> None:
+    # The materializer seam: load + build the export payload independently of the adapter/render.
+    seeded = await _seed_revision_fixture(db_session)
+    payload = await materialize_revision_export_payload(db_session, seeded.revision.id)
+    assert set(payload) >= {"layouts", "layers", "blocks", "entities"}
+    assert isinstance(payload["entities"], list) and payload["entities"]
+
+
+async def test_render_uses_injected_adapter_provider(
+    db_session: AsyncSession,
+) -> None:
+    # The adapter-provider seam: render uses an injected provider (no registry monkeypatching),
+    # so adapter-result handling is exercised with a stub adapter.
+    seeded = await _seed_revision_fixture(db_session)
+    descriptor = _select_export_descriptor()
+
+    def _provider() -> tuple[AdapterDescriptor, ExportAdapter]:
+        return descriptor, cast(ExportAdapter, _ContractFailingAdapter())
+
+    with pytest.raises(RevisedDxfExportError) as exc_info:
+        await render_revised_dxf_export(db_session, seeded.revision.id, adapter_provider=_provider)
+    assert exc_info.value.code == "ADAPTER_FAILED"
