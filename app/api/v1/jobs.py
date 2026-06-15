@@ -30,6 +30,7 @@ from app.api.pagination import (
     read_cursor_int,
     read_cursor_uuid,
 )
+from app.api.v1.job_locking import get_job_lock_metadata_or_404, lock_job_for_mutation
 from app.core.errors import ErrorCode
 from app.core.exceptions import raise_not_found
 from app.db.session import get_db
@@ -38,10 +39,8 @@ from app.jobs.worker import (
     prepare_job_enqueue_intent,
     publish_job_enqueue_intent,
 )
-from app.models.file import File
 from app.models.job import Job
 from app.models.job_event import JobEvent
-from app.models.project import Project
 from app.schemas.job import JobEventPage, JobEventRead, JobRead
 
 jobs_router = APIRouter()
@@ -60,113 +59,6 @@ async def _get_job_or_404(db: AsyncSession, job_id: UUID) -> Job:
     result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
     if job is None:
-        raise_not_found("Job", str(job_id))
-    assert job is not None
-
-    return job
-
-
-async def _get_job_lock_metadata_or_404(
-    db: AsyncSession,
-    job_id: UUID,
-) -> tuple[UUID, UUID]:
-    """Return project/file identifiers needed for ordered job locking."""
-    result = await db.execute(select(Job.project_id, Job.file_id).where(Job.id == job_id))
-    row = result.one_or_none()
-    if row is None:
-        raise_not_found("Job", str(job_id))
-
-    assert row is not None
-    project_id, file_id = row
-    return project_id, file_id
-
-
-async def _get_project_for_job_update_or_404(
-    db: AsyncSession,
-    *,
-    job_id: UUID,
-    project_id: UUID,
-) -> Project:
-    """Lock a job's project row before any job/file row locks."""
-    result = await db.execute(
-        select(Project).where(Project.id == project_id).with_for_update(of=Project)
-    )
-    project = result.scalar_one_or_none()
-    if project is None:
-        raise_not_found("Job", str(job_id))
-    assert project is not None
-
-    return project
-
-
-async def _get_job_for_update_or_404(
-    db: AsyncSession,
-    job_id: UUID,
-    *,
-    expected_project_id: UUID | None = None,
-    expected_file_id: UUID | None = None,
-) -> Job:
-    """Return a persisted job with a row lock or raise not found."""
-    result = await db.execute(select(Job).where(Job.id == job_id).with_for_update(of=Job))
-    job = result.scalar_one_or_none()
-    if job is None:
-        raise_not_found("Job", str(job_id))
-    assert job is not None
-    if expected_project_id is not None and job.project_id != expected_project_id:
-        raise_not_found("Job", str(job_id))
-    if expected_file_id is not None and job.file_id != expected_file_id:
-        raise_not_found("Job", str(job_id))
-
-    return job
-
-
-async def _get_file_for_job_update_or_404(
-    db: AsyncSession,
-    *,
-    job_id: UUID,
-    project_id: UUID,
-    file_id: UUID,
-) -> File:
-    """Lock a job's source file row after project and job locks."""
-    result = await db.execute(
-        select(File)
-        .where((File.project_id == project_id) & (File.id == file_id))
-        .with_for_update(of=File)
-    )
-    source_file = result.scalar_one_or_none()
-    if source_file is None:
-        raise_not_found("Job", str(job_id))
-    assert source_file is not None
-
-    return source_file
-
-
-async def _lock_retry_source_or_404(
-    db: AsyncSession,
-    job_id: UUID,
-    *,
-    project_id: UUID,
-    file_id: UUID,
-) -> Job:
-    """Lock retry source rows in Project -> Job -> File order."""
-    project = await _get_project_for_job_update_or_404(
-        db,
-        job_id=job_id,
-        project_id=project_id,
-    )
-    job = await _get_job_for_update_or_404(
-        db,
-        job_id,
-        expected_project_id=project_id,
-        expected_file_id=file_id,
-    )
-    source_file = await _get_file_for_job_update_or_404(
-        db,
-        job_id=job_id,
-        project_id=project_id,
-        file_id=file_id,
-    )
-    if project.deleted_at is not None or source_file.deleted_at is not None:
         raise_not_found("Job", str(job_id))
     assert job is not None
 
@@ -302,23 +194,19 @@ async def cancel_job(
 
     async def _preclaim_cancel() -> Response | None:
         nonlocal project_id, file_id
-        project_id, file_id = await _get_job_lock_metadata_or_404(db, job_id)
+        project_id, file_id = await get_job_lock_metadata_or_404(db, job_id)
         return None
 
     async def _mutate_cancel() -> IdempotentMutationSuccess[Job]:
         assert project_id is not None
         assert file_id is not None
 
-        await _get_project_for_job_update_or_404(
-            db,
-            job_id=job_id,
-            project_id=project_id,
-        )
-        job = await _get_job_for_update_or_404(
+        job = await lock_job_for_mutation(
             db,
             job_id,
-            expected_project_id=project_id,
-            expected_file_id=file_id,
+            project_id=project_id,
+            file_id=file_id,
+            lock_source_file=False,
         )
         if job.status not in _TERMINAL_JOB_STATUSES:
             job.cancel_requested = True
@@ -363,18 +251,19 @@ async def retry_job(
 
     async def _preclaim_retry() -> Response | None:
         nonlocal project_id, file_id
-        project_id, file_id = await _get_job_lock_metadata_or_404(db, job_id)
+        project_id, file_id = await get_job_lock_metadata_or_404(db, job_id)
         return None
 
     async def _mutate_retry() -> IdempotentMutationSuccess[Job]:
         assert project_id is not None
         assert file_id is not None
 
-        job = await _lock_retry_source_or_404(
+        job = await lock_job_for_mutation(
             db,
             job_id,
             project_id=project_id,
             file_id=file_id,
+            lock_source_file=True,
         )
         if job.status != "failed" or job.attempts >= job.max_attempts:
             return IdempotentMutationSuccess(
