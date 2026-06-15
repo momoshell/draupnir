@@ -40,6 +40,7 @@ from app.ingestion.contracts import (
 from app.ingestion.loader import load_export_adapter
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.ingestion.selection import (
+    AdapterCandidate,
     select_adapter_candidates,
     select_export_candidates,
     select_export_descriptor,
@@ -2227,3 +2228,61 @@ async def test_run_ingestion_enforces_cancellation_checkpoint_before_execute(
     error = exc_info.value
     assert error.error_code is ErrorCode.JOB_CANCELLED
     assert error.details["stage"] == "execute"
+
+
+def test_select_adapter_candidates_uses_injected_registry() -> None:
+    """The DescriptorRegistry seam: selection resolves via the injected registry, not globals."""
+    real = registry_module.get_descriptor(InputFamily.DXF)
+
+    class _FakeRegistry:
+        def get_descriptor(self, family: InputFamily) -> AdapterDescriptor:
+            assert family is InputFamily.DXF
+            return real
+
+        def descriptors_for_upload_format(
+            self, _upload_format: UploadFormat
+        ) -> tuple[AdapterDescriptor, ...]:
+            return (real,)
+
+        def get_export_descriptor(self, _output_format: str) -> AdapterDescriptor:
+            raise AssertionError("not expected")
+
+        def get_export_descriptors(self, _output_format: str) -> tuple[AdapterDescriptor, ...]:
+            raise AssertionError("not expected")
+
+    candidates = select_adapter_candidates(
+        InputFamily.DXF, media_type=None, registry=_FakeRegistry()
+    )
+    assert len(candidates) == 1
+    assert candidates[0].descriptor is real
+
+
+async def test_run_ingestion_uses_injected_selector_and_loader() -> None:
+    """The AdapterSelector/AdapterLoader seams: runner iterates candidates + handles load failure
+    via injected fakes, with no global registry and no real adapter module import."""
+    descriptor = registry_module.get_descriptor(InputFamily.DXF)
+
+    def _selector(
+        detected_format: str | None,
+        *,
+        media_type: str | None,
+        requested_input_family: InputFamily | None = None,
+    ) -> tuple[AdapterCandidate, ...]:
+        return (AdapterCandidate(UploadFormat.DXF, InputFamily.DXF, descriptor),)
+
+    def _loader(descriptor: AdapterDescriptor) -> Any:
+        raise ModuleNotFoundError("simulated missing module", name=descriptor.module)
+
+    request = IngestionRunRequest(
+        job_id=uuid4(),
+        file_id=uuid4(),
+        checksum_sha256="deadbeef",
+        detected_format="dxf",
+        media_type="application/dxf",
+    )
+
+    with pytest.raises(IngestionRunnerError) as exc_info:
+        await run_ingestion(
+            request, storage=MemoryStorage(), selector=_selector, adapter_loader=_loader
+        )
+    assert exc_info.value.error_code is ErrorCode.ADAPTER_UNAVAILABLE
