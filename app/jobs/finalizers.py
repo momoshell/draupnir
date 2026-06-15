@@ -8,7 +8,6 @@ via the injected WorkerDeps; shared queries/primitives come from sibling modules
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from collections.abc import Sequence
 from copy import deepcopy
@@ -55,6 +54,10 @@ from app.jobs.report_lineage import (
     _build_export_artifact_lineage_json,
     _build_persisted_validation_report_json,
 )
+from app.jobs.result_builders import (
+    build_estimate_rows,
+    build_quantity_takeoff_rows,
+)
 from app.jobs.revision_materialization import (
     _build_changeset_revision_materialization_rows,
     _build_revision_materialization_rows,
@@ -95,11 +98,11 @@ from app.jobs.worker_deps import WorkerDeps
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
 from app.models.drawing_revision import DrawingRevision
-from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
+from app.models.estimate_version import EstimateVersion
 from app.models.file import File
 from app.models.generated_artifact import GeneratedArtifact
 from app.models.job import Job, JobType
-from app.models.quantity_takeoff import QuantityItem, QuantityItemKind, QuantityTakeoff
+from app.models.quantity_takeoff import QuantityTakeoff
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntity,
@@ -718,137 +721,6 @@ async def _finalize_ingest_job(
     return True
 
 
-def _nonempty_quantity_type(value: str | None) -> str:
-    """Normalize persisted quantity type labels to non-empty strings."""
-    if value is None:
-        return "unknown"
-    normalized = value.strip()
-    return normalized or "unknown"
-
-
-def _nonempty_quantity_unit(value: str | None) -> str:
-    """Normalize persisted quantity units to non-empty strings."""
-    if value is None:
-        return "unknown"
-    normalized = value.strip()
-    return normalized or "unknown"
-
-
-def _duplicate_entity_ids_json(values: tuple[str, ...]) -> list[str]:
-    """Copy duplicate contributor lineage ids into a JSON-safe list."""
-    return [value for value in values if value]
-
-
-def _serialize_quantity_context(context: Any) -> str | None:
-    """Render quantity context as a deterministic persisted label suffix."""
-    if context is None:
-        return None
-    if isinstance(context, str):
-        normalized = context.strip()
-        return normalized or None
-
-    try:
-        serialized = json.dumps(context, sort_keys=True, separators=(",", ":"))
-    except TypeError:
-        serialized = str(context).strip()
-
-    return serialized or None
-
-
-def _quantity_item_type_label(quantity_type: str | None, context: Any) -> str:
-    """Persist the quantity type with stable quantity-context disambiguation."""
-    normalized_quantity_type = _nonempty_quantity_type(quantity_type)
-    serialized_context = _serialize_quantity_context(context)
-    if serialized_context is None:
-        return normalized_quantity_type
-
-    return f"{normalized_quantity_type}:{serialized_context}"
-
-
-def _build_quantity_items(
-    *,
-    quantity_takeoff_id: UUID,
-    project_id: UUID,
-    drawing_revision_id: UUID,
-    review_state: str,
-    validation_status: str,
-    quantity_gate: str,
-    result: QuantityEngineResult,
-) -> list[QuantityItem]:
-    """Build immutable quantity item rows for a takeoff result."""
-    items: list[QuantityItem] = []
-
-    for contributor in result.contributors:
-        items.append(
-            QuantityItem(
-                id=uuid.uuid4(),
-                quantity_takeoff_id=quantity_takeoff_id,
-                project_id=project_id,
-                drawing_revision_id=drawing_revision_id,
-                item_kind=QuantityItemKind.CONTRIBUTOR.value,
-                quantity_type=_quantity_item_type_label(
-                    contributor.quantity_type,
-                    getattr(contributor, "context", None),
-                ),
-                value=contributor.value,
-                unit=_nonempty_quantity_unit(contributor.unit),
-                review_state=review_state,
-                validation_status=validation_status,
-                quantity_gate=quantity_gate,
-                source_entity_id=contributor.entity_id,
-                excluded_source_entity_ids_json=_duplicate_entity_ids_json(
-                    contributor.duplicate_entity_ids
-                ),
-            )
-        )
-
-    for aggregate in result.aggregates:
-        items.append(
-            QuantityItem(
-                id=uuid.uuid4(),
-                quantity_takeoff_id=quantity_takeoff_id,
-                project_id=project_id,
-                drawing_revision_id=drawing_revision_id,
-                item_kind=QuantityItemKind.AGGREGATE.value,
-                quantity_type=_quantity_item_type_label(
-                    aggregate.quantity_type,
-                    getattr(aggregate, "context", None),
-                ),
-                value=aggregate.total,
-                unit=_nonempty_quantity_unit(aggregate.unit),
-                review_state=review_state,
-                validation_status=validation_status,
-                quantity_gate=quantity_gate,
-                source_entity_id=None,
-                excluded_source_entity_ids_json=[],
-            )
-        )
-
-    for exclusion in result.exclusions:
-        items.append(
-            QuantityItem(
-                id=uuid.uuid4(),
-                quantity_takeoff_id=quantity_takeoff_id,
-                project_id=project_id,
-                drawing_revision_id=drawing_revision_id,
-                item_kind=QuantityItemKind.EXCLUSION.value,
-                quantity_type=_quantity_item_type_label(
-                    exclusion.quantity_type,
-                    getattr(exclusion, "context", None),
-                ),
-                value=None,
-                unit="unknown",
-                review_state=review_state,
-                validation_status=validation_status,
-                quantity_gate=quantity_gate,
-                source_entity_id=exclusion.entity_id,
-                excluded_source_entity_ids_json=[],
-            )
-        )
-
-    return items
-
-
 async def _finalize_export_job(
     job_id: UUID,
     *,
@@ -1130,28 +1002,16 @@ async def _finalize_quantity_takeoff_job(
             )
             return False
 
-        quantity_takeoff_id = uuid.uuid4()
-        quantity_takeoff = QuantityTakeoff(
-            id=quantity_takeoff_id,
+        rows = build_quantity_takeoff_rows(
             project_id=job.project_id,
             source_file_id=job.file_id,
-            drawing_revision_id=execution.drawing_revision_id,
             source_job_id=job.id,
-            source_job_type=JobType.QUANTITY_TAKEOFF.value,
-            review_state=execution.review_state,
-            validation_status=execution.validation_status,
-            quantity_gate=execution.quantity_gate,
-            trusted_totals=result.trusted_totals,
-        )
-        quantity_items = _build_quantity_items(
-            quantity_takeoff_id=quantity_takeoff_id,
-            project_id=job.project_id,
-            drawing_revision_id=execution.drawing_revision_id,
-            review_state=execution.review_state,
-            validation_status=execution.validation_status,
-            quantity_gate=execution.quantity_gate,
+            execution=execution,
             result=result,
         )
+        quantity_takeoff = rows.takeoff
+        quantity_takeoff_id = quantity_takeoff.id
+        quantity_items = rows.items
 
         session.add(quantity_takeoff)
         await session.flush()
@@ -1193,9 +1053,7 @@ async def _finalize_estimate_job(
     if session_maker is None:
         raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
 
-    estimate_version_kwargs = output.estimate_version_model_kwargs()
-    snapshot_entry_kwargs = list(output.snapshot_entry_model_kwargs())
-    line_item_kwargs = list(output.line_item_model_kwargs())
+    rows = build_estimate_rows(output)
 
     async with session_maker() as session:
         locked_source = await deps.lock_job_source(session, job_id)
@@ -1252,7 +1110,7 @@ async def _finalize_estimate_job(
             logger.info("estimate_job_cancelled_inactive_source", job_id=str(job_id))
             return False
 
-        output_revision_id = cast(UUID | None, estimate_version_kwargs.get("drawing_revision_id"))
+        output_revision_id = cast(UUID | None, rows.version.drawing_revision_id)
         if job.base_revision_id != output_revision_id:
             raise _RevisionConflictError(
                 message="Estimate base revision changed before finalization.",
@@ -1273,9 +1131,9 @@ async def _finalize_estimate_job(
             )
             return False
 
-        estimate_version = EstimateVersion(**estimate_version_kwargs)
-        snapshot_entries = [EstimateSnapshotEntry(**kwargs) for kwargs in snapshot_entry_kwargs]
-        line_items = [EstimateItem(**kwargs) for kwargs in line_item_kwargs]
+        estimate_version = rows.version
+        snapshot_entries = rows.snapshot_entries
+        line_items = rows.line_items
 
         session.add(estimate_version)
         await session.flush()
