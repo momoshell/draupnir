@@ -122,11 +122,40 @@ class _BlockRecord:
     entities: list[Any]
 
 
-def write_canonical_dxf(
+@dataclass(frozen=True, slots=True)
+class _ParsedCanonical:
+    """Parsed + structurally-validated canonical payload, ready to render."""
+
+    layers: list[_LayerRecord]
+    layout_by_id: dict[str, _LayoutRecord]
+    layout_by_name: dict[str, _LayoutRecord]
+    layer_by_id: dict[str, _LayerRecord]
+    layer_by_name: dict[str, _LayerRecord]
+    entities: list[Any]
+    resolved_blocks: list[tuple[_BlockRecord, list[_ResolvedEntity]]]
+    unit_spec: UnitSpec
+    default_layout: str | None
+
+
+def validate_canonical(
     canonical: Mapping[str, Any],
     options: DxfWriteOptions | Mapping[str, Any] | None = None,
-) -> DxfWriteResult:
-    """Render canonical revision payload into parseable ASCII DXF bytes."""
+) -> None:
+    """Fail-fast structural validation of a canonical payload, without rendering.
+
+    Raises ``DxfWriteError`` on the first structural problem (unsupported top-level sections,
+    invalid/ambiguous layouts, unknown layers, unresolvable units, malformed entities/blocks).
+    Returns ``None`` when the payload is renderable.
+    """
+
+    _parse_canonical(canonical, options)
+
+
+def _parse_canonical(
+    canonical: Mapping[str, Any],
+    options: DxfWriteOptions | Mapping[str, Any] | None,
+) -> _ParsedCanonical:
+    """Parse + structurally validate the canonical payload into render-ready records."""
 
     payload = _coerce_mapping(canonical, field_path="canonical")
     write_options = _coerce_write_options(options)
@@ -164,6 +193,34 @@ def write_canonical_dxf(
         # (it labels the unit; the scale converts the source magnitudes into that unit).
         unit_spec = replace(unit_spec, meter_scale=unit_spec.meter_scale * coordinate_scale)
     default_layout = _resolve_default_model_layout(layouts)
+
+    return _ParsedCanonical(
+        layers=layers,
+        layout_by_id=layout_by_id,
+        layout_by_name=layout_by_name,
+        layer_by_id=layer_by_id,
+        layer_by_name=layer_by_name,
+        entities=entities,
+        resolved_blocks=resolved_blocks,
+        unit_spec=unit_spec,
+        default_layout=default_layout,
+    )
+
+
+def write_canonical_dxf(
+    canonical: Mapping[str, Any],
+    options: DxfWriteOptions | Mapping[str, Any] | None = None,
+) -> DxfWriteResult:
+    """Render canonical revision payload into parseable ASCII DXF bytes."""
+
+    parsed = _parse_canonical(canonical, options)
+    layers = parsed.layers
+    layout_by_id, layout_by_name = parsed.layout_by_id, parsed.layout_by_name
+    layer_by_id, layer_by_name = parsed.layer_by_id, parsed.layer_by_name
+    entities = parsed.entities
+    resolved_blocks = parsed.resolved_blocks
+    unit_spec = parsed.unit_spec
+    default_layout = parsed.default_layout
 
     with _fixed_ezdxf_metadata():
         doc = new_dxf_document(dxfversion="R2010")

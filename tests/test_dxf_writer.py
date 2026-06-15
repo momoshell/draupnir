@@ -563,3 +563,43 @@ def test_write_canonical_dxf_rejects_non_positive_coordinate_scale() -> None:
         write_canonical_dxf(payload)
 
     assert exc_info.value.code == "INVALID_COORDINATE"
+
+
+def test_validate_canonical_passes_for_valid_payload() -> None:
+    from app.cad.dxf import validate_canonical
+
+    # No raise for a renderable payload, and produces no DXF bytes.
+    validate_canonical(_base_payload())
+
+
+def test_validate_canonical_fails_fast_on_invalid_layer_name() -> None:
+    from app.cad.dxf import validate_canonical
+
+    payload = _base_payload()
+    payload["layers"] = [{"layer_ref": "bad", "payload": {"name": "bad/name"}}]
+    with pytest.raises(DxfWriteError) as exc_info:
+        validate_canonical(payload)
+    assert exc_info.value.code == "UNKNOWN_LAYER"
+
+
+def test_validate_canonical_fails_fast_on_unsupported_unit() -> None:
+    from app.cad.dxf import validate_canonical
+
+    payload = _base_payload()
+    payload["unit"] = "feet"
+    with pytest.raises(DxfWriteError) as exc_info:
+        validate_canonical(payload)
+    assert exc_info.value.code == "UNSUPPORTED_UNITS"
+
+
+def test_validate_canonical_fails_fast_on_ambiguous_layouts() -> None:
+    from app.cad.dxf import validate_canonical
+
+    payload = _base_payload()
+    payload["layouts"] = [
+        {"layout_ref": "p1", "payload": {"name": "Paper Space"}},
+        {"layout_ref": "p2", "payload": {"name": "Sheet 2"}},
+    ]
+    with pytest.raises(DxfWriteError) as exc_info:
+        validate_canonical(payload)
+    assert exc_info.value.code == "UNSUPPORTED_LAYOUT"
