@@ -29,8 +29,7 @@ from app.interpretation.devices import (
 )
 from app.interpretation.layer_roles import RULE_VERSION, classify_layer_role
 from app.interpretation.legend import resolve_legend_devices, schedule_from_legend_devices
-from app.models.adapter_run_output import AdapterRunOutput
-from app.models.drawing_revision import DrawingRevision
+from app.interpretation.loaders import load_adapter_text_blocks
 from app.models.revision_materialization import RevisionLayer
 from app.schemas.devices import (
     DeviceRead,
@@ -46,21 +45,6 @@ from app.schemas.revision import RevisionEntityManifestRead
 devices_router = APIRouter()
 
 _MAX_NESTING_DEPTH = 8
-
-
-async def _load_text_blocks(db: AsyncSession, revision: DrawingRevision) -> list[dict[str, object]]:
-    """Return the revision's extracted text blocks (from its adapter run output), or []."""
-
-    if revision.adapter_run_output_id is None:
-        return []
-    output = await db.get(AdapterRunOutput, revision.adapter_run_output_id)
-    if output is None or not output.canonical_json:
-        return []
-    metadata = output.canonical_json.get("metadata")
-    if not isinstance(metadata, dict):
-        return []
-    text_blocks = metadata.get("text_blocks")
-    return list(text_blocks) if isinstance(text_blocks, list) else []
 
 
 @devices_router.get(
@@ -141,7 +125,7 @@ async def list_revision_legend_devices(
         raise_not_found("Drawing revision", str(revision_id))
     assert revision is not None
 
-    text_blocks = await _load_text_blocks(db, revision)
+    text_blocks = await load_adapter_text_blocks(db, revision)
     dictionary, devices = resolve_legend_devices(text_blocks)
     schedule = schedule_from_legend_devices(devices)
 
