@@ -31,6 +31,54 @@ class ValidationReportSummary(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class CoverageEntities(BaseModel):
+    """Entity-level extraction coverage counts."""
+
+    total: int
+    mapped: int
+    unmapped: int
+    mapped_ratio: float
+    by_type: dict[str, int] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="allow")
+
+
+class CoverageLayers(BaseModel):
+    """Layer resolution coverage."""
+
+    count: int
+    entities_with_layer_ref: int
+    # Provenance of the layer set: native ("ocg") vs derived ("pen_signature") vs the
+    # source adapter's own table; null when the adapter does not record it.
+    source: str | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class CoverageBlocks(BaseModel):
+    """Block reference coverage."""
+
+    count: int
+    child_geometry_count: int
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ValidationReportCoverage(BaseModel):
+    """Honest extraction-coverage metrics (replacement signal for the confidence score)."""
+
+    schema_version: str
+    entities: CoverageEntities
+    unmapped_by_reason: dict[str, int] = Field(default_factory=dict)
+    layers: CoverageLayers
+    blocks: CoverageBlocks
+    review_flagged_entities: int
+    # Present only when the adapter records per-type entity counts in metadata.
+    adapter_counts: dict[str, int] | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ValidationReportResponse(BaseModel):
     """Canonical validation report returned by the API."""
 
@@ -46,6 +94,7 @@ class ValidationReportResponse(BaseModel):
     validator: ValidationReportValidator
     generated_at: datetime
     summary: ValidationReportSummary
+    coverage: ValidationReportCoverage | None = None
     checks: list[Any] = Field(default_factory=list)
     findings: list[Any] = Field(default_factory=list)
     adapter_warnings: list[Any] = Field(default_factory=list)

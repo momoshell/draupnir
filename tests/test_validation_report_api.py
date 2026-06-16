@@ -131,6 +131,22 @@ class TestValidationReportApi:
         assert body["adapter_warnings"] == validation_report.report_json["adapter_warnings"]
         assert body["provenance"] == validation_report.report_json["provenance"]
 
+        coverage = body["coverage"]
+        persisted_coverage = validation_report.report_json["coverage"]
+        # Every persisted coverage key round-trips; the typed schema may additionally
+        # surface optional fields (e.g. adapter_counts) as explicit nulls.
+        assert {key: coverage[key] for key in persisted_coverage} == persisted_coverage
+        assert coverage["schema_version"]
+        assert (
+            coverage["entities"]["total"]
+            == coverage["entities"]["mapped"] + (coverage["entities"]["unmapped"])
+        )
+        assert isinstance(coverage["entities"]["mapped_ratio"], float)
+        assert isinstance(coverage["entities"]["by_type"], dict)
+        assert isinstance(coverage["layers"]["count"], int)
+        assert isinstance(coverage["blocks"]["count"], int)
+        assert isinstance(coverage["review_flagged_entities"], int)
+
     async def test_get_validation_report_rewrites_nested_confidence_from_db_columns(
         self,
         async_client: httpx.AsyncClient,

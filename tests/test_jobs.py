@@ -425,6 +425,27 @@ def _build_fake_ingest_payload(
         "runner": "tests.fake_ingestion_runner",
         "detected_format": request.detected_format,
     }
+    coverage_json = {
+        "schema_version": "0.1",
+        "entities": {
+            "total": 1,
+            "mapped": 1,
+            "unmapped": 0,
+            "mapped_ratio": 1.0,
+            "by_type": {"line": 1},
+        },
+        "unmapped_by_reason": {},
+        "layers": {
+            "count": 1,
+            "entities_with_layer_ref": 0,
+            "source": None,
+        },
+        "blocks": {
+            "count": 0,
+            "child_geometry_count": 0,
+        },
+        "review_flagged_entities": 0,
+    }
     report_json = {
         "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
         "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
@@ -439,6 +460,7 @@ def _build_fake_ingest_payload(
             "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
             "entity_counts": entity_counts,
         },
+        "coverage": coverage_json,
         "checks": [],
         "findings": [],
         "adapter_warnings": warnings_json,
