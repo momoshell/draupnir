@@ -15,7 +15,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from types import ModuleType
-from typing import cast
+from typing import Any, cast
+
+from shapely.geometry import MultiPolygon, Polygon
+from shapely.ops import unary_union
 
 from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
@@ -313,12 +316,18 @@ class IfcOpenShellAdapter(IngestionAdapter):
         util_element = _resolve_element_module(runtime)
         units = _extract_units(project)
 
+        from app.core.config import settings as _settings
+
+        space_geometry_enabled = _settings.ifc_space_geometry_enabled
+
         raw_entities = [
             _extract_entity_payload(
                 product=product,
                 util_element=util_element,
                 units=units,
                 warnings=warnings,
+                runtime=runtime,
+                space_geometry_enabled=space_geometry_enabled,
             )
             for product in products
         ]
@@ -619,6 +628,8 @@ def _extract_entity_payload(
     util_element: object | None,
     units: Mapping[str, JSONValue],
     warnings: list[AdapterWarning],
+    runtime: ModuleType | None = None,
+    space_geometry_enabled: bool = False,
 ) -> _RawEntity:
     ifc_type = _entity_type(product)
     global_id = _string_or_none(getattr(product, "GlobalId", None))
@@ -690,7 +701,15 @@ def _extract_entity_payload(
         "psets": psets,
         "qtos": qtos,
         "material_refs": material_refs,
-        "geometry": _entity_geometry(units=units),
+        "geometry": _resolve_entity_geometry(
+            product=product,
+            ifc_type=ifc_type,
+            units=units,
+            runtime=runtime,
+            space_geometry_enabled=space_geometry_enabled,
+            step_id_token=step_id_token,
+            warnings=warnings,
+        ),
         "properties": _entity_properties(
             ifc_type=ifc_type,
             global_id=global_id,
@@ -771,6 +790,157 @@ def _entity_geometry(*, units: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
             "reason": "semantic_metadata_only",
         },
     }
+
+
+def _resolve_entity_geometry(
+    *,
+    product: object,
+    ifc_type: str,
+    units: Mapping[str, JSONValue],
+    runtime: ModuleType | None,
+    space_geometry_enabled: bool,
+    step_id_token: str | None,
+    warnings: list[AdapterWarning],
+) -> dict[str, JSONValue]:
+    """Return canonical geometry for one product.
+
+    Defaults to the semantic-only stub. When IfcSpace footprint extraction is
+    opted in (issue #462), IfcSpace entities get a tessellated footprint polygon;
+    a failure to extract one degrades to the stub with a warning.
+    """
+    if space_geometry_enabled and runtime is not None and _matches_ifc_type(product, "IfcSpace"):
+        geometry = _extract_space_geometry(product, runtime=runtime, units=units)
+        if geometry is not None:
+            return geometry
+        warnings.append(
+            _build_helper_warning(
+                code="ifc.space_geometry_unavailable",
+                message=(
+                    "IfcSpace footprint geometry could not be extracted; continuing with "
+                    "semantic metadata only."
+                ),
+                ifc_type=ifc_type,
+                step_id_token=step_id_token,
+            )
+        )
+    return _entity_geometry(units=units)
+
+
+# Minimum planar area (in the model's length unit²) for a tessellated triangle to
+# contribute to a space footprint; filters numerical-noise slivers.
+_FOOTPRINT_MIN_TRIANGLE_AREA = 1e-9
+
+
+def _footprint_from_mesh(
+    verts: Sequence[float],
+    faces: Sequence[int],
+) -> list[tuple[float, float]] | None:
+    """Project a tessellated mesh to the XY plane and return its footprint ring.
+
+    ``verts`` is a flat ``[x0, y0, z0, x1, y1, z1, ...]`` list and ``faces`` a flat
+    ``[i0, j0, k0, ...]`` triangle-index list (IfcOpenShell mesh layout). The
+    triangles are projected to XY and unioned; the exterior ring of the largest
+    resulting polygon is returned as ``(x, y)`` vertices (open ring, no repeated
+    closing point). Returns ``None`` when no positive-area footprint is formed.
+    """
+    if len(verts) < 9 or len(faces) < 3:
+        return None
+
+    points = [(float(verts[i]), float(verts[i + 1])) for i in range(0, len(verts) - 2, 3)]
+    triangles: list[Polygon] = []
+    for base in range(0, len(faces) - 2, 3):
+        try:
+            a, b, c = points[faces[base]], points[faces[base + 1]], points[faces[base + 2]]
+        except IndexError:
+            continue
+        triangle = Polygon((a, b, c))
+        if triangle.is_valid and triangle.area > _FOOTPRINT_MIN_TRIANGLE_AREA:
+            triangles.append(triangle)
+
+    if not triangles:
+        return None
+
+    merged = unary_union(triangles)
+    polygon = _largest_polygon(merged)
+    if polygon is None or polygon.area <= 0:
+        return None
+
+    ring = [(float(x), float(y)) for x, y in polygon.exterior.coords]
+    if len(ring) > 1 and ring[0] == ring[-1]:
+        ring.pop()
+    return ring if len(ring) >= 3 else None
+
+
+def _largest_polygon(geometry: object) -> Polygon | None:
+    """Return the largest-area polygon in a polygon/multipolygon union, or ``None``."""
+    if isinstance(geometry, Polygon):
+        return geometry if not geometry.is_empty else None
+    if isinstance(geometry, MultiPolygon):
+        polygons = [poly for poly in geometry.geoms if not poly.is_empty]
+        if not polygons:
+            return None
+        return max(polygons, key=lambda poly: float(poly.area))
+    return None
+
+
+def _extract_space_geometry(
+    product: object,
+    *,
+    runtime: ModuleType,
+    units: Mapping[str, JSONValue],
+) -> dict[str, JSONValue] | None:
+    """Tessellate an IfcSpace and emit its footprint as canonical polygon geometry.
+
+    Uses ``ifcopenshell.geom`` in world coordinates, projects the mesh to XY, and
+    builds a closed footprint polygon. Returns ``None`` on any failure (missing
+    geom module, no representation, degenerate footprint) so the caller can fall
+    back to the semantic-only stub.
+    """
+    geom_module = _resolve_geom_module(runtime)
+    if geom_module is None:
+        return None
+    try:
+        settings = geom_module.settings()
+        settings.set(settings.USE_WORLD_COORDS, True)
+        shape = geom_module.create_shape(settings, product)
+        mesh = shape.geometry
+        ring = _footprint_from_mesh(list(mesh.verts), list(mesh.faces))
+    except Exception:
+        return None
+    if ring is None:
+        return None
+
+    xs = [x for x, _ in ring]
+    ys = [y for _, y in ring]
+    vertices: tuple[JSONValue, ...] = tuple({"x": x, "y": y, "z": 0.0} for x, y in ring)
+    return {
+        "kind": "polygon",
+        "vertices": vertices,
+        "closed": True,
+        "bbox": {
+            "min": {"x": min(xs), "y": min(ys), "z": 0.0},
+            "max": {"x": max(xs), "y": max(ys), "z": 0.0},
+        },
+        "units": dict(units),
+        "status": "present",
+        "reason": "ifc_space_footprint",
+        "geometry_summary": {
+            "kind": "polygon",
+            "vertex_count": len(ring),
+            "closed": True,
+            "source": "ifcspace_tessellation",
+        },
+    }
+
+
+def _resolve_geom_module(runtime: ModuleType) -> Any:
+    geom_module = getattr(runtime, "geom", None)
+    if geom_module is not None:
+        return geom_module
+    try:
+        return importlib.import_module("ifcopenshell.geom")
+    except ModuleNotFoundError:
+        return None
 
 
 def _entity_properties(
