@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     pymupdf_max_drawings_per_page: int = 64_000
     pymupdf_max_total_drawings: int = 250_000
     pymupdf_max_entities: int = 250_000
+    # IFC extraction is semantic-first; shape tessellation is intentionally disabled
+    # by default. Opt in to extract IfcSpace footprint geometry (for room
+    # containment, issue #462) — this enables ifcopenshell.geom tessellation for
+    # IfcSpace entities only. See ADR / issue #462.
+    ifc_space_geometry_enabled: bool = False
     idempotency_key_hash_secret: str | None = None
     # How long an in-progress idempotency reservation may sit before an identical retry
     # is allowed to take it over (the original request crashed before completing).
