@@ -60,7 +60,6 @@ from app.jobs import runner as job_runner
 from app.jobs.conflict_diagnostics import (
     _build_changeset_apply_conflict_details,
     _build_quantity_conflict_summaries,
-    _quantity_gate_details,
 )
 from app.jobs.estimate_assembly import (
     _build_estimate_engine_input as _build_estimate_engine_input,
@@ -252,9 +251,6 @@ _PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexp
 _PROCESS_ESTIMATE_JOB_ERROR_MESSAGE = "Estimate job failed unexpectedly."
 _PROCESS_EXPORT_JOB_ERROR_MESSAGE = "Export job failed unexpectedly."
 _PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Changeset apply job failed unexpectedly."
-_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE = (
-    "Quantity takeoff is blocked by the revision validation gate."
-)
 _QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE = (
     "Quantity takeoff detected conflicting contributor inputs."
 )
@@ -2162,28 +2158,8 @@ async def _execute_quantity_takeoff_job_attempt(
     """Build quantity inputs, compute deterministic outputs, and defer finalization."""
     _ = deps  # uniform dispatch contract; no injected collaborators in this stage
     execution = await _build_quantity_takeoff_execution_input(job_id, attempt_token=attempt_token)
-    if execution.quantity_gate in {"review_gated", "blocked"}:
-        error_details = _quantity_gate_details(
-            drawing_revision_id=execution.drawing_revision_id,
-            review_state=execution.review_state,
-            validation_status=execution.validation_status,
-            quantity_gate=execution.quantity_gate,
-        )
-        await _mark_job_failed(
-            job_id,
-            error_message=_QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE,
-            error_code=ErrorCode.INPUT_INVALID,
-            attempt_token=attempt_token,
-            error_details=error_details,
-        )
-        logger.warning(
-            "quantity_takeoff_job_gate_blocked",
-            job_id=str(job_id),
-            error_code=ErrorCode.INPUT_INVALID.value,
-            **error_details,
-        )
-        return None
-
+    # Quantities are always computed; the gate is recorded as informational
+    # provenance on the takeoff rather than blocking the job (Path B 2).
     result = compute_quantities(execution.gate, execution.entities)
     if result.conflicts:
         error_details = {

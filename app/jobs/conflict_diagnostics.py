@@ -1,17 +1,15 @@
 """Pure builders for persisted job-failure diagnostic payloads.
 
 These helpers shape deterministic, size-bounded JSON metadata for job failures
-(quantity gate failures, quantity conflict summaries, and changeset-apply stale
-conflicts). They are pure transformations over their arguments — no DB access, no
-worker module state — extracted from ``worker.py`` to keep that module focused on
-orchestration.
+(quantity conflict summaries and changeset-apply stale conflicts). They are pure
+transformations over their arguments — no DB access, no worker module state —
+extracted from ``worker.py`` to keep that module focused on orchestration.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
-from uuid import UUID
 
 from app.cad.changeset import ChangeSetApplyConflict
 
@@ -20,22 +18,6 @@ _QUANTITY_CONFLICT_ENTITY_ID_LIMIT = 10
 _QUANTITY_CONFLICT_DETAIL_ITEM_LIMIT = 10
 _QUANTITY_CONFLICT_DETAIL_DEPTH_LIMIT = 3
 _QUANTITY_CONFLICT_TEXT_LIMIT = 200
-
-
-def _quantity_gate_details(
-    *,
-    drawing_revision_id: UUID,
-    review_state: str,
-    validation_status: str,
-    quantity_gate: str,
-) -> dict[str, Any]:
-    """Build stable structured metadata for quantity gate failures."""
-    return {
-        "drawing_revision_id": str(drawing_revision_id),
-        "review_state": review_state,
-        "validation_status": validation_status,
-        "quantity_gate": quantity_gate,
-    }
 
 
 def _bounded_conflict_text(value: Any) -> str | None:

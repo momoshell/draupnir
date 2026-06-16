@@ -134,12 +134,10 @@ def compute_quantities(
                 )
 
     deduped = deduplicate_contributors(candidates)
+    # Always compute aggregates; ``trusted_totals`` is informational provenance
+    # (true only for an ``allowed`` gate) rather than a gate on whether totals exist.
     trusted_totals = gate.status == "allowed"
-    aggregates = (
-        _aggregate(deduped.contributors, trusted=trusted_totals)
-        if gate.status in {"allowed", "allowed_provisional"}
-        else ()
-    )
+    aggregates = _aggregate(deduped.contributors, trusted=trusted_totals)
     return QuantityEngineResult(
         gate=gate,
         aggregates=aggregates,

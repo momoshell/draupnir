@@ -168,17 +168,20 @@ async def test_missing_validation_report_is_not_found() -> None:
     assert exc.value.error_code == ErrorCode.NOT_FOUND
 
 
-async def test_gated_report_short_circuits_with_no_entities() -> None:
-    # A review-gated/blocked report returns early without loading the manifest/entities.
+async def test_gated_report_still_loads_entities_and_records_gate() -> None:
+    # A review-gated/blocked report no longer short-circuits: it loads the manifest
+    # and entities like an allowed gate, recording the gate as informational metadata.
     loader = _FakeLoader(
         job=_job(),
         drawing_revision=_revision(),
         report=_report(quantity_gate="review_gated", review_state="review_required"),
-        manifest=None,  # would raise if reached
+        manifest=_manifest(2),
+        entities=[_entity("e1"), _entity("e2")],
     )
     execution = await _build(loader)
-    assert execution.entities == []
+    assert [e.entity_id for e in execution.entities] == ["e1", "e2"]
     assert execution.quantity_gate == "review_gated"
+    assert execution.gate.status == "review_gated"
     assert execution.gate.reason == "review_required"
 
 
