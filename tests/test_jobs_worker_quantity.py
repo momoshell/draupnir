@@ -900,6 +900,10 @@ class TestJobsWorkerQuantity:
         [
             ("approved", "valid", "allowed", True),
             ("provisional", "valid", "allowed_provisional", False),
+            # Path B 2: review-gated/blocked revisions now compute a populated takeoff
+            # (no job failure); only ``trusted_totals`` reflects the gate.
+            ("review_required", "needs_review", "review_gated", False),
+            ("rejected", "invalid", "blocked", False),
         ],
     )
     async def test_process_quantity_takeoff_job_persists_expected_takeoff(
@@ -913,7 +917,7 @@ class TestJobsWorkerQuantity:
         quantity_gate: str,
         trusted_totals: bool,
     ) -> None:
-        """Quantity worker should persist trusted outputs for allowed gates."""
+        """Quantity worker should persist a populated takeoff for every gate status."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -1082,7 +1086,7 @@ class TestJobsWorkerQuantity:
         fixture_filename: str,
         quantity_gate: str,
     ) -> None:
-        """Non-DXF fixture manifest entries should deterministically keep totals untrusted."""
+        """Non-DXF gated fixtures publish a takeoff with untrusted (not blocked) totals."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -1122,16 +1126,18 @@ class TestJobsWorkerQuantity:
 
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
-        assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert takeoffs == []
+        assert updated_job.status == "succeeded"
+        assert updated_job.error_code is None
+        assert len(takeoffs) == 1
+        assert takeoffs[0].quantity_gate == quantity_gate
+        assert takeoffs[0].trusted_totals is False
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
-        assert event_payload["status"] == "failed"
-        assert event_payload["details"]["quantity_gate"] == quantity_gate
-        assert "trusted_totals" not in event_payload
+        assert event_payload["status"] == "succeeded"
+        assert event_payload["quantity_gate"] == quantity_gate
+        assert event_payload["trusted_totals"] is False
 
     async def test_process_quantity_takeoff_job_manifest_dxf_rerun_semantics_are_stable(
         self,
@@ -1633,7 +1639,7 @@ class TestJobsWorkerQuantity:
             ("rejected", "invalid", "blocked"),
         ],
     )
-    async def test_process_quantity_takeoff_job_short_circuits_gate_before_materialization(
+    async def test_process_quantity_takeoff_job_computes_gated_revision_from_materialization(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
@@ -1643,7 +1649,7 @@ class TestJobsWorkerQuantity:
         validation_status: str,
         quantity_gate: str,
     ) -> None:
-        """Gate failures should not require normalized entity materialization lookups."""
+        """Review-gated/blocked revisions load materialization and compute untrusted totals."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -1657,100 +1663,31 @@ class TestJobsWorkerQuantity:
                 validation_status=validation_status,
                 quantity_gate=quantity_gate,
             )
-
-        async def _unexpected_manifest_lookup(*_: Any, **__: Any) -> None:
-            raise AssertionError("Quantity gate failures must short-circuit before materialization")
 
         monkeypatch.setattr(worker_module, "run_ingestion", _run_review_gated_ingestion)
         _, _, _, _, quantity_job = await _create_ready_quantity_takeoff_job(async_client)
-        monkeypatch.setattr(
-            worker_module,
-            "_get_revision_entity_manifest_for_revision",
-            _unexpected_manifest_lookup,
-        )
 
         await worker_module.process_quantity_takeoff_job(quantity_job.id)
 
         updated_job = await _get_job(quantity_job.id)
         takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
-        assert updated_job.status == "failed"
-        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert (
-            updated_job.error_message == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
-        )
-        assert takeoffs == []
+        assert updated_job.status == "succeeded"
+        assert updated_job.error_code is None
+        assert len(takeoffs) == 1
+        takeoff = takeoffs[0]
+        assert takeoff.quantity_gate == quantity_gate
+        assert takeoff.trusted_totals is False
 
-    @pytest.mark.parametrize(
-        ("review_state", "validation_status", "quantity_gate"),
-        [
-            ("review_required", "needs_review", "review_gated"),
-            ("rejected", "invalid", "blocked"),
-        ],
-    )
-    async def test_process_quantity_takeoff_job_fails_review_only_gate_without_rows(
-        self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        enqueued_job_ids: list[str],
-        monkeypatch: pytest.MonkeyPatch,
-        review_state: str,
-        validation_status: str,
-        quantity_gate: str,
-    ) -> None:
-        """Quantity worker should fail terminally when validation gate blocks execution."""
-        _ = self
-        _ = cleanup_projects
-        _ = enqueued_job_ids
-
-        async def _run_review_gated_ingestion(
-            request: IngestionRunRequest,
-        ) -> IngestFinalizationPayload:
-            return _build_fake_quantity_ingest_payload(
-                request,
-                review_state=review_state,
-                validation_status=validation_status,
-                quantity_gate=quantity_gate,
-            )
-
-        monkeypatch.setattr(worker_module, "run_ingestion", _run_review_gated_ingestion)
-
-        project = await _create_project(async_client)
-        uploaded = await _upload_file(async_client, project["id"])
-        ingest_job = await _get_job_for_file(str(uploaded["id"]))
-        await worker_module.process_ingest_job(ingest_job.id)
-        base_revision = await _get_latest_revision_for_file(uuid.UUID(uploaded["id"]))
-        assert base_revision is not None
-
-        quantity_job = await _create_quantity_takeoff_job(
-            project_id=uuid.UUID(project["id"]),
-            file_id=uuid.UUID(uploaded["id"]),
-            base_revision_id=base_revision.id,
-            parent_job_id=ingest_job.id,
-            status="pending",
-        )
-
-        await worker_module.process_quantity_takeoff_job(quantity_job.id)
-
-        updated_job = await _get_job(quantity_job.id)
-        takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
-        assert updated_job.status == "failed"
-        assert updated_job.attempts == 1
-        assert updated_job.error_code == ErrorCode.INPUT_INVALID.value
-        assert (
-            updated_job.error_message == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
-        )
-        assert takeoffs == []
+        items = await _get_quantity_items_for_takeoff(takeoff.id)
+        assert items, "gated revision should still produce quantity items"
+        assert all(item.quantity_gate == quantity_gate for item in items)
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
-        assert event_payload["status"] == "failed"
-        assert event_payload["error_code"] == ErrorCode.INPUT_INVALID.value
-        assert (
-            event_payload["error_message"]
-            == worker_module._QUANTITY_TAKEOFF_GATE_BLOCKED_ERROR_MESSAGE
-        )
-        assert event_payload["details"]["quantity_gate"] == quantity_gate
+        assert event_payload["status"] == "succeeded"
+        assert event_payload["trusted_totals"] is False
+        assert event_payload["quantity_gate"] == quantity_gate
 
     async def test_process_quantity_takeoff_job_fails_conflicts_without_rows(
         self,

@@ -37,9 +37,7 @@ def test_allowed_line_length_is_trusted_and_summarizes_bbox() -> None:
         ("length", "model"): 10.0,
     }
     contributor = next(
-        contributor
-        for contributor in result.contributors
-        if contributor.quantity_type == "length"
+        contributor for contributor in result.contributors if contributor.quantity_type == "length"
     )
     assert contributor.bbox is not None
     assert contributor.bbox.min_x == 0.0
@@ -111,8 +109,7 @@ def test_allowed_provisional_totals_are_not_trusted() -> None:
 
     assert result.trusted_totals is False
     totals = {
-        (aggregate.quantity_type, aggregate.context): aggregate
-        for aggregate in result.aggregates
+        (aggregate.quantity_type, aggregate.context): aggregate for aggregate in result.aggregates
     }
     assert totals[("length", None)].total == 5.0
     assert totals[("length", None)].trusted is False
@@ -120,7 +117,7 @@ def test_allowed_provisional_totals_are_not_trusted() -> None:
     assert totals[("count", "line_count")].total == 1.0
 
 
-def test_review_gated_suppresses_aggregates() -> None:
+def test_review_gated_totals_are_computed_but_not_trusted() -> None:
     result = compute_quantities(
         RevisionGateMetadata(status="review_gated", reason="scale_unknown"),
         [
@@ -142,8 +139,14 @@ def test_review_gated_suppresses_aggregates() -> None:
         ],
     )
 
-    assert result.aggregates == ()
+    # Aggregates are always computed; the gate only marks totals untrusted (Path B 2).
+    assert result.trusted_totals is False
     assert len(result.contributors) == 3
+    totals = {
+        (aggregate.quantity_type, aggregate.context): aggregate for aggregate in result.aggregates
+    }
+    assert totals[("length", None)].total == 7.0
+    assert all(aggregate.trusted is False for aggregate in result.aggregates)
 
 
 def test_source_hash_dedups_identical_contributors_and_conflicts_on_mismatch() -> None:
@@ -200,9 +203,7 @@ def test_source_hash_dedups_identical_contributors_and_conflicts_on_mismatch() -
     )
     assert len(deduped.contributors) == 3
     length_contributor = next(
-        contributor
-        for contributor in deduped.contributors
-        if contributor.quantity_type == "length"
+        contributor for contributor in deduped.contributors if contributor.quantity_type == "length"
     )
     assert length_contributor.duplicate_entity_ids == ("line-2",)
     totals = {
@@ -270,9 +271,7 @@ def test_missing_source_hash_uses_fingerprint_scoped_lower_trust_fallback() -> N
     )
 
     length_contributors = [
-        contributor
-        for contributor in result.contributors
-        if contributor.quantity_type == "length"
+        contributor for contributor in result.contributors if contributor.quantity_type == "length"
     ]
     assert len(length_contributors) == 2
     assert {contributor.value for contributor in length_contributors} == {5.0, 10.0}
@@ -460,9 +459,7 @@ def test_adapter_style_normalized_units_aggregate_length() -> None:
         ("length", None): 5.0,
     }
     length_contributor = next(
-        contributor
-        for contributor in result.contributors
-        if contributor.quantity_type == "length"
+        contributor for contributor in result.contributors if contributor.quantity_type == "length"
     )
     assert length_contributor.unit == "meter"
 

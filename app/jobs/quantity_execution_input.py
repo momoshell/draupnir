@@ -170,16 +170,6 @@ async def build_quantity_takeoff_execution_input(
             details={"drawing_revision_id": str(drawing_revision.id)},
         )
 
-    if report.quantity_gate in {"review_gated", "blocked"}:
-        return _QuantityTakeoffExecutionInput(
-            drawing_revision_id=drawing_revision.id,
-            review_state=report.review_state,
-            validation_status=report.validation_status,
-            quantity_gate=report.quantity_gate,
-            gate=_build_quantity_gate_metadata(report),
-            entities=[],
-        )
-
     manifest = await loader.get_entity_manifest(
         project_id=job.project_id,
         source_file_id=job.file_id,
