@@ -30,6 +30,9 @@ from app.api.v1.revision_routes.quantity_takeoffs import (
     quantity_takeoff_create_router,
     quantity_takeoffs_router,
 )
+from app.api.v1.revision_routes.rooms import (
+    rooms_router,
+)
 from app.api.v1.revision_routes.validation_reports import (
     validation_reports_router,
 )
@@ -43,6 +46,7 @@ revisions_router.include_router(changesets_router)
 revisions_router.include_router(generated_artifacts_router)
 revisions_router.include_router(materialization_router)
 revisions_router.include_router(devices_router)
+revisions_router.include_router(rooms_router)
 revisions_router.include_router(quantity_takeoffs_router)
 revisions_router.include_router(estimates_router)
 revisions_router.include_router(exports_router)
