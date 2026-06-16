@@ -25,7 +25,12 @@ from app.interpretation.geometry import (
 
 @dataclass(frozen=True, slots=True)
 class Room:
-    """A room/space candidate with its geometry and (optional) resolved name."""
+    """A room/space candidate with its geometry and (optional) resolved name.
+
+    ``confidence`` is an optional provenance caveat in ``[0, 1]`` for heuristic
+    sources (e.g. wall-derived rooms); ``None`` means "not scored" (e.g. an
+    explicit room-boundary polygon, taken at face value).
+    """
 
     id: str
     name: str | None
@@ -33,6 +38,7 @@ class Room:
     polygon: Polygon
     area: float
     bounds: BoundingBox
+    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,7 @@ def room_from_polygon(
     *,
     source: str,
     name: str | None = None,
+    confidence: float | None = None,
 ) -> Room:
     """Build a :class:`Room`, deriving area and bounds from the polygon."""
     return Room(
@@ -74,6 +81,7 @@ def room_from_polygon(
         polygon=polygon,
         area=polygon_area(polygon),
         bounds=bounding_box(polygon),
+        confidence=confidence,
     )
 
 
