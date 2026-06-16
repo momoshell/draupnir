@@ -913,6 +913,12 @@ def _extract_space_geometry(
     xs = [x for x, _ in ring]
     ys = [y for _, y in ring]
     vertices: tuple[JSONValue, ...] = tuple({"x": x, "y": y, "z": 0.0} for x, y in ring)
+    # The space's room name/number travel with the footprint so the interpretation
+    # tier (issue #429) can name IFC-sourced rooms without re-reading the model.
+    space_name = _string_or_none(getattr(product, "LongName", None)) or _string_or_none(
+        getattr(product, "Name", None)
+    )
+    space_number = _string_or_none(getattr(product, "Name", None))
     return {
         "kind": "polygon",
         "vertices": vertices,
@@ -924,6 +930,8 @@ def _extract_space_geometry(
         "units": dict(units),
         "status": "present",
         "reason": "ifc_space_footprint",
+        "name": space_name,
+        "number": space_number,
         "geometry_summary": {
             "kind": "polygon",
             "vertex_count": len(ring),

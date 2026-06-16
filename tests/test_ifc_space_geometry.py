@@ -109,8 +109,14 @@ def _runtime_with_geom(geom: object | None) -> ModuleType:
     return module
 
 
-def _space(ifc_type: str = "IfcSpace") -> SimpleNamespace:
-    return SimpleNamespace(is_a=lambda query=None: query == ifc_type if query else ifc_type)
+def _space(
+    ifc_type: str = "IfcSpace", *, long_name: str | None = None, name: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_a=lambda query=None: query == ifc_type if query else ifc_type,
+        LongName=long_name,
+        Name=name,
+    )
 
 
 # --- _extract_space_geometry ---
@@ -128,6 +134,15 @@ def test_extract_space_geometry_emits_polygon() -> None:
         "max": {"x": 1.0, "y": 1.0, "z": 0.0},
     }
     assert len(geometry["vertices"]) == 4  # type: ignore[arg-type]
+
+
+def test_extract_space_geometry_carries_space_name_and_number() -> None:
+    runtime = _runtime_with_geom(_FakeGeomModule(_SQUARE_VERTS, _SQUARE_FACES))
+    space = _space(long_name="Conference Room", name="C-204")
+    geometry = _extract_space_geometry(space, runtime=runtime, units=_UNITS)
+    assert geometry is not None
+    assert geometry["name"] == "Conference Room"  # LongName preferred
+    assert geometry["number"] == "C-204"
 
 
 def test_extract_space_geometry_returns_none_without_geom_module() -> None:
