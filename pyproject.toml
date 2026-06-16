@@ -208,6 +208,11 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 strict_optional = true
 
+[[tool.mypy.overrides]]
+# shapely ships no type stubs / py.typed marker; treat as untyped at the boundary.
+module = ["shapely.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
