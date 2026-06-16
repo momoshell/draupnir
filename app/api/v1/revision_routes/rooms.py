@@ -32,8 +32,9 @@ from app.schemas.rooms import (
 
 rooms_router = APIRouter()
 
-# Entity types that can form room boundaries (closed polylines) or wall linework.
-_ROOM_GEOMETRY_ENTITY_TYPES = ("polyline", "line")
+# Entity types that can form room geometry: closed polylines / wall linework, plus
+# IFC products (IfcSpace footprints carry their geometry on an ifc_product entity).
+_ROOM_GEOMETRY_ENTITY_TYPES = ("polyline", "line", "ifc_product")
 _MAX_NESTING_DEPTH = 8
 
 

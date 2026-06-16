@@ -89,18 +89,22 @@ def assign_labels_to_rooms(
     rooms: Sequence[Room],
     labels: Sequence[RoomLabel],
 ) -> list[Room]:
-    """Name each room from the tag text whose point falls inside it.
+    """Name each *unnamed* room from the tag text whose point falls inside it.
 
     A label is matched to the smallest room containing its point. The first label
-    (in input order) matched to a room wins; rooms with no matching label keep
-    their existing name. Returns a new list; inputs are not mutated.
+    (in input order) matched to a room wins. A room that already has a name (e.g.
+    an authoritative IfcSpace name) is never overridden; rooms with no matching
+    label keep their existing name. Returns a new list; inputs are not mutated.
     """
     names: dict[str, str] = {}
     for label in labels:
         room = _smallest_containing_room(label.point, rooms)
         if room is not None:
             names.setdefault(room.id, label.text)
-    return [replace(room, name=names.get(room.id, room.name)) for room in rooms]
+    return [
+        replace(room, name=room.name if room.name is not None else names.get(room.id))
+        for room in rooms
+    ]
 
 
 def assign_devices_to_rooms(

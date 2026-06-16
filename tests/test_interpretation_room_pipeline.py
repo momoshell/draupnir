@@ -14,6 +14,7 @@ from app.api.v1.revision_routes.rooms import _device_placements, _room_labels
 from app.interpretation.devices import Device, _TagCandidate
 from app.interpretation.room_pipeline import (
     ROOM_STRATEGY_EXPLICIT,
+    ROOM_STRATEGY_IFC,
     ROOM_STRATEGY_WALLS,
     interpret_rooms,
 )
@@ -53,6 +54,20 @@ def _wall_line(start: tuple[float, float], end: tuple[float, float]) -> _FakeEnt
     )
 
 
+def _ifc_space(vertices: list[tuple[float, float]], *, name: str | None = None) -> _FakeEntity:
+    return _FakeEntity(
+        f"space-{vertices[0]}",
+        None,
+        {
+            "kind": "polygon",
+            "closed": True,
+            "reason": "ifc_space_footprint",
+            "name": name,
+            "vertices": [{"x": x, "y": y, "z": 0.0} for x, y in vertices],
+        },
+    )
+
+
 SQUARE = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
 
 
@@ -70,6 +85,33 @@ def test_auto_prefers_explicit_layer_when_present() -> None:
     assert result.strategy == ROOM_STRATEGY_EXPLICIT
     assert result.source_layers == ("A-ROOM",)
     assert len(result.rooms) == 1
+
+
+def test_auto_prefers_ifc_spaces_over_explicit_and_walls() -> None:
+    entities = [
+        _ifc_space(SQUARE, name="Atrium"),
+        _closed_polyline(SQUARE, layer="A-ROOM"),
+        *_square_wall_lines(),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=[])
+    assert result.strategy == ROOM_STRATEGY_IFC
+    assert result.source_layers == ()
+    assert len(result.rooms) == 1
+    assert result.rooms[0].name == "Atrium"
+
+
+def test_ifc_strategy_forced_even_when_empty() -> None:
+    result = interpret_rooms(
+        _square_wall_lines(), devices=[], labels=[], strategy=ROOM_STRATEGY_IFC
+    )
+    assert result.strategy == ROOM_STRATEGY_IFC
+    assert result.rooms == []
+
+
+def test_auto_skips_ifc_when_no_spaces_present() -> None:
+    entities = [_closed_polyline(SQUARE, layer="A-ROOM")]
+    result = interpret_rooms(entities, devices=[], labels=[])
+    assert result.strategy == ROOM_STRATEGY_EXPLICIT
 
 
 def test_auto_falls_back_to_walls_without_explicit_layer() -> None:
