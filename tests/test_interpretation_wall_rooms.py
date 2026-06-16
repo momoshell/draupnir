@@ -11,7 +11,9 @@ from typing import Any
 
 from app.interpretation.rooms import DevicePlacement, RoomLabel
 from app.interpretation.wall_rooms import (
+    GAP_CLOSED_ROOM_CONFIDENCE,
     ROOM_SOURCE_WALL_POLYGONIZE,
+    WALL_ROOM_CONFIDENCE,
     build_rooms_from_walls,
     detect_wall_layers,
     interpret_wall_rooms,
@@ -148,3 +150,52 @@ def test_interpret_wall_rooms_no_wall_layer() -> None:
     result = interpret_wall_rooms(entities, devices=[], labels=[])
     assert result.rooms == []
     assert result.wall_layers == ()
+
+
+# --- robustness (#428b): gap-close, slivers, confidence ---
+
+
+def _walls_with_door_gap(gap: float) -> list[_FakeEntity]:
+    # A square whose bottom edge has a `gap`-wide door opening at the middle.
+    return [
+        _line((0.0, 0.0), (5.0 - gap / 2, 0.0)),  # bottom-left up to the opening
+        _line((5.0 + gap / 2, 0.0), (10.0, 0.0)),  # bottom-right after the opening
+        _line((10.0, 0.0), (10.0, 10.0)),
+        _line((10.0, 10.0), (0.0, 10.0)),
+        _line((0.0, 10.0), (0.0, 0.0)),
+    ]
+
+
+def test_door_gap_breaks_loop_without_snapping() -> None:
+    rooms = build_rooms_from_walls(_walls_with_door_gap(0.9), layer_refs={"A-WALL"})
+    assert rooms == []  # the opening leaves the loop unclosed
+
+
+def test_snap_tolerance_closes_door_gap_and_lowers_confidence() -> None:
+    rooms = build_rooms_from_walls(
+        _walls_with_door_gap(0.9), layer_refs={"A-WALL"}, snap_tolerance=1.0
+    )
+    assert len(rooms) == 1
+    assert rooms[0].confidence == GAP_CLOSED_ROOM_CONFIDENCE
+
+
+def test_clean_loop_keeps_base_confidence_even_with_snap_enabled() -> None:
+    # Snapping is enabled but nothing needs bridging -> base confidence.
+    rooms = build_rooms_from_walls(_square_walls(SQUARE), layer_refs={"A-WALL"}, snap_tolerance=1.0)
+    assert len(rooms) == 1
+    assert rooms[0].confidence == WALL_ROOM_CONFIDENCE
+
+
+def test_min_area_drops_sliver_faces() -> None:
+    # A big room plus a tiny 1x1 sliver room; min_area filters the sliver.
+    big = _square_walls(SQUARE)
+    sliver = _square_walls([(20.0, 20.0), (21.0, 20.0), (21.0, 21.0), (20.0, 21.0)])
+    rooms = build_rooms_from_walls([*big, *sliver], layer_refs={"A-WALL"}, min_area=10.0)
+    assert [room.area for room in rooms] == [100.0]
+
+
+def test_snap_tolerance_does_not_over_merge_distinct_corners() -> None:
+    # A clean square with tolerance smaller than the shortest edge stays one room.
+    rooms = build_rooms_from_walls(_square_walls(SQUARE), layer_refs={"A-WALL"}, snap_tolerance=0.5)
+    assert len(rooms) == 1
+    assert rooms[0].area == 100.0
