@@ -23,9 +23,6 @@ class ValidationReportSummary(BaseModel):
     """Authoritative validation summary details."""
 
     validation_status: str
-    review_state: str
-    quantity_gate: str
-    effective_confidence: float
     entity_counts: dict[str, int] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="allow")
@@ -88,9 +85,6 @@ class ValidationReportResponse(BaseModel):
     validation_report_schema_version: str
     canonical_entity_schema_version: str
     validation_status: str
-    review_state: str
-    quantity_gate: str
-    effective_confidence: float
     validator: ValidationReportValidator
     generated_at: datetime
     summary: ValidationReportSummary
@@ -115,15 +109,12 @@ def build_validation_report_response(report: ValidationReport) -> ValidationRepo
     summary_json = report_json.get("summary")
     summary = dict(summary_json) if isinstance(summary_json, dict) else {}
     summary["validation_status"] = report.validation_status
-    summary["review_state"] = report.review_state
-    summary["quantity_gate"] = report.quantity_gate
-    summary["effective_confidence"] = report.effective_confidence
-
-    confidence_json = report_json.get("confidence")
-    confidence = dict(confidence_json) if isinstance(confidence_json, dict) else {}
-    confidence["effective_confidence"] = report.effective_confidence
-    confidence["review_state"] = report.review_state
-    confidence["review_required"] = report.review_state == "review_required"
+    # Path B 5a: confidence/gate fields are no longer exposed. Strip any persisted
+    # copies so they don't leak through the model's extra="allow" passthrough.
+    for vestigial_key in ("review_state", "quantity_gate", "effective_confidence"):
+        summary.pop(vestigial_key, None)
+        report_json.pop(vestigial_key, None)
+    report_json.pop("confidence", None)
 
     report_json["validation_report_id"] = report.id
     report_json["drawing_revision_id"] = report.drawing_revision_id
@@ -131,11 +122,7 @@ def build_validation_report_response(report: ValidationReport) -> ValidationRepo
     report_json["validation_report_schema_version"] = report.validation_report_schema_version
     report_json["canonical_entity_schema_version"] = report.canonical_entity_schema_version
     report_json["validation_status"] = report.validation_status
-    report_json["review_state"] = report.review_state
-    report_json["quantity_gate"] = report.quantity_gate
-    report_json["effective_confidence"] = report.effective_confidence
     report_json["validator"] = validator
-    report_json["confidence"] = confidence
     report_json["generated_at"] = report.generated_at
     report_json["summary"] = summary
 

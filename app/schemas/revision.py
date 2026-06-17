@@ -34,12 +34,10 @@ class DrawingRevisionRead(BaseModel):
     )
     revision_sequence: int = Field(..., ge=1, description="Monotonic revision sequence")
     revision_kind: str = Field(..., description="Revision lifecycle kind")
-    review_state: str = Field(..., description="Revision review state")
     canonical_entity_schema_version: str = Field(
         ...,
         description="Canonical entity schema version used by the revision",
     )
-    confidence_score: float = Field(..., description="Effective revision confidence score")
     created_at: datetime = Field(..., description="Revision creation timestamp")
 
 
@@ -73,7 +71,6 @@ class AdapterRunOutputRead(BaseModel):
         ...,
         description="Canonical entity schema version emitted by the adapter",
     )
-    confidence_score: float = Field(..., description="Adapter output confidence score")
     result_checksum_sha256: str = Field(
         ...,
         min_length=64,
@@ -294,7 +291,6 @@ class RevisionEntityRead(BaseModel):
         None,
         description="Raw parent entity reference from the canonical payload",
     )
-    confidence_score: float = Field(..., description="Entity confidence score")
     confidence: dict[str, Any] = Field(
         validation_alias="confidence_json",
         description="Entity confidence payload",

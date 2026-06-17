@@ -107,25 +107,22 @@ class TestValidationReportApi:
             == validation_report.canonical_entity_schema_version
         )
         assert body["validation_status"] == validation_report.validation_status
-        assert body["review_state"] == validation_report.review_state
-        assert body["quantity_gate"] == validation_report.quantity_gate
-        assert body["effective_confidence"] == validation_report.effective_confidence
+        # Path B 5a: confidence/gate fields are no longer exposed in the response.
+        assert "review_state" not in body
+        assert "quantity_gate" not in body
+        assert "effective_confidence" not in body
+        assert "confidence" not in body
         assert body["validator"] == {
             "name": validation_report.validator_name,
             "version": validation_report.validator_version,
         }
-        assert body["confidence"]["effective_confidence"] == validation_report.effective_confidence
-        assert body["confidence"]["review_state"] == validation_report.review_state
-        assert body["confidence"]["review_required"] == (
-            validation_report.review_state == "review_required"
-        )
         assert _parse_timestamp(body["generated_at"]) == (
             validation_report.generated_at.astimezone(UTC)
         )
         assert body["summary"]["validation_status"] == validation_report.validation_status
-        assert body["summary"]["review_state"] == validation_report.review_state
-        assert body["summary"]["quantity_gate"] == validation_report.quantity_gate
-        assert body["summary"]["effective_confidence"] == validation_report.effective_confidence
+        assert "review_state" not in body["summary"]
+        assert "quantity_gate" not in body["summary"]
+        assert "effective_confidence" not in body["summary"]
         assert body["checks"]
         assert body["findings"] == validation_report.report_json["findings"]
         assert body["adapter_warnings"] == validation_report.report_json["adapter_warnings"]
@@ -147,14 +144,14 @@ class TestValidationReportApi:
         assert isinstance(coverage["blocks"]["count"], int)
         assert isinstance(coverage["review_flagged_entities"], int)
 
-    async def test_get_validation_report_rewrites_nested_confidence_from_db_columns(
+    async def test_get_validation_report_does_not_leak_persisted_confidence_gate(
         self,
         async_client: httpx.AsyncClient,
         cleanup_projects: None,
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """API output should prefer persisted columns over stale nested confidence JSON."""
+        """Persisted confidence/gate JSON must not leak through extra='allow' (Path B 5a)."""
         _ = self
         _ = cleanup_projects
         _ = enqueued_job_ids
@@ -214,21 +211,16 @@ class TestValidationReportApi:
 
         assert response.status_code == 200
         body = response.json()
+        # validation_status is still surfaced; the vestigial confidence/gate fields
+        # are stripped even though they remain in the persisted report_json.
         assert body["validation_status"] == "needs_review"
-        assert body["review_state"] == "review_required"
-        assert body["quantity_gate"] == "review_gated"
-        assert body["effective_confidence"] == 0.59
-        assert body["summary"]["validation_status"] == "needs_review"
-        assert body["summary"]["review_state"] == "review_required"
-        assert body["summary"]["quantity_gate"] == "review_gated"
-        assert body["summary"]["effective_confidence"] == 0.59
-        assert body["confidence"] == {
-            "score": 0.95,
-            "effective_confidence": 0.59,
-            "review_state": "review_required",
-            "review_required": True,
-            "basis": "stale",
-        }
+        assert "review_state" not in body
+        assert "quantity_gate" not in body
+        assert "effective_confidence" not in body
+        assert "confidence" not in body
+        assert "review_state" not in body["summary"]
+        assert "quantity_gate" not in body["summary"]
+        assert "effective_confidence" not in body["summary"]
 
     async def test_get_validation_report_returns_404_for_missing_revision(
         self,
@@ -442,12 +434,12 @@ class TestValidationReportApi:
         assert item["predecessor_revision_id"] is None
         assert item["revision_sequence"] == drawing_revision.revision_sequence
         assert item["revision_kind"] == drawing_revision.revision_kind
-        assert item["review_state"] == drawing_revision.review_state
+        assert "review_state" not in item
         assert (
             item["canonical_entity_schema_version"]
             == drawing_revision.canonical_entity_schema_version
         )
-        assert item["confidence_score"] == drawing_revision.confidence_score
+        assert "confidence_score" not in item
         assert _parse_timestamp(item["created_at"]) == drawing_revision.created_at.astimezone(UTC)
 
     async def test_list_file_revisions_serializes_changeset_origin_null_origins(
@@ -541,12 +533,12 @@ class TestValidationReportApi:
         assert changeset_item["predecessor_revision_id"] == str(drawing_revision.id)
         assert changeset_item["revision_sequence"] == changeset_revision.revision_sequence
         assert changeset_item["revision_kind"] == changeset_revision.revision_kind
-        assert changeset_item["review_state"] == changeset_revision.review_state
+        assert "review_state" not in changeset_item
         assert (
             changeset_item["canonical_entity_schema_version"]
             == changeset_revision.canonical_entity_schema_version
         )
-        assert changeset_item["confidence_score"] == changeset_revision.confidence_score
+        assert "confidence_score" not in changeset_item
         assert _parse_timestamp(changeset_item["created_at"]) == changeset_created_at.astimezone(
             UTC
         )
@@ -702,7 +694,7 @@ class TestValidationReportApi:
             by_revision_body["canonical_entity_schema_version"]
             == adapter_output.canonical_entity_schema_version
         )
-        assert by_revision_body["confidence_score"] == adapter_output.confidence_score
+        assert "confidence_score" not in by_revision_body
         assert by_revision_body["result_checksum_sha256"] == adapter_output.result_checksum_sha256
         assert _parse_timestamp(by_revision_body["created_at"]) == (
             adapter_output.created_at.astimezone(UTC)
