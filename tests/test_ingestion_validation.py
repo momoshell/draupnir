@@ -145,19 +145,17 @@ def _build_result(
 
 
 @pytest.mark.parametrize(
-    ("score", "validation_status", "review_state", "quantity_gate"),
+    ("score", "validation_status"),
     [
-        (0.59, "needs_review", "review_required", "review_gated"),
-        (0.60, "valid", "provisional", "allowed_provisional"),
-        (0.949, "valid", "provisional", "allowed_provisional"),
-        (0.95, "valid", "approved", "allowed"),
+        (0.59, "needs_review"),
+        (0.60, "valid"),
+        (0.949, "valid"),
+        (0.95, "valid"),
     ],
 )
 def test_build_validation_outcome_applies_confidence_thresholds(
     score: float,
     validation_status: str,
-    review_state: str,
-    quantity_gate: str,
 ) -> None:
     outcome = build_validation_outcome(
         input_family=InputFamily.DXF,
@@ -168,8 +166,6 @@ def test_build_validation_outcome_applies_confidence_thresholds(
     )
 
     assert outcome.validation_status == validation_status
-    assert outcome.review_state == review_state
-    assert outcome.quantity_gate == quantity_gate
 
 
 def test_build_validation_outcome_raster_is_review_first() -> None:
@@ -181,11 +177,7 @@ def test_build_validation_outcome_raster_is_review_first() -> None:
         generated_at=_GENERATED_AT,
     )
 
-    assert outcome.confidence_score == 0.99
-    assert outcome.effective_confidence == 0.59
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
     assert outcome.report_json["findings"][0]["check_key"] == "raster_review_policy"
 
 
@@ -210,8 +202,6 @@ def test_build_validation_outcome_missing_pdf_scale_requires_review() -> None:
         "calibration_status": "missing",
     }
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 def test_build_validation_outcome_missing_ifc_schema_blocks_quantities() -> None:
@@ -237,10 +227,7 @@ def test_build_validation_outcome_missing_ifc_schema_blocks_quantities() -> None
         "schema_present": False,
         "supported": False,
     }
-    assert outcome.effective_confidence == 0.0
     assert outcome.validation_status == "invalid"
-    assert outcome.review_state == "rejected"
-    assert outcome.quantity_gate == "blocked"
 
 
 def test_build_validation_outcome_aggregates_adapter_warnings() -> None:
@@ -257,7 +244,6 @@ def test_build_validation_outcome_aggregates_adapter_warnings() -> None:
     )
 
     assert outcome.validation_status == "valid_with_warnings"
-    assert outcome.review_state == "approved"
     assert outcome.report_json["adapter_warnings"] == [
         {"code": "layer-map", "message": "Layer map incomplete", "details": None},
         {
@@ -420,8 +406,6 @@ def test_build_validation_outcome_accepts_declared_canonical_layer_identifiers(
 
     assert layer_check["status"] == "pass"
     assert outcome.validation_status == "valid"
-    assert outcome.review_state == "approved"
-    assert outcome.quantity_gate == "allowed"
 
 
 @pytest.mark.parametrize(
@@ -473,8 +457,6 @@ def test_build_validation_outcome_reports_missing_canonical_layer_identifiers(
     assert layer_check["status"] == "review_required"
     assert layer_check["details"]["missing_layers"] == expected_missing
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 def test_build_validation_outcome_minimal_dxf_requires_review_for_missing_mvp_checks() -> None:
@@ -489,8 +471,6 @@ def test_build_validation_outcome_minimal_dxf_requires_review_for_missing_mvp_ch
     checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
 
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
     assert checks_by_key["units_presence_normalization"]["status"] == "review_required"
     assert checks_by_key["coordinate_system_capture"]["status"] == "review_required"
     assert checks_by_key["geometry_validity"]["status"] == "review_required"
@@ -514,8 +494,6 @@ def test_build_validation_outcome_requires_geometry_evidence_for_line_entities()
     assert geometry_check["check_key"] == "geometry_validity"
     assert geometry_check["status"] == "review_required"
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 @pytest.mark.parametrize(
@@ -549,8 +527,6 @@ def test_build_validation_outcome_review_gates_two_point_closed_area_entities(
     assert checks_by_key["geometry_validity"]["status"] == "review_required"
     assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 def test_build_validation_outcome_review_gates_degenerate_closed_polygon() -> None:
@@ -579,8 +555,6 @@ def test_build_validation_outcome_review_gates_degenerate_closed_polygon() -> No
 
     assert checks_by_key["geometry_validity"]["status"] == "review_required"
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 @pytest.mark.parametrize(
@@ -630,8 +604,6 @@ def test_build_validation_outcome_review_gates_high_magnitude_collinear_polygon(
 
     assert checks_by_key["geometry_validity"]["status"] == "review_required"
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
 
 
 def test_build_validation_outcome_accepts_non_degenerate_closed_polygon() -> None:
@@ -661,8 +633,6 @@ def test_build_validation_outcome_accepts_non_degenerate_closed_polygon() -> Non
     assert checks_by_key["geometry_validity"]["status"] == "pass"
     assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "valid"
-    assert outcome.review_state == "approved"
-    assert outcome.quantity_gate == "allowed"
 
 
 def test_build_validation_outcome_keeps_explicit_geometry_validity_override() -> None:
@@ -692,33 +662,27 @@ def test_build_validation_outcome_keeps_explicit_geometry_validity_override() ->
     assert checks_by_key["geometry_validity"]["status"] == "pass"
     assert checks_by_key["closed_polygon_eligibility_for_area_quantities"]["status"] == "pass"
     assert outcome.validation_status == "valid"
-    assert outcome.review_state == "approved"
-    assert outcome.quantity_gate == "allowed"
 
 
 @pytest.mark.parametrize(
-    ("pdf_scale", "check_status", "validation_status", "review_state", "quantity_gate"),
+    ("pdf_scale", "check_status", "validation_status"),
     [
-        ("", "fail", "invalid", "rejected", "blocked"),
-        ({}, "fail", "invalid", "rejected", "blocked"),
-        (False, "fail", "invalid", "rejected", "blocked"),
-        ("placeholder", "review_required", "needs_review", "review_required", "review_gated"),
+        ("", "fail", "invalid"),
+        ({}, "fail", "invalid"),
+        (False, "fail", "invalid"),
+        ("placeholder", "review_required", "needs_review"),
         (
             {"calibration_status": "unconfirmed", "ratio": "1:100"},
             "review_required",
             "needs_review",
-            "review_required",
-            "review_gated",
         ),
-        ({"status": "invalid", "ratio": "1:100"}, "fail", "invalid", "rejected", "blocked"),
+        ({"status": "invalid", "ratio": "1:100"}, "fail", "invalid"),
     ],
 )
 def test_build_validation_outcome_rejects_invalid_or_unconfirmed_pdf_scale_values(
     pdf_scale: JSONValue,
     check_status: str,
     validation_status: str,
-    review_state: str,
-    quantity_gate: str,
 ) -> None:
     outcome = build_validation_outcome(
         input_family=InputFamily.PDF_VECTOR,
@@ -734,8 +698,6 @@ def test_build_validation_outcome_rejects_invalid_or_unconfirmed_pdf_scale_value
 
     assert pdf_scale_check["status"] == check_status
     assert outcome.validation_status == validation_status
-    assert outcome.review_state == review_state
-    assert outcome.quantity_gate == quantity_gate
 
 
 def test_build_validation_outcome_review_gates_placeholder_mode_without_placeholder_semantics() -> (
@@ -768,8 +730,6 @@ def test_build_validation_outcome_review_gates_placeholder_mode_without_placehol
     findings = {finding["check_key"]: finding for finding in outcome.report_json["findings"]}
 
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
     assert findings["placeholder_semantics"]["details"] == {
         "status": "placeholder",
         "quantity_gate": "review_gated",
@@ -822,8 +782,6 @@ def test_build_validation_outcome_forces_review_gated_placeholder_semantics_when
     findings = {finding["check_key"]: finding for finding in outcome.report_json["findings"]}
 
     assert outcome.validation_status == "needs_review"
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
     assert findings["placeholder_semantics"]["details"] == {
         "status": "sparse",
         "quantity_gate": "review_gated",
@@ -969,8 +927,6 @@ def test_build_validation_outcome_rejects_entity_provenance_contract_failures(
 
     assert checks_by_key["entity_provenance_contract"]["status"] == "fail"
     assert outcome.validation_status == "invalid"
-    assert outcome.review_state == "rejected"
-    assert outcome.quantity_gate == "blocked"
     assert provenance_findings
     assert error_fragment in provenance_findings[0]["details"]["invalid_entities"][0]["error"]
 
@@ -980,31 +936,16 @@ def test_build_ingest_finalization_payload_calls_validation_once(
 ) -> None:
     calls: list[tuple[InputFamily, str]] = []
     fake_outcome = ValidationOutcome(
-        confidence_score=0.95,
-        effective_confidence=0.95,
         validation_status="valid",
-        review_state="approved",
-        quantity_gate="allowed",
         validator_name="ingestion.runner",
         validator_version="0.1",
-        confidence_json={
-            "score": 0.95,
-            "effective_confidence": 0.95,
-            "review_state": "approved",
-            "review_required": False,
-            "basis": "dxf",
-        },
         adapter_warnings_json=[],
         report_json={
             "validation_report_schema_version": "0.1",
             "canonical_entity_schema_version": "0.1",
             "validation_status": "valid",
-            "review_state": "approved",
-            "quantity_gate": "allowed",
-            "effective_confidence": 0.95,
             "validator_name": "ingestion.runner",
             "validator_version": "0.1",
-            "confidence": {},
             "summary": {
                 "checks_total": 10,
                 "findings_total": 0,
@@ -1066,7 +1007,6 @@ def test_build_ingest_finalization_payload_calls_validation_once(
 
     assert calls == [(InputFamily.DXF, "0.1")]
     assert payload.validation_status == "valid"
-    assert payload.review_state == "approved"
 
 
 def test_build_ingest_finalization_payload_rejects_invalid_entity_provenance() -> None:
@@ -1115,8 +1055,6 @@ def test_build_ingest_finalization_payload_rejects_invalid_entity_provenance() -
 
     assert checks_by_key["entity_provenance_contract"]["status"] == "fail"
     assert payload.validation_status == "invalid"
-    assert payload.review_state == "rejected"
-    assert payload.quantity_gate == "blocked"
     assert provenance_findings
     assert (
         "source_hash must be a raw 64-character SHA-256 hex string"
@@ -1168,8 +1106,7 @@ def test_build_validation_outcome_review_gates_block_reference_without_hint() ->
 
     assert block_check["status"] == "review_required"
     assert block_check["details"]["block_references_present"] is True
-    assert outcome.review_state == "review_required"
-    assert outcome.quantity_gate == "review_gated"
+    assert outcome.validation_status == "needs_review"
 
 
 def test_build_validation_outcome_passes_block_reference_with_confirmed_hint() -> None:
@@ -1204,7 +1141,7 @@ def test_build_validation_outcome_fails_block_reference_with_invalid_hint() -> N
     checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
 
     assert checks_by_key["block_transform_validity"]["status"] == "fail"
-    assert outcome.quantity_gate == "blocked"
+    assert outcome.validation_status == "invalid"
 
 
 def test_build_validation_outcome_includes_extraction_coverage() -> None:

@@ -39,17 +39,9 @@ def _build_persisted_validation_report_json(
     validator["name"] = payload.validator_name
     validator["version"] = payload.validator_version
 
-    confidence = dict(payload.confidence_json)
-    confidence["effective_confidence"] = payload.effective_confidence
-    confidence["review_state"] = payload.review_state
-    confidence["review_required"] = payload.review_state == "review_required"
-
     summary_json = report_json.get("summary")
     summary = dict(summary_json) if isinstance(summary_json, dict) else {}
     summary["validation_status"] = payload.validation_status
-    summary["review_state"] = payload.review_state
-    summary["quantity_gate"] = payload.quantity_gate
-    summary["effective_confidence"] = payload.effective_confidence
 
     checks_json = report_json.get("checks")
     checks = list(checks_json) if isinstance(checks_json, list) else []
@@ -70,11 +62,7 @@ def _build_persisted_validation_report_json(
     report_json["validation_report_schema_version"] = payload.validation_report_schema_version
     report_json["canonical_entity_schema_version"] = payload.canonical_entity_schema_version
     report_json["validation_status"] = payload.validation_status
-    report_json["review_state"] = payload.review_state
-    report_json["quantity_gate"] = payload.quantity_gate
-    report_json["effective_confidence"] = payload.effective_confidence
     report_json["validator"] = validator
-    report_json["confidence"] = confidence
     report_json["provenance"] = deepcopy(payload.provenance_json)
     report_json["generated_at"] = payload.generated_at.isoformat()
     report_json["summary"] = summary
@@ -107,9 +95,6 @@ def _build_changeset_validation_report_json(
     summary_json = report_json.get("summary")
     summary = dict(summary_json) if isinstance(summary_json, dict) else {}
     summary["validation_status"] = base_report.validation_status
-    summary["review_state"] = base_report.review_state
-    summary["quantity_gate"] = base_report.quantity_gate
-    summary["effective_confidence"] = base_report.effective_confidence
 
     checks_json = report_json.get("checks")
     checks = list(checks_json) if isinstance(checks_json, list) else []
@@ -119,8 +104,7 @@ def _build_changeset_validation_report_json(
                 "code": "changeset_validation_report_persisted",
                 "status": "passed",
                 "message": (
-                    "Changeset-origin revisions inherit the predecessor validation gate "
-                    "for quantity workflow compatibility."
+                    "Changeset-origin revisions inherit the predecessor validation status."
                 ),
             }
         )
@@ -141,9 +125,6 @@ def _build_changeset_validation_report_json(
     report_json["validation_report_schema_version"] = base_report.validation_report_schema_version
     report_json["canonical_entity_schema_version"] = base_report.canonical_entity_schema_version
     report_json["validation_status"] = base_report.validation_status
-    report_json["review_state"] = base_report.review_state
-    report_json["quantity_gate"] = base_report.quantity_gate
-    report_json["effective_confidence"] = base_report.effective_confidence
     report_json["validator"] = validator
     report_json["summary"] = summary
     report_json["checks"] = checks

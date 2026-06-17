@@ -134,8 +134,7 @@ class QuantityTakeoff(Base):
             name="ck_quantity_takeoffs_review_state_valid",
         ),
         CheckConstraint(
-            "validation_status IN "
-            f"({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
+            f"validation_status IN ({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
             name="ck_quantity_takeoffs_validation_status_valid",
         ),
         CheckConstraint(
@@ -211,20 +210,22 @@ class QuantityTakeoff(Base):
         default=JobType.QUANTITY_TAKEOFF.value,
         comment="Denormalized job type used by the composite source-job contract",
     )
-    review_state: Mapped[str] = mapped_column(
+    # Path B 5b: review_state / quantity_gate are no longer derived (flow as NULL;
+    # dropped in Path B stage 6). validation_status is kept.
+    review_state: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Review disposition for the persisted takeoff output",
+        nullable=True,
+        comment="Vestigial review disposition (no longer derived; dropped in Path B stage 6)",
     )
     validation_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         comment="Validation status inherited by downstream takeoff consumers",
     )
-    quantity_gate: Mapped[str] = mapped_column(
+    quantity_gate: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Quantity gate result controlling downstream trusted usage",
+        nullable=True,
+        comment="Vestigial quantity gate (no longer derived; dropped in Path B stage 6)",
     )
     trusted_totals: Mapped[bool] = mapped_column(
         Boolean,
@@ -281,8 +282,7 @@ class QuantityItem(Base):
             name="ck_quantity_items_review_state_valid",
         ),
         CheckConstraint(
-            "validation_status IN "
-            f"({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
+            f"validation_status IN ({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
             name="ck_quantity_items_validation_status_valid",
         ),
         CheckConstraint(
@@ -376,20 +376,21 @@ class QuantityItem(Base):
         nullable=False,
         comment="Display/storage unit captured for the persisted quantity value",
     )
-    review_state: Mapped[str] = mapped_column(
+    # Path B 5b: review_state / quantity_gate no longer derived (NULL; dropped in stage 6).
+    review_state: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Review disposition for this itemized quantity row",
+        nullable=True,
+        comment="Vestigial review disposition (no longer derived; dropped in Path B stage 6)",
     )
     validation_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         comment="Validation status for this itemized quantity row",
     )
-    quantity_gate: Mapped[str] = mapped_column(
+    quantity_gate: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Quantity gating result for this itemized quantity row",
+        nullable=True,
+        comment="Vestigial quantity gating result (no longer derived; dropped in Path B stage 6)",
     )
     source_entity_id: Mapped[str | None] = mapped_column(
         String(255),

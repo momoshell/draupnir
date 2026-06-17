@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from ._constants import (
-    _APPROVED_THRESHOLD,
     _PLACEHOLDER_ADAPTER_MODE_VALUES,
     _PLACEHOLDER_EMPTY_ENTITY_REASONS,
     _PLACEHOLDER_STATUS_VALUES,
@@ -186,41 +185,3 @@ def _derive_validation_status(
         return "valid_with_warnings"
 
     return "valid"
-
-
-def _derive_review_state(
-    *,
-    validation_status: str,
-    effective_confidence: float,
-    review_required: bool,
-) -> str:
-    if validation_status == "invalid":
-        return "rejected"
-
-    if review_required or validation_status == "needs_review":
-        return "review_required"
-
-    if effective_confidence < _APPROVED_THRESHOLD:
-        return "provisional"
-
-    return "approved"
-
-
-def _derive_quantity_gate(*, validation_status: str, review_state: str) -> str:
-    if validation_status == "invalid" or review_state in {"rejected", "superseded"}:
-        return "blocked"
-
-    if review_state == "approved" and validation_status in {"valid", "valid_with_warnings"}:
-        return "allowed"
-
-    if review_state == "provisional" and validation_status in {
-        "valid",
-        "valid_with_warnings",
-        "needs_review",
-    }:
-        return "allowed_provisional"
-
-    if review_state == "review_required":
-        return "review_gated"
-
-    return "blocked"

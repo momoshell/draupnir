@@ -277,15 +277,11 @@ def _build_debug_overlay_generator_config(
     *,
     title: str,
     source_label: str,
-    review_state: str,
-    confidence_score: float,
 ) -> dict[str, Any]:
     """Build persisted generator settings for the debug overlay artifact."""
     return {
         "title": title,
         "source_label": source_label,
-        "review_state": review_state,
-        "confidence_score": confidence_score,
     }
 
 
@@ -538,8 +534,6 @@ async def _finalize_ingest_job(
             payload.canonical_json,
             title=overlay_title,
             source_label=overlay_source_label,
-            review_state=payload.review_state,
-            confidence_score=payload.confidence_score,
         )
         overlay_storage_key = build_generated_artifact_storage_key(
             debug_overlay_artifact_id,
@@ -548,8 +542,6 @@ async def _finalize_ingest_job(
         overlay_generator_config = _build_debug_overlay_generator_config(
             title=overlay_title,
             source_label=overlay_source_label,
-            review_state=payload.review_state,
-            confidence_score=payload.confidence_score,
         )
         overlay_lineage_json = _build_debug_overlay_lineage_json(
             source_file=source_file,
@@ -586,7 +578,6 @@ async def _finalize_ingest_job(
                     canonical_json=payload.canonical_json,
                     provenance_json=payload.provenance_json,
                     confidence_json=payload.confidence_json,
-                    confidence_score=payload.confidence_score,
                     warnings_json=payload.warnings_json,
                     diagnostics_json=payload.diagnostics_json,
                     result_checksum_sha256=payload.result_checksum_sha256,
@@ -603,9 +594,7 @@ async def _finalize_ingest_job(
                     predecessor_revision_id=predecessor_revision_id,
                     revision_sequence=revision_sequence,
                     revision_kind=payload.revision_kind,
-                    review_state=payload.review_state,
                     canonical_entity_schema_version=payload.canonical_entity_schema_version,
-                    confidence_score=payload.confidence_score,
                 )
             )
             session.add(
@@ -617,9 +606,6 @@ async def _finalize_ingest_job(
                     validation_report_schema_version=payload.validation_report_schema_version,
                     canonical_entity_schema_version=payload.canonical_entity_schema_version,
                     validation_status=payload.validation_status,
-                    review_state=payload.review_state,
-                    quantity_gate=payload.quantity_gate,
-                    effective_confidence=payload.effective_confidence,
                     validator_name=payload.validator_name,
                     validator_version=payload.validator_version,
                     report_json=_build_persisted_validation_report_json(

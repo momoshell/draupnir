@@ -128,10 +128,11 @@ class AdapterRunOutput(Base):
         nullable=False,
         comment="Structured confidence payload for adapter output review workflows",
     )
-    confidence_score: Mapped[float] = mapped_column(
+    # Path B 5b: no longer persisted (nullable until #491 drops it).
+    confidence_score: Mapped[float | None] = mapped_column(
         Float,
-        nullable=False,
-        comment="Overall adapter confidence score for this committed output",
+        nullable=True,
+        comment="Vestigial adapter confidence score (no longer derived; dropped in Path B stage 6)",
     )
     warnings_json: Mapped[list[Any]] = mapped_column(
         JSON,

@@ -34,15 +34,11 @@ class IngestFinalizationPayload:
     canonical_json: dict[str, Any]
     provenance_json: dict[str, Any]
     confidence_json: dict[str, Any]
-    confidence_score: float
     warnings_json: list[Any]
     diagnostics_json: dict[str, Any]
     result_checksum_sha256: str
     validation_report_schema_version: str
     validation_status: str
-    review_state: str
-    quantity_gate: str
-    effective_confidence: float
     validator_name: str
     validator_version: str
     report_json: dict[str, Any]
@@ -106,7 +102,15 @@ def build_ingest_finalization_payload(
         generated_at=emitted_at,
     )
     warnings_json = validation_outcome.adapter_warnings_json
-    confidence_json = validation_outcome.confidence_json
+    # Honest adapter-reported confidence metadata (Path B 5b retired the derived
+    # gating block; the per-output confidence_json payload is kept as provenance).
+    confidence_json = {
+        "score": result.confidence.score if result.confidence is not None else None,
+        "basis": result.confidence.basis if result.confidence is not None else None,
+        "review_required": (
+            bool(result.confidence.review_required) if result.confidence is not None else None
+        ),
+    }
     provenance_json = {
         "schema_version": canonical_entity_schema_version,
         "adapter": {
@@ -141,7 +145,6 @@ def build_ingest_finalization_payload(
         "canonical_json": canonical_json,
         "provenance_json": provenance_json,
         "confidence_json": confidence_json,
-        "confidence_score": validation_outcome.confidence_score,
         "warnings_json": warnings_json,
         "diagnostics_json": diagnostics_json,
     }
@@ -155,15 +158,11 @@ def build_ingest_finalization_payload(
         canonical_json=canonical_json,
         provenance_json=provenance_json,
         confidence_json=confidence_json,
-        confidence_score=validation_outcome.confidence_score,
         warnings_json=warnings_json,
         diagnostics_json=diagnostics_json,
         result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
         validation_report_schema_version=VALIDATION_REPORT_SCHEMA_VERSION,
         validation_status=validation_outcome.validation_status,
-        review_state=validation_outcome.review_state,
-        quantity_gate=validation_outcome.quantity_gate,
-        effective_confidence=validation_outcome.effective_confidence,
         validator_name=validation_outcome.validator_name,
         validator_version=validation_outcome.validator_version,
         report_json=report_json,

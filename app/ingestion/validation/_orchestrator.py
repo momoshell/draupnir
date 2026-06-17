@@ -9,7 +9,6 @@ from typing import Any
 from app.ingestion.contracts import AdapterResult, InputFamily
 
 from ._constants import (
-    _REVIEW_CAPPED_CONFIDENCE,
     _REVIEW_THRESHOLD,
     _SOURCE_DOCUMENT_REF,
     RUNNER_VALIDATOR_NAME,
@@ -32,8 +31,6 @@ from .checks import (
 )
 from .policy import (
     _apply_placeholder_review_policy,
-    _derive_quantity_gate,
-    _derive_review_state,
     _derive_validation_status,
 )
 
@@ -48,12 +45,12 @@ def build_validation_outcome(
 ) -> ValidationOutcome:
     """Build the canonical v0.1 validation report and review policy outcome."""
 
+    # confidence_score is a transient review signal (feeds validation_status + findings);
+    # it is no longer capped, derived into a gate, or persisted (Path B 5b).
     confidence_score = _confidence_score(result)
-    effective_confidence = confidence_score
     adapter_review_required = bool(
         result.confidence.review_required if result.confidence is not None else True
     )
-    confidence_basis = result.confidence.basis if result.confidence is not None else None
     adapter_warnings_json = [_json_compatible(warning) for warning in result.warnings]
     findings: list[dict[str, Any]] = []
 
@@ -85,7 +82,6 @@ def build_validation_outcome(
         return finding_id
 
     if input_family == InputFamily.PDF_RASTER:
-        effective_confidence = min(effective_confidence, _REVIEW_CAPPED_CONFIDENCE)
         add_finding(
             check_key="raster_review_policy",
             severity="warning",
@@ -98,7 +94,6 @@ def build_validation_outcome(
         )
 
     if confidence_score < _REVIEW_THRESHOLD:
-        effective_confidence = min(effective_confidence, confidence_score)
         add_finding(
             check_key="confidence_threshold",
             severity="warning",
@@ -114,7 +109,6 @@ def build_validation_outcome(
         )
 
     if adapter_review_required:
-        effective_confidence = min(effective_confidence, _REVIEW_CAPPED_CONFIDENCE)
         add_finding(
             check_key="adapter_review_required",
             severity="warning",
@@ -130,36 +124,24 @@ def build_validation_outcome(
         canonical_json=canonical_json,
         add_finding=add_finding,
     )
-    if placeholder_requires_review:
-        effective_confidence = min(effective_confidence, _REVIEW_CAPPED_CONFIDENCE)
 
-    checks, required_checks_require_review, required_checks_invalid = _build_required_checks(
+    checks, required_checks_require_review, _required_checks_invalid = _build_required_checks(
         canonical_json=canonical_json,
         add_finding=add_finding,
     )
-    if required_checks_require_review:
-        effective_confidence = min(effective_confidence, _REVIEW_CAPPED_CONFIDENCE)
-    if required_checks_invalid:
-        effective_confidence = 0.0
 
     pdf_scale_check, pdf_scale_requires_review = _build_pdf_scale_check(
         input_family=input_family,
         canonical_json=canonical_json,
         add_finding=add_finding,
     )
-    if pdf_scale_requires_review:
-        effective_confidence = min(effective_confidence, _REVIEW_CAPPED_CONFIDENCE)
-    if pdf_scale_check["status"] == "fail":
-        effective_confidence = 0.0
     checks.append(pdf_scale_check)
 
-    ifc_schema_check, ifc_schema_invalid = _build_ifc_schema_check(
+    ifc_schema_check, _ifc_schema_invalid = _build_ifc_schema_check(
         input_family=input_family,
         canonical_json=canonical_json,
         add_finding=add_finding,
     )
-    if ifc_schema_invalid:
-        effective_confidence = 0.0
     checks.append(ifc_schema_check)
 
     for index, warning in enumerate(adapter_warnings_json, start=1):
@@ -175,51 +157,25 @@ def build_validation_outcome(
             details={"warning": normalized_warning},
         )
 
+    review_required = (
+        input_family == InputFamily.PDF_RASTER
+        or confidence_score < _REVIEW_THRESHOLD
+        or adapter_review_required
+        or placeholder_requires_review
+        or required_checks_require_review
+        or pdf_scale_requires_review
+    )
     validation_status = _derive_validation_status(
         checks=checks,
         findings=findings,
-        review_required=(
-            input_family == InputFamily.PDF_RASTER
-            or confidence_score < _REVIEW_THRESHOLD
-            or adapter_review_required
-            or placeholder_requires_review
-            or required_checks_require_review
-            or pdf_scale_requires_review
-        ),
+        review_required=review_required,
     )
-    review_state = _derive_review_state(
-        validation_status=validation_status,
-        effective_confidence=effective_confidence,
-        review_required=(
-            input_family == InputFamily.PDF_RASTER
-            or confidence_score < _REVIEW_THRESHOLD
-            or adapter_review_required
-            or placeholder_requires_review
-            or required_checks_require_review
-            or pdf_scale_requires_review
-        ),
-    )
-    quantity_gate = _derive_quantity_gate(
-        validation_status=validation_status,
-        review_state=review_state,
-    )
-    confidence_json = {
-        "score": result.confidence.score if result.confidence is not None else None,
-        "effective_confidence": effective_confidence,
-        "review_state": review_state,
-        "review_required": review_state == "review_required",
-        "basis": confidence_basis,
-    }
     report_json = {
         "validation_report_schema_version": VALIDATION_REPORT_SCHEMA_VERSION,
         "canonical_entity_schema_version": canonical_entity_schema_version,
         "validation_status": validation_status,
-        "review_state": review_state,
-        "quantity_gate": quantity_gate,
-        "effective_confidence": effective_confidence,
         "validator_name": RUNNER_VALIDATOR_NAME,
         "validator_version": RUNNER_VALIDATOR_VERSION,
-        "confidence": confidence_json,
         "provenance": _json_compatible(result.provenance),
         "summary": _build_summary(canonical_json=canonical_json, checks=checks, findings=findings),
         "coverage": _build_coverage(canonical_json),
@@ -230,14 +186,9 @@ def build_validation_outcome(
     }
 
     return ValidationOutcome(
-        confidence_score=confidence_score,
-        effective_confidence=effective_confidence,
         validation_status=validation_status,
-        review_state=review_state,
-        quantity_gate=quantity_gate,
         validator_name=RUNNER_VALIDATOR_NAME,
         validator_version=RUNNER_VALIDATOR_VERSION,
-        confidence_json=confidence_json,
         adapter_warnings_json=adapter_warnings_json,
         report_json=report_json,
     )

@@ -9,8 +9,6 @@ RUNNER_VALIDATOR_NAME: Final[str] = "ingestion.runner"
 RUNNER_VALIDATOR_VERSION: Final[str] = "0.1"
 
 _REVIEW_THRESHOLD: Final[float] = 0.60
-_APPROVED_THRESHOLD: Final[float] = 0.95
-_REVIEW_CAPPED_CONFIDENCE: Final[float] = 0.59
 _SUPPORTED_IFC_SCHEMAS: Final[frozenset[str]] = frozenset({"IFC2X3", "IFC4", "IFC4X3"})
 _SOURCE_DOCUMENT_REF: Final[str] = "source-document"
 _REVIEW_STATUS_VALUES: Final[frozenset[str]] = frozenset(

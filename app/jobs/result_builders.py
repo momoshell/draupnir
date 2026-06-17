@@ -91,9 +91,9 @@ def _build_quantity_items(
     quantity_takeoff_id: UUID,
     project_id: UUID,
     drawing_revision_id: UUID,
-    review_state: str,
+    review_state: str | None,
     validation_status: str,
-    quantity_gate: str,
+    quantity_gate: str | None,
     result: QuantityEngineResult,
 ) -> list[QuantityItem]:
     """Build immutable quantity item rows for a takeoff result."""

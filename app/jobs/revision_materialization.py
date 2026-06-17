@@ -362,10 +362,12 @@ def _resolve_entity_schema_version(
 
 def _resolve_entity_confidence_score(
     entity_payload_json: dict[str, Any],
-    *,
-    default_score: float,
-) -> float:
-    """Resolve the entity confidence score from contract payloads or a payload default."""
+) -> float | None:
+    """Resolve the per-entity confidence score from contract payloads, if present.
+
+    Path B 5b: the revision-level confidence_score fallback is gone; the column is
+    populated only from per-entity canonical confidence (and is no longer derived).
+    """
     confidence_score = _float_value(entity_payload_json.get("confidence_score"))
     if confidence_score is not None:
         return confidence_score
@@ -381,13 +383,13 @@ def _resolve_entity_confidence_score(
         if nested_score is not None:
             return nested_score
 
-    return default_score
+    return None
 
 
 def _resolve_entity_confidence_json(
     entity_payload_json: dict[str, Any],
     *,
-    confidence_score: float,
+    confidence_score: float | None,
 ) -> dict[str, Any]:
     """Resolve the entity confidence payload from contract or legacy payloads."""
     for key in ("confidence_json", "confidence"):
@@ -486,10 +488,7 @@ def _build_revision_materialization_rows(
             default_schema_version=payload.canonical_entity_schema_version,
         )
         parent_entity_ref = _resolve_entity_parent_ref(payload_json)
-        confidence_score = _resolve_entity_confidence_score(
-            payload_json,
-            default_score=payload.confidence_score,
-        )
+        confidence_score = _resolve_entity_confidence_score(payload_json)
         confidence_json = _resolve_entity_confidence_json(
             payload_json,
             confidence_score=confidence_score,

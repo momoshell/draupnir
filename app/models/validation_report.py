@@ -47,8 +47,7 @@ class ValidationReport(Base):
             name="uq_validation_reports_source_job_id",
         ),
         CheckConstraint(
-            "validation_status IN "
-            "('valid', 'valid_with_warnings', 'invalid', 'needs_review')",
+            "validation_status IN ('valid', 'valid_with_warnings', 'invalid', 'needs_review')",
             name="ck_validation_reports_status",
         ),
         CheckConstraint(
@@ -57,8 +56,7 @@ class ValidationReport(Base):
             name="ck_validation_reports_review_state",
         ),
         CheckConstraint(
-            "quantity_gate IN "
-            "('allowed', 'allowed_provisional', 'review_gated', 'blocked')",
+            "quantity_gate IN ('allowed', 'allowed_provisional', 'review_gated', 'blocked')",
             name="ck_validation_reports_quantity_gate",
         ),
         CheckConstraint(
@@ -111,20 +109,21 @@ class ValidationReport(Base):
         nullable=False,
         comment="Technical validation status for the drawing revision",
     )
-    review_state: Mapped[str] = mapped_column(
+    # Path B 5b: no longer derived/persisted (nullable until #491 drops them).
+    review_state: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Inherited review state recorded on the validation report",
+        nullable=True,
+        comment="Vestigial review state (no longer derived; dropped in Path B stage 6)",
     )
-    quantity_gate: Mapped[str] = mapped_column(
+    quantity_gate: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Derived quantity gate outcome for the drawing revision",
+        nullable=True,
+        comment="Vestigial quantity gate (no longer derived; dropped in Path B stage 6)",
     )
-    effective_confidence: Mapped[float] = mapped_column(
+    effective_confidence: Mapped[float | None] = mapped_column(
         Float,
-        nullable=False,
-        comment="Conservative effective confidence used for quantity gate decisions",
+        nullable=True,
+        comment="Vestigial effective confidence (no longer derived; dropped in Path B stage 6)",
     )
     validator_name: Mapped[str] = mapped_column(
         String(128),
@@ -140,8 +139,7 @@ class ValidationReport(Base):
         JSON,
         nullable=False,
         comment=(
-            "Validation report payload containing summary, checks, findings, "
-            "and adapter warnings"
+            "Validation report payload containing summary, checks, findings, and adapter warnings"
         ),
     )
     generated_at: Mapped[datetime] = mapped_column(

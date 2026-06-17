@@ -272,10 +272,11 @@ class EstimateVersion(Base):
         nullable=False,
         comment="Job identifier that finalized this immutable estimate version",
     )
-    quantity_gate: Mapped[str] = mapped_column(
+    # Path B 5b: copied from the (now-NULL) takeoff gate; vestigial, dropped in stage 6.
+    quantity_gate: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Frozen estimate input gate copied from the referenced quantity takeoff",
+        nullable=True,
+        comment="Vestigial estimate input gate copied from the takeoff (dropped in stage 6)",
     )
     trusted_totals: Mapped[bool] = mapped_column(
         Boolean,

@@ -178,7 +178,8 @@ class EstimateVersionHeader:
     subtotal_amount: Decimal
     tax_amount: Decimal
     total_amount: Decimal
-    quantity_gate: EstimateQuantityGate = "allowed"
+    # Path B 5b: vestigial gate, may be NULL (dropped in Path B stage 6).
+    quantity_gate: EstimateQuantityGate | None = None
     trusted_totals: bool = True
 
     def as_model_kwargs(self) -> dict[str, object]:

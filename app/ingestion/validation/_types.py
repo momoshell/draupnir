@@ -11,14 +11,9 @@ from typing import Any
 class ValidationOutcome:
     """Typed validation policy result for ingest finalization."""
 
-    confidence_score: float
-    effective_confidence: float
     validation_status: str
-    review_state: str
-    quantity_gate: str
     validator_name: str
     validator_version: str
-    confidence_json: dict[str, Any]
     adapter_warnings_json: list[Any]
     report_json: dict[str, Any]
 

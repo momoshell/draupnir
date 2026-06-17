@@ -455,9 +455,6 @@ def _build_fake_ingest_payload(
         },
         "summary": {
             "validation_status": _FAKE_RUNNER_VALIDATION_STATUS,
-            "review_state": _FAKE_RUNNER_REVIEW_STATE,
-            "quantity_gate": _FAKE_RUNNER_QUANTITY_GATE,
-            "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
             "entity_counts": entity_counts,
         },
         "coverage": coverage_json,
@@ -474,7 +471,6 @@ def _build_fake_ingest_payload(
         "canonical_json": canonical_json,
         "provenance_json": provenance_json,
         "confidence_json": confidence_json,
-        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
         "warnings_json": warnings_json,
         "diagnostics_json": diagnostics_json,
     }
@@ -488,15 +484,11 @@ def _build_fake_ingest_payload(
         canonical_json=canonical_json,
         provenance_json=provenance_json,
         confidence_json=confidence_json,
-        confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
         warnings_json=warnings_json,
         diagnostics_json=diagnostics_json,
         result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
         validation_report_schema_version=_FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
         validation_status=_FAKE_RUNNER_VALIDATION_STATUS,
-        review_state=_FAKE_RUNNER_REVIEW_STATE,
-        quantity_gate=_FAKE_RUNNER_QUANTITY_GATE,
-        effective_confidence=_FAKE_RUNNER_CONFIDENCE_SCORE,
         validator_name=_FAKE_RUNNER_VALIDATOR_NAME,
         validator_version=_FAKE_RUNNER_VALIDATOR_VERSION,
         report_json=report_json,
@@ -573,7 +565,6 @@ def _replace_fake_canonical_payload(
         "canonical_json": canonical_json,
         "provenance_json": payload.provenance_json,
         "confidence_json": payload.confidence_json,
-        "confidence_score": payload.confidence_score,
         "warnings_json": payload.warnings_json,
         "diagnostics_json": payload.diagnostics_json,
     }
@@ -592,32 +583,20 @@ def _replace_fake_validation_outcome(
     validation_status: str,
     quantity_gate: str,
 ) -> IngestFinalizationPayload:
-    """Replace fake validation gate metadata while preserving deterministic payload shape."""
-    confidence_json = {
-        **payload.confidence_json,
-        "review_state": review_state,
-        "effective_confidence": payload.effective_confidence,
-    }
+    """Replace the fake validation_status while preserving deterministic payload shape.
+
+    Path B 5b: review_state / quantity_gate are no longer derived or persisted, so they
+    flow as NULL regardless of these (now-vestigial) params; only validation_status is set.
+    """
+    _ = (review_state, quantity_gate)
     report_json = deepcopy(payload.report_json)
     summary = report_json.get("summary")
     if isinstance(summary, dict):
-        report_json["summary"] = {
-            **summary,
-            "validation_status": validation_status,
-            "review_state": review_state,
-            "quantity_gate": quantity_gate,
-            "effective_confidence": payload.effective_confidence,
-        }
+        report_json["summary"] = {**summary, "validation_status": validation_status}
     report_json["validation_status"] = validation_status
-    report_json["review_state"] = review_state
-    report_json["quantity_gate"] = quantity_gate
-    report_json["effective_confidence"] = payload.effective_confidence
     return replace(
         payload,
-        confidence_json=confidence_json,
         validation_status=validation_status,
-        review_state=review_state,
-        quantity_gate=quantity_gate,
         report_json=report_json,
     )
 

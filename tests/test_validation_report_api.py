@@ -167,9 +167,6 @@ class TestValidationReportApi:
             return replace(
                 payload,
                 validation_status="needs_review",
-                review_state="review_required",
-                quantity_gate="review_gated",
-                effective_confidence=0.59,
                 confidence_json={
                     "score": 0.95,
                     "effective_confidence": 0.95,
