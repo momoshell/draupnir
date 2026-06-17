@@ -809,11 +809,13 @@ async def test_create_export_rejects_inactive_or_deleted_revision(
     [(False, QuantityGate.ALLOWED.value), (False, "blocked")],
     ids=["untrusted", "non_allowed_gate"],
 )
-async def test_create_export_rejects_ineligible_takeoff(
+async def test_create_export_allows_gated_or_untrusted_takeoff(
     async_client: AsyncClient,
     trusted_totals: bool,
     quantity_gate: str,
 ) -> None:
+    # Path B 4: quantity/estimate exports are no longer gated on
+    # quantity_gate / trusted_totals; any persisted takeoff is exportable.
     lineage = await _seed_export_lineage()
     takeoff_id = await _create_takeoff(
         lineage,
@@ -829,8 +831,9 @@ async def test_create_export_rejects_ineligible_takeoff(
         json=EXPORT_CREATE_CASES[1].body,
     )
 
-    assert response.status_code == 400
-    assert await _count_export_side_effects(lineage) == (0, 0, 0)
+    assert response.status_code == 202
+    # one export job + one export input persisted (no artifact until the worker runs)
+    assert await _count_export_side_effects(lineage) == (1, 1, 0)
 
 
 async def test_create_estimate_export_rejects_estimate_version_outside_path_takeoff(

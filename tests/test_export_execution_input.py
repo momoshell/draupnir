@@ -217,21 +217,37 @@ async def test_changeset_export_succeeds_with_changeset_revision() -> None:
     assert execution.changeset_id == changeset_id
 
 
-async def test_quantity_export_requires_allowed_gate_and_trusted_totals() -> None:
+async def test_quantity_export_builds_from_gated_untrusted_takeoff() -> None:
+    # Path B 4: exports are no longer gated on quantity_gate / trusted_totals; a
+    # review-gated, untrusted takeoff builds as long as its lineage is consistent.
+    takeoff_id = uuid.uuid4()
+    takeoff = cast(
+        QuantityTakeoff,
+        SimpleNamespace(
+            id=takeoff_id,
+            project_id=PROJECT_ID,
+            source_file_id=FILE_ID,
+            drawing_revision_id=REVISION_ID,
+            quantity_gate="blocked",
+            trusted_totals=False,
+            source_job_type=JobType.QUANTITY_TAKEOFF.value,
+        ),
+    )
     loader = _FakeLoader(
         job=_job(),
         export_input=_export_input(
             export_kind="quantity_csv",
             export_format="csv",
             media_type="text/csv",
-            quantity_takeoff_id=uuid.uuid4(),
+            quantity_takeoff_id=takeoff_id,
             quantity_gate="blocked",
             trusted_totals=False,
         ),
         drawing_revision=_revision(),
+        quantity_takeoff=takeoff,
     )
-    with pytest.raises(_ExportJobInputError):
-        await _build(loader)
+    execution = await _build(loader)
+    assert execution.quantity_takeoff_id == takeoff_id
 
 
 async def test_quantity_export_missing_takeoff_row_is_not_found() -> None:

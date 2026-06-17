@@ -259,15 +259,9 @@ async def build_export_execution_input(
             "Export job input is missing its quantity takeoff linkage.",
             details={"export_kind": export_input.export_kind},
         )
-    if export_input.quantity_gate != "allowed" or export_input.trusted_totals is not True:
-        raise _build_export_job_input_error(
-            "Export job input requires a trusted quantity takeoff with allowed gate.",
-            details={
-                "quantity_takeoff_id": str(quantity_takeoff_id),
-                "quantity_gate": export_input.quantity_gate,
-                "trusted_totals": export_input.trusted_totals,
-            },
-        )
+    # Path B 4: exports are no longer gated on quantity_gate / trusted_totals. The
+    # takeoff lineage consistency check below still ensures the persisted input mirrors
+    # the source takeoff's recorded gate/trusted values.
 
     quantity_takeoff = await loader.get_quantity_takeoff(quantity_takeoff_id)
     if quantity_takeoff is None:

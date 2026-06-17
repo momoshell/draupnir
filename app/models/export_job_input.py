@@ -162,10 +162,11 @@ class ExportJobInput(Base):
             name="ck_export_job_inputs_kind_format_media_type_matrix",
         ),
         CheckConstraint(
-            "(export_kind = 'quantity_csv' AND quantity_takeoff_id IS NOT NULL "
-            "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
-            "(export_kind IN ('estimate_csv', 'estimate_pdf') AND quantity_takeoff_id IS NOT NULL "
-            "AND quantity_gate = 'allowed' AND trusted_totals IS TRUE) OR "
+            # Path B 4: quantity/estimate exports are no longer gated to allowed +
+            # trusted takeoffs; only the export_kind <-> lineage shape is enforced.
+            # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
+            "(export_kind IN ('quantity_csv', 'estimate_csv', 'estimate_pdf') "
+            "AND quantity_takeoff_id IS NOT NULL) OR "
             "(export_kind IN ('revision_json', 'dxf', 'revised_dxf') "
             "AND quantity_takeoff_id IS NULL "
             "AND quantity_gate IS NULL AND trusted_totals IS NULL)",

@@ -18,9 +18,6 @@ from app.api.idempotency import (
     replay_idempotency_response,
     run_idempotent_mutation,
 )
-from app.api.v1.revision_estimate_inputs import (
-    _raise_estimate_takeoff_gate_invalid,
-)
 from app.api.v1.revision_lineage import (
     _get_active_revision,
     _get_revision_estimate_version_or_404,
@@ -38,7 +35,7 @@ from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_version import EstimateVersion
 from app.models.export_job_input import ExportJobInput
 from app.models.job import Job, JobType
-from app.models.quantity_takeoff import QuantityGate, QuantityTakeoff
+from app.models.quantity_takeoff import QuantityTakeoff
 from app.schemas.export import (
     EXPORT_KIND_MATRIX,
     EstimateExportCreateRequest,
@@ -217,12 +214,6 @@ def _build_export_job_input(
     return ExportJobInput(**payload)
 
 
-def _takeoff_is_exportable(takeoff: QuantityTakeoff) -> bool:
-    """Return whether a takeoff is trusted and allowed for export."""
-
-    return takeoff.quantity_gate == QuantityGate.ALLOWED.value and takeoff.trusted_totals
-
-
 def _estimate_belongs_to_takeoff(
     estimate_version: EstimateVersion,
     takeoff_id: UUID,
@@ -237,12 +228,13 @@ async def _get_exportable_takeoff_or_404(
     takeoff_id: UUID,
     db: AsyncSession,
 ) -> QuantityTakeoff:
-    """Return an exportable takeoff or raise the standard route error."""
+    """Return the revision's takeoff or raise the standard route error.
 
-    takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
-    if not _takeoff_is_exportable(takeoff):
-        _raise_estimate_takeoff_gate_invalid(takeoff)
-    return takeoff
+    Path B 4: exports are no longer gated on quantity_gate / trusted_totals;
+    any persisted takeoff is exportable.
+    """
+
+    return await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
 
 
 async def _get_exportable_estimate_or_404(
