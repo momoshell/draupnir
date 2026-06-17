@@ -201,14 +201,8 @@ class EstimateVersion(Base):
             ondelete="RESTRICT",
             name="fk_estimate_versions_source_job_lineage",
         ),
-        CheckConstraint(
-            "quantity_gate = 'allowed'",
-            name="ck_estimate_versions_quantity_gate_allowed",
-        ),
-        CheckConstraint(
-            "trusted_totals = TRUE",
-            name="ck_estimate_versions_trusted_totals_true",
-        ),
+        # Path B 3: estimate versions are no longer gated to allowed + trusted takeoffs.
+        # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
         CheckConstraint(
             "currency = 'GBP'",
             name="ck_estimate_versions_currency_gbp",

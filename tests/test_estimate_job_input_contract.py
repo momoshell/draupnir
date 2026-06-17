@@ -354,13 +354,17 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
 
     for constraint_name in (
         "ck_estimate_job_inputs_source_job_type_estimate",
-        "ck_estimate_job_inputs_quantity_gate_allowed",
-        "ck_estimate_job_inputs_trusted_totals_true",
         "ck_estimate_job_inputs_currency_gbp",
         "ck_estimate_job_inputs_pricing_mode_valid",
         "ck_estimate_job_inputs_assumptions_json_object",
     ):
         assert constraint_name in check_constraints["estimate_job_inputs"]
+    # Path B 3: estimate creation is no longer gated to allowed + trusted takeoffs.
+    for constraint_name in (
+        "ck_estimate_job_inputs_quantity_gate_allowed",
+        "ck_estimate_job_inputs_trusted_totals_true",
+    ):
+        assert constraint_name not in check_constraints["estimate_job_inputs"]
     for constraint_name in (
         "ck_estimate_job_input_catalog_refs_selection_key_nonblank",
         "ck_estimate_job_input_catalog_refs_ref_order_nonnegative",
@@ -540,8 +544,7 @@ async def test_estimate_job_contract_rejects_ambiguous_job_inputs(
             {"source_job_type": JobType.REPROCESS.value},
             "ck_estimate_job_inputs_source_job_type_estimate",
         ),
-        ({"quantity_gate": "review_gated"}, "ck_estimate_job_inputs_quantity_gate_allowed"),
-        ({"trusted_totals": False}, "ck_estimate_job_inputs_trusted_totals_true"),
+        # Path B 3: quantity_gate / trusted_totals are no longer gate-constrained here.
         ({"currency": "USD"}, "ck_estimate_job_inputs_currency_gbp"),
         ({"pricing_mode": "retry_timestamp"}, "ck_estimate_job_inputs_pricing_mode_valid"),
         ({"assumptions_json": []}, "ck_estimate_job_inputs_assumptions_json_object"),

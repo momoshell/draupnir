@@ -426,35 +426,25 @@ def test_compose_estimate_replays_rate_lines_from_persisted_quantity_scale() -> 
 
 
 @pytest.mark.parametrize("quantity_gate", ["provisional", "review_gated", "blocked"])
-def test_compose_estimate_rejects_non_allowed_takeoffs(quantity_gate: str) -> None:
-    engine_input = _valid_engine_input(quantity_gate=quantity_gate)
+def test_compose_estimate_accepts_non_allowed_takeoffs(quantity_gate: str) -> None:
+    # Path B 3: estimates are no longer gated to an allowed takeoff.
+    result = compose_estimate(_valid_engine_input(quantity_gate=quantity_gate))
 
-    with pytest.raises(EstimateEngineError) as exc_info:
-        compose_estimate(engine_input)
-
-    assert exc_info.value.code == "INPUT_INVALID"
-    assert exc_info.value.reason == "quantity_gate_not_allowed"
+    assert result.line_items
 
 
-def test_compose_estimate_rejects_missing_lineage_and_untrusted_totals() -> None:
+def test_compose_estimate_accepts_untrusted_totals() -> None:
+    # Path B 3: untrusted totals no longer block estimate creation.
+    engine_input = dataclasses.replace(_valid_engine_input(), trusted_totals=False)
+
+    result = compose_estimate(engine_input)
+
+    assert result.line_items
+
+
+def test_compose_estimate_rejects_missing_lineage() -> None:
     engine_input = _valid_engine_input()
-    broken_input = EstimateEngineInput(
-        estimate_job_id=engine_input.estimate_job_id,
-        project_id=engine_input.project_id,
-        file_id=None,
-        drawing_revision_id=engine_input.drawing_revision_id,
-        quantity_takeoff_id=engine_input.quantity_takeoff_id,
-        source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=False,
-        tax_rate=engine_input.tax_rate,
-        quantity_entries=engine_input.quantity_entries,
-        rate_entries=engine_input.rate_entries,
-        material_entries=engine_input.material_entries,
-        formula_entries=engine_input.formula_entries,
-        assumption_entries=engine_input.assumption_entries,
-        line_inputs=engine_input.line_inputs,
-    )
+    broken_input = dataclasses.replace(engine_input, file_id=None)
 
     with pytest.raises(EstimateEngineError) as exc_info:
         compose_estimate(broken_input)

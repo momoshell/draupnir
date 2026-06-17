@@ -279,74 +279,78 @@ async def test_estimate_version_schema_matches_contract() -> None:
         assert estimate_columns[required_column]["nullable"] is False
 
     assert ("source_job_id",) in unique_constraints["estimate_versions"]
-    assert ("id", "project_id", "drawing_revision_id") in unique_constraints[
-        "estimate_versions"
-    ]
+    assert ("id", "project_id", "drawing_revision_id") in unique_constraints["estimate_versions"]
     assert ("project_id",) in indexes["estimate_versions"]
     assert ("source_file_id",) in indexes["estimate_versions"]
     assert ("quantity_takeoff_id",) in indexes["estimate_versions"]
     assert ("drawing_revision_id",) in indexes["estimate_versions"]
 
     for constraint_name in (
-        "ck_estimate_versions_quantity_gate_allowed",
-        "ck_estimate_versions_trusted_totals_true",
         "ck_estimate_versions_currency_gbp",
         "ck_estimate_versions_subtotal_amount_nonnegative",
         "ck_estimate_versions_tax_amount_nonnegative",
         "ck_estimate_versions_total_amount_nonnegative",
     ):
         assert constraint_name in check_constraints
+    # Path B 3: estimate versions are no longer gated to allowed + trusted takeoffs.
+    for constraint_name in (
+        "ck_estimate_versions_quantity_gate_allowed",
+        "ck_estimate_versions_trusted_totals_true",
+    ):
+        assert constraint_name not in check_constraints
 
-    quantity_gate_sql = _normalize_constraint_sqltext(
-        check_constraints["ck_estimate_versions_quantity_gate_allowed"]
-    ).lower()
-    trusted_totals_sql = _normalize_constraint_sqltext(
-        check_constraints["ck_estimate_versions_trusted_totals_true"]
-    ).lower()
     currency_sql = _normalize_constraint_sqltext(
         check_constraints["ck_estimate_versions_currency_gbp"]
     ).lower()
-    assert "quantity_gate = 'allowed'" in quantity_gate_sql
-    assert "trusted_totals = true" in trusted_totals_sql
     assert "currency = 'gbp'" in currency_sql
 
     assert foreign_keys[(("project_id",), "projects", ("id",))] == "RESTRICT"
-    assert foreign_keys[
-        (("source_file_id", "project_id"), "files", ("id", "project_id"))
-    ] == "RESTRICT"
-    assert foreign_keys[
-        (
-            ("drawing_revision_id", "project_id", "source_file_id"),
-            "drawing_revisions",
-            ("id", "project_id", "source_file_id"),
-        )
-    ] == "RESTRICT"
-    assert foreign_keys[
-        (
+    assert (
+        foreign_keys[(("source_file_id", "project_id"), "files", ("id", "project_id"))]
+        == "RESTRICT"
+    )
+    assert (
+        foreign_keys[
             (
-                "quantity_takeoff_id",
-                "project_id",
-                "drawing_revision_id",
-                "quantity_gate",
-                "trusted_totals",
-            ),
-            "quantity_takeoffs",
+                ("drawing_revision_id", "project_id", "source_file_id"),
+                "drawing_revisions",
+                ("id", "project_id", "source_file_id"),
+            )
+        ]
+        == "RESTRICT"
+    )
+    assert (
+        foreign_keys[
             (
-                "id",
-                "project_id",
-                "drawing_revision_id",
-                "quantity_gate",
-                "trusted_totals",
-            ),
-        )
-    ] == "RESTRICT"
-    assert foreign_keys[
-        (
-            ("source_job_id", "project_id", "source_file_id"),
-            "jobs",
-            ("id", "project_id", "file_id"),
-        )
-    ] == "RESTRICT"
+                (
+                    "quantity_takeoff_id",
+                    "project_id",
+                    "drawing_revision_id",
+                    "quantity_gate",
+                    "trusted_totals",
+                ),
+                "quantity_takeoffs",
+                (
+                    "id",
+                    "project_id",
+                    "drawing_revision_id",
+                    "quantity_gate",
+                    "trusted_totals",
+                ),
+            )
+        ]
+        == "RESTRICT"
+    )
+    assert (
+        foreign_keys[
+            (
+                ("source_job_id", "project_id", "source_file_id"),
+                "jobs",
+                ("id", "project_id", "file_id"),
+            )
+        ]
+        == "RESTRICT"
+    )
 
     quantity_takeoff_table = cast(Table, QuantityTakeoff.__table__)
     quantity_takeoff_model_uniques = {
@@ -379,7 +383,7 @@ async def test_estimate_version_schema_matches_contract() -> None:
 
     migration_sql = _ESTIMATE_VERSION_MIGRATION_PATH.read_text(encoding="utf-8")
     for column_name in ("subtotal_amount", "tax_amount", "total_amount"):
-        assert f'"{column_name}::text <> \'NaN\' AND {column_name} >= 0::numeric"' in migration_sql
+        assert f"\"{column_name}::text <> 'NaN' AND {column_name} >= 0::numeric\"" in migration_sql
 
 
 async def test_estimate_version_persists_allowed_trusted_header(

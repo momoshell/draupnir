@@ -97,14 +97,8 @@ class EstimateJobInput(Base):
             f"source_job_type = '{JobType.ESTIMATE.value}'",
             name="ck_estimate_job_inputs_source_job_type_estimate",
         ),
-        CheckConstraint(
-            f"quantity_gate = '{QuantityGate.ALLOWED.value}'",
-            name="ck_estimate_job_inputs_quantity_gate_allowed",
-        ),
-        CheckConstraint(
-            "trusted_totals = TRUE",
-            name="ck_estimate_job_inputs_trusted_totals_true",
-        ),
+        # Path B 3: estimates are no longer gated to allowed + trusted takeoffs.
+        # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
         CheckConstraint(
             "currency = 'GBP'",
             name="ck_estimate_job_inputs_currency_gbp",
