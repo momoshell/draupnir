@@ -18,7 +18,6 @@ from app.core.exceptions import create_error_response
 from app.models.drawing_revision import DrawingRevision
 from app.models.job import Job, JobType
 from app.models.quantity_takeoff import (
-    QuantityGate,
     QuantityItem,
     QuantityItemKind,
     QuantityTakeoff,
@@ -435,7 +434,6 @@ async def _resolve_estimate_catalog_refs(
                     & (QuantityItem.quantity_takeoff_id == takeoff.id)
                     & (QuantityItem.project_id == revision.project_id)
                     & (QuantityItem.drawing_revision_id == revision.id)
-                    & (QuantityItem.quantity_gate == QuantityGate.ALLOWED.value)
                 )
             )
             quantity_item = quantity_item_result.scalar_one_or_none()

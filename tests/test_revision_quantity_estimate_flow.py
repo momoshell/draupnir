@@ -25,10 +25,7 @@ from tests.test_jobs import (
     _get_latest_revision_for_file,
 )
 from tests.test_quantity_takeoff_api import (
-    _assert_no_estimate_persistence_for_project,
     _build_estimate_request_body,
-    _response_error_code,
-    _seed_quantity_lineage,
 )
 
 
@@ -61,6 +58,8 @@ async def _create_rate_catalog_entry(
 
 def _select_eligible_aggregate_quantity_item_payload(
     items: list[dict[str, Any]],
+    *,
+    quantity_gate: str = QuantityGate.ALLOWED.value,
 ) -> dict[str, Any]:
     eligible_items = sorted(
         (
@@ -68,7 +67,7 @@ def _select_eligible_aggregate_quantity_item_payload(
             for item in items
             if item["item_kind"] == "aggregate"
             and item["value"] is not None
-            and item["quantity_gate"] == QuantityGate.ALLOWED.value
+            and item["quantity_gate"] == quantity_gate
         ),
         key=lambda item: (str(item["quantity_type"]), str(item["id"])),
     )
@@ -99,6 +98,10 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     enqueued_job_ids: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    review_state = "approved"
+    validation_status = "valid"
+    quantity_gate = QuantityGate.ALLOWED.value
+    trusted_totals = True
     await _truncate_and_reset_database_pool()
     _ = enqueued_job_ids
     published_job_ids: list[UUID] = []
@@ -108,9 +111,9 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     ) -> IngestFinalizationPayload:
         return _build_fake_quantity_ingest_payload(
             request,
-            review_state="approved",
-            validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
+            review_state=review_state,
+            validation_status=validation_status,
+            quantity_gate=quantity_gate,
         )
 
     async def _capture_publish_job_enqueue_intent(
@@ -164,8 +167,8 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert quantity_takeoff["drawing_revision_id"] == str(revision.id)
     assert quantity_takeoff["source_job_id"] == str(quantity_job_id)
     assert quantity_takeoff["source_job_type"] == JobType.QUANTITY_TAKEOFF.value
-    assert quantity_takeoff["quantity_gate"] == QuantityGate.ALLOWED.value
-    assert quantity_takeoff["trusted_totals"] is True
+    assert quantity_takeoff["quantity_gate"] == quantity_gate
+    assert quantity_takeoff["trusted_totals"] is trusted_totals
 
     quantity_read_response = await async_client.get(
         f"/v1/revisions/{revision.id}/quantity-takeoffs/{quantity_takeoff['id']}"
@@ -179,12 +182,14 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert quantity_items_response.status_code == 200
     quantity_items_body = quantity_items_response.json()
     assert quantity_items_body["next_cursor"] is None
-    quantity_item = _select_eligible_aggregate_quantity_item_payload(quantity_items_body["items"])
+    quantity_item = _select_eligible_aggregate_quantity_item_payload(
+        quantity_items_body["items"], quantity_gate=quantity_gate
+    )
     assert quantity_item["quantity_takeoff_id"] == quantity_takeoff["id"]
     assert quantity_item["project_id"] == project["id"]
     assert quantity_item["drawing_revision_id"] == str(revision.id)
-    assert quantity_item["review_state"] == "approved"
-    assert quantity_item["validation_status"] == "valid"
+    assert quantity_item["review_state"] == review_state
+    assert quantity_item["validation_status"] == validation_status
 
     rate = await _create_rate_catalog_entry(
         async_client,
@@ -237,8 +242,8 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert listed_estimate["drawing_revision_id"] == str(revision.id)
     assert listed_estimate["quantity_takeoff_id"] == quantity_takeoff["id"]
     assert listed_estimate["source_job_id"] == str(estimate_job_id)
-    assert listed_estimate["quantity_gate"] == QuantityGate.ALLOWED.value
-    assert listed_estimate["trusted_totals"] is True
+    assert listed_estimate["quantity_gate"] == quantity_gate
+    assert listed_estimate["trusted_totals"] is trusted_totals
     assert listed_estimate["currency"] == "GBP"
 
     quantity_value = Decimal(str(quantity_item["value"]))
@@ -305,44 +310,3 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert Decimal(rate_snapshot["unit_amount"]) == rate_amount
     assert rate_snapshot["effective_date"] == rate["effective_from"]
     assert published_job_ids == [quantity_job_id, estimate_job_id]
-
-
-@pytest.mark.anyio
-@requires_database
-async def test_revision_estimate_create_api_rejects_review_gated_takeoff_without_persistence(
-    async_client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await _truncate_and_reset_database_pool()
-    seed = await _seed_quantity_lineage(
-        quantity_gate=QuantityGate.REVIEW_GATED.value,
-        trusted_totals=False,
-    )
-    await _reset_database_pool()
-    request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
-    published_job_ids: list[UUID] = []
-
-    async def _capture_publish_job_enqueue_intent(
-        job_id: UUID,
-        *,
-        publisher: Any = None,
-        suppress_exceptions: bool = False,
-    ) -> None:
-        _ = (publisher, suppress_exceptions)
-        published_job_ids.append(job_id)
-
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_publish_job_enqueue_intent",
-        _capture_publish_job_enqueue_intent,
-    )
-
-    response = await async_client.post(
-        f"/v1/revisions/{seed.revision_id}/quantity-takeoffs/{seed.takeoff_id}/estimate-versions",
-        json=request_body,
-    )
-
-    assert response.status_code == 400
-    assert _response_error_code(response) == "INPUT_INVALID"
-    assert published_job_ids == []
-    await _assert_no_estimate_persistence_for_project(seed)

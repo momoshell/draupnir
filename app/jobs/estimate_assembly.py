@@ -231,14 +231,6 @@ async def _build_estimate_engine_input(
                         "item_kind": quantity_item.item_kind,
                     },
                 )
-            if quantity_item.quantity_gate != "allowed":
-                raise _build_estimate_job_input_error(
-                    "quantity_item_gate_not_allowed",
-                    extra_details={
-                        "quantity_item_id": str(quantity_item.id),
-                        "quantity_gate": quantity_item.quantity_gate,
-                    },
-                )
             if quantity_item.value is None or not math.isfinite(quantity_item.value):
                 raise _build_estimate_job_input_error(
                     "invalid_quantity_value",

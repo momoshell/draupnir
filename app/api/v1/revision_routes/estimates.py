@@ -74,9 +74,6 @@ from app.api.v1.revision_estimate_inputs import (
     _raise_estimate_input_invalid as _raise_estimate_input_invalid_direct,
 )
 from app.api.v1.revision_estimate_inputs import (
-    _raise_estimate_takeoff_gate_invalid as _raise_estimate_takeoff_gate_invalid_direct,
-)
-from app.api.v1.revision_estimate_inputs import (
     _resolve_catalog_model as _resolve_catalog_model_direct,
 )
 from app.api.v1.revision_estimate_inputs import (
@@ -114,7 +111,7 @@ from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, Est
 from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.project import Project
-from app.models.quantity_takeoff import QuantityGate, QuantityItem, QuantityTakeoff
+from app.models.quantity_takeoff import QuantityItem, QuantityTakeoff
 from app.schemas.estimate import (
     EstimateItemListResponse,
     EstimateItemRead,
@@ -212,15 +209,6 @@ def _utc_now() -> datetime:
     """Route-local clock seam for estimate create flows."""
 
     return datetime.now(UTC)
-
-
-def _raise_estimate_takeoff_gate_invalid(takeoff: QuantityTakeoff) -> None:
-    """Raise the standard pre-enqueue error for non-runnable estimate inputs."""
-
-    _raise_estimate_takeoff_gate_invalid_direct(
-        takeoff,
-        raise_estimate_input_invalid=_raise_estimate_input_invalid,
-    )
 
 
 def _mapped_attribute_keys(model_class: type[Any]) -> set[str]:
@@ -469,8 +457,6 @@ async def create_revision_estimate_version(
         assert revision is not None
 
         takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
-        if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
-            _raise_estimate_takeoff_gate_invalid(takeoff)
 
         job_created_at = _utc_now()
         pricing_mode, pricing_effective_date = _resolve_estimate_pricing_contract(
@@ -493,8 +479,6 @@ async def create_revision_estimate_version(
         assert revision is not None
 
         takeoff = await _get_revision_quantity_takeoff_or_404(revision_id, takeoff_id, db)
-        if takeoff.quantity_gate != QuantityGate.ALLOWED.value or not takeoff.trusted_totals:
-            _raise_estimate_takeoff_gate_invalid(takeoff)
         assert job_created_at is not None
         assert pricing_mode is not None
         assert pricing_effective_date is not None

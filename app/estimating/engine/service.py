@@ -189,16 +189,6 @@ def _validate_engine_input(engine_input: EstimateEngineInput) -> None:
             reason="unsupported_currency",
             message="estimate engine supports GBP only",
         )
-    if engine_input.quantity_gate != "allowed":
-        raise_input_invalid(
-            reason="quantity_gate_not_allowed",
-            message="estimate input requires quantity_gate='allowed'",
-        )
-    if not engine_input.trusted_totals:
-        raise_input_invalid(
-            reason="untrusted_totals",
-            message="estimate input requires trusted_totals=True",
-        )
     if engine_input.tax_rate < 0:
         raise_input_invalid(reason="negative_tax_rate", message="tax_rate must be nonnegative")
     if engine_input.tax_rate > _MAX_TAX_RATE:

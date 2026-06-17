@@ -1522,142 +1522,6 @@ def test_create_revision_estimate_version_rejects_non_gbp(monkeypatch: Any) -> N
     assert publish_calls == []
 
 
-def test_create_revision_estimate_version_rejects_non_allowed_quantity_gate_before_enqueue(
-    monkeypatch: Any,
-) -> None:
-    revision = _build_revision()
-    takeoff = _build_takeoff(revision, quantity_gate=QuantityGate.REVIEW_GATED.value)
-    session = _AsyncSessionStub()
-    app = _build_app(session)
-    client = TestClient(app)
-    publish_calls: list[UUID] = []
-    enqueue_calls: list[UUID] = []
-
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
-
-    async def fake_get_revision_quantity_takeoff_or_404(
-        revision_id: UUID,
-        takeoff_id: UUID,
-        db: AsyncSession,
-    ) -> SimpleNamespace:
-        _ = db
-        if revision_id != revision.id or takeoff_id != takeoff.id:
-            raise AssertionError("Unexpected takeoff lookup")
-        return takeoff
-
-    async def fake_publish_job_enqueue_intent(
-        job_id: UUID,
-        *,
-        publisher: Any = None,
-        suppress_exceptions: bool = False,
-    ) -> None:
-        _ = (publisher, suppress_exceptions)
-        publish_calls.append(job_id)
-
-    def fake_enqueue_estimate_job(job_id: UUID) -> None:
-        enqueue_calls.append(job_id)
-
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_get_active_revision",
-        fake_get_active_revision,
-    )
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_get_revision_quantity_takeoff_or_404",
-        fake_get_revision_quantity_takeoff_or_404,
-    )
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_publish_job_enqueue_intent",
-        fake_publish_job_enqueue_intent,
-    )
-    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
-
-    response = client.post(
-        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
-        json=_build_estimate_request_body(quantity_item_id=uuid4()),
-    )
-
-    assert response.status_code == 400
-    assert _response_error_code(response) == "INPUT_INVALID"
-    assert session.added == []
-    assert session.commits == 0
-    assert publish_calls == []
-    assert enqueue_calls == []
-
-
-def test_create_revision_estimate_version_rejects_untrusted_takeoff(monkeypatch: Any) -> None:
-    revision = _build_revision()
-    takeoff = _build_takeoff(revision, trusted_totals=False)
-    session = _AsyncSessionStub()
-    app = _build_app(session)
-    client = TestClient(app)
-    publish_calls: list[UUID] = []
-
-    async def fake_get_active_revision(
-        revision_id: UUID,
-        db: AsyncSession,
-        *,
-        for_update: bool = False,
-    ) -> SimpleNamespace | None:
-        _ = (db, for_update)
-        return revision if revision_id == revision.id else None
-
-    async def fake_get_revision_quantity_takeoff_or_404(
-        revision_id: UUID,
-        takeoff_id: UUID,
-        db: AsyncSession,
-    ) -> SimpleNamespace:
-        _ = db
-        if revision_id != revision.id or takeoff_id != takeoff.id:
-            raise AssertionError("Unexpected takeoff lookup")
-        return takeoff
-
-    async def fake_publish_job_enqueue_intent(
-        job_id: UUID,
-        *,
-        publisher: Any = None,
-        suppress_exceptions: bool = False,
-    ) -> None:
-        _ = (publisher, suppress_exceptions)
-        publish_calls.append(job_id)
-
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_get_active_revision",
-        fake_get_active_revision,
-    )
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_get_revision_quantity_takeoff_or_404",
-        fake_get_revision_quantity_takeoff_or_404,
-    )
-    monkeypatch.setattr(
-        estimates_routes_module,
-        "_publish_job_enqueue_intent",
-        fake_publish_job_enqueue_intent,
-    )
-
-    response = client.post(
-        f"/v1/revisions/{revision.id}/quantity-takeoffs/{takeoff.id}/estimate-versions",
-        json=_build_estimate_request_body(quantity_item_id=uuid4()),
-    )
-
-    assert response.status_code == 400
-    assert _response_error_code(response) == "INPUT_INVALID"
-    assert session.added == []
-    assert session.commits == 0
-    assert publish_calls == []
-
-
 def test_create_revision_estimate_version_rejects_catalog_validation_before_idempotency_claim(
     monkeypatch: Any,
 ) -> None:
@@ -1812,16 +1676,17 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
     ],
 )
 @requires_database
-async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_before_insert(
+async def test_create_revision_estimate_version_accepts_gated_or_untrusted_takeoff(
     async_client: AsyncClient,
     monkeypatch: Any,
     quantity_gate: str,
     trusted_totals: bool,
 ) -> None:
+    # Path B 3: estimate creation is no longer gated to allowed + trusted takeoffs;
+    # the route proceeds past the takeoff lookup to resolve refs and enqueue the job.
     seed = await _seed_quantity_lineage(quantity_gate=quantity_gate, trusted_totals=trusted_totals)
     request_body = _build_estimate_request_body(quantity_item_id=seed.quantity_item_id)
     publish_calls: list[UUID] = []
-    enqueue_calls: list[UUID] = []
     catalog_resolver_called = False
 
     async def fake_publish_job_enqueue_intent(
@@ -1832,9 +1697,6 @@ async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_befor
     ) -> None:
         _ = (publisher, suppress_exceptions)
         publish_calls.append(job_id)
-
-    def fake_enqueue_estimate_job(job_id: UUID) -> None:
-        enqueue_calls.append(job_id)
 
     async def fake_resolve_estimate_catalog_refs(
         revision_value: Any,
@@ -1853,7 +1715,6 @@ async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_befor
         "_publish_job_enqueue_intent",
         fake_publish_job_enqueue_intent,
     )
-    monkeypatch.setattr(estimates_routes_module, "enqueue_estimate_job", fake_enqueue_estimate_job)
     monkeypatch.setattr(
         estimates_routes_module,
         "_resolve_estimate_catalog_refs",
@@ -1865,12 +1726,9 @@ async def test_create_revision_estimate_version_rejects_trust_gate_takeoff_befor
         json=request_body,
     )
 
-    assert response.status_code == 400
-    assert _response_error_code(response) == "INPUT_INVALID"
-    assert catalog_resolver_called is False
-    assert publish_calls == []
-    assert enqueue_calls == []
-    await _assert_no_estimate_persistence_for_project(seed)
+    assert response.status_code == 202
+    assert catalog_resolver_called is True
+    assert len(publish_calls) == 1
 
 
 @pytest.mark.anyio
