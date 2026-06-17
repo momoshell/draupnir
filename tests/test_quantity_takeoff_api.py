@@ -2561,17 +2561,18 @@ async def test_create_revision_quantity_takeoff_rechecks_locked_lineage_before_i
     "quantity_gate",
     [QuantityGate.REVIEW_GATED.value, QuantityGate.BLOCKED.value],
 )
-def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
+def test_create_revision_quantity_takeoff_accepts_review_gated_or_blocked(
     monkeypatch: Any,
     quantity_gate: str,
 ) -> None:
+    # Path B 2b: quantity-takeoff creation is no longer gated on the revision's
+    # quantity_gate; review-gated/blocked revisions enqueue a takeoff job like any other.
     revision = _build_revision()
     session = _AsyncSessionStub()
     app = _build_app(session)
     client = TestClient(app)
     manifest = SimpleNamespace(id=uuid4())
-    enqueue_calls: list[UUID] = []
-    publish_calls: list[UUID] = []
+    enqueued_job_ids: list[UUID] = []
 
     async def fake_get_active_revision(
         revision_id: UUID,
@@ -2599,7 +2600,7 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
         return _build_validation_report(quantity_gate=quantity_gate)
 
     def fake_prepare_job_enqueue_intent(job: Any) -> None:
-        raise AssertionError(f"unexpected prepare for {job.id}")
+        _ = job
 
     async def fake_publish_job_enqueue_intent(
         job_id: UUID,
@@ -2607,11 +2608,12 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
         publisher: Any = None,
         suppress_exceptions: bool = False,
     ) -> None:
-        _ = (publisher, suppress_exceptions)
-        publish_calls.append(job_id)
+        _ = suppress_exceptions
+        assert publisher is quantity_takeoffs_routes_module.enqueue_quantity_takeoff_job
+        publisher(job_id)
 
     def fake_enqueue_quantity_takeoff_job(job_id: UUID) -> None:
-        enqueue_calls.append(job_id)
+        enqueued_job_ids.append(job_id)
 
     async def fake_get_active_revision_manifest_or_409(
         revision_id: UUID,
@@ -2654,12 +2656,12 @@ def test_create_revision_quantity_takeoff_rejects_review_gated_or_blocked(
 
     response = client.post(f"/v1/revisions/{revision.id}/quantity-takeoffs")
 
-    assert response.status_code == 400
-    assert _response_error_code(response) == "INPUT_INVALID"
-    assert session.added == []
-    assert session.commits == 0
-    assert publish_calls == []
-    assert enqueue_calls == []
+    assert response.status_code == 202
+    assert response.json()["job_type"] == "quantity_takeoff"
+    assert response.json()["base_revision_id"] == str(revision.id)
+    assert len(session.added) == 1
+    assert session.commits == 1
+    assert enqueued_job_ids == [UUID(response.json()["id"])]
 
 
 def test_revision_quantity_takeoff_routes_return_404_for_unknown_revision(

@@ -92,16 +92,25 @@ async def _truncate_and_reset_database_pool() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("review_state", "validation_status", "quantity_gate", "trusted_totals"),
+    [
+        ("approved", "valid", QuantityGate.ALLOWED.value, True),
+        # Path B: a review-gated, untrusted revision flows end-to-end (takeoff
+        # creation #495 → estimate creation #488) to a persisted estimate version.
+        ("review_required", "needs_review", QuantityGate.REVIEW_GATED.value, False),
+    ],
+)
 @requires_database
 async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     async_client: httpx.AsyncClient,
     enqueued_job_ids: list[str],
     monkeypatch: pytest.MonkeyPatch,
+    review_state: str,
+    validation_status: str,
+    quantity_gate: str,
+    trusted_totals: bool,
 ) -> None:
-    review_state = "approved"
-    validation_status = "valid"
-    quantity_gate = QuantityGate.ALLOWED.value
-    trusted_totals = True
     await _truncate_and_reset_database_pool()
     _ = enqueued_job_ids
     published_job_ids: list[UUID] = []
