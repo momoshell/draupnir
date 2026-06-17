@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,8 +54,7 @@ from app.api.v1.revision_lineage import (
 from app.api.v1.revision_lineage import (
     _raise_entities_not_materialized as _raise_entities_not_materialized_direct,
 )
-from app.core.errors import ErrorCode
-from app.core.exceptions import create_error_response, raise_not_found
+from app.core.exceptions import raise_not_found
 from app.db.session import get_db
 from app.jobs.worker import (
     enqueue_quantity_takeoff_job as _enqueue_quantity_takeoff_job_direct,
@@ -70,7 +69,7 @@ from app.models.drawing_revision import DrawingRevision
 from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.project import Project
-from app.models.quantity_takeoff import QuantityGate, QuantityItem, QuantityTakeoff
+from app.models.quantity_takeoff import QuantityItem, QuantityTakeoff
 from app.models.revision_materialization import RevisionEntityManifest
 from app.models.validation_report import ValidationReport
 from app.schemas.job import JobRead
@@ -203,23 +202,6 @@ def enqueue_quantity_takeoff_job(job_id: UUID) -> None:
     """Route-local quantity enqueue seam for tests."""
 
     _enqueue_quantity_takeoff_job_direct(job_id)
-
-
-def _raise_quantity_takeoff_gate_invalid(report: ValidationReport) -> None:
-    """Raise the standard pre-enqueue error for non-runnable quantity gates."""
-
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=create_error_response(
-            code=ErrorCode.INPUT_INVALID,
-            message=("Quantity takeoff requires a revision with an allowed quantity gate."),
-            details={
-                "quantity_gate": report.quantity_gate,
-                "review_state": report.review_state,
-                "validation_status": report.validation_status,
-            },
-        ),
-    )
 
 
 @quantity_takeoffs_router.get(
@@ -383,12 +365,10 @@ async def create_revision_quantity_takeoff(
             raise_not_found("Drawing revision", str(revision_id))
 
         await _get_active_revision_manifest_or_409(revision_id, db)
-        report = await _get_active_validation_report_or_404(revision_id, db)
-        if report.quantity_gate in {
-            QuantityGate.REVIEW_GATED.value,
-            QuantityGate.BLOCKED.value,
-        }:
-            _raise_quantity_takeoff_gate_invalid(report)
+        # The validation report must exist (the takeoff worker requires it), but its
+        # quantity_gate no longer blocks creation — quantities are always computed and
+        # the gate is recorded as informational lineage (Path B 2b).
+        await _get_active_validation_report_or_404(revision_id, db)
         return None
 
     async def _mutate() -> IdempotentMutationSuccess[Job] | IdempotentMutationKnownError:
