@@ -59,9 +59,7 @@ def _select_eligible_aggregate_quantity_item(quantity_items: list[QuantityItem])
         (
             item
             for item in quantity_items
-            if item.item_kind == "aggregate"
-            and item.value is not None
-            and item.quantity_gate in {"allowed", "allowed_provisional"}
+            if item.item_kind == "aggregate" and item.value is not None
         ),
         key=lambda item: (item.quantity_type, str(item.id)),
     )
@@ -451,32 +449,15 @@ async def _create_ready_estimate_execution_job(
         request: IngestionRunRequest,
     ) -> IngestFinalizationPayload:
         payload = _build_fake_ingest_payload(request)
-        confidence_json = {
-            **payload.confidence_json,
-            "review_state": "approved",
-            "effective_confidence": payload.effective_confidence,
-        }
         report_json = deepcopy(payload.report_json)
         summary = report_json.get("summary")
         if isinstance(summary, dict):
-            report_json["summary"] = {
-                **summary,
-                "validation_status": "valid",
-                "review_state": "approved",
-                "quantity_gate": "allowed",
-                "effective_confidence": payload.effective_confidence,
-            }
+            report_json["summary"] = {**summary, "validation_status": "valid"}
         report_json["validation_status"] = "valid"
-        report_json["review_state"] = "approved"
-        report_json["quantity_gate"] = "allowed"
-        report_json["effective_confidence"] = payload.effective_confidence
 
         return replace(
             payload,
-            confidence_json=confidence_json,
             validation_status="valid",
-            review_state="approved",
-            quantity_gate="allowed",
             report_json=report_json,
         )
 
@@ -488,6 +469,8 @@ async def _create_ready_estimate_execution_job(
         base_revision,
         quantity_job,
     ) = await _create_ready_quantity_takeoff_job(async_client)
+    # Path B 5b: ingest no longer derives a gate; the takeoff/estimate flow runs with a
+    # NULL gate (the estimate engine no longer requires an allowed gate).
     await worker_module.process_quantity_takeoff_job(quantity_job.id)
     takeoffs = await _get_quantity_takeoffs_for_job(quantity_job.id)
     assert len(takeoffs) == 1

@@ -530,9 +530,11 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
         index=True,
         comment="Optional raw parent entity reference extracted from the canonical entity payload",
     )
-    confidence_score: Mapped[float] = mapped_column(
-        nullable=False,
-        comment="Entity confidence score extracted from the canonical entity payload",
+    # Path B 5b: populated only from per-entity canonical confidence, else NULL
+    # (no revision-level fallback; dropped in Path B stage 6).
+    confidence_score: Mapped[float | None] = mapped_column(
+        nullable=True,
+        comment="Vestigial entity confidence score (dropped in Path B stage 6)",
     )
     confidence_json: Mapped[dict[str, Any]] = mapped_column(
         JSON,

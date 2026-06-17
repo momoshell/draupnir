@@ -322,7 +322,6 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
         "drawing_revision_id",
         "quantity_takeoff_id",
         "source_job_type",
-        "quantity_gate",
         "trusted_totals",
         "currency",
         "pricing_effective_date",
@@ -331,6 +330,8 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
         "created_at",
     ):
         assert columns["estimate_job_inputs"][required_column]["nullable"] is False
+    # Path B 5b: quantity_gate is vestigial and nullable.
+    assert columns["estimate_job_inputs"]["quantity_gate"]["nullable"] is True
     for required_column in (
         "estimate_job_id",
         "ref_type",

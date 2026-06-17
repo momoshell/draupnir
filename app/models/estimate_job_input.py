@@ -24,7 +24,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 from app.models.job import JobType
-from app.models.quantity_takeoff import QuantityGate
 
 _ESTIMATE_JOB_INPUT_REF_TYPED_CATALOG_CONTRACT = (
     "(ref_type = 'rate' AND rate_catalog_entry_id IS NOT NULL "
@@ -154,11 +153,11 @@ class EstimateJobInput(Base):
         default=JobType.ESTIMATE.value,
         comment="Denormalized job type used by the composite estimate-job contract",
     )
-    quantity_gate: Mapped[str] = mapped_column(
+    # Path B 5b: copied from the (now-NULL) takeoff gate; vestigial, dropped in stage 6.
+    quantity_gate: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        default=QuantityGate.ALLOWED.value,
-        comment="Persisted quantity gate contract copied from the selected takeoff",
+        nullable=True,
+        comment="Vestigial quantity gate copied from the takeoff (dropped in Path B stage 6)",
     )
     trusted_totals: Mapped[bool] = mapped_column(
         Boolean,

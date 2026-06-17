@@ -154,7 +154,9 @@ def compose_estimate(engine_input: EstimateEngineInput) -> EstimateEngineOutput:
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=_required_uuid("source_job_id", engine_input.source_job_id),
         currency=engine_input.currency,
-        quantity_gate=_required_quantity_gate(engine_input.quantity_gate),
+        # Path B 5b: quantity_gate is vestigial and may be NULL; pass it through
+        # unchanged rather than requiring an allowed gate.
+        quantity_gate=engine_input.quantity_gate,
         trusted_totals=engine_input.trusted_totals,
         subtotal_amount=subtotal_amount,
         tax_amount=tax_amount,
@@ -777,17 +779,6 @@ def _required_uuid(name: str, value: UUID | None) -> UUID:
     if value is None:
         raise_input_invalid(reason="missing_lineage", message=f"{name} is required")
     return value
-
-
-def _required_quantity_gate(
-    value: str | None,
-) -> Literal["allowed", "provisional", "review_gated", "blocked"]:
-    if value is None:
-        raise_input_invalid(
-            reason="quantity_gate_not_allowed",
-            message="quantity_gate is required",
-        )
-    return value  # type: ignore[return-value]
 
 
 def _resolve_adjustment_anchor(

@@ -273,9 +273,6 @@ def _build_fake_ingest_payload(
         },
         "summary": {
             "validation_status": _FAKE_RUNNER_VALIDATION_STATUS,
-            "review_state": _FAKE_RUNNER_REVIEW_STATE,
-            "quantity_gate": _FAKE_RUNNER_QUANTITY_GATE,
-            "effective_confidence": _FAKE_RUNNER_CONFIDENCE_SCORE,
             "entity_counts": entity_counts,
         },
         "checks": [],
@@ -291,7 +288,6 @@ def _build_fake_ingest_payload(
         "canonical_json": canonical_json,
         "provenance_json": provenance_json,
         "confidence_json": confidence_json,
-        "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
         "warnings_json": warnings_json,
         "diagnostics_json": diagnostics_json,
     }
@@ -305,15 +301,11 @@ def _build_fake_ingest_payload(
         canonical_json=canonical_json,
         provenance_json=provenance_json,
         confidence_json=confidence_json,
-        confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
         warnings_json=warnings_json,
         diagnostics_json=diagnostics_json,
         result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
         validation_report_schema_version=_FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
         validation_status=_FAKE_RUNNER_VALIDATION_STATUS,
-        review_state=_FAKE_RUNNER_REVIEW_STATE,
-        quantity_gate=_FAKE_RUNNER_QUANTITY_GATE,
-        effective_confidence=_FAKE_RUNNER_CONFIDENCE_SCORE,
         validator_name=_FAKE_RUNNER_VALIDATOR_NAME,
         validator_version=_FAKE_RUNNER_VALIDATOR_VERSION,
         report_json=report_json,
@@ -390,7 +382,6 @@ def _replace_fake_canonical_payload(
         "canonical_json": canonical_json,
         "provenance_json": payload.provenance_json,
         "confidence_json": payload.confidence_json,
-        "confidence_score": payload.confidence_score,
         "warnings_json": payload.warnings_json,
         "diagnostics_json": payload.diagnostics_json,
     }
@@ -409,32 +400,20 @@ def _replace_fake_validation_outcome(
     validation_status: str,
     quantity_gate: str,
 ) -> IngestFinalizationPayload:
-    """Replace fake validation gate metadata while preserving deterministic payload shape."""
-    confidence_json = {
-        **payload.confidence_json,
-        "review_state": review_state,
-        "effective_confidence": payload.effective_confidence,
-    }
+    """Replace the fake validation_status while preserving deterministic payload shape.
+
+    Path B 5b: review_state / quantity_gate are no longer derived or persisted, so they
+    flow as NULL regardless of these (now-vestigial) params; only validation_status is set.
+    """
+    _ = (review_state, quantity_gate)
     report_json = deepcopy(payload.report_json)
     summary = report_json.get("summary")
     if isinstance(summary, dict):
-        report_json["summary"] = {
-            **summary,
-            "validation_status": validation_status,
-            "review_state": review_state,
-            "quantity_gate": quantity_gate,
-            "effective_confidence": payload.effective_confidence,
-        }
+        report_json["summary"] = {**summary, "validation_status": validation_status}
     report_json["validation_status"] = validation_status
-    report_json["review_state"] = review_state
-    report_json["quantity_gate"] = quantity_gate
-    report_json["effective_confidence"] = payload.effective_confidence
     return replace(
         payload,
-        confidence_json=confidence_json,
         validation_status=validation_status,
-        review_state=review_state,
-        quantity_gate=quantity_gate,
         report_json=report_json,
     )
 
@@ -898,10 +877,10 @@ class TestJobsWorkerQuantity:
     @pytest.mark.parametrize(
         ("review_state", "validation_status", "quantity_gate", "trusted_totals"),
         [
-            ("approved", "valid", "allowed", True),
+            # Path B 5b: review_state / quantity_gate are no longer persisted, so the
+            # gate metadata is NULL and ``trusted_totals`` is always False.
+            ("approved", "valid", "allowed", False),
             ("provisional", "valid", "allowed_provisional", False),
-            # Path B 2: review-gated/blocked revisions now compute a populated takeoff
-            # (no job failure); only ``trusted_totals`` reflects the gate.
             ("review_required", "needs_review", "review_gated", False),
             ("rejected", "invalid", "blocked", False),
         ],
@@ -965,9 +944,9 @@ class TestJobsWorkerQuantity:
         assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
         assert takeoff.drawing_revision_id == base_revision.id
         assert takeoff.source_job_id == quantity_job.id
-        assert takeoff.review_state == review_state
+        assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
-        assert takeoff.quantity_gate == quantity_gate
+        assert takeoff.quantity_gate is None
         assert takeoff.trusted_totals is trusted_totals
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
@@ -977,9 +956,9 @@ class TestJobsWorkerQuantity:
             "contributor",
             "exclusion",
         }
-        assert all(item.review_state == review_state for item in items)
+        assert all(item.review_state is None for item in items)
         assert all(item.validation_status == validation_status for item in items)
-        assert all(item.quantity_gate == quantity_gate for item in items)
+        assert all(item.quantity_gate is None for item in items)
         assert sum(item.item_kind == "aggregate" for item in items) == 2
         assert sum(item.item_kind == "contributor" for item in items) == 2
         assert sum(item.item_kind == "exclusion" for item in items) == 1
@@ -1015,7 +994,6 @@ class TestJobsWorkerQuantity:
         expected_line_count, expected_total_length = _manifest_dxf_line_expectations(
             fixture_filename
         )
-        review_state = _manifest_expected_text(fixture_filename, "expected_review_state")
         validation_status = _manifest_expected_text(
             fixture_filename,
             "expected_validation_status",
@@ -1041,15 +1019,15 @@ class TestJobsWorkerQuantity:
         assert takeoff.project_id == uuid.UUID(project["id"])
         assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
         assert takeoff.drawing_revision_id == base_revision.id
-        assert takeoff.review_state == review_state
+        assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
-        assert takeoff.quantity_gate == "allowed"
-        assert takeoff.trusted_totals is True
+        assert takeoff.quantity_gate is None
+        assert takeoff.trusted_totals is False
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
-        assert all(item.review_state == review_state for item in items)
+        assert all(item.review_state is None for item in items)
         assert all(item.validation_status == validation_status for item in items)
-        assert all(item.quantity_gate == "allowed" for item in items)
+        assert all(item.quantity_gate is None for item in items)
         assert all(item.item_kind != "exclusion" for item in items)
 
         aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
@@ -1129,14 +1107,14 @@ class TestJobsWorkerQuantity:
         assert updated_job.status == "succeeded"
         assert updated_job.error_code is None
         assert len(takeoffs) == 1
-        assert takeoffs[0].quantity_gate == quantity_gate
+        assert takeoffs[0].quantity_gate is None
         assert takeoffs[0].trusted_totals is False
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "succeeded"
-        assert event_payload["quantity_gate"] == quantity_gate
+        assert event_payload["quantity_gate"] is None
         assert event_payload["trusted_totals"] is False
 
     async def test_process_quantity_takeoff_job_manifest_dxf_rerun_semantics_are_stable(
@@ -1675,19 +1653,19 @@ class TestJobsWorkerQuantity:
         assert updated_job.error_code is None
         assert len(takeoffs) == 1
         takeoff = takeoffs[0]
-        assert takeoff.quantity_gate == quantity_gate
+        assert takeoff.quantity_gate is None
         assert takeoff.trusted_totals is False
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert items, "gated revision should still produce quantity items"
-        assert all(item.quantity_gate == quantity_gate for item in items)
+        assert all(item.quantity_gate is None for item in items)
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "succeeded"
         assert event_payload["trusted_totals"] is False
-        assert event_payload["quantity_gate"] == quantity_gate
+        assert event_payload["quantity_gate"] is None
 
     async def test_process_quantity_takeoff_job_fails_conflicts_without_rows(
         self,

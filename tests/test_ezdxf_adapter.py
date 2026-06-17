@@ -1207,8 +1207,6 @@ async def test_ezdxf_adapter_passes_shared_contract_harness_for_smoke_fixture() 
         input_family=input_family(),
         expectation=ContractFinalizationExpectation(
             validation_status="valid",
-            review_state="approved",
-            quantity_gate="allowed",
             diagnostic_codes=("dxf_document_loaded", "dxf_entities_extracted"),
         ),
         adapter_key="ezdxf",
@@ -1221,9 +1219,7 @@ async def test_ezdxf_adapter_passes_shared_contract_harness_for_smoke_fixture() 
         "blocks": 0,
         "entities": 1,
     }
-    assert payload.review_state == "approved"
     assert payload.validation_status == "valid"
-    assert payload.quantity_gate == "allowed"
 
 
 @pytest.mark.asyncio
@@ -1240,8 +1236,6 @@ async def test_ezdxf_adapter_empty_modelspace_passes_shared_contract_harness(
         input_family=input_family(),
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             diagnostic_codes=("dxf_document_loaded", "dxf_entities_extracted"),
         ),
         adapter_key="ezdxf",

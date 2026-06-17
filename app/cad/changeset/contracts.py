@@ -38,7 +38,8 @@ class RevisionEntitySnapshot:
     entity_id: str
     entity_type: str
     entity_schema_version: str
-    confidence_score: float
+    # Path B 5b: per-entity confidence column is now nullable (no longer derived).
+    confidence_score: float | None
     confidence_json: Mapping[str, Any]
     geometry_json: Mapping[str, Any]
     properties_json: Mapping[str, Any]

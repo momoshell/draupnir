@@ -52,15 +52,11 @@ def _fake_ingest_payload(*, generated_at: datetime) -> IngestFinalizationPayload
         canonical_json={"entities": []},
         provenance_json={"source": "smoke-test"},
         confidence_json={"entities": []},
-        confidence_score=0.99,
         warnings_json=[],
         diagnostics_json={},
         result_checksum_sha256="a" * 64,
         validation_report_schema_version="0.1",
         validation_status="valid_with_warnings",
-        review_state="approved",
-        quantity_gate="allowed",
-        effective_confidence=0.99,
         validator_name="smoke-validator",
         validator_version="0.0.1",
         report_json={
@@ -659,5 +655,3 @@ class TestHealthEndpointRealServer:
         assert validation_data["drawing_revision_id"] == str(revision_id)
         assert validation_data["source_job_id"] == str(job_id)
         assert validation_data["validation_status"] == "valid"
-        assert validation_data["review_state"] == "approved"
-        assert validation_data["quantity_gate"] == "allowed"

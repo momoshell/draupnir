@@ -827,8 +827,6 @@ async def test_vtracer_tesseract_ingest_returns_raster_scaffold(
         generated_at=datetime.now(UTC),
     )
     findings = cast(list[dict[str, object]], validation.report_json["findings"])
-    assert validation.review_state == "review_required"
-    assert validation.quantity_gate == "review_gated"
     assert any(
         finding.get("check_key") == "placeholder_semantics"
         and cast(dict[str, object], finding["details"]).get("reason")
@@ -864,8 +862,6 @@ async def test_vtracer_tesseract_adapter_passes_shared_contract_harness(
         adapter_key="vtracer_tesseract",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             warning_codes=(
                 "RASTER_SCAFFOLD_ONLY",
                 "RASTER_SCALE_UNCONFIRMED",
@@ -1224,8 +1220,6 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
         adapter_key="pymupdf",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             diagnostic_codes=("pymupdf.extract",),
         ),
         timeout=AdapterTimeout(seconds=5),
@@ -1448,8 +1442,6 @@ async def test_pymupdf_ingest_uses_process_hook_instead_of_parent_parser_calls(
         adapter_key="pymupdf",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             diagnostic_codes=("pymupdf.extract",),
         ),
     )

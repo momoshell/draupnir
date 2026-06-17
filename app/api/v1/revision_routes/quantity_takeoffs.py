@@ -301,10 +301,11 @@ async def list_revision_quantity_takeoff_items(
         select(QuantityItem)
         .join(
             QuantityTakeoff,
+            # Path B 5b: quantity_gate is vestigial/NULL and no longer part of the join key
+            # (id + project + revision already identify the takeoff).
             (QuantityTakeoff.id == QuantityItem.quantity_takeoff_id)
             & (QuantityTakeoff.project_id == QuantityItem.project_id)
-            & (QuantityTakeoff.drawing_revision_id == QuantityItem.drawing_revision_id)
-            & (QuantityTakeoff.quantity_gate == QuantityItem.quantity_gate),
+            & (QuantityTakeoff.drawing_revision_id == QuantityItem.drawing_revision_id),
         )
         .join(
             File,

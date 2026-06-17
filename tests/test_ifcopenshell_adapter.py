@@ -256,8 +256,6 @@ async def test_ifcopenshell_adapter_emits_semantic_canonical_payload(
         adapter_key="ifcopenshell",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             diagnostic_codes=("ifc.schema_sniff", "ifc.semantic_extract"),
         ),
     )
@@ -679,8 +677,6 @@ async def test_ifcopenshell_adapter_short_circuits_invalid_schema_through_valida
         adapter_key="ifcopenshell",
         expectation=ContractFinalizationExpectation(
             validation_status="invalid",
-            review_state="rejected",
-            quantity_gate="blocked",
             warning_codes=(expected_warning,),
             diagnostic_codes=("ifc.schema_sniff", "ifc.semantic_extract"),
         ),

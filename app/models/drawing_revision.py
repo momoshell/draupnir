@@ -176,20 +176,21 @@ class DrawingRevision(Base):
         nullable=False,
         comment="Drawing revision kind recorded for this append-only revision",
     )
-    review_state: Mapped[str] = mapped_column(
+    # Path B 5b: no longer derived/persisted (nullable until #491 drops them).
+    review_state: Mapped[str | None] = mapped_column(
         String(32),
-        nullable=False,
-        comment="Review state recorded for this drawing revision",
+        nullable=True,
+        comment="Vestigial review state (no longer derived; dropped in Path B stage 6)",
     )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
         comment="Canonical entity schema version stored on this drawing revision",
     )
-    confidence_score: Mapped[float] = mapped_column(
+    confidence_score: Mapped[float | None] = mapped_column(
         Float,
-        nullable=False,
-        comment="Overall drawing revision confidence score for review workflows",
+        nullable=True,
+        comment="Vestigial confidence score (no longer derived; dropped in Path B stage 6)",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

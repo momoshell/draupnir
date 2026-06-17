@@ -46,7 +46,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_ADAPTER_VERSION,
     _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
     _FAKE_RUNNER_CONFIDENCE_SCORE,
-    _FAKE_RUNNER_QUANTITY_GATE,
     _FAKE_RUNNER_REVIEW_STATE,
     _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
     _FAKE_RUNNER_VALIDATION_STATUS,
@@ -179,7 +178,6 @@ def _replace_fake_canonical_payload(
         "canonical_json": canonical_json,
         "provenance_json": payload.provenance_json,
         "confidence_json": payload.confidence_json,
-        "confidence_score": payload.confidence_score,
         "warnings_json": payload.warnings_json,
         "diagnostics_json": payload.diagnostics_json,
     }
@@ -203,23 +201,15 @@ def _assert_validation_report_json_matches_columns(report: ValidationReport) -> 
     )
     assert report_json["canonical_entity_schema_version"] == report.canonical_entity_schema_version
     assert report_json["validation_status"] == report.validation_status
-    assert report_json["review_state"] == report.review_state
-    assert report_json["quantity_gate"] == report.quantity_gate
-    assert report_json["effective_confidence"] == report.effective_confidence
+    assert report.review_state is None
+    assert report.quantity_gate is None
+    assert report.effective_confidence is None
     assert report_json["validator"] == {
         "name": report.validator_name,
         "version": report.validator_version,
     }
-    assert report_json["confidence"]["effective_confidence"] == report.effective_confidence
-    assert report_json["confidence"]["review_state"] == report.review_state
-    assert report_json["confidence"]["review_required"] == (
-        report.review_state == "review_required"
-    )
     assert report_json["generated_at"] == report.generated_at.isoformat()
     assert report_json["summary"]["validation_status"] == report.validation_status
-    assert report_json["summary"]["review_state"] == report.review_state
-    assert report_json["summary"]["quantity_gate"] == report.quantity_gate
-    assert report_json["summary"]["effective_confidence"] == report.effective_confidence
     assert report_json["checks"]
 
 
@@ -248,8 +238,6 @@ def _assert_debug_overlay_artifact(
     assert artifact.generator_config_json == {
         "title": f"plan.pdf revision {drawing_revision.revision_sequence}",
         "source_label": "plan.pdf",
-        "review_state": drawing_revision.review_state,
-        "confidence_score": drawing_revision.confidence_score,
     }
     assert artifact.storage_key == build_generated_artifact_storage_key(artifact.id, artifact.name)
     assert artifact.storage_uri
@@ -485,7 +473,7 @@ class TestIngestOutputPersistence:
         assert (
             adapter_output.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
-        assert adapter_output.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert adapter_output.confidence_score is None
         assert adapter_output.canonical_json == {
             "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
             "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
@@ -553,12 +541,12 @@ class TestIngestOutputPersistence:
         assert drawing_revision.predecessor_revision_id is None
         assert drawing_revision.revision_sequence == 1
         assert drawing_revision.revision_kind == "ingest"
-        assert drawing_revision.review_state == _FAKE_RUNNER_REVIEW_STATE
+        assert drawing_revision.review_state is None
         assert (
             drawing_revision.canonical_entity_schema_version
             == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
-        assert drawing_revision.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert drawing_revision.confidence_score is None
 
         assert validation_report.project_id == job.project_id
         assert validation_report.drawing_revision_id == drawing_revision.id
@@ -572,9 +560,9 @@ class TestIngestOutputPersistence:
             == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
         assert validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
-        assert validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
-        assert validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
-        assert validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert validation_report.review_state is None
+        assert validation_report.quantity_gate is None
+        assert validation_report.effective_confidence is None
         _assert_validation_report_json_matches_columns(validation_report)
         assert validation_report.report_json["summary"]["entity_counts"] == {
             "layouts": 1,
@@ -864,15 +852,11 @@ class TestIngestOutputPersistence:
             return replace(
                 payload,
                 validation_status="invalid",
-                review_state="rejected",
-                quantity_gate="blocked",
                 report_json={
                     **payload.report_json,
                     "summary": {
                         **payload.report_json["summary"],
                         "validation_status": "invalid",
-                        "review_state": "rejected",
-                        "quantity_gate": "blocked",
                     },
                     "findings": [
                         {
@@ -911,10 +895,10 @@ class TestIngestOutputPersistence:
 
         drawing_revision = drawing_revisions[0]
         validation_report = validation_reports[0]
-        assert drawing_revision.review_state == "rejected"
+        assert drawing_revision.review_state is None
         assert validation_report.validation_status == "invalid"
-        assert validation_report.review_state == "rejected"
-        assert validation_report.quantity_gate == "blocked"
+        assert validation_report.review_state is None
+        assert validation_report.quantity_gate is None
         _assert_validation_report_json_matches_columns(validation_report)
         assert validation_report.report_json["findings"] == [
             {
@@ -1469,7 +1453,7 @@ class TestIngestOutputPersistence:
             payload = _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
             payload.report_json.pop("provenance", None)
             payload.report_json["confidence"] = {
-                "score": payload.confidence_score,
+                "score": payload.confidence_json.get("score"),
                 "effective_confidence": 0.01,
                 "review_state": "approved",
                 "review_required": False,
@@ -1496,20 +1480,10 @@ class TestIngestOutputPersistence:
         assert validation_report.report_json["confidence"]["score"] == captured_payloads[
             0
         ].confidence_json.get("score")
-        assert (
-            validation_report.report_json["confidence"]["effective_confidence"]
-            == validation_report.effective_confidence
-        )
-        assert (
-            validation_report.report_json["confidence"]["review_state"]
-            == validation_report.review_state
-        )
-        assert validation_report.report_json["confidence"]["review_required"] == (
-            validation_report.review_state == "review_required"
-        )
-        assert validation_report.report_json["confidence"].get("basis") == captured_payloads[
-            0
-        ].confidence_json.get("basis")
+        # Path B 5b: effective_confidence / review_state are no longer persisted as columns.
+        assert validation_report.effective_confidence is None
+        assert validation_report.review_state is None
+        assert validation_report.quantity_gate is None
 
     async def test_reprocess_creates_second_revision_with_predecessor(
         self,
@@ -1599,9 +1573,9 @@ class TestIngestOutputPersistence:
         assert second_validation_report.source_job_id == second_job.id
         assert second_validation_report.drawing_revision_id == second_revision.id
         assert second_validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
-        assert second_validation_report.review_state == _FAKE_RUNNER_REVIEW_STATE
-        assert second_validation_report.quantity_gate == _FAKE_RUNNER_QUANTITY_GATE
-        assert second_validation_report.effective_confidence == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert second_validation_report.review_state is None
+        assert second_validation_report.quantity_gate is None
+        assert second_validation_report.effective_confidence is None
         _assert_debug_overlay_artifact(
             first_generated_artifact,
             job=first_job,
@@ -1638,17 +1612,14 @@ class TestIngestOutputPersistence:
         ) -> IngestFinalizationPayload:
             payload = _replace_fake_canonical_payload(_build_fake_ingest_payload(request))
             validation_status = "valid_with_warnings"
-            quantity_gate = "allowed_provisional"
             return replace(
                 payload,
                 validation_status=validation_status,
-                quantity_gate=quantity_gate,
                 report_json={
                     **payload.report_json,
                     "summary": {
                         **payload.report_json["summary"],
                         "validation_status": validation_status,
-                        "quantity_gate": quantity_gate,
                     },
                 },
             )
@@ -1666,7 +1637,7 @@ class TestIngestOutputPersistence:
 
         validation_report = validation_reports[0]
         assert validation_report.validation_status == "valid_with_warnings"
-        assert validation_report.quantity_gate == "allowed_provisional"
+        assert validation_report.quantity_gate is None
 
     async def test_concurrent_reprocess_creates_linear_three_revision_chain(
         self,

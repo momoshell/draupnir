@@ -92,19 +92,17 @@ class _AlwaysCancelled:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("score", "validation_status", "review_state", "quantity_gate"),
+    ("score", "validation_status"),
     [
-        (0.97, "valid", "approved", "allowed"),
-        (0.70, "valid", "provisional", "allowed_provisional"),
-        (0.40, "needs_review", "review_required", "review_gated"),
+        (0.97, "valid"),
+        (0.70, "valid"),
+        (0.40, "needs_review"),
     ],
 )
 async def test_contract_harness_applies_review_thresholds(
     tmp_path: Path,
     score: float,
     validation_status: str,
-    review_state: str,
-    quantity_gate: str,
 ) -> None:
     source_path = tmp_path / "source.dxf"
     source_path.write_text("0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n", encoding="utf-8")
@@ -127,8 +125,6 @@ async def test_contract_harness_applies_review_thresholds(
         adapter_key=adapter_key,
         expectation=ContractFinalizationExpectation(
             validation_status=validation_status,
-            review_state=review_state,
-            quantity_gate=quantity_gate,
         ),
     )
 
@@ -168,8 +164,6 @@ async def test_contract_harness_asserts_warnings_and_diagnostics_shape(tmp_path:
         adapter_key=adapter_key,
         expectation=ContractFinalizationExpectation(
             validation_status="valid_with_warnings",
-            review_state="approved",
-            quantity_gate="allowed",
             warning_codes=("layer-map", "xref"),
             diagnostic_codes=("probe.elapsed",),
         ),
@@ -203,8 +197,6 @@ async def test_contract_harness_rejects_missing_entities_key(tmp_path: Path) -> 
             adapter_key=adapter_key,
             expectation=ContractFinalizationExpectation(
                 validation_status="valid",
-                review_state="approved",
-                quantity_gate="allowed",
             ),
         )
 
@@ -242,8 +234,6 @@ async def test_contract_harness_rejects_missing_entity_envelope_fields(tmp_path:
             adapter_key=adapter_key,
             expectation=ContractFinalizationExpectation(
                 validation_status="valid",
-                review_state="approved",
-                quantity_gate="allowed",
             ),
         )
 
@@ -276,8 +266,6 @@ async def test_contract_harness_rejects_empty_entities_without_explicit_reason(
             adapter_key=adapter_key,
             expectation=ContractFinalizationExpectation(
                 validation_status="valid",
-                review_state="approved",
-                quantity_gate="allowed",
             ),
         )
 
@@ -321,8 +309,6 @@ async def test_contract_harness_rejects_absent_geometry_without_explicit_reason(
             adapter_key=adapter_key,
             expectation=ContractFinalizationExpectation(
                 validation_status="valid",
-                review_state="approved",
-                quantity_gate="allowed",
             ),
         )
 
@@ -407,8 +393,8 @@ def test_fixture_manifest_has_multi_format_smoke_contract_coverage() -> None:
 
             if filename.endswith(".txt"):
                 placeholder_intent = fixture.get("placeholder_intent")
-                has_placeholder_intent = (
-                    isinstance(placeholder_intent, str) and bool(placeholder_intent.strip())
+                has_placeholder_intent = isinstance(placeholder_intent, str) and bool(
+                    placeholder_intent.strip()
                 )
                 has_fallback_intent = any(
                     isinstance(fixture.get(key), str) and fixture.get(key, "").strip()
@@ -432,8 +418,6 @@ def test_fixture_manifest_has_multi_format_smoke_contract_coverage() -> None:
 
         quantity_check = quantities.get(quantity_key)
         if not isinstance(quantity_check, dict):
-            raise AssertionError(
-                f"Fixture {filename} missing quantity check for {quantity_key}."
-            )
+            raise AssertionError(f"Fixture {filename} missing quantity check for {quantity_key}.")
 
         assert quantity_check.get("expected_review_state") == review_state

@@ -382,8 +382,6 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
         adapter_key="libredwg",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             warning_codes=("libredwg.units_unconfirmed",),
             diagnostic_codes=("libredwg.extract",),
         ),
@@ -542,8 +540,6 @@ async def test_libredwg_adapter_maps_line_entities_into_canonical_payload(
         generated_at=datetime.now(UTC),
     )
     findings = cast(list[Mapping[str, object]], validation.report_json["findings"])
-    assert validation.review_state == "review_required"
-    assert validation.quantity_gate == "review_gated"
     assert not any(finding.get("check_key") == "placeholder_semantics" for finding in findings)
 
 
@@ -2991,8 +2987,6 @@ async def test_libredwg_adapter_contract_accepts_unknown_geometry_entities(
         adapter_key="libredwg",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             warning_codes=expected_warning_codes,
             diagnostic_codes=("libredwg.extract",),
         ),
@@ -3962,8 +3956,6 @@ async def test_libredwg_adapter_block_reference_passes_shared_contract_harness(
         adapter_key="libredwg",
         expectation=ContractFinalizationExpectation(
             validation_status="needs_review",
-            review_state="review_required",
-            quantity_gate="review_gated",
             warning_codes=("libredwg.block_reference_captured",),
             diagnostic_codes=("libredwg.extract",),
         ),

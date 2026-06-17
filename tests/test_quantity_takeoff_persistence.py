@@ -484,14 +484,15 @@ class TestQuantityTakeoffPersistence:
             "drawing_revision_id",
             "source_job_id",
             "source_job_type",
-            "review_state",
             "validation_status",
-            "quantity_gate",
             "trusted_totals",
             "created_at",
         ):
             assert required_column in takeoff_columns
             assert takeoff_columns[required_column]["nullable"] is False
+        # Path B 5b: review_state / quantity_gate are vestigial and nullable.
+        assert takeoff_columns["review_state"]["nullable"] is True
+        assert takeoff_columns["quantity_gate"]["nullable"] is True
 
         assert (
             "id",

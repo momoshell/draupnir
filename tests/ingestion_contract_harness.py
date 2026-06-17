@@ -54,8 +54,6 @@ class ContractFinalizationExpectation:
     """Expected finalization posture produced from an adapter run."""
 
     validation_status: str
-    review_state: str
-    quantity_gate: str
     warning_codes: tuple[str, ...] = ()
     diagnostic_codes: tuple[str, ...] = ()
 
@@ -280,9 +278,7 @@ def _assert_placeholder_semantics(metadata: dict[str, JSONValue], *, reason: str
 
     status = placeholder_semantics.get("status")
     if not isinstance(status, str) or not status.strip():
-        raise AssertionError(
-            "Placeholder semantics must include a non-empty placeholder status."
-        )
+        raise AssertionError("Placeholder semantics must include a non-empty placeholder status.")
     if placeholder_semantics.get("review_required") is not True:
         raise AssertionError("Placeholder semantics must explicitly require review.")
     if placeholder_semantics.get("quantity_gate") != "review_gated":
@@ -296,9 +292,7 @@ def _assert_placeholder_semantics(metadata: dict[str, JSONValue], *, reason: str
 
     coverage = placeholder_semantics.get("coverage")
     if not isinstance(coverage, dict) or not coverage:
-        raise AssertionError(
-            "Placeholder semantics must describe extraction coverage limitations."
-        )
+        raise AssertionError("Placeholder semantics must describe extraction coverage limitations.")
 
 
 def _assert_entity_envelopes(
@@ -521,10 +515,6 @@ async def exercise_adapter_contract(
 
     if payload.validation_status != expectation.validation_status:
         raise AssertionError("Validation status did not match expected contract output.")
-    if payload.review_state != expectation.review_state:
-        raise AssertionError("Review state did not match expected contract output.")
-    if payload.quantity_gate != expectation.quantity_gate:
-        raise AssertionError("Quantity gate did not match expected contract output.")
 
     return payload
 

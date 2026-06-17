@@ -729,10 +729,7 @@ async def test_run_ingestion_falls_back_to_next_candidate_and_is_deterministic(
     assert payload_one.adapter_version == "test-1.0"
     assert payload_one.input_family == InputFamily.PDF_RASTER.value
     assert payload_one.revision_kind == "ingest"
-    assert payload_one.review_state == "review_required"
     assert payload_one.validation_status == "needs_review"
-    assert payload_one.quantity_gate == "review_gated"
-    assert payload_one.confidence_score == 0.61
     assert payload_one.report_json["checks"]
     assert payload_one.result_checksum_sha256 == payload_two.result_checksum_sha256
     assert payload_one.canonical_json["canonical_entity_schema_version"] == "0.1"
@@ -1267,10 +1264,7 @@ async def test_run_ingestion_smoke_uses_real_ezdxf_adapter(tmp_path: Path) -> No
     assert payload.adapter_version != "unknown"
     assert payload.input_family == InputFamily.DXF.value
     assert payload.revision_kind == "ingest"
-    assert payload.review_state == "approved"
     assert payload.validation_status == "valid"
-    assert payload.quantity_gate == "allowed"
-    assert payload.confidence_score >= 0.95
     assert payload.canonical_json["canonical_entity_schema_version"] == "0.1"
     assert payload.canonical_json["units"] == {
         "normalized": "meter",
@@ -1362,9 +1356,7 @@ async def test_run_ingestion_review_gates_unitless_dxf_quantities(tmp_path: Path
         temp_root=tmp_path,
     )
 
-    assert payload.review_state == "review_required"
     assert payload.validation_status == "needs_review"
-    assert payload.quantity_gate == "review_gated"
     assert payload.canonical_json["units"] == {
         "normalized": "unitless",
         "source": "$INSUNITS",
@@ -2068,9 +2060,7 @@ async def test_run_ingestion_keeps_pymupdf_no_vector_result_without_raster_fallb
 
     assert payload.adapter_key == "pymupdf"
     assert payload.input_family == InputFamily.PDF_VECTOR.value
-    assert payload.review_state == "review_required"
     assert payload.validation_status == "needs_review"
-    assert payload.quantity_gate == "review_gated"
     assert payload.canonical_json["entities"] == []
     assert payload.report_json["summary"]["entity_counts"]["entities"] == 0
     assert payload.report_json["checks"]

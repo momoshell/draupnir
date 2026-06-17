@@ -34,8 +34,10 @@ class _QuantityTakeoffExecutionInput:
     """Loaded immutable quantity takeoff execution inputs."""
 
     drawing_revision_id: UUID
-    review_state: str
+    # Path B 5b: review_state / quantity_gate are vestigial (sourced from the now-NULL
+    # validation report); removed entirely in 5c. validation_status is kept.
+    review_state: str | None
     validation_status: str
-    quantity_gate: str
+    quantity_gate: str | None
     gate: RevisionGateMetadata
     entities: list[RevisionEntityInput]
