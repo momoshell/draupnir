@@ -141,8 +141,6 @@ class ExportJobInputRead(ExportJobInputBase):
     source_file_id: UUID
     drawing_revision_id: UUID
     source_job_type: str
-    quantity_gate: str | None = None
-    trusted_totals: bool | None = None
     created_at: datetime
 
 

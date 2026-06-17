@@ -230,7 +230,7 @@ class TestRevisionMaterializationApi:
         parent_item, child_item, paper_item = entities_body["items"]
         assert parent_item["entity_id"] == parent_entity.entity_id
         assert parent_item["entity_type"] == parent_entity.entity_type
-        assert parent_item["confidence_score"] == _FAKE_RUNNER_CONFIDENCE_SCORE
+        assert "confidence_score" not in parent_item
         assert parent_item["confidence"] == parent_entity.confidence_json
         assert parent_item["geometry"] == parent_entity.geometry_json
         assert parent_item["properties"] == parent_entity.properties_json

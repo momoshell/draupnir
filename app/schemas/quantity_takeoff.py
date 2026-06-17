@@ -19,10 +19,7 @@ class QuantityTakeoffRead(BaseModel):
     drawing_revision_id: UUID
     source_job_id: UUID
     source_job_type: str
-    review_state: str
     validation_status: str
-    quantity_gate: str
-    trusted_totals: bool
     created_at: datetime
 
 
@@ -46,9 +43,7 @@ class QuantityItemRead(BaseModel):
     quantity_type: str
     value: float | None
     unit: str
-    review_state: str
     validation_status: str
-    quantity_gate: str
     source_entity_id: str | None
     excluded_source_entity_ids: list[str] = Field(
         validation_alias="excluded_source_entity_ids_json"

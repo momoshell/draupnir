@@ -58,17 +58,9 @@ async def _create_rate_catalog_entry(
 
 def _select_eligible_aggregate_quantity_item_payload(
     items: list[dict[str, Any]],
-    *,
-    quantity_gate: str = QuantityGate.ALLOWED.value,
 ) -> dict[str, Any]:
     eligible_items = sorted(
-        (
-            item
-            for item in items
-            if item["item_kind"] == "aggregate"
-            and item["value"] is not None
-            and item["quantity_gate"] == quantity_gate
-        ),
+        (item for item in items if item["item_kind"] == "aggregate" and item["value"] is not None),
         key=lambda item: (str(item["quantity_type"]), str(item["id"])),
     )
     assert eligible_items, "expected at least one API-visible eligible aggregate quantity item"
@@ -176,8 +168,9 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert quantity_takeoff["drawing_revision_id"] == str(revision.id)
     assert quantity_takeoff["source_job_id"] == str(quantity_job_id)
     assert quantity_takeoff["source_job_type"] == JobType.QUANTITY_TAKEOFF.value
-    assert quantity_takeoff["quantity_gate"] == quantity_gate
-    assert quantity_takeoff["trusted_totals"] is trusted_totals
+    # Path B 5a: quantity_gate / trusted_totals are no longer exposed in the response.
+    assert "quantity_gate" not in quantity_takeoff
+    assert "trusted_totals" not in quantity_takeoff
 
     quantity_read_response = await async_client.get(
         f"/v1/revisions/{revision.id}/quantity-takeoffs/{quantity_takeoff['id']}"
@@ -191,13 +184,11 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert quantity_items_response.status_code == 200
     quantity_items_body = quantity_items_response.json()
     assert quantity_items_body["next_cursor"] is None
-    quantity_item = _select_eligible_aggregate_quantity_item_payload(
-        quantity_items_body["items"], quantity_gate=quantity_gate
-    )
+    quantity_item = _select_eligible_aggregate_quantity_item_payload(quantity_items_body["items"])
     assert quantity_item["quantity_takeoff_id"] == quantity_takeoff["id"]
     assert quantity_item["project_id"] == project["id"]
     assert quantity_item["drawing_revision_id"] == str(revision.id)
-    assert quantity_item["review_state"] == review_state
+    assert "review_state" not in quantity_item
     assert quantity_item["validation_status"] == validation_status
 
     rate = await _create_rate_catalog_entry(
@@ -251,8 +242,8 @@ async def test_revision_quantity_takeoff_to_estimate_create_and_read_api_flow(
     assert listed_estimate["drawing_revision_id"] == str(revision.id)
     assert listed_estimate["quantity_takeoff_id"] == quantity_takeoff["id"]
     assert listed_estimate["source_job_id"] == str(estimate_job_id)
-    assert listed_estimate["quantity_gate"] == quantity_gate
-    assert listed_estimate["trusted_totals"] is trusted_totals
+    assert "quantity_gate" not in listed_estimate
+    assert "trusted_totals" not in listed_estimate
     assert listed_estimate["currency"] == "GBP"
 
     quantity_value = Decimal(str(quantity_item["value"]))

@@ -127,8 +127,6 @@ class EstimateVersionRead(BaseModel):
     drawing_revision_id: UUID
     quantity_takeoff_id: UUID
     source_job_id: UUID
-    quantity_gate: str
-    trusted_totals: bool
     currency: str
     subtotal_amount: Decimal
     tax_amount: Decimal
