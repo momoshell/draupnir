@@ -992,7 +992,7 @@ async def test_process_export_job_revision_drift_fails_without_artifact(
     assert await _get_generated_artifacts_for_job(export_job_id) == []
 
 
-async def test_process_export_job_invalid_trust_gate_fails_without_artifact(
+async def test_process_export_job_invalid_input_fails_without_artifact(
     async_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1008,32 +1008,25 @@ async def test_process_export_job_invalid_trust_gate_fails_without_artifact(
         trusted_totals=True,
     )
 
-    async def _raise_invalid_trust_gate(
+    async def _raise_invalid_input(
         job_id: uuid.UUID,
         *,
         attempt_token: uuid.UUID,
     ) -> worker_module._ExportExecutionInput:
         _ = (job_id, attempt_token)
         raise worker_module._build_export_job_input_error(
-            "Export job input requires a trusted quantity takeoff with allowed gate.",
-            details={
-                "quantity_takeoff_id": str(lineage.quantity_takeoff_id),
-                "quantity_gate": "review_gated",
-                "trusted_totals": False,
-            },
+            "Export job input is missing its quantity takeoff linkage.",
+            details={"export_kind": "quantity_csv"},
         )
 
-    monkeypatch.setattr(worker_module, "_build_export_execution_input", _raise_invalid_trust_gate)
+    monkeypatch.setattr(worker_module, "_build_export_execution_input", _raise_invalid_input)
 
     await worker_module.process_export_job(export_job_id)
 
     job = await _get_job(export_job_id)
     assert job.status == "failed"
     assert job.error_code == ErrorCode.INPUT_INVALID.value
-    assert (
-        job.error_message
-        == "Export job input requires a trusted quantity takeoff with allowed gate."
-    )
+    assert job.error_message == "Export job input is missing its quantity takeoff linkage."
     assert await _get_generated_artifacts_for_job(export_job_id) == []
 
 

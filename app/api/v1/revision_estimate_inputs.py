@@ -56,24 +56,6 @@ def _raise_estimate_input_invalid(
     )
 
 
-def _raise_estimate_takeoff_gate_invalid(
-    takeoff: QuantityTakeoff,
-    *,
-    raise_estimate_input_invalid: Callable[..., None] = _raise_estimate_input_invalid,
-) -> None:
-    """Raise the standard pre-enqueue error for non-runnable estimate inputs."""
-
-    raise_estimate_input_invalid(
-        "Estimate jobs require a trusted quantity takeoff with an allowed quantity gate.",
-        details={
-            "quantity_gate": takeoff.quantity_gate,
-            "trusted_totals": takeoff.trusted_totals,
-            "review_state": takeoff.review_state,
-            "validation_status": takeoff.validation_status,
-        },
-    )
-
-
 def _normalize_estimate_request_body(payload: EstimateVersionCreateRequest) -> dict[str, Any]:
     """Return the normalized create-request body used for idempotency fingerprints."""
 
@@ -553,7 +535,6 @@ __all__ = [
     "_normalize_estimate_request_body",
     "_quantity_item_is_executable",
     "_raise_estimate_input_invalid",
-    "_raise_estimate_takeoff_gate_invalid",
     "_resolve_catalog_model",
     "_resolve_catalog_supersession_model",
     "_resolve_estimate_catalog_refs",
