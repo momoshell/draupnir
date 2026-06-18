@@ -3,7 +3,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,7 +18,8 @@ from app.api.v1.revision_lineage import (
     _get_active_revision_manifest_or_409,
     _manifest_counts,
 )
-from app.core.exceptions import raise_not_found
+from app.core.errors import ErrorCode
+from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
 from app.models.revision_materialization import (
     RevisionBlock,
@@ -32,6 +33,7 @@ from app.schemas.revision import (
     RevisionEntityListResponse,
     RevisionEntityManifestRead,
     RevisionEntityRead,
+    RevisionEntitySummary,
     RevisionLayerListResponse,
     RevisionLayerRead,
     RevisionLayoutListResponse,
@@ -176,6 +178,60 @@ async def list_revision_blocks(
     )
 
 
+# Heavy projectable blocks: summary field name -> RevisionEntity ORM attribute.
+_ENTITY_HEAVY_FIELDS = {
+    "geometry": "geometry_json",
+    "properties": "properties_json",
+    "provenance": "provenance_json",
+    "confidence": "confidence_json",
+    "canonical": "canonical_entity_json",
+}
+
+
+def _parse_entity_fields(fields: str | None) -> frozenset[str]:
+    """Parse + validate the ``fields=`` projection (heavy blocks to include)."""
+    if not fields:
+        return frozenset()
+    requested = {token.strip() for token in fields.split(",") if token.strip()}
+    unknown = sorted(requested - _ENTITY_HEAVY_FIELDS.keys())
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=create_error_response(
+                code=ErrorCode.INPUT_INVALID,
+                message="Unknown entity field(s) requested.",
+                details={
+                    "unknown_fields": unknown,
+                    "allowed_fields": sorted(_ENTITY_HEAVY_FIELDS),
+                },
+            ),
+        )
+    return frozenset(requested)
+
+
+def _entity_summary(row: RevisionEntity, *, include: frozenset[str]) -> RevisionEntitySummary:
+    """Build a compact entity summary, populating only the requested heavy blocks."""
+    return RevisionEntitySummary(
+        id=row.id,
+        sequence_index=row.sequence_index,
+        entity_id=row.entity_id,
+        entity_type=row.entity_type,
+        entity_schema_version=row.entity_schema_version,
+        parent_entity_ref=row.parent_entity_ref,
+        layout_ref=row.layout_ref,
+        layer_ref=row.layer_ref,
+        block_ref=row.block_ref,
+        source_identity=row.source_identity,
+        source_hash=row.source_hash,
+        created_at=row.created_at,
+        **{
+            name: getattr(row, attr)
+            for name, attr in _ENTITY_HEAVY_FIELDS.items()
+            if name in include
+        },
+    )
+
+
 @materialization_router.get(
     "/revisions/{revision_id}/entities",
     response_model=RevisionEntityListResponse,
@@ -193,9 +249,20 @@ async def list_revision_entities(
     parent_entity_ref: str | None = Query(default=None),
     source_identity: str | None = Query(default=None),
     source_hash: str | None = Query(default=None),
+    fields: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Comma-separated heavy blocks to include "
+                "(geometry, properties, provenance, confidence, canonical). "
+                "Default: none — a compact row spine."
+            ),
+        ),
+    ] = None,
 ) -> RevisionEntityListResponse:
-    """List materialized entity rows for a drawing revision."""
+    """List compact materialized entity rows; heavy blocks are opt-in via ``fields``."""
 
+    include_fields = _parse_entity_fields(fields)
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
     pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
 
@@ -242,7 +309,7 @@ async def list_revision_entities(
     return RevisionEntityListResponse(
         manifest=RevisionEntityManifestRead.model_validate(manifest),
         counts=counts,
-        items=[RevisionEntityRead.model_validate(row) for row in page],
+        items=[_entity_summary(row, include=include_fields) for row in page],
         next_cursor=next_cursor,
     )
 
