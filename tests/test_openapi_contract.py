@@ -56,6 +56,30 @@ def test_operation_ids_are_clean_and_unique() -> None:
     assert len(operation_ids) == len(set(operation_ids)), "operationIds must be unique"
 
 
+def test_data_endpoints_document_the_error_envelope() -> None:
+    """Representative data endpoints advertise the standard 400/404/409 error envelope."""
+    spec = create_app().openapi()
+    assert "APIErrorResponse" in spec["components"]["schemas"], (
+        "the error envelope schema must be a documented component"
+    )
+    ops = _v1_operations()
+    by_id = {op["operationId"]: op for op in ops.values()}
+    for operation_id in (
+        "get_project",
+        "list_revision_entities",
+        "create_revision_changeset",
+        "get_job",
+        "create_rate",
+    ):
+        responses = by_id[operation_id]["responses"]
+        for code in ("400", "404", "409"):
+            assert code in responses, f"{operation_id} should document a {code} response"
+            schema = responses["400"]["content"]["application/json"]["schema"]
+            assert schema["$ref"].endswith("/APIErrorResponse"), (
+                f"{operation_id} {code} should use the APIErrorResponse envelope"
+            )
+
+
 def test_operation_id_inventory_is_pinned() -> None:
     """Pin the operationId set so new/renamed routes consciously keep the surface clean."""
     actual = {op["operationId"] for op in _v1_operations().values()}

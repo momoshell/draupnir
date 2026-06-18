@@ -1,5 +1,7 @@
 """FastAPI application factory."""
 
+from typing import Any
+
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -14,7 +16,11 @@ from app.api.v1 import (
     system_router,
 )
 from app.core.config import settings
-from app.core.exceptions import custom_http_exception_handler, request_validation_exception_handler
+from app.core.exceptions import (
+    APIErrorResponse,
+    custom_http_exception_handler,
+    request_validation_exception_handler,
+)
 from app.core.logging import configure_logging, get_logger
 from app.core.middleware import ContentLengthLimitMiddleware, RequestIdMiddleware
 
@@ -51,6 +57,19 @@ _OPENAPI_TAGS = [
 ]
 
 
+# Standardized error responses documented on every data endpoint, so consumers and
+# generated clients (incl. the MCP tool layer) see the `{error: {code, message, details}}`
+# envelope + the ErrorCode taxonomy. FastAPI auto-documents 422 for request validation.
+_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"model": APIErrorResponse, "description": "Invalid request (bad input or cursor)."},
+    404: {"model": APIErrorResponse, "description": "Resource not found."},
+    409: {
+        "model": APIErrorResponse,
+        "description": "Conflict (idempotency key reuse or concurrent revision change).",
+    },
+}
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application instance."""
     # Configure structured logging first
@@ -81,12 +100,26 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router, prefix=settings.api_prefix, tags=["System"])
     app.include_router(system_router, prefix=settings.api_prefix, tags=["System"])
-    app.include_router(project_router, prefix=f"{settings.api_prefix}/projects", tags=["Projects"])
-    app.include_router(files_router, prefix=settings.api_prefix, tags=["Files"])
-    app.include_router(jobs_router, prefix=settings.api_prefix, tags=["Jobs"])
+    app.include_router(
+        project_router,
+        prefix=f"{settings.api_prefix}/projects",
+        tags=["Projects"],
+        responses=_ERROR_RESPONSES,
+    )
+    app.include_router(
+        files_router, prefix=settings.api_prefix, tags=["Files"], responses=_ERROR_RESPONSES
+    )
+    app.include_router(
+        jobs_router, prefix=settings.api_prefix, tags=["Jobs"], responses=_ERROR_RESPONSES
+    )
     # revisions_router applies its own per-domain tags at the sub-router level.
-    app.include_router(revisions_router, prefix=settings.api_prefix)
-    app.include_router(estimation_router, prefix=settings.api_prefix, tags=["Estimation Catalog"])
+    app.include_router(revisions_router, prefix=settings.api_prefix, responses=_ERROR_RESPONSES)
+    app.include_router(
+        estimation_router,
+        prefix=settings.api_prefix,
+        tags=["Estimation Catalog"],
+        responses=_ERROR_RESPONSES,
+    )
 
     logger.info("app_started", version=settings.app_version)
 
