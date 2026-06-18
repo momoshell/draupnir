@@ -178,9 +178,6 @@ class EstimateVersionHeader:
     subtotal_amount: Decimal
     tax_amount: Decimal
     total_amount: Decimal
-    # Path B 5b: vestigial gate, may be NULL (dropped in Path B stage 6).
-    quantity_gate: EstimateQuantityGate | None = None
-    trusted_totals: bool = True
 
     def as_model_kwargs(self) -> dict[str, object]:
         return {
@@ -190,8 +187,6 @@ class EstimateVersionHeader:
             "drawing_revision_id": self.drawing_revision_id,
             "quantity_takeoff_id": self.quantity_takeoff_id,
             "source_job_id": self.source_job_id,
-            "quantity_gate": self.quantity_gate,
-            "trusted_totals": self.trusted_totals,
             "currency": self.currency,
             "subtotal_amount": self.subtotal_amount,
             "tax_amount": self.tax_amount,
@@ -289,8 +284,6 @@ class EstimateEngineInput:
     file_id: UUID | None = None
     source_job_id: UUID | None = None
     currency: EstimateCurrency = "GBP"
-    quantity_gate: EstimateQuantityGate | None = None
-    trusted_totals: bool = False
     tax_rate: Decimal = Decimal("0")
     quantity_entries: tuple[EstimateQuantityEntryInput, ...] = ()
     rate_entries: tuple[EstimateRateEntryInput, ...] = ()

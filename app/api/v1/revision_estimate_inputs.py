@@ -482,8 +482,6 @@ def _build_estimate_job_input_payload(
         "quantity_takeoff_id": takeoff.id,
         "source_job_type": JobType.ESTIMATE.value,
         "currency": request.pricing.currency,
-        "quantity_gate": takeoff.quantity_gate,
-        "trusted_totals": takeoff.trusted_totals,
         "pricing_mode": pricing_mode,
         "pricing_effective_date": pricing_effective_date,
         "assumptions_json": request.assumptions,

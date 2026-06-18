@@ -91,9 +91,7 @@ def _build_quantity_items(
     quantity_takeoff_id: UUID,
     project_id: UUID,
     drawing_revision_id: UUID,
-    review_state: str | None,
     validation_status: str,
-    quantity_gate: str | None,
     result: QuantityEngineResult,
 ) -> list[QuantityItem]:
     """Build immutable quantity item rows for a takeoff result."""
@@ -113,9 +111,7 @@ def _build_quantity_items(
                 ),
                 value=contributor.value,
                 unit=_nonempty_quantity_unit(contributor.unit),
-                review_state=review_state,
                 validation_status=validation_status,
-                quantity_gate=quantity_gate,
                 source_entity_id=contributor.entity_id,
                 excluded_source_entity_ids_json=_duplicate_entity_ids_json(
                     contributor.duplicate_entity_ids
@@ -137,9 +133,7 @@ def _build_quantity_items(
                 ),
                 value=aggregate.total,
                 unit=_nonempty_quantity_unit(aggregate.unit),
-                review_state=review_state,
                 validation_status=validation_status,
-                quantity_gate=quantity_gate,
                 source_entity_id=None,
                 excluded_source_entity_ids_json=[],
             )
@@ -159,9 +153,7 @@ def _build_quantity_items(
                 ),
                 value=None,
                 unit="unknown",
-                review_state=review_state,
                 validation_status=validation_status,
-                quantity_gate=quantity_gate,
                 source_entity_id=exclusion.entity_id,
                 excluded_source_entity_ids_json=[],
             )
@@ -190,18 +182,13 @@ def build_quantity_takeoff_rows(
         drawing_revision_id=execution.drawing_revision_id,
         source_job_id=source_job_id,
         source_job_type=JobType.QUANTITY_TAKEOFF.value,
-        review_state=execution.review_state,
         validation_status=execution.validation_status,
-        quantity_gate=execution.quantity_gate,
-        trusted_totals=result.trusted_totals,
     )
     items = _build_quantity_items(
         quantity_takeoff_id=quantity_takeoff_id,
         project_id=project_id,
         drawing_revision_id=execution.drawing_revision_id,
-        review_state=execution.review_state,
         validation_status=execution.validation_status,
-        quantity_gate=execution.quantity_gate,
         result=result,
     )
     return QuantityTakeoffRows(takeoff=takeoff, items=items)

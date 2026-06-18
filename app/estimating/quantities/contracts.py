@@ -73,7 +73,6 @@ class QuantityAggregate:
     context: str | None
     total: float
     contributor_count: int
-    trusted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,4 +98,3 @@ class QuantityEngineResult:
     contributors: tuple[QuantityContributor, ...]
     exclusions: tuple[QuantityExclusion, ...]
     conflicts: tuple[QuantityConflict, ...]
-    trusted_totals: bool

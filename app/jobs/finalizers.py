@@ -1015,8 +1015,6 @@ async def _finalize_quantity_takeoff_job(
                 "attempts": job.attempts,
                 "quantity_takeoff_id": str(quantity_takeoff_id),
                 "quantity_item_count": len(quantity_items),
-                "trusted_totals": result.trusted_totals,
-                "quantity_gate": execution.quantity_gate,
             },
             session=session,
         )

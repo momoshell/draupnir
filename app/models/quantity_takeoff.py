@@ -227,10 +227,10 @@ class QuantityTakeoff(Base):
         nullable=True,
         comment="Vestigial quantity gate (no longer derived; dropped in Path B stage 6)",
     )
-    trusted_totals: Mapped[bool] = mapped_column(
+    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
+    trusted_totals: Mapped[bool | None] = mapped_column(
         Boolean,
-        default=False,
-        nullable=False,
+        nullable=True,
         comment="Whether aggregate totals are trusted for downstream automation",
     )
     created_at: Mapped[datetime] = mapped_column(

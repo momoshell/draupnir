@@ -2164,7 +2164,6 @@ async def _execute_quantity_takeoff_job_attempt(
     if result.conflicts:
         error_details = {
             "drawing_revision_id": str(execution.drawing_revision_id),
-            "quantity_gate": execution.quantity_gate,
             "conflict_count": len(result.conflicts),
             "conflicts": _build_quantity_conflict_summaries(result.conflicts),
         }

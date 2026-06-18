@@ -95,9 +95,7 @@ class _CapturingPersister:
 def _execution(revision_id: uuid.UUID) -> Any:
     return SimpleNamespace(
         drawing_revision_id=revision_id,
-        review_state="approved",
         validation_status="valid",
-        quantity_gate="passed",
     )
 
 
@@ -115,7 +113,6 @@ def _result() -> Any:
         aggregates=(),
         exclusions=(),
         conflicts=(),
-        trusted_totals=True,
     )
 
 
@@ -203,6 +200,6 @@ async def test_finalize_quantity_takeoff_routes_writes_through_persister(monkeyp
     assert job.attempt_token is None  # lease cleared
     # The persister captured a rowset equivalent to the builder output (no DB rows).
     assert persister.quantity_rows is not None
-    assert persister.quantity_rows.takeoff.trusted_totals is True
+    assert persister.quantity_rows.takeoff.trusted_totals is None
     assert len(persister.quantity_rows.items) == len(expected.items)
     assert events and events[0]["status"] == "succeeded"

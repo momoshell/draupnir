@@ -26,9 +26,7 @@ def _execution(drawing_revision_id: uuid.UUID) -> _QuantityTakeoffExecutionInput
         _QuantityTakeoffExecutionInput,
         SimpleNamespace(
             drawing_revision_id=drawing_revision_id,
-            review_state="approved",
             validation_status="valid",
-            quantity_gate="passed",
         ),
     )
 
@@ -59,7 +57,6 @@ def _result() -> QuantityEngineResult:
             contributors=(contributor,),
             aggregates=(aggregate,),
             exclusions=(exclusion,),
-            trusted_totals=True,
         ),
     )
 
@@ -83,7 +80,6 @@ def test_build_quantity_takeoff_rows_builds_header_and_linked_items() -> None:
     assert takeoff.source_file_id == file_id
     assert takeoff.source_job_id == job_id
     assert takeoff.drawing_revision_id == revision_id
-    assert takeoff.trusted_totals is True
 
     # Every item is linked to the freshly-allocated takeoff id.
     assert rows.items, "expected at least one item"

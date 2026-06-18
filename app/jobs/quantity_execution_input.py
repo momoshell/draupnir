@@ -201,9 +201,7 @@ async def build_quantity_takeoff_execution_input(
 
     return _QuantityTakeoffExecutionInput(
         drawing_revision_id=drawing_revision.id,
-        review_state=report.review_state,
         validation_status=report.validation_status,
-        quantity_gate=report.quantity_gate,
         gate=_build_quantity_gate_metadata(report),
         entities=[_build_revision_entity_input(entity) for entity in entities],
     )

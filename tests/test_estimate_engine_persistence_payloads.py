@@ -173,8 +173,6 @@ def _build_engine_input(
         drawing_revision_id=seed.drawing_revision_id,
         quantity_takeoff_id=seed.quantity_takeoff_id,
         source_job_id=estimate_job_id,
-        quantity_gate="allowed",
-        trusted_totals=True,
         tax_rate=Decimal("0.20"),
         quantity_entries=(
             EstimateQuantityEntryInput(
@@ -441,8 +439,6 @@ async def test_engine_output_replays_rate_lines_from_persisted_quantity_scale(
             drawing_revision_id=seed.drawing_revision_id,
             quantity_takeoff_id=seed.quantity_takeoff_id,
             source_job_id=estimate_job_id,
-            quantity_gate="allowed",
-            trusted_totals=True,
             tax_rate=Decimal("0"),
             quantity_entries=(
                 EstimateQuantityEntryInput(

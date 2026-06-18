@@ -71,7 +71,7 @@ def _formula_definition() -> FormulaDefinition:
     )
 
 
-def _valid_engine_input(*, quantity_gate: str = "allowed") -> EstimateEngineInput:
+def _valid_engine_input() -> EstimateEngineInput:
     estimate_job_id = UUID("11111111-1111-1111-1111-111111111111")
     project_id = UUID("22222222-2222-2222-2222-222222222222")
     file_id = UUID("33333333-3333-3333-3333-333333333333")
@@ -86,8 +86,6 @@ def _valid_engine_input(*, quantity_gate: str = "allowed") -> EstimateEngineInpu
         drawing_revision_id=drawing_revision_id,
         quantity_takeoff_id=quantity_takeoff_id,
         source_job_id=source_job_id,
-        quantity_gate=quantity_gate,  # type: ignore[arg-type]
-        trusted_totals=True,
         tax_rate=Decimal("0.20"),
         quantity_entries=(
             EstimateQuantityEntryInput(
@@ -285,8 +283,6 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
     assert result.header.subtotal_amount == result.subtotal_amount
     assert result.header.tax_amount == result.tax_amount
     assert result.header.total_amount == result.total_amount
-    assert result.header.quantity_gate == "allowed"
-    assert result.header.trusted_totals is True
 
     snapshot_payloads = result.snapshot_entry_model_kwargs()
     formula_snapshot_payload = next(
@@ -303,7 +299,6 @@ def test_compose_estimate_builds_deterministic_payloads_and_totals() -> None:
         if payload["line_key"] == "line:formula"
     )
 
-    assert result.estimate_version_model_kwargs()["quantity_gate"] == "allowed"
     assert formula_snapshot_payload["source_payload_json"] == {
         "formula_definition": {
             "formula_id": "formula.rounded_markup",
@@ -377,8 +372,6 @@ def test_compose_estimate_replays_rate_lines_from_persisted_quantity_scale() -> 
             drawing_revision_id=drawing_revision_id,
             quantity_takeoff_id=quantity_takeoff_id,
             source_job_id=source_job_id,
-            quantity_gate="allowed",
-            trusted_totals=True,
             tax_rate=Decimal("0"),
             quantity_entries=(
                 EstimateQuantityEntryInput(
@@ -425,19 +418,10 @@ def test_compose_estimate_replays_rate_lines_from_persisted_quantity_scale() -> 
     assert result.line_item_model_kwargs() == replay.line_item_model_kwargs()
 
 
-@pytest.mark.parametrize("quantity_gate", ["provisional", "review_gated", "blocked"])
-def test_compose_estimate_accepts_non_allowed_takeoffs(quantity_gate: str) -> None:
-    # Path B 3: estimates are no longer gated to an allowed takeoff.
-    result = compose_estimate(_valid_engine_input(quantity_gate=quantity_gate))
-
-    assert result.line_items
-
-
-def test_compose_estimate_accepts_untrusted_totals() -> None:
-    # Path B 3: untrusted totals no longer block estimate creation.
-    engine_input = dataclasses.replace(_valid_engine_input(), trusted_totals=False)
-
-    result = compose_estimate(engine_input)
+def test_compose_estimate_accepts_non_allowed_takeoffs() -> None:
+    # Path B 3/5c: estimates are no longer gated to an allowed takeoff, and the
+    # vestigial quantity_gate / trusted_totals fields have been removed.
+    result = compose_estimate(_valid_engine_input())
 
     assert result.line_items
 
@@ -495,8 +479,6 @@ def test_compose_estimate_rejects_invalid_checksum() -> None:
         drawing_revision_id=engine_input.drawing_revision_id,
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         tax_rate=engine_input.tax_rate,
         quantity_entries=engine_input.quantity_entries,
         rate_entries=(
@@ -540,8 +522,6 @@ def test_compose_estimate_rejects_unit_mismatch_without_conversion() -> None:
         drawing_revision_id=engine_input.drawing_revision_id,
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         tax_rate=engine_input.tax_rate,
         quantity_entries=engine_input.quantity_entries,
         rate_entries=(
@@ -585,8 +565,6 @@ def test_compose_estimate_rejects_negative_adjustment_lines() -> None:
         drawing_revision_id=engine_input.drawing_revision_id,
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         tax_rate=engine_input.tax_rate,
         quantity_entries=engine_input.quantity_entries,
         rate_entries=engine_input.rate_entries,
@@ -618,8 +596,6 @@ def test_compose_estimate_rejects_invalid_rate_scale() -> None:
         drawing_revision_id=engine_input.drawing_revision_id,
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         tax_rate=engine_input.tax_rate,
         quantity_entries=engine_input.quantity_entries,
         rate_entries=(
@@ -684,8 +660,6 @@ def test_compose_estimate_rejects_adjustments_without_exactly_one_anchor(
         drawing_revision_id=engine_input.drawing_revision_id,
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=engine_input.source_job_id,
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         tax_rate=engine_input.tax_rate,
         quantity_entries=engine_input.quantity_entries,
         rate_entries=engine_input.rate_entries,
@@ -731,8 +705,6 @@ def test_compose_estimate_resolves_scalar_and_money_formula_inputs() -> None:
         drawing_revision_id=UUID("44444444-4444-4444-4444-444444444444"),
         quantity_takeoff_id=UUID("55555555-5555-5555-5555-555555555555"),
         source_job_id=UUID("66666666-6666-6666-6666-666666666666"),
-        quantity_gate="allowed",
-        trusted_totals=True,
         tax_rate=Decimal("0"),
         assumption_entries=(
             EstimateAssumptionEntryInput(
