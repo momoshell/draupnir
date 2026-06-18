@@ -39,7 +39,6 @@ from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.project import Project
 from app.models.quantity_takeoff import (
-    QuantityGate,
     QuantityItem,
     QuantityItemKind,
     QuantityTakeoff,
@@ -138,7 +137,7 @@ def _build_revision(*, revision_id: UUID | None = None) -> SimpleNamespace:
     )
 
 
-def _build_validation_report(*, quantity_gate: str = QuantityGate.ALLOWED.value) -> SimpleNamespace:
+def _build_validation_report(*, quantity_gate: str = "allowed") -> SimpleNamespace:
     return SimpleNamespace(
         quantity_gate=quantity_gate,
         review_state="approved",
@@ -150,7 +149,7 @@ def _build_takeoff(
     revision: SimpleNamespace,
     *,
     takeoff_id: UUID | None = None,
-    quantity_gate: str = QuantityGate.ALLOWED.value,
+    quantity_gate: str = "allowed",
     trusted_totals: bool = True,
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -198,9 +197,12 @@ def _build_estimate_request_body(
 
 async def _seed_quantity_lineage(
     *,
-    quantity_gate: str = QuantityGate.ALLOWED.value,
+    quantity_gate: str = "allowed",
     trusted_totals: bool = True,
 ) -> _QuantityLineageSeed:
+    # Path B: quantity_gate / trusted_totals are no longer persisted on the takeoff
+    # row; these params are retained only so callers can express the seeded intent.
+    _ = (quantity_gate, trusted_totals)
     session_factory = session_module.AsyncSessionLocal
     assert session_factory is not None
 
@@ -273,7 +275,6 @@ async def _seed_quantity_lineage(
             canonical_json={},
             provenance_json={},
             confidence_json={},
-            confidence_score=1.0,
             warnings_json=[],
             diagnostics_json={},
             result_checksum_sha256="1" * 64,
@@ -288,9 +289,7 @@ async def _seed_quantity_lineage(
             predecessor_revision_id=None,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1.0.0",
-            confidence_score=1.0,
         )
         quantity_job = Job(
             id=quantity_job_id,
@@ -318,10 +317,7 @@ async def _seed_quantity_lineage(
             drawing_revision_id=revision_id,
             source_job_id=quantity_job_id,
             source_job_type=JobType.QUANTITY_TAKEOFF.value,
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=quantity_gate,
-            trusted_totals=trusted_totals,
         )
         item = QuantityItem(
             quantity_takeoff_id=takeoff_id,
@@ -331,9 +327,7 @@ async def _seed_quantity_lineage(
             quantity_type="area",
             value=42.0,
             unit="sq_ft",
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=quantity_gate,
             source_entity_id=None,
             excluded_source_entity_ids_json=[],
         )
@@ -1668,11 +1662,11 @@ def test_create_revision_estimate_version_rejects_catalog_validation_before_idem
     ("quantity_gate", "trusted_totals"),
     [
         pytest.param(
-            QuantityGate.REVIEW_GATED.value,
+            "review_gated",
             False,
             id="review_gated",
         ),
-        pytest.param(QuantityGate.ALLOWED.value, False, id="untrusted"),
+        pytest.param("allowed", False, id="untrusted"),
     ],
 )
 @requires_database
@@ -2178,7 +2172,6 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
             entity_id="entity-1",
             entity_type="polygon",
             entity_schema_version="1.0.0",
-            confidence_score=1.0,
             confidence_json={},
             geometry_json={},
             properties_json={},
@@ -2198,9 +2191,7 @@ async def test_create_revision_estimate_version_rejects_non_executable_quantity_
             quantity_type="area",
             value=None,
             unit="sq_ft",
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
             source_entity_id="entity-1",
             excluded_source_entity_ids_json=[],
         )
@@ -2299,10 +2290,7 @@ async def test_list_and_get_revision_quantity_takeoffs(async_client: AsyncClient
             drawing_revision_id=seed.revision_id,
             source_job_id=second_quantity_job_id,
             source_job_type=JobType.QUANTITY_TAKEOFF.value,
-            review_state="provisional",
             validation_status="valid_with_warnings",
-            quantity_gate="allowed_provisional",
-            trusted_totals=False,
             created_at=datetime(2100, 1, 1, tzinfo=UTC),
         )
         db.add(second_quantity_job)
@@ -2346,9 +2334,7 @@ async def test_list_revision_quantity_takeoff_items(async_client: AsyncClient) -
             quantity_type="area",
             value=20.0,
             unit="sq_ft",
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
             source_entity_id=None,
             excluded_source_entity_ids_json=[],
             created_at=datetime(2100, 1, 1, tzinfo=UTC),
@@ -2559,7 +2545,7 @@ async def test_create_revision_quantity_takeoff_rechecks_locked_lineage_before_i
 
 @pytest.mark.parametrize(
     "quantity_gate",
-    [QuantityGate.REVIEW_GATED.value, QuantityGate.BLOCKED.value],
+    ["review_gated", "blocked"],
 )
 def test_create_revision_quantity_takeoff_accepts_review_gated_or_blocked(
     monkeypatch: Any,

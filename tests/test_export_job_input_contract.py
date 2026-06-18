@@ -279,8 +279,6 @@ async def _create_estimate_version(
             drawing_revision_id=seed.drawing_revision_id,
             quantity_takeoff_id=seed.quantity_takeoff_id,
             source_job_id=estimate_job_id,
-            quantity_gate="allowed",
-            trusted_totals=True,
             currency="GBP",
             subtotal_amount=Decimal("100.00"),
             tax_amount=Decimal("20.00"),
@@ -299,8 +297,6 @@ def _build_export_input(
     export_format: str,
     media_type: str,
     quantity_takeoff_id: uuid.UUID | None,
-    quantity_gate: str | None,
-    trusted_totals: bool | None,
     estimate_version_id: uuid.UUID | None,
     source_job_type: str = JobType.EXPORT.value,
     options_json: object = cast(object, {"include_headers": True}),
@@ -316,8 +312,6 @@ def _build_export_input(
         media_type=media_type,
         options_json=cast(dict[str, Any], options_json),
         quantity_takeoff_id=quantity_takeoff_id,
-        quantity_gate=quantity_gate,
-        trusted_totals=trusted_totals,
         estimate_version_id=estimate_version_id,
     )
 
@@ -354,8 +348,6 @@ async def test_export_job_input_schema_matches_contract() -> None:
 
     for nullable_column in (
         "quantity_takeoff_id",
-        "quantity_gate",
-        "trusted_totals",
         "estimate_version_id",
     ):
         assert columns["export_job_inputs"][nullable_column]["nullable"] is True
@@ -408,11 +400,9 @@ async def test_export_job_input_schema_matches_contract() -> None:
             "quantity_takeoff_id",
             "project_id",
             "drawing_revision_id",
-            "quantity_gate",
-            "trusted_totals",
         ),
         "quantity_takeoffs",
-        ("id", "project_id", "drawing_revision_id", "quantity_gate", "trusted_totals"),
+        ("id", "project_id", "drawing_revision_id"),
     ) in foreign_keys
     assert (
         (
@@ -461,8 +451,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_format="json",
                 media_type="application/json",
                 quantity_takeoff_id=None,
-                quantity_gate=None,
-                trusted_totals=None,
                 estimate_version_id=None,
             ),
             _build_export_input(
@@ -472,8 +460,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_format="dxf",
                 media_type="application/dxf",
                 quantity_takeoff_id=None,
-                quantity_gate=None,
-                trusted_totals=None,
                 estimate_version_id=None,
             ),
             _build_export_input(
@@ -483,8 +469,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_format="csv",
                 media_type="text/csv",
                 quantity_takeoff_id=seed.quantity_takeoff_id,
-                quantity_gate="allowed",
-                trusted_totals=True,
                 estimate_version_id=None,
             ),
             _build_export_input(
@@ -494,8 +478,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_format="csv",
                 media_type="text/csv",
                 quantity_takeoff_id=seed.quantity_takeoff_id,
-                quantity_gate="allowed",
-                trusted_totals=True,
                 estimate_version_id=estimate_version_id,
             ),
             _build_export_input(
@@ -505,8 +487,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
                 export_format="pdf",
                 media_type="application/pdf",
                 quantity_takeoff_id=seed.quantity_takeoff_id,
-                quantity_gate="allowed",
-                trusted_totals=True,
                 estimate_version_id=estimate_version_id,
             ),
         ]
@@ -541,8 +521,6 @@ async def test_export_job_input_persists_valid_revision_quantity_and_estimate_in
     assert by_job_id[quantity_job_id].export_format == "csv"
     assert by_job_id[quantity_job_id].media_type == "text/csv"
     assert by_job_id[quantity_job_id].quantity_takeoff_id == seed.quantity_takeoff_id
-    assert by_job_id[quantity_job_id].quantity_gate == "allowed"
-    assert by_job_id[quantity_job_id].trusted_totals is True
     assert by_job_id[quantity_job_id].estimate_version_id is None
 
     assert by_job_id[estimate_csv_job_id].export_kind == "estimate_csv"
@@ -602,8 +580,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "json",
                 "media_type": "application/json",
                 "quantity_takeoff_id": None,
-                "quantity_gate": None,
-                "trusted_totals": None,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_source_job_type_export",
@@ -614,8 +590,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "json",
                 "media_type": "application/json",
                 "quantity_takeoff_id": None,
-                "quantity_gate": None,
-                "trusted_totals": None,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_kind_format_media_type_matrix",
@@ -626,8 +600,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "pdf",
                 "media_type": "application/pdf",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_kind_format_media_type_matrix",
@@ -638,8 +610,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "dxf",
                 "media_type": "application/dxf",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_quantity_lineage",
@@ -650,8 +620,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "json",
                 "media_type": "application/json",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_quantity_lineage",
@@ -662,8 +630,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "csv",
                 "media_type": "text/csv",
                 "quantity_takeoff_id": None,
-                "quantity_gate": None,
-                "trusted_totals": None,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_quantity_lineage",
@@ -674,8 +640,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "csv",
                 "media_type": "text/csv",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": estimate_version_id,
             },
             "ck_export_job_inputs_estimate_lineage",
@@ -686,8 +650,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "csv",
                 "media_type": "text/csv",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": None,
             },
             "ck_export_job_inputs_estimate_lineage",
@@ -698,11 +660,15 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "pdf",
                 "media_type": "application/pdf",
                 "quantity_takeoff_id": uuid.uuid4(),
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": estimate_version_id,
             },
-            "fk_export_job_inputs_trusted_quantity_takeoff",
+            # A bogus quantity_takeoff_id breaks both the gate-free takeoff lineage FK
+            # and the estimate-version lineage FK (which also keys on quantity_takeoff_id);
+            # Postgres may report either.
+            (
+                "fk_export_job_inputs_takeoff_lineage",
+                "fk_export_job_inputs_estimate_version_lineage",
+            ),
         ),
         (
             {
@@ -710,8 +676,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "pdf",
                 "media_type": "application/pdf",
                 "quantity_takeoff_id": seed.quantity_takeoff_id,
-                "quantity_gate": "allowed",
-                "trusted_totals": True,
                 "estimate_version_id": uuid.uuid4(),
             },
             "fk_export_job_inputs_estimate_version_lineage",
@@ -722,8 +686,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 "export_format": "json",
                 "media_type": "application/json",
                 "quantity_takeoff_id": None,
-                "quantity_gate": None,
-                "trusted_totals": None,
                 "estimate_version_id": None,
                 "source_file_id": uuid.uuid4(),
             },
@@ -741,8 +703,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
             "export_format": "json",
             "media_type": "application/json",
             "quantity_takeoff_id": None,
-            "quantity_gate": None,
-            "trusted_totals": None,
             "estimate_version_id": None,
             "source_job_type": JobType.EXPORT.value,
             "options_json": {"include_headers": True},
@@ -762,8 +722,6 @@ async def test_export_job_input_contract_rejects_ambiguous_and_invalid_lineage_i
                 media_type=cast(str, payload["media_type"]),
                 options_json=cast(dict[str, Any], payload["options_json"]),
                 quantity_takeoff_id=cast(uuid.UUID | None, payload["quantity_takeoff_id"]),
-                quantity_gate=cast(str | None, payload["quantity_gate"]),
-                trusted_totals=cast(bool | None, payload["trusted_totals"]),
                 estimate_version_id=cast(uuid.UUID | None, payload["estimate_version_id"]),
             ),
             expected_substring,
@@ -792,8 +750,6 @@ async def test_export_job_inputs_are_append_only_and_revised_dxf_downgrade_guard
             export_format="csv",
             media_type="text/csv",
             quantity_takeoff_id=seed.quantity_takeoff_id,
-            quantity_gate="allowed",
-            trusted_totals=True,
             estimate_version_id=estimate_version_id,
         )
     )
@@ -832,8 +788,6 @@ async def test_export_job_inputs_are_append_only_and_revised_dxf_downgrade_guard
             export_format="dxf",
             media_type="application/dxf",
             quantity_takeoff_id=None,
-            quantity_gate=None,
-            trusted_totals=None,
             estimate_version_id=None,
         )
     )

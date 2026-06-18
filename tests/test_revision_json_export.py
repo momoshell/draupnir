@@ -42,7 +42,7 @@ pytestmark = [pytest.mark.asyncio, requires_database]
 
 _FIXTURE_UUID_NAMESPACE = uuid.UUID("a6f84dd8-3f4c-4f81-a4f9-2e8a14f7df70")
 _EXPECTED_REVISION_JSON_CHECKSUM = (
-    "5090d3538da96662cef7629a7536507b39b3c3ce2a5d34a524e2f5ae10c60056"
+    "a4d822b34c2cb83503cdab05822b281282dc58402286c846ff91e3cf16f6e0e0"
 )
 
 
@@ -105,7 +105,6 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
                 "block_ref": None,
                 "source_identity": "src-b",
                 "source_hash": "b" * 64,
-                "confidence_score": 0.9,
                 "confidence": {"z": 2, "a": 1},
                 "geometry": {"z": [3, 2], "a": [1, 0]},
                 "properties": {"z": 9, "a": 8},
@@ -126,7 +125,6 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
                 "block_ref": "Block-A",
                 "source_identity": "src-a",
                 "source_hash": None,
-                "confidence_score": 0.75,
                 "confidence": {"status": "ok", "a": 1},
                 "geometry": {"coords": [{"y": 2, "x": 1}]},
                 "properties": {"text": "αβ", "name": "Door"},
@@ -167,9 +165,7 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
             "predecessor_revision_id": None,
             "revision_sequence": 1,
             "revision_kind": "ingest",
-            "review_state": "approved",
             "canonical_entity_schema_version": "1.0",
-            "confidence_score": 0.875,
             "created_at": "2026-05-27T16:05:00Z",
         },
         "manifest": {
@@ -209,7 +205,6 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
                 "block_ref": "Block-A",
                 "source_identity": "src-a",
                 "source_hash": None,
-                "confidence_score": 0.75,
                 "confidence": {"status": "ok", "a": 1},
                 "geometry": {"coords": [{"y": 2, "x": 1}]},
                 "properties": {"text": "αβ", "name": "Door"},
@@ -227,7 +222,6 @@ async def test_render_revision_json_export_is_deterministic_and_canonical(
                 "block_ref": None,
                 "source_identity": "src-b",
                 "source_hash": "b" * 64,
-                "confidence_score": 0.9,
                 "confidence": {"z": 2, "a": 1},
                 "geometry": {"z": [3, 2], "a": [1, 0]},
                 "properties": {"z": 9, "a": 8},
@@ -292,7 +286,6 @@ async def test_render_revision_json_export_orders_materialization_rows_by_sequen
                 "block_ref": "Block-2",
                 "source_identity": "src-2",
                 "source_hash": None,
-                "confidence_score": 0.6,
                 "confidence": {},
                 "geometry": {"n": 2},
                 "properties": {},
@@ -310,7 +303,6 @@ async def test_render_revision_json_export_orders_materialization_rows_by_sequen
                 "block_ref": "Block-1",
                 "source_identity": "src-1",
                 "source_hash": None,
-                "confidence_score": 0.7,
                 "confidence": {},
                 "geometry": {"n": 1},
                 "properties": {},
@@ -328,7 +320,6 @@ async def test_render_revision_json_export_orders_materialization_rows_by_sequen
                 "block_ref": None,
                 "source_identity": "src-3",
                 "source_hash": None,
-                "confidence_score": 0.8,
                 "confidence": {},
                 "geometry": {"n": 3},
                 "properties": {},
@@ -439,7 +430,6 @@ async def _seed_revision_fixture(
         canonical_json={"entities": [], "layers": [], "layouts": [], "blocks": []},
         provenance_json={"adapter": {"key": "tests.fake", "version": "1.0"}},
         confidence_json={"score": 0.875},
-        confidence_score=0.875,
         warnings_json=[],
         diagnostics_json={"duration_ms": 3},
         result_checksum_sha256="b" * 64,
@@ -455,9 +445,7 @@ async def _seed_revision_fixture(
         predecessor_revision_id=None,
         revision_sequence=1,
         revision_kind="ingest",
-        review_state="approved",
         canonical_entity_schema_version="1.0",
-        confidence_score=0.875,
         created_at=datetime(2026, 5, 27, 16, 5, tzinfo=UTC),
     )
 
@@ -583,7 +571,6 @@ async def _seed_revision_fixture(
             entity_type=str(spec["entity_type"]),
             entity_schema_version=str(spec["entity_schema_version"]),
             parent_entity_ref=parent_entity_ref,
-            confidence_score=float(spec["confidence_score"]),
             confidence_json=dict(spec["confidence"]),
             geometry_json=dict(spec["geometry"]),
             properties_json=dict(spec["properties"]),

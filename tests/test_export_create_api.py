@@ -25,8 +25,6 @@ from app.models.idempotency_key import IdempotencyKey
 from app.models.job import Job, JobType
 from app.models.project import Project
 from app.models.quantity_takeoff import (
-    QuantityGate,
-    QuantityReviewState,
     QuantityTakeoff,
     QuantityValidationStatus,
 )
@@ -154,7 +152,6 @@ async def _seed_export_lineage() -> ExportLineage:
             canonical_json={"entities": []},
             provenance_json={"origin": "test"},
             confidence_json={"entities": []},
-            confidence_score=0.99,
             warnings_json=[],
             diagnostics_json={},
             result_checksum_sha256="2" * 64,
@@ -171,9 +168,7 @@ async def _seed_export_lineage() -> ExportLineage:
             predecessor_revision_id=None,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1.0",
-            confidence_score=0.99,
         )
         session.add(revision)
         await session.flush()
@@ -213,9 +208,7 @@ async def _seed_export_lineage() -> ExportLineage:
             predecessor_revision_id=revision.id,
             revision_sequence=2,
             revision_kind="changeset",
-            review_state="approved",
             canonical_entity_schema_version="1.0",
-            confidence_score=0.99,
             changeset_id=change_set.id,
         )
         session.add(changeset_revision)
@@ -243,10 +236,7 @@ async def _seed_export_lineage() -> ExportLineage:
             source_file_id=source_file.id,
             drawing_revision_id=revision.id,
             source_job_id=takeoff_source_job.id,
-            review_state=QuantityReviewState.APPROVED.value,
             validation_status=QuantityValidationStatus.VALID.value,
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
         )
         session.add(takeoff)
         await session.flush()
@@ -274,8 +264,6 @@ async def _seed_export_lineage() -> ExportLineage:
             drawing_revision_id=revision.id,
             quantity_takeoff_id=takeoff.id,
             source_job_id=estimate_source_job.id,
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
             currency="GBP",
             subtotal_amount=Decimal("100.00"),
             tax_amount=Decimal("20.00"),
@@ -405,9 +393,6 @@ async def _set_project_deleted(lineage: ExportLineage) -> None:
 
 async def _create_takeoff(
     lineage: ExportLineage,
-    *,
-    trusted_totals: bool,
-    quantity_gate: str,
 ) -> UUID:
     assert session_module.AsyncSessionLocal is not None
 
@@ -434,10 +419,7 @@ async def _create_takeoff(
             source_file_id=lineage.file_id,
             drawing_revision_id=lineage.revision_id,
             source_job_id=takeoff_source_job.id,
-            review_state=QuantityReviewState.APPROVED.value,
             validation_status=QuantityValidationStatus.VALID.value,
-            quantity_gate=quantity_gate,
-            trusted_totals=trusted_totals,
         )
         session.add(takeoff)
         await session.commit()
@@ -471,10 +453,7 @@ async def _create_alternate_takeoff_and_estimate(lineage: ExportLineage) -> tupl
             source_file_id=lineage.file_id,
             drawing_revision_id=lineage.revision_id,
             source_job_id=alternate_takeoff_source_job.id,
-            review_state=QuantityReviewState.APPROVED.value,
             validation_status=QuantityValidationStatus.VALID.value,
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
         )
         session.add(alternate_takeoff)
         await session.flush()
@@ -502,8 +481,6 @@ async def _create_alternate_takeoff_and_estimate(lineage: ExportLineage) -> tupl
             drawing_revision_id=lineage.revision_id,
             quantity_takeoff_id=alternate_takeoff.id,
             source_job_id=alternate_estimate_source_job.id,
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
             currency="GBP",
             subtotal_amount=Decimal("50.00"),
             tax_amount=Decimal("10.00"),
@@ -588,20 +565,12 @@ async def test_create_export_persists_pending_job_and_input(
 
         if case.export_kind in (ExportKind.REVISION_JSON, ExportKind.DXF):
             assert export_input.quantity_takeoff_id is None
-            assert export_input.quantity_gate is None
-            assert export_input.trusted_totals is None
             assert export_input.estimate_version_id is None
         elif case.export_kind == ExportKind.QUANTITY_CSV:
             assert export_input.quantity_takeoff_id == lineage.takeoff_id
-            # Path B 5c: quantity_gate / trusted_totals are no longer copied onto exports.
-            assert export_input.quantity_gate is None
-            assert export_input.trusted_totals is None
             assert export_input.estimate_version_id is None
         else:
             assert export_input.quantity_takeoff_id == lineage.takeoff_id
-            # Path B 5c: quantity_gate / trusted_totals are no longer copied onto exports.
-            assert export_input.quantity_gate is None
-            assert export_input.trusted_totals is None
             assert export_input.estimate_version_id == lineage.estimate_version_id
 
         generated_artifact_count = await session.scalar(
@@ -675,8 +644,6 @@ async def test_create_revised_dxf_export_persists_pending_job_and_input(
             "include_review_flags": True,
         }
         assert export_input.quantity_takeoff_id is None
-        assert export_input.quantity_gate is None
-        assert export_input.trusted_totals is None
         assert export_input.estimate_version_id is None
 
     assert await _count_export_side_effects_for_revision(
@@ -806,24 +773,13 @@ async def test_create_export_rejects_inactive_or_deleted_revision(
     assert await _count_export_side_effects(lineage) == (0, 0, 0)
 
 
-@pytest.mark.parametrize(
-    ("trusted_totals", "quantity_gate"),
-    [(False, QuantityGate.ALLOWED.value), (False, "blocked")],
-    ids=["untrusted", "non_allowed_gate"],
-)
 async def test_create_export_allows_gated_or_untrusted_takeoff(
     async_client: AsyncClient,
-    trusted_totals: bool,
-    quantity_gate: str,
 ) -> None:
     # Path B 4: quantity/estimate exports are no longer gated on
     # quantity_gate / trusted_totals; any persisted takeoff is exportable.
     lineage = await _seed_export_lineage()
-    takeoff_id = await _create_takeoff(
-        lineage,
-        trusted_totals=trusted_totals,
-        quantity_gate=quantity_gate,
-    )
+    takeoff_id = await _create_takeoff(lineage)
 
     response = await async_client.post(
         (

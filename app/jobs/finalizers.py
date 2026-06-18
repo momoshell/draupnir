@@ -1398,9 +1398,7 @@ async def _finalize_changeset_apply_job(
             predecessor_revision_id=current_revision.id,
             revision_sequence=current_revision.revision_sequence + 1,
             revision_kind="changeset",
-            review_state=validation_report.review_state,
             canonical_entity_schema_version=base_manifest.canonical_entity_schema_version,
-            confidence_score=validation_report.effective_confidence,
         )
 
         session.add(drawing_revision)
@@ -1415,9 +1413,6 @@ async def _finalize_changeset_apply_job(
                 validation_report_schema_version=validation_report.validation_report_schema_version,
                 canonical_entity_schema_version=validation_report.canonical_entity_schema_version,
                 validation_status=validation_report.validation_status,
-                review_state=validation_report.review_state,
-                quantity_gate=validation_report.quantity_gate,
-                effective_confidence=validation_report.effective_confidence,
                 validator_name=validation_report.validator_name,
                 validator_version=validation_report.validator_version,
                 report_json=_build_changeset_validation_report_json(

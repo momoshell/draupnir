@@ -225,9 +225,7 @@ def _select_eligible_aggregate_quantity_item(quantity_items: list[QuantityItem])
         (
             item
             for item in quantity_items
-            if item.item_kind == "aggregate"
-            and item.value is not None
-            and item.quantity_gate in {"allowed", "allowed_provisional"}
+            if item.item_kind == "aggregate" and item.value is not None
         ),
         key=lambda item: (item.quantity_type, str(item.id)),
     )
@@ -246,19 +244,14 @@ def _quantity_takeoff_semantic_payload(
             "quantity_type": item.quantity_type,
             "value": item.value,
             "unit": item.unit,
-            "review_state": item.review_state,
             "validation_status": item.validation_status,
-            "quantity_gate": item.quantity_gate,
             "source_entity_id": item.source_entity_id,
             "excluded_source_entity_ids_json": item.excluded_source_entity_ids_json,
         }
         for item in items
     ]
     return {
-        "review_state": takeoff.review_state,
         "validation_status": takeoff.validation_status,
-        "quantity_gate": takeoff.quantity_gate,
-        "trusted_totals": takeoff.trusted_totals,
         "items": sorted(
             item_payloads,
             key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
@@ -325,8 +318,6 @@ def _estimate_persisted_semantic_payload(
             "quantity_takeoff_id": estimate_version.quantity_takeoff_id,
             "source_file_id": estimate_version.source_file_id,
             "drawing_revision_id": estimate_version.drawing_revision_id,
-            "quantity_gate": estimate_version.quantity_gate,
-            "trusted_totals": estimate_version.trusted_totals,
             "currency": estimate_version.currency,
             "subtotal_amount": estimate_version.subtotal_amount,
             "tax_amount": estimate_version.tax_amount,
@@ -776,8 +767,6 @@ async def _persist_estimate_job_input(
         drawing_revision_id=quantity_takeoff.drawing_revision_id,
         quantity_takeoff_id=quantity_takeoff.id,
         source_job_type="estimate",
-        quantity_gate=quantity_takeoff.quantity_gate,
-        trusted_totals=quantity_takeoff.trusted_totals,
         currency="GBP",
         pricing_effective_date=date(2026, 1, 2),
         pricing_mode="explicit",

@@ -7,7 +7,6 @@ from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
-    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -75,29 +74,19 @@ class EstimateJobInput(Base):
             name="fk_estimate_job_inputs_source_job_contract",
         ),
         ForeignKeyConstraint(
-            [
-                "quantity_takeoff_id",
-                "project_id",
-                "drawing_revision_id",
-                "quantity_gate",
-                "trusted_totals",
-            ],
+            ["quantity_takeoff_id", "project_id", "drawing_revision_id"],
             [
                 "quantity_takeoffs.id",
                 "quantity_takeoffs.project_id",
                 "quantity_takeoffs.drawing_revision_id",
-                "quantity_takeoffs.quantity_gate",
-                "quantity_takeoffs.trusted_totals",
             ],
             ondelete="RESTRICT",
-            name="fk_estimate_job_inputs_takeoff_contract",
+            name="fk_estimate_job_inputs_takeoff_lineage",
         ),
         CheckConstraint(
             f"source_job_type = '{JobType.ESTIMATE.value}'",
             name="ck_estimate_job_inputs_source_job_type_estimate",
         ),
-        # Path B 3: estimates are no longer gated to allowed + trusted takeoffs.
-        # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
         CheckConstraint(
             "currency = 'GBP'",
             name="ck_estimate_job_inputs_currency_gbp",
@@ -152,18 +141,6 @@ class EstimateJobInput(Base):
         nullable=False,
         default=JobType.ESTIMATE.value,
         comment="Denormalized job type used by the composite estimate-job contract",
-    )
-    # Path B 5b: copied from the (now-NULL) takeoff gate; vestigial, dropped in stage 6.
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial quantity gate copied from the takeoff (dropped in Path B stage 6)",
-    )
-    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
-    trusted_totals: Mapped[bool | None] = mapped_column(
-        Boolean,
-        nullable=True,
-        comment="Persisted trusted-total contract copied from the selected takeoff",
     )
     currency: Mapped[str] = mapped_column(
         String(3),

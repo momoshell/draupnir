@@ -10,7 +10,6 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
     ForeignKeyConstraint,
     String,
@@ -47,10 +46,6 @@ class AdapterRunOutput(Base):
         UniqueConstraint(
             "source_job_id",
             name="uq_adapter_run_outputs_source_job_id",
-        ),
-        CheckConstraint(
-            "confidence_score >= 0.0 AND confidence_score <= 1.0",
-            name="ck_adapter_outputs_confidence_0_1",
         ),
         CheckConstraint(
             "length(result_checksum_sha256) = 64 "
@@ -127,12 +122,6 @@ class AdapterRunOutput(Base):
         JSON,
         nullable=False,
         comment="Structured confidence payload for adapter output review workflows",
-    )
-    # Path B 5b: no longer persisted (nullable until #491 drops it).
-    confidence_score: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-        comment="Vestigial adapter confidence score (no longer derived; dropped in Path B stage 6)",
     )
     warnings_json: Mapped[list[Any]] = mapped_column(
         JSON,

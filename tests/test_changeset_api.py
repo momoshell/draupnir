@@ -105,7 +105,6 @@ async def _seed_changeset_lineage() -> ChangesetLineage:
             canonical_json={"entities": []},
             provenance_json={"origin": "test"},
             confidence_json={"entities": []},
-            confidence_score=0.99,
             warnings_json=[],
             diagnostics_json={},
             result_checksum_sha256=uuid4().hex + uuid4().hex,
@@ -122,9 +121,7 @@ async def _seed_changeset_lineage() -> ChangesetLineage:
             predecessor_revision_id=None,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1.0",
-            confidence_score=0.99,
         )
         session.add(revision)
         await session.flush()

@@ -9,7 +9,6 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
-    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -27,16 +26,6 @@ from app.db.base import Base
 from app.models.job import JobType, _sql_in_list
 
 
-class QuantityReviewState(StrEnum):
-    """Review states allowed for persisted quantity outputs."""
-
-    APPROVED = "approved"
-    PROVISIONAL = "provisional"
-    REVIEW_REQUIRED = "review_required"
-    REJECTED = "rejected"
-    SUPERSEDED = "superseded"
-
-
 class QuantityValidationStatus(StrEnum):
     """Validation statuses allowed for persisted quantity outputs."""
 
@@ -44,15 +33,6 @@ class QuantityValidationStatus(StrEnum):
     VALID_WITH_WARNINGS = "valid_with_warnings"
     INVALID = "invalid"
     NEEDS_REVIEW = "needs_review"
-
-
-class QuantityGate(StrEnum):
-    """Quantity gating outcomes allowed for persisted outputs."""
-
-    ALLOWED = "allowed"
-    ALLOWED_PROVISIONAL = "allowed_provisional"
-    REVIEW_GATED = "review_gated"
-    BLOCKED = "blocked"
 
 
 class QuantityItemKind(StrEnum):
@@ -64,14 +44,8 @@ class QuantityItemKind(StrEnum):
     CONFLICT = "conflict"
 
 
-_QUANTITY_REVIEW_STATE_VALUES = tuple(state.value for state in QuantityReviewState)
 _QUANTITY_VALIDATION_STATUS_VALUES = tuple(status.value for status in QuantityValidationStatus)
-_QUANTITY_GATE_VALUES = tuple(gate.value for gate in QuantityGate)
 _QUANTITY_ITEM_KIND_VALUES = tuple(kind.value for kind in QuantityItemKind)
-_QUANTITY_CONFLICT_ITEM_GATE_VALUES = (
-    QuantityGate.REVIEW_GATED.value,
-    QuantityGate.BLOCKED.value,
-)
 _QUANTITY_ITEM_SOURCE_ENTITY_CONTRACT = (
     "((item_kind = 'contributor' AND source_entity_id IS NOT NULL) "
     "OR (item_kind = 'aggregate' AND source_entity_id IS NULL) "
@@ -83,10 +57,6 @@ _QUANTITY_ITEM_VALUE_CONTRACT = (
     "OR (item_kind = 'aggregate' AND value IS NOT NULL) "
     "OR (item_kind = 'exclusion' AND value IS NULL) "
     "OR (item_kind = 'conflict' AND value IS NULL))"
-)
-_QUANTITY_ITEM_CONFLICT_GATE_CONTRACT = (
-    "(item_kind <> 'conflict' OR quantity_gate IN "
-    f"({_sql_in_list(_QUANTITY_CONFLICT_ITEM_GATE_VALUES)}))"
 )
 
 
@@ -130,45 +100,18 @@ class QuantityTakeoff(Base):
             name="fk_quantity_takeoffs_source_job_contract",
         ),
         CheckConstraint(
-            f"review_state IN ({_sql_in_list(_QUANTITY_REVIEW_STATE_VALUES)})",
-            name="ck_quantity_takeoffs_review_state_valid",
-        ),
-        CheckConstraint(
             f"validation_status IN ({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
             name="ck_quantity_takeoffs_validation_status_valid",
         ),
         CheckConstraint(
-            f"quantity_gate IN ({_sql_in_list(_QUANTITY_GATE_VALUES)})",
-            name="ck_quantity_takeoffs_quantity_gate_valid",
-        ),
-        CheckConstraint(
             f"source_job_type = '{JobType.QUANTITY_TAKEOFF.value}'",
             name="ck_quantity_takeoffs_source_job_type_quantity_takeoff",
-        ),
-        CheckConstraint(
-            "trusted_totals = FALSE OR quantity_gate = 'allowed'",
-            name="ck_quantity_takeoffs_trusted_totals_allowed_gate",
         ),
         UniqueConstraint(
             "id",
             "project_id",
             "drawing_revision_id",
             name="uq_quantity_takeoffs_id_project_id_drawing_revision_id",
-        ),
-        UniqueConstraint(
-            "id",
-            "project_id",
-            "drawing_revision_id",
-            "quantity_gate",
-            name="uq_quantity_takeoffs_id_project_rev_gate",
-        ),
-        UniqueConstraint(
-            "id",
-            "project_id",
-            "drawing_revision_id",
-            "quantity_gate",
-            "trusted_totals",
-            name="uq_quantity_takeoffs_id_project_rev_gate_trusted",
         ),
         UniqueConstraint(
             "source_job_id",
@@ -210,28 +153,10 @@ class QuantityTakeoff(Base):
         default=JobType.QUANTITY_TAKEOFF.value,
         comment="Denormalized job type used by the composite source-job contract",
     )
-    # Path B 5b: review_state / quantity_gate are no longer derived (flow as NULL;
-    # dropped in Path B stage 6). validation_status is kept.
-    review_state: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial review disposition (no longer derived; dropped in Path B stage 6)",
-    )
     validation_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         comment="Validation status inherited by downstream takeoff consumers",
-    )
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial quantity gate (no longer derived; dropped in Path B stage 6)",
-    )
-    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
-    trusted_totals: Mapped[bool | None] = mapped_column(
-        Boolean,
-        nullable=True,
-        comment="Whether aggregate totals are trusted for downstream automation",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -257,17 +182,6 @@ class QuantityItem(Base):
             name="fk_quantity_items_takeoff_lineage",
         ),
         ForeignKeyConstraint(
-            ["quantity_takeoff_id", "project_id", "drawing_revision_id", "quantity_gate"],
-            [
-                "quantity_takeoffs.id",
-                "quantity_takeoffs.project_id",
-                "quantity_takeoffs.drawing_revision_id",
-                "quantity_takeoffs.quantity_gate",
-            ],
-            ondelete="RESTRICT",
-            name="fk_quantity_items_takeoff_gate_contract",
-        ),
-        ForeignKeyConstraint(
             ["drawing_revision_id", "source_entity_id"],
             ["revision_entities.drawing_revision_id", "revision_entities.entity_id"],
             ondelete="RESTRICT",
@@ -278,16 +192,8 @@ class QuantityItem(Base):
             name="ck_quantity_items_item_kind_valid",
         ),
         CheckConstraint(
-            f"review_state IN ({_sql_in_list(_QUANTITY_REVIEW_STATE_VALUES)})",
-            name="ck_quantity_items_review_state_valid",
-        ),
-        CheckConstraint(
             f"validation_status IN ({_sql_in_list(_QUANTITY_VALIDATION_STATUS_VALUES)})",
             name="ck_quantity_items_validation_status_valid",
-        ),
-        CheckConstraint(
-            f"quantity_gate IN ({_sql_in_list(_QUANTITY_GATE_VALUES)})",
-            name="ck_quantity_items_quantity_gate_valid",
         ),
         CheckConstraint(
             "value IS NULL OR (value >= 0::float8 AND value < 'Infinity'::float8)",
@@ -300,10 +206,6 @@ class QuantityItem(Base):
         CheckConstraint(
             _QUANTITY_ITEM_VALUE_CONTRACT,
             name="ck_quantity_items_kind_value_contract",
-        ),
-        CheckConstraint(
-            _QUANTITY_ITEM_CONFLICT_GATE_CONTRACT,
-            name="ck_quantity_items_conflict_gate_review_only",
         ),
         CheckConstraint(
             "quantity_type <> ''",
@@ -376,21 +278,10 @@ class QuantityItem(Base):
         nullable=False,
         comment="Display/storage unit captured for the persisted quantity value",
     )
-    # Path B 5b: review_state / quantity_gate no longer derived (NULL; dropped in stage 6).
-    review_state: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial review disposition (no longer derived; dropped in Path B stage 6)",
-    )
     validation_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
         comment="Validation status for this itemized quantity row",
-    )
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial quantity gating result (no longer derived; dropped in Path B stage 6)",
     )
     source_entity_id: Mapped[str | None] = mapped_column(
         String(255),

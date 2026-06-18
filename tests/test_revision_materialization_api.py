@@ -32,7 +32,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_ADAPTER_VERSION,
     _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
     _FAKE_RUNNER_CONFIDENCE_SCORE,
-    _FAKE_RUNNER_REVIEW_STATE,
     _build_fake_ingest_payload,
 )
 
@@ -1033,7 +1032,6 @@ class TestRevisionMaterializationApi:
                     },
                     provenance_json={"adapter": {"key": _FAKE_RUNNER_ADAPTER_KEY}},
                     confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     warnings_json=[],
                     diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
                     result_checksum_sha256="0" * 64,
@@ -1050,9 +1048,7 @@ class TestRevisionMaterializationApi:
                     predecessor_revision_id=None,
                     revision_sequence=1,
                     revision_kind="ingest",
-                    review_state=_FAKE_RUNNER_REVIEW_STATE,
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 )
             )
             await session.commit()
@@ -1105,7 +1101,6 @@ class TestRevisionMaterializationApi:
                     canonical_json={"layouts": [], "layers": [], "blocks": [], "entities": []},
                     provenance_json={"adapter": {"key": _FAKE_RUNNER_ADAPTER_KEY}},
                     confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     warnings_json=[],
                     diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
                     result_checksum_sha256="0" * 64,
@@ -1122,9 +1117,7 @@ class TestRevisionMaterializationApi:
                     predecessor_revision_id=None,
                     revision_sequence=1,
                     revision_kind="ingest",
-                    review_state=_FAKE_RUNNER_REVIEW_STATE,
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 )
             )
             for index, name in enumerate(pens):
@@ -1222,7 +1215,6 @@ class TestRevisionMaterializationApi:
                         "generated_at": "2026-01-02T03:04:05+00:00",
                     },
                     confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     warnings_json=[],
                     diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
                     result_checksum_sha256="0" * 64,
@@ -1239,9 +1231,7 @@ class TestRevisionMaterializationApi:
                     predecessor_revision_id=None,
                     revision_sequence=1,
                     revision_kind="ingest",
-                    review_state=_FAKE_RUNNER_REVIEW_STATE,
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 )
             )
             await session.commit()

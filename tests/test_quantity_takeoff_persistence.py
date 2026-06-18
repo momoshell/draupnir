@@ -196,10 +196,7 @@ async def _seed_quantity_lineage(async_client: httpx.AsyncClient) -> _QuantityPe
                 drawing_revision_id=drawing_revision_id,
                 source_job_id=quantity_job_id,
                 source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                review_state="approved",
                 validation_status="valid",
-                quantity_gate="allowed",
-                trusted_totals=True,
             )
         )
         await session.flush()
@@ -213,9 +210,7 @@ async def _seed_quantity_lineage(async_client: httpx.AsyncClient) -> _QuantityPe
                 quantity_type="linear_length",
                 value=12.5,
                 unit="m",
-                review_state="approved",
                 validation_status="valid",
-                quantity_gate="allowed",
                 source_entity_id=source_entity_id,
                 excluded_source_entity_ids_json=[],
             )
@@ -304,7 +299,6 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                     canonical_json,
                     provenance_json,
                     confidence_json,
-                    confidence_score,
                     warnings_json,
                     diagnostics_json,
                     result_checksum_sha256
@@ -321,7 +315,6 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                     CAST(:canonical_json AS json),
                     CAST(:provenance_json AS json),
                     CAST(:confidence_json AS json),
-                    :confidence_score,
                     CAST(:warnings_json AS json),
                     CAST(:diagnostics_json AS json),
                     :result_checksum_sha256
@@ -341,7 +334,6 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                 "canonical_json": dumps(adapter_output.canonical_json, separators=(",", ":")),
                 "provenance_json": dumps(adapter_output.provenance_json, separators=(",", ":")),
                 "confidence_json": dumps(adapter_output.confidence_json, separators=(",", ":")),
-                "confidence_score": adapter_output.confidence_score,
                 "warnings_json": dumps(adapter_output.warnings_json, separators=(",", ":")),
                 "diagnostics_json": dumps(adapter_output.diagnostics_json, separators=(",", ":")),
                 "result_checksum_sha256": f"{uuid.uuid4().hex}{uuid.uuid4().hex}",
@@ -360,9 +352,7 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                     predecessor_revision_id,
                     revision_sequence,
                     revision_kind,
-                    review_state,
-                    canonical_entity_schema_version,
-                    confidence_score
+                    canonical_entity_schema_version
                 ) VALUES (
                     :id,
                     :project_id,
@@ -373,9 +363,7 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                     :predecessor_revision_id,
                     :revision_sequence,
                     :revision_kind,
-                    :review_state,
-                    :canonical_entity_schema_version,
-                    :confidence_score
+                    :canonical_entity_schema_version
                 )
                 """
             ),
@@ -389,9 +377,7 @@ async def _create_additional_drawing_revision(seed: _QuantityPersistenceSeed) ->
                 "predecessor_revision_id": base_revision.id,
                 "revision_sequence": base_revision.revision_sequence + 1,
                 "revision_kind": "reprocess",
-                "review_state": base_revision.review_state,
                 "canonical_entity_schema_version": base_revision.canonical_entity_schema_version,
-                "confidence_score": base_revision.confidence_score,
             },
         )
         await session.commit()
@@ -436,10 +422,7 @@ async def _create_quantity_takeoff(
                 drawing_revision_id=seed.drawing_revision_id,
                 source_job_id=quantity_job_id,
                 source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                review_state=review_state,
                 validation_status=validation_status,
-                quantity_gate=quantity_gate,
-                trusted_totals=trusted_totals,
             )
         )
         await session.commit()
@@ -489,31 +472,18 @@ class TestQuantityTakeoffPersistence:
         ):
             assert required_column in takeoff_columns
             assert takeoff_columns[required_column]["nullable"] is False
-        # Path B 5b/5c: review_state / quantity_gate / trusted_totals are vestigial + nullable.
-        assert takeoff_columns["review_state"]["nullable"] is True
-        assert takeoff_columns["quantity_gate"]["nullable"] is True
-        assert takeoff_columns["trusted_totals"]["nullable"] is True
 
         assert (
             "id",
             "project_id",
             "drawing_revision_id",
         ) in unique_constraints["quantity_takeoffs"]
-        assert (
-            "id",
-            "project_id",
-            "drawing_revision_id",
-            "quantity_gate",
-        ) in unique_constraints["quantity_takeoffs"]
         assert ("source_job_id",) in unique_constraints["quantity_takeoffs"]
         assert ("project_id",) in indexes["quantity_takeoffs"]
         assert ("source_file_id",) in indexes["quantity_takeoffs"]
         for constraint_name in (
-            "ck_quantity_takeoffs_review_state_valid",
             "ck_quantity_takeoffs_validation_status_valid",
-            "ck_quantity_takeoffs_quantity_gate_valid",
             "ck_quantity_takeoffs_source_job_type_quantity_takeoff",
-            "ck_quantity_takeoffs_trusted_totals_allowed_gate",
         ):
             assert constraint_name in check_constraints["quantity_takeoffs"]
 
@@ -525,9 +495,7 @@ class TestQuantityTakeoffPersistence:
             "item_kind",
             "quantity_type",
             "unit",
-            "review_state",
             "validation_status",
-            "quantity_gate",
             "excluded_source_entity_ids_json",
             "created_at",
         ):
@@ -543,13 +511,10 @@ class TestQuantityTakeoffPersistence:
         assert ("drawing_revision_id", "source_entity_id") in indexes["quantity_items"]
         for constraint_name in (
             "ck_quantity_items_item_kind_valid",
-            "ck_quantity_items_review_state_valid",
             "ck_quantity_items_validation_status_valid",
-            "ck_quantity_items_quantity_gate_valid",
             "ck_quantity_items_value_nonnegative_finite",
             "ck_quantity_items_kind_source_entity_contract",
             "ck_quantity_items_kind_value_contract",
-            "ck_quantity_items_conflict_gate_review_only",
             "ck_quantity_items_quantity_type_nonempty",
             "ck_quantity_items_unit_nonempty",
             "ck_quantity_items_excluded_source_entity_ids_json_array",
@@ -590,14 +555,6 @@ class TestQuantityTakeoffPersistence:
             quantity_item_checks["ck_quantity_items_excluded_source_entity_ids_json_array"]
         )
         assert "json_typeof excluded_source_entity_ids_json = 'array'" in excluded_refs_sql
-
-        conflict_gate_sql = _normalize_constraint_sqltext(
-            quantity_item_checks["ck_quantity_items_conflict_gate_review_only"]
-        )
-        assert "item_kind <> 'conflict'" in conflict_gate_sql
-        assert "quantity_gate" in conflict_gate_sql
-        for expected_gate in ("review_gated", "blocked"):
-            assert expected_gate in conflict_gate_sql
 
         assert (
             foreign_keys["quantity_takeoffs"][(("project_id",), "projects", ("id",))] == "RESTRICT"
@@ -648,83 +605,12 @@ class TestQuantityTakeoffPersistence:
         assert (
             foreign_keys["quantity_items"][
                 (
-                    (
-                        "quantity_takeoff_id",
-                        "project_id",
-                        "drawing_revision_id",
-                        "quantity_gate",
-                    ),
-                    "quantity_takeoffs",
-                    ("id", "project_id", "drawing_revision_id", "quantity_gate"),
-                )
-            ]
-            == "RESTRICT"
-        )
-        assert (
-            foreign_keys["quantity_items"][
-                (
                     ("drawing_revision_id", "source_entity_id"),
                     "revision_entities",
                     ("drawing_revision_id", "entity_id"),
                 )
             ]
             == "RESTRICT"
-        )
-
-    async def test_quantity_takeoff_constraints_reject_invalid_gate(
-        self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        enqueued_job_ids: list[str],
-    ) -> None:
-        _ = self
-        _ = cleanup_projects
-        _ = enqueued_job_ids
-
-        seed = await _seed_quantity_lineage(async_client)
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-
-        async with session_maker() as session:
-            invalid_job_id = uuid.uuid4()
-            session.add(
-                Job(
-                    id=invalid_job_id,
-                    project_id=seed.project_id,
-                    file_id=seed.file_id,
-                    base_revision_id=seed.drawing_revision_id,
-                    job_type=JobType.QUANTITY_TAKEOFF.value,
-                    status=JobStatus.SUCCEEDED.value,
-                    enqueue_status="published",
-                    enqueue_attempts=0,
-                    cancel_requested=False,
-                )
-            )
-            await session.flush()
-            session.add(
-                QuantityTakeoff(
-                    id=uuid.uuid4(),
-                    project_id=seed.project_id,
-                    source_file_id=seed.file_id,
-                    drawing_revision_id=seed.drawing_revision_id,
-                    source_job_id=invalid_job_id,
-                    source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                    review_state="approved",
-                    validation_status="valid",
-                    quantity_gate="review_gated",
-                    trusted_totals=True,
-                )
-            )
-
-            with pytest.raises((IntegrityError, DBAPIError)) as exc_info:
-                await session.commit()
-
-            await session.rollback()
-
-        _assert_constraint_failure(
-            exc_info.value,
-            expected_fragment="ck_quantity_takeoffs_trusted_totals_allowed_gate",
         )
 
     async def test_quantity_takeoff_source_job_contract_rejects_base_revision_mismatch(
@@ -766,10 +652,7 @@ class TestQuantityTakeoffPersistence:
                     drawing_revision_id=seed.drawing_revision_id,
                     source_job_id=invalid_job_id,
                     source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
-                    trusted_totals=False,
                 )
             )
 
@@ -811,10 +694,7 @@ class TestQuantityTakeoffPersistence:
                     drawing_revision_id=seed.drawing_revision_id,
                     source_job_id=invalid_job_id,
                     source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
-                    trusted_totals=False,
                 )
             )
 
@@ -970,9 +850,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_takeoff_id=seed.quantity_takeoff_id,
                     project_id=seed.project_id,
                     drawing_revision_id=seed.drawing_revision_id,
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
                     excluded_source_entity_ids_json=[],
                     **resolved_item_kwargs,
                 )
@@ -1018,9 +896,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_type="linear_length",
                     value=None,
                     unit="m",
-                    review_state="review_required",
                     validation_status="needs_review",
-                    quantity_gate="review_gated",
                     source_entity_id=None,
                     excluded_source_entity_ids_json=[],
                 )
@@ -1034,94 +910,6 @@ class TestQuantityTakeoffPersistence:
         _assert_constraint_failure(
             exc_info.value,
             expected_fragment="ck_quantity_items_kind_source_entity_contract",
-        )
-
-    async def test_quantity_conflict_item_rejects_non_review_gate_under_trusted_takeoff(
-        self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        enqueued_job_ids: list[str],
-    ) -> None:
-        _ = self
-        _ = cleanup_projects
-        _ = enqueued_job_ids
-
-        seed = await _seed_quantity_lineage(async_client)
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-
-        async with session_maker() as session:
-            session.add(
-                QuantityItem(
-                    id=uuid.uuid4(),
-                    quantity_takeoff_id=seed.quantity_takeoff_id,
-                    project_id=seed.project_id,
-                    drawing_revision_id=seed.drawing_revision_id,
-                    item_kind="conflict",
-                    quantity_type="linear_length",
-                    value=None,
-                    unit="m",
-                    review_state="approved",
-                    validation_status="valid",
-                    quantity_gate="allowed",
-                    source_entity_id=seed.source_entity_id,
-                    excluded_source_entity_ids_json=[],
-                )
-            )
-
-            with pytest.raises((IntegrityError, DBAPIError)) as exc_info:
-                await session.commit()
-
-            await session.rollback()
-
-        _assert_constraint_failure(
-            exc_info.value,
-            expected_fragment="ck_quantity_items_conflict_gate_review_only",
-        )
-
-    async def test_quantity_item_rejects_parent_gate_mismatch(
-        self,
-        async_client: httpx.AsyncClient,
-        cleanup_projects: None,
-        enqueued_job_ids: list[str],
-    ) -> None:
-        _ = self
-        _ = cleanup_projects
-        _ = enqueued_job_ids
-
-        seed = await _seed_quantity_lineage(async_client)
-
-        session_maker = session_module.AsyncSessionLocal
-        assert session_maker is not None
-
-        async with session_maker() as session:
-            session.add(
-                QuantityItem(
-                    id=uuid.uuid4(),
-                    quantity_takeoff_id=seed.quantity_takeoff_id,
-                    project_id=seed.project_id,
-                    drawing_revision_id=seed.drawing_revision_id,
-                    item_kind="contributor",
-                    quantity_type="linear_length",
-                    value=1.0,
-                    unit="m",
-                    review_state="approved",
-                    validation_status="valid",
-                    quantity_gate="review_gated",
-                    source_entity_id=seed.source_entity_id,
-                    excluded_source_entity_ids_json=[],
-                )
-            )
-
-            with pytest.raises((IntegrityError, DBAPIError)) as exc_info:
-                await session.commit()
-
-            await session.rollback()
-
-        _assert_constraint_failure(
-            exc_info.value,
-            expected_fragment="fk_quantity_items_takeoff_gate_contract",
         )
 
     @pytest.mark.parametrize(
@@ -1168,9 +956,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_type="linear_length",
                     value=None,
                     unit="m",
-                    review_state=review_state,
                     validation_status=validation_status,
-                    quantity_gate=quantity_gate,
                     source_entity_id=seed.source_entity_id,
                     excluded_source_entity_ids_json=[seed.source_entity_id],
                 )
@@ -1182,7 +968,6 @@ class TestQuantityTakeoffPersistence:
 
         assert persisted_item is not None
         assert persisted_item.item_kind == "conflict"
-        assert persisted_item.quantity_gate == quantity_gate
         assert persisted_item.source_entity_id == seed.source_entity_id
 
     async def test_quantity_item_takeoff_lineage_rejects_revision_mismatch(
@@ -1211,9 +996,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_type="linear_length",
                     value=1.0,
                     unit="m",
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
                     source_entity_id=None,
                     excluded_source_entity_ids_json=[],
                 )
@@ -1258,9 +1041,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_type="linear_length",
                     value=1.0,
                     unit="m",
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
                     source_entity_id=source_seed.source_entity_id,
                     excluded_source_entity_ids_json=[],
                 )
@@ -1302,9 +1083,7 @@ class TestQuantityTakeoffPersistence:
                     quantity_type="linear_length",
                     value=1.0,
                     unit="m",
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
                     source_entity_id="missing-entity",
                     excluded_source_entity_ids_json=[],
                 )

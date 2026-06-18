@@ -335,6 +335,15 @@ async def _load_revision_entities(
     return tuple(_revision_entity_snapshot_from_model(entity) for entity in result.scalars())
 
 
+def _confidence_score_from_json(confidence_json: object) -> float | None:
+    """Best-effort per-entity confidence score from the canonical confidence payload."""
+    if isinstance(confidence_json, dict):
+        score = confidence_json.get("score")
+        if isinstance(score, int | float) and not isinstance(score, bool):
+            return float(score)
+    return None
+
+
 def _revision_entity_snapshot_from_model(entity: RevisionEntity) -> RevisionEntitySnapshot:
     return RevisionEntitySnapshot(
         id=entity.id,
@@ -342,7 +351,7 @@ def _revision_entity_snapshot_from_model(entity: RevisionEntity) -> RevisionEnti
         entity_id=entity.entity_id,
         entity_type=entity.entity_type,
         entity_schema_version=entity.entity_schema_version,
-        confidence_score=entity.confidence_score,
+        confidence_score=_confidence_score_from_json(entity.confidence_json),
         confidence_json=copy.deepcopy(entity.confidence_json),
         geometry_json=copy.deepcopy(entity.geometry_json),
         properties_json=copy.deepcopy(entity.properties_json),

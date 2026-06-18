@@ -12,12 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from uuid import UUID
 
 from app.core.errors import ErrorCode
 from app.estimating.quantities.contracts import (
-    GateStatus,
     RevisionEntityInput,
     RevisionGateMetadata,
 )
@@ -61,15 +60,18 @@ def _manifest_entity_count(manifest: RevisionEntityManifest) -> int | None:
 
 
 def _build_quantity_gate_metadata(report: ValidationReport) -> RevisionGateMetadata:
-    """Build quantity engine gate metadata from the persisted validation report."""
+    """Build quantity engine gate metadata from the persisted validation report.
+
+    Path B 6: the gate/review/confidence columns are gone; quantities are always
+    computed, so the gate is recorded as informational provenance with a fixed
+    ``allowed`` status carrying only the technical validation status.
+    """
     return RevisionGateMetadata(
-        status=cast(GateStatus, report.quantity_gate),
+        status="allowed",
         validation_status=report.validation_status,
-        reason=report.review_state if report.quantity_gate in {"review_gated", "blocked"} else None,
+        reason=None,
         details={
             "drawing_revision_id": str(report.drawing_revision_id),
-            "review_state": report.review_state,
-            "effective_confidence": report.effective_confidence,
         },
     )
 

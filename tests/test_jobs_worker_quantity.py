@@ -170,19 +170,14 @@ def _quantity_takeoff_semantic_payload(
             "quantity_type": item.quantity_type,
             "value": item.value,
             "unit": item.unit,
-            "review_state": item.review_state,
             "validation_status": item.validation_status,
-            "quantity_gate": item.quantity_gate,
             "source_entity_id": item.source_entity_id,
             "excluded_source_entity_ids_json": item.excluded_source_entity_ids_json,
         }
         for item in items
     ]
     return {
-        "review_state": takeoff.review_state,
         "validation_status": takeoff.validation_status,
-        "quantity_gate": takeoff.quantity_gate,
-        "trusted_totals": takeoff.trusted_totals,
         "items": sorted(
             item_payloads,
             key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
@@ -944,11 +939,7 @@ class TestJobsWorkerQuantity:
         assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
         assert takeoff.drawing_revision_id == base_revision.id
         assert takeoff.source_job_id == quantity_job.id
-        assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
-        assert takeoff.quantity_gate is None
-        # Path B 5c: trusted_totals is no longer derived/written (NULL).
-        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert len(items) == 5
@@ -957,9 +948,7 @@ class TestJobsWorkerQuantity:
             "contributor",
             "exclusion",
         }
-        assert all(item.review_state is None for item in items)
         assert all(item.validation_status == validation_status for item in items)
-        assert all(item.quantity_gate is None for item in items)
         assert sum(item.item_kind == "aggregate" for item in items) == 2
         assert sum(item.item_kind == "contributor" for item in items) == 2
         assert sum(item.item_kind == "exclusion" for item in items) == 1
@@ -1020,15 +1009,10 @@ class TestJobsWorkerQuantity:
         assert takeoff.project_id == uuid.UUID(project["id"])
         assert takeoff.source_file_id == uuid.UUID(uploaded["id"])
         assert takeoff.drawing_revision_id == base_revision.id
-        assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
-        assert takeoff.quantity_gate is None
-        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
-        assert all(item.review_state is None for item in items)
         assert all(item.validation_status == validation_status for item in items)
-        assert all(item.quantity_gate is None for item in items)
         assert all(item.item_kind != "exclusion" for item in items)
 
         aggregate_values = _quantity_item_values_by_type(items, item_kind="aggregate")
@@ -1108,8 +1092,6 @@ class TestJobsWorkerQuantity:
         assert updated_job.status == "succeeded"
         assert updated_job.error_code is None
         assert len(takeoffs) == 1
-        assert takeoffs[0].quantity_gate is None
-        assert takeoffs[0].trusted_totals is None
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
@@ -1544,10 +1526,7 @@ class TestJobsWorkerQuantity:
                     drawing_revision_id=base_revision.id,
                     source_job_id=quantity_job.id,
                     source_job_type=JobType.QUANTITY_TAKEOFF.value,
-                    review_state="approved",
                     validation_status="valid",
-                    quantity_gate="allowed",
-                    trusted_totals=True,
                 )
             )
             with pytest.raises(IntegrityError):
@@ -1653,12 +1632,9 @@ class TestJobsWorkerQuantity:
         assert updated_job.error_code is None
         assert len(takeoffs) == 1
         takeoff = takeoffs[0]
-        assert takeoff.quantity_gate is None
-        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert items, "gated revision should still produce quantity items"
-        assert all(item.quantity_gate is None for item in items)
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200

@@ -30,7 +30,6 @@ from app.models.file import File
 from app.models.job import Job, JobType
 from app.models.project import Project
 from app.models.quantity_takeoff import (
-    QuantityGate,
     QuantityItem,
     QuantityItemKind,
     QuantityTakeoff,
@@ -175,7 +174,6 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             canonical_json={},
             provenance_json={},
             confidence_json={},
-            confidence_score=1.0,
             warnings_json=[],
             diagnostics_json={},
             result_checksum_sha256="1" * 64,
@@ -190,9 +188,7 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             predecessor_revision_id=None,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1.0.0",
-            confidence_score=1.0,
         )
         quantity_job = Job(
             id=quantity_job_id,
@@ -220,10 +216,7 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             drawing_revision_id=revision_id,
             source_job_id=quantity_job_id,
             source_job_type=JobType.QUANTITY_TAKEOFF.value,
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
         )
         quantity_item = QuantityItem(
             id=quantity_item_id,
@@ -234,9 +227,7 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             quantity_type="area",
             value=42.0,
             unit="sq_ft",
-            review_state="approved",
             validation_status="valid",
-            quantity_gate=QuantityGate.ALLOWED.value,
             source_entity_id=None,
             excluded_source_entity_ids_json=[],
         )
@@ -266,8 +257,6 @@ async def _seed_estimate_lineage() -> _EstimateLineageSeed:
             drawing_revision_id=revision_id,
             quantity_takeoff_id=takeoff_id,
             source_job_id=estimate_job_id,
-            quantity_gate=QuantityGate.ALLOWED.value,
-            trusted_totals=True,
             currency="GBP",
             subtotal_amount=Decimal("100.00"),
             tax_amount=Decimal("20.00"),

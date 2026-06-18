@@ -7,7 +7,6 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -178,22 +177,14 @@ class EstimateVersion(Base):
             name="fk_estimate_versions_revision_lineage",
         ),
         ForeignKeyConstraint(
-            [
-                "quantity_takeoff_id",
-                "project_id",
-                "drawing_revision_id",
-                "quantity_gate",
-                "trusted_totals",
-            ],
+            ["quantity_takeoff_id", "project_id", "drawing_revision_id"],
             [
                 "quantity_takeoffs.id",
                 "quantity_takeoffs.project_id",
                 "quantity_takeoffs.drawing_revision_id",
-                "quantity_takeoffs.quantity_gate",
-                "quantity_takeoffs.trusted_totals",
             ],
             ondelete="RESTRICT",
-            name="fk_estimate_versions_takeoff_contract",
+            name="fk_estimate_versions_takeoff_lineage",
         ),
         ForeignKeyConstraint(
             ["source_job_id", "project_id", "source_file_id"],
@@ -201,8 +192,6 @@ class EstimateVersion(Base):
             ondelete="RESTRICT",
             name="fk_estimate_versions_source_job_lineage",
         ),
-        # Path B 3: estimate versions are no longer gated to allowed + trusted takeoffs.
-        # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
         CheckConstraint(
             "currency = 'GBP'",
             name="ck_estimate_versions_currency_gbp",
@@ -271,18 +260,6 @@ class EstimateVersion(Base):
     source_job_id: Mapped[uuid.UUID] = mapped_column(
         nullable=False,
         comment="Job identifier that finalized this immutable estimate version",
-    )
-    # Path B 5b: copied from the (now-NULL) takeoff gate; vestigial, dropped in stage 6.
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial estimate input gate copied from the takeoff (dropped in stage 6)",
-    )
-    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
-    trusted_totals: Mapped[bool | None] = mapped_column(
-        Boolean,
-        nullable=True,
-        comment="Frozen trusted-input posture copied from the referenced quantity takeoff",
     )
     currency: Mapped[str] = mapped_column(
         String(3),

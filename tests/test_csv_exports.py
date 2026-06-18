@@ -43,10 +43,8 @@ from app.models.file import File
 from app.models.job import Job, JobStatus, JobType
 from app.models.project import Project
 from app.models.quantity_takeoff import (
-    QuantityGate,
     QuantityItem,
     QuantityItemKind,
-    QuantityReviewState,
     QuantityTakeoff,
     QuantityValidationStatus,
 )
@@ -55,7 +53,7 @@ from tests.conftest import requires_database
 pytestmark = [pytest.mark.asyncio, requires_database]
 
 _FIXTURE_UUID_NAMESPACE = uuid.UUID("4b7a71cb-4eb0-4738-b6c6-8b3af08e4e3c")
-_EXPECTED_QUANTITY_CSV_CHECKSUM = "9d06cec6bd7b523c069a1d3f0d1b894a77342bb1ba0534838586db7e50a64f4e"
+_EXPECTED_QUANTITY_CSV_CHECKSUM = "0e2db318a54773649f718b4803ab909ef341fc42d50472c6d21ff5aea5d02292"
 _EXPECTED_ESTIMATE_CSV_CHECKSUM = "f054d06bf73f77cf1faa90e5b78efdcf606b7f15fee806641b34cda980e9f48a"
 
 
@@ -101,12 +99,12 @@ async def test_render_quantity_csv_export_is_deterministic_and_stable(
     assert rows[1][7] == '\'=length "A", B'
     assert rows[1][8] == "3.14159265358979"
     assert rows[2][8] == "0.25"
-    assert rows[1][13] == ""
-    assert rows[1][14] == '["entity-2","entity\\"3"]'
-    assert rows[2][13] == ""
-    assert rows[2][14] == "[]"
-    assert rows[1][15] == "2026-05-27T18:00:00Z"
-    assert rows[2][15] == "2026-05-27T18:01:00Z"
+    assert rows[1][11] == ""
+    assert rows[1][12] == '["entity-2","entity\\"3"]'
+    assert rows[2][11] == ""
+    assert rows[2][12] == "[]"
+    assert rows[1][13] == "2026-05-27T18:00:00Z"
+    assert rows[2][13] == "2026-05-27T18:01:00Z"
 
     text = first.content_bytes.decode("utf-8")
     assert text.endswith("\n")
@@ -169,8 +167,6 @@ async def test_iter_estimate_rows_formats_non_null_quantity_and_rate_with_fixed_
         drawing_revision_id=uuid.uuid4(),
         quantity_takeoff_id=uuid.uuid4(),
         source_job_id=uuid.uuid4(),
-        quantity_gate=QuantityGate.ALLOWED.value,
-        trusted_totals=True,
         currency="GBP",
         subtotal_amount=Decimal("55.35"),
         tax_amount=Decimal("0.00"),
@@ -296,7 +292,6 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         canonical_json={"entities": [], "layers": [], "layouts": [], "blocks": []},
         provenance_json={"adapter": {"key": "tests.fake", "version": "1.0"}},
         confidence_json={"score": 0.9},
-        confidence_score=0.9,
         warnings_json=[],
         diagnostics_json={"duration_ms": 4},
         result_checksum_sha256="b" * 64,
@@ -312,9 +307,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         predecessor_revision_id=None,
         revision_sequence=1,
         revision_kind="ingest",
-        review_state="approved",
         canonical_entity_schema_version="1.0",
-        confidence_score=0.9,
         created_at=datetime(2026, 5, 27, 17, 5, tzinfo=UTC),
     )
     quantity_job = Job(
@@ -341,10 +334,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         drawing_revision_id=revision.id,
         source_job_id=quantity_job.id,
         source_job_type=JobType.QUANTITY_TAKEOFF.value,
-        review_state=QuantityReviewState.APPROVED.value,
         validation_status=QuantityValidationStatus.VALID.value,
-        quantity_gate=QuantityGate.ALLOWED.value,
-        trusted_totals=True,
         created_at=datetime(2026, 5, 27, 17, 8, tzinfo=UTC),
     )
 
@@ -373,9 +363,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         quantity_type='=length "A", B',
         value=3.14159265358979,
         unit="m",
-        review_state=QuantityReviewState.APPROVED.value,
         validation_status=QuantityValidationStatus.VALID.value,
-        quantity_gate=QuantityGate.ALLOWED.value,
         source_entity_id=None,
         excluded_source_entity_ids_json=["entity-2", 'entity"3'],
         created_at=datetime(2026, 5, 27, 18, 0, tzinfo=UTC),
@@ -389,9 +377,7 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         quantity_type="area",
         value=0.25,
         unit="m2",
-        review_state=QuantityReviewState.APPROVED.value,
         validation_status=QuantityValidationStatus.VALID.value,
-        quantity_gate=QuantityGate.ALLOWED.value,
         source_entity_id=None,
         excluded_source_entity_ids_json=[],
         created_at=datetime(2026, 5, 27, 18, 1, tzinfo=UTC),
@@ -427,8 +413,6 @@ async def _seed_export_fixture(db_session: AsyncSession) -> SeededExportFixture:
         drawing_revision_id=revision.id,
         quantity_takeoff_id=quantity_takeoff.id,
         source_job_id=estimate_job.id,
-        quantity_gate=QuantityGate.ALLOWED.value,
-        trusted_totals=True,
         currency="GBP",
         subtotal_amount=Decimal("575.88"),
         tax_amount=Decimal("0.00"),

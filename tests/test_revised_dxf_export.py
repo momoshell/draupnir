@@ -525,7 +525,6 @@ async def _seed_revision_fixture(
         },
         provenance_json={"adapter": {"key": "tests.fake", "version": "1.0"}},
         confidence_json={"score": 0.875},
-        confidence_score=0.875,
         warnings_json=[],
         diagnostics_json={"duration_ms": 3},
         result_checksum_sha256="b" * 64,
@@ -541,9 +540,7 @@ async def _seed_revision_fixture(
         predecessor_revision_id=None,
         revision_sequence=1,
         revision_kind="ingest",
-        review_state="approved",
         canonical_entity_schema_version="1.0",
-        confidence_score=0.875,
         created_at=datetime(2026, 6, 2, 18, 5, tzinfo=UTC),
     )
     changeset_source_job = Job(
@@ -582,9 +579,7 @@ async def _seed_revision_fixture(
         predecessor_revision_id=base_revision.id,
         revision_sequence=2,
         revision_kind="changeset",
-        review_state="approved",
         canonical_entity_schema_version="1.0",
-        confidence_score=0.875,
         created_at=datetime(2026, 6, 2, 18, 10, tzinfo=UTC),
     )
 
@@ -712,7 +707,6 @@ async def _seed_revision_fixture(
             entity_type=str(spec["entity_type"]),
             entity_schema_version=str(spec["entity_schema_version"]),
             parent_entity_ref=None,
-            confidence_score=1.0,
             confidence_json={},
             geometry_json=dict(spec["geometry"]),
             properties_json=dict(spec["properties"]),
