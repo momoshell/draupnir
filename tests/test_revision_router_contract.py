@@ -347,6 +347,7 @@ def test_revision_router_routes_match_baseline_contract() -> None:
                 ("query", "parent_entity_ref", False, None, None, None, None),
                 ("query", "source_identity", False, None, None, None, None),
                 ("query", "source_hash", False, None, None, None, None),
+                ("query", "fields", False, None, None, None, None),
                 ("dependency", "db", None, None, None, None, "get_db"),
             ),
         ),

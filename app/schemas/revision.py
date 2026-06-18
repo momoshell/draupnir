@@ -322,6 +322,35 @@ class RevisionEntityRead(BaseModel):
     created_at: datetime = Field(..., description="Materialization timestamp")
 
 
+class RevisionEntitySummary(BaseModel):
+    """Compact entity row for agent/bulk listing.
+
+    The cheap DB-column spine is always present; the heavy payload blocks
+    (``geometry``/``properties``/``provenance``/``confidence``/``canonical``) are
+    ``None`` unless explicitly requested via the ``fields`` query parameter, so the
+    default listing stays small. Use the single-entity read for the full row.
+    """
+
+    id: UUID = Field(..., description="Materialized entity row identifier")
+    sequence_index: int = Field(..., ge=0, description="Zero-based entity position")
+    entity_id: str = Field(..., description="Stable entity identifier")
+    entity_type: str = Field(..., description="Canonical entity type")
+    entity_schema_version: str = Field(..., description="Entity schema version")
+    parent_entity_ref: str | None = Field(None, description="Raw parent entity reference")
+    layout_ref: str | None = Field(None, description="Raw layout reference")
+    layer_ref: str | None = Field(None, description="Raw layer reference")
+    block_ref: str | None = Field(None, description="Raw block reference")
+    source_identity: str | None = Field(None, description="Stable source identity")
+    source_hash: str | None = Field(None, description="Stable source hash")
+    created_at: datetime = Field(..., description="Materialization timestamp")
+    # Heavy blocks — populated only when selected via ``fields=``.
+    geometry: dict[str, Any] | None = Field(None, description="Entity geometry payload")
+    properties: dict[str, Any] | None = Field(None, description="Entity properties payload")
+    provenance: dict[str, Any] | None = Field(None, description="Entity provenance payload")
+    confidence: dict[str, Any] | None = Field(None, description="Entity confidence payload")
+    canonical: dict[str, Any] | None = Field(None, description="Raw canonical entity payload")
+
+
 class RevisionMaterializationListResponseBase(BaseModel):
     """Shared metadata for revision materialization list responses."""
 
@@ -367,9 +396,9 @@ class RevisionBlockListResponse(RevisionMaterializationListResponseBase):
 
 
 class RevisionEntityListResponse(RevisionMaterializationListResponseBase):
-    """Schema for revision entity list responses."""
+    """Schema for revision entity list responses (compact rows; heavy blocks opt-in)."""
 
-    items: list[RevisionEntityRead] = Field(
+    items: list[RevisionEntitySummary] = Field(
         default_factory=list,
-        description="Materialized entity rows for the requested revision",
+        description="Compact materialized entity rows for the requested revision",
     )

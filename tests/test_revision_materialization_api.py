@@ -227,40 +227,55 @@ class TestRevisionMaterializationApi:
         assert entities_body["next_cursor"] is None
 
         parent_item, child_item, paper_item = entities_body["items"]
+        # Compact default: cheap spine present; heavy blocks null until requested via fields=.
         assert parent_item["entity_id"] == parent_entity.entity_id
         assert parent_item["entity_type"] == parent_entity.entity_type
-        assert "confidence_score" not in parent_item
-        assert parent_item["confidence"] == parent_entity.confidence_json
-        assert parent_item["geometry"] == parent_entity.geometry_json
-        assert parent_item["properties"] == parent_entity.properties_json
-        assert parent_item["provenance"] == parent_entity.provenance_json
         assert parent_item["layout_ref"] == parent_entity.layout_ref
         assert parent_item["layer_ref"] == parent_entity.layer_ref
         assert parent_item["block_ref"] == parent_entity.block_ref
         assert parent_item["parent_entity_ref"] is None
         assert parent_item["source_identity"] == parent_entity.source_identity
         assert parent_item["source_hash"] is None
-        assert parent_item["layout_id"] == str(parent_entity.layout_id)
-        assert parent_item["layer_id"] == str(parent_entity.layer_id)
-        assert parent_item["block_id"] == str(parent_entity.block_id)
-        assert parent_item["parent_entity_row_id"] is None
-        assert "canonical_entity_json" not in parent_item
+        assert parent_item["geometry"] is None
+        assert parent_item["properties"] is None
+        assert parent_item["provenance"] is None
+        assert parent_item["confidence"] is None
+        assert parent_item["canonical"] is None
+        # Resolved row ids / canonical-keyed fields are not part of the compact list.
+        assert "layout_id" not in parent_item
+        assert "parent_entity_row_id" not in parent_item
+        assert "confidence_score" not in parent_item
         assert "geometry_json" not in parent_item
-        assert "properties_json" not in parent_item
-        assert "provenance_json" not in parent_item
-        assert "confidence_json" not in parent_item
 
         assert child_item["entity_id"] == child_entity.entity_id
         assert child_item["parent_entity_ref"] == child_entity.parent_entity_ref
         assert child_item["source_hash"] == child_entity.source_hash
-        assert child_item["layout_id"] == str(child_entity.layout_id)
-        assert child_item["layer_id"] == str(child_entity.layer_id)
-        assert child_item["block_id"] is None
-        assert child_item["parent_entity_row_id"] == str(child_entity.parent_entity_row_id)
 
         assert paper_item["entity_id"] == paper_entity.entity_id
         assert paper_item["layout_ref"] == "Paper"
         assert paper_item["source_identity"] == "entity-source-paper"
+
+        # fields= populates the requested heavy blocks (and only those).
+        projected = (
+            await async_client.get(
+                f"/v1/revisions/{drawing_revision.id}/entities",
+                params={"fields": "geometry,confidence"},
+            )
+        ).json()["items"][0]
+        assert projected["geometry"] == parent_entity.geometry_json
+        assert projected["confidence"] == parent_entity.confidence_json
+        assert projected["properties"] is None
+        assert projected["provenance"] is None
+        assert projected["canonical"] is None
+
+        # Unknown projection field is rejected.
+        bad = await async_client.get(
+            f"/v1/revisions/{drawing_revision.id}/entities",
+            params={"fields": "geometry,bogus"},
+        )
+        assert bad.status_code == 400
+        assert bad.json()["error"]["code"] == "INPUT_INVALID"
+        assert "bogus" in bad.json()["error"]["details"]["unknown_fields"]
 
     async def test_devices_endpoint_returns_schedule_and_tag_association(
         self,
@@ -817,7 +832,12 @@ class TestRevisionMaterializationApi:
 
         response = await async_client.get(
             f"/v1/revisions/{drawing_revision.id}/entities",
-            params={"layout_ref": "Model", "layer_ref": "A-WALL", "entity_type": "text"},
+            params={
+                "layout_ref": "Model",
+                "layer_ref": "A-WALL",
+                "entity_type": "text",
+                "fields": "geometry,properties",
+            },
         )
         assert response.status_code == 200
         items = response.json()["items"]
