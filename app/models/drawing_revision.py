@@ -8,7 +8,6 @@ from datetime import datetime
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Integer,
@@ -100,15 +99,6 @@ class DrawingRevision(Base):
             "AND extraction_profile_id IS NOT NULL AND adapter_run_output_id IS NOT NULL)",
             name="ck_drawing_revisions_origin_fields",
         ),
-        CheckConstraint(
-            "review_state IN "
-            "('approved', 'provisional', 'review_required', 'rejected', 'superseded')",
-            name="ck_drawing_revisions_review_state",
-        ),
-        CheckConstraint(
-            "confidence_score >= 0.0 AND confidence_score <= 1.0",
-            name="ck_drawing_revisions_conf_0_1",
-        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -176,21 +166,10 @@ class DrawingRevision(Base):
         nullable=False,
         comment="Drawing revision kind recorded for this append-only revision",
     )
-    # Path B 5b: no longer derived/persisted (nullable until #491 drops them).
-    review_state: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial review state (no longer derived; dropped in Path B stage 6)",
-    )
     canonical_entity_schema_version: Mapped[str] = mapped_column(
         String(16),
         nullable=False,
         comment="Canonical entity schema version stored on this drawing revision",
-    )
-    confidence_score: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-        comment="Vestigial confidence score (no longer derived; dropped in Path B stage 6)",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

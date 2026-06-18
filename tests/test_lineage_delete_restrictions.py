@@ -676,7 +676,6 @@ class TestLineageDeleteRestrictions:
             "entity_type",
             "entity_schema_version",
             "parent_entity_ref",
-            "confidence_score",
             "confidence_json",
             "geometry_json",
             "properties_json",

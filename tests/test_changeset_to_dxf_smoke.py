@@ -121,7 +121,6 @@ async def _seed_changeset_smoke_lineage() -> _SeededChangesetSmokeLineage:
             canonical_json={"entities": []},
             provenance_json={"adapter": "test_adapter"},
             confidence_json={},
-            confidence_score=1.0,
             warnings_json=[],
             diagnostics_json=[],
             result_checksum_sha256=uuid4().hex + uuid4().hex,
@@ -137,9 +136,7 @@ async def _seed_changeset_smoke_lineage() -> _SeededChangesetSmokeLineage:
             adapter_run_output_id=adapter_output.id,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1",
-            confidence_score=1.0,
         )
         session.add(base_revision)
         await session.flush()
@@ -183,7 +180,6 @@ async def _seed_changeset_smoke_lineage() -> _SeededChangesetSmokeLineage:
             entity_id="line-1",
             entity_type="line",
             entity_schema_version="1",
-            confidence_score=1.0,
             confidence_json={},
             geometry_json={
                 "start": {"x": 0.0, "y": 0.0},
@@ -225,9 +221,6 @@ async def _seed_changeset_smoke_lineage() -> _SeededChangesetSmokeLineage:
             validation_report_schema_version="0.1",
             canonical_entity_schema_version="1",
             validation_status="valid",
-            review_state="approved",
-            quantity_gate="allowed",
-            effective_confidence=1.0,
             validator_name="test_validation_service",
             validator_version="1",
             report_json={"summary": {"validation_status": "valid"}},
@@ -507,7 +500,6 @@ async def test_changeset_apply_stale_base_conflict_leaves_no_revised_dxf_artifac
             canonical_json={"entities": []},
             provenance_json={"adapter": "test_adapter"},
             confidence_json={},
-            confidence_score=1.0,
             warnings_json=[],
             diagnostics_json=[],
             result_checksum_sha256=uuid4().hex + uuid4().hex,
@@ -524,9 +516,7 @@ async def test_changeset_apply_stale_base_conflict_leaves_no_revised_dxf_artifac
             predecessor_revision_id=lineage.base_revision_id,
             revision_sequence=2,
             revision_kind="reprocess",
-            review_state="approved",
             canonical_entity_schema_version="1",
-            confidence_score=1.0,
         )
         session.add(stale_revision)
         await session.commit()

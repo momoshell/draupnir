@@ -237,8 +237,6 @@ async def _create_estimate_job_input(
             drawing_revision_id=seed.drawing_revision_id,
             quantity_takeoff_id=seed.quantity_takeoff_id,
             source_job_type=JobType.ESTIMATE.value,
-            quantity_gate="allowed",
-            trusted_totals=True,
             currency="GBP",
             pricing_effective_date=date(2026, 5, 18),
             pricing_mode="explicit",
@@ -255,8 +253,6 @@ def _build_estimate_job_input(
     estimate_job_id: uuid.UUID,
     source_job_type: str = JobType.ESTIMATE.value,
     quantity_takeoff_id: uuid.UUID | None = None,
-    quantity_gate: str = "allowed",
-    trusted_totals: bool = True,
     currency: str = "GBP",
     pricing_mode: str = "explicit",
     assumptions_json: object = cast(object, {"waste_factor": "10%"}),
@@ -268,8 +264,6 @@ def _build_estimate_job_input(
         drawing_revision_id=seed.drawing_revision_id,
         quantity_takeoff_id=quantity_takeoff_id or seed.quantity_takeoff_id,
         source_job_type=source_job_type,
-        quantity_gate=quantity_gate,
-        trusted_totals=trusted_totals,
         currency=currency,
         pricing_effective_date=date(2026, 5, 18),
         pricing_mode=pricing_mode,
@@ -329,9 +323,6 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
         "created_at",
     ):
         assert columns["estimate_job_inputs"][required_column]["nullable"] is False
-    # Path B 5b/5c: quantity_gate and trusted_totals are vestigial and nullable.
-    assert columns["estimate_job_inputs"]["quantity_gate"]["nullable"] is True
-    assert columns["estimate_job_inputs"]["trusted_totals"]["nullable"] is True
     for required_column in (
         "estimate_job_id",
         "ref_type",
@@ -392,11 +383,9 @@ async def test_estimate_job_input_schema_matches_contract() -> None:
             "quantity_takeoff_id",
             "project_id",
             "drawing_revision_id",
-            "quantity_gate",
-            "trusted_totals",
         ),
         "quantity_takeoffs",
-        ("id", "project_id", "drawing_revision_id", "quantity_gate", "trusted_totals"),
+        ("id", "project_id", "drawing_revision_id"),
     ) in foreign_keys["estimate_job_inputs"]
     for constrained_column, referred_table in (
         ("rate_catalog_entry_id", "rate_catalog_entries"),
@@ -456,8 +445,6 @@ async def test_estimate_job_input_persists_lineage_catalog_refs_and_worker_bound
     assert persisted_input.drawing_revision_id == seed.drawing_revision_id
     assert persisted_input.quantity_takeoff_id == seed.quantity_takeoff_id
     assert persisted_input.source_job_type == JobType.ESTIMATE.value
-    assert persisted_input.quantity_gate == "allowed"
-    assert persisted_input.trusted_totals is True
     assert persisted_input.currency == "GBP"
     assert persisted_input.pricing_effective_date == date(2026, 5, 18)
     assert persisted_input.pricing_mode == "explicit"

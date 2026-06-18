@@ -85,9 +85,7 @@ async def render_revision_json_export(
             "predecessor_revision_id": revision.predecessor_revision_id,
             "revision_sequence": revision.revision_sequence,
             "revision_kind": revision.revision_kind,
-            "review_state": revision.review_state,
             "canonical_entity_schema_version": revision.canonical_entity_schema_version,
-            "confidence_score": revision.confidence_score,
             "created_at": revision.created_at,
         },
         "manifest": {
@@ -132,7 +130,6 @@ async def render_revision_json_export(
                 "block_ref": entity.block_ref,
                 "source_identity": entity.source_identity,
                 "source_hash": entity.source_hash,
-                "confidence_score": entity.confidence_score,
                 "confidence": entity.confidence_json,
                 "geometry": entity.geometry_json,
                 "properties": entity.properties_json,

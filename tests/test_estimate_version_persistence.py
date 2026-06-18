@@ -12,14 +12,13 @@ import httpx
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
-from sqlalchemy import CheckConstraint, Table, UniqueConstraint, select, text
+from sqlalchemy import CheckConstraint, Table, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.db.session as session_module
 from app.models.estimate_version import EstimateVersion
 from app.models.job import Job, JobStatus, JobType
-from app.models.quantity_takeoff import QuantityTakeoff
 from tests import test_quantity_takeoff_persistence as quantity_takeoff_persistence
 from tests.conftest import requires_database
 
@@ -214,8 +213,6 @@ def _build_estimate_version(
     source_job_id: uuid.UUID,
     quantity_takeoff_id: uuid.UUID,
     drawing_revision_id: uuid.UUID | None = None,
-    quantity_gate: str = "allowed",
-    trusted_totals: bool = True,
     currency: str = "GBP",
     subtotal_amount: Decimal = Decimal("100.00"),
     tax_amount: Decimal = Decimal("20.00"),
@@ -228,8 +225,6 @@ def _build_estimate_version(
         drawing_revision_id=drawing_revision_id or seed.drawing_revision_id,
         quantity_takeoff_id=quantity_takeoff_id,
         source_job_id=source_job_id,
-        quantity_gate=quantity_gate,
-        trusted_totals=trusted_totals,
         currency=currency,
         subtotal_amount=subtotal_amount,
         tax_amount=tax_amount,
@@ -245,13 +240,6 @@ async def test_estimate_version_schema_matches_contract() -> None:
     check_constraints = schema["check_constraints"]["estimate_versions"]
     foreign_keys = schema["foreign_keys"]["estimate_versions"]
 
-    assert (
-        "id",
-        "project_id",
-        "drawing_revision_id",
-        "quantity_gate",
-        "trusted_totals",
-    ) in unique_constraints["quantity_takeoffs"]
     assert (
         "id",
         "project_id",
@@ -275,9 +263,6 @@ async def test_estimate_version_schema_matches_contract() -> None:
     ):
         assert required_column in estimate_columns
         assert estimate_columns[required_column]["nullable"] is False
-    # Path B 5b/5c: quantity_gate and trusted_totals are vestigial and nullable.
-    assert estimate_columns["quantity_gate"]["nullable"] is True
-    assert estimate_columns["trusted_totals"]["nullable"] is True
 
     assert ("source_job_id",) in unique_constraints["estimate_versions"]
     assert ("id", "project_id", "drawing_revision_id") in unique_constraints["estimate_versions"]
@@ -327,16 +312,12 @@ async def test_estimate_version_schema_matches_contract() -> None:
                     "quantity_takeoff_id",
                     "project_id",
                     "drawing_revision_id",
-                    "quantity_gate",
-                    "trusted_totals",
                 ),
                 "quantity_takeoffs",
                 (
                     "id",
                     "project_id",
                     "drawing_revision_id",
-                    "quantity_gate",
-                    "trusted_totals",
                 ),
             )
         ]
@@ -352,20 +333,6 @@ async def test_estimate_version_schema_matches_contract() -> None:
         ]
         == "RESTRICT"
     )
-
-    quantity_takeoff_table = cast(Table, QuantityTakeoff.__table__)
-    quantity_takeoff_model_uniques = {
-        tuple(constraint.columns.keys()): constraint.name
-        for constraint in quantity_takeoff_table.constraints
-        if isinstance(constraint, UniqueConstraint)
-    }
-    assert (
-        "id",
-        "project_id",
-        "drawing_revision_id",
-        "quantity_gate",
-        "trusted_totals",
-    ) in quantity_takeoff_model_uniques
 
     estimate_version_table = cast(Table, EstimateVersion.__table__)
     estimate_version_model_checks = {
@@ -406,39 +373,10 @@ async def test_estimate_version_persists_allowed_trusted_header(
         select(EstimateVersion).where(EstimateVersion.id == estimate_version.id)
     )
     assert persisted is not None
-    assert persisted.quantity_gate == "allowed"
-    assert persisted.trusted_totals is True
     assert persisted.currency == "GBP"
     assert persisted.subtotal_amount == Decimal("100.00")
     assert persisted.tax_amount == Decimal("20.00")
     assert persisted.total_amount == Decimal("120.00")
-
-
-async def test_estimate_version_rejects_takeoff_without_allowed_trusted_contract(
-    async_client: httpx.AsyncClient,
-    db_session: AsyncSession,
-) -> None:
-    seed = await quantity_takeoff_persistence._seed_quantity_lineage(async_client)
-    source_job_id = await _create_estimate_source_job(seed)
-    provisional_takeoff_id = await quantity_takeoff_persistence._create_quantity_takeoff(
-        seed,
-        review_state="provisional",
-        validation_status="valid_with_warnings",
-        quantity_gate="allowed_provisional",
-        trusted_totals=False,
-    )
-
-    await _assert_commit_fails(
-        db_session,
-        _build_estimate_version(
-            seed,
-            source_job_id=source_job_id,
-            quantity_takeoff_id=provisional_takeoff_id,
-            quantity_gate="allowed",
-            trusted_totals=True,
-        ),
-        "fk_estimate_versions_takeoff_contract",
-    )
 
 
 async def test_estimate_version_rejects_revision_mismatch(
@@ -459,7 +397,7 @@ async def test_estimate_version_rejects_revision_mismatch(
             quantity_takeoff_id=seed.quantity_takeoff_id,
             drawing_revision_id=mismatched_revision_id,
         ),
-        "fk_estimate_versions_takeoff_contract",
+        "fk_estimate_versions_takeoff_lineage",
     )
 
 

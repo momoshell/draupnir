@@ -8,7 +8,6 @@ from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
-    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -93,22 +92,14 @@ class ExportJobInput(Base):
             name="fk_export_job_inputs_source_job_lineage_jobs",
         ),
         ForeignKeyConstraint(
-            [
-                "quantity_takeoff_id",
-                "project_id",
-                "drawing_revision_id",
-                "quantity_gate",
-                "trusted_totals",
-            ],
+            ["quantity_takeoff_id", "project_id", "drawing_revision_id"],
             [
                 "quantity_takeoffs.id",
                 "quantity_takeoffs.project_id",
                 "quantity_takeoffs.drawing_revision_id",
-                "quantity_takeoffs.quantity_gate",
-                "quantity_takeoffs.trusted_totals",
             ],
             ondelete="RESTRICT",
-            name="fk_export_job_inputs_trusted_quantity_takeoff",
+            name="fk_export_job_inputs_takeoff_lineage",
         ),
         ForeignKeyConstraint(
             [
@@ -164,12 +155,10 @@ class ExportJobInput(Base):
         CheckConstraint(
             # Path B 4: quantity/estimate exports are no longer gated to allowed +
             # trusted takeoffs; only the export_kind <-> lineage shape is enforced.
-            # quantity_gate / trusted_totals columns stay (dropped in Path B stage 6).
             "(export_kind IN ('quantity_csv', 'estimate_csv', 'estimate_pdf') "
             "AND quantity_takeoff_id IS NOT NULL) OR "
             "(export_kind IN ('revision_json', 'dxf', 'revised_dxf') "
-            "AND quantity_takeoff_id IS NULL "
-            "AND quantity_gate IS NULL AND trusted_totals IS NULL)",
+            "AND quantity_takeoff_id IS NULL)",
             name="ck_export_job_inputs_quantity_lineage",
         ),
         CheckConstraint(
@@ -247,16 +236,6 @@ class ExportJobInput(Base):
             "Trusted quantity takeoff required for quantity_csv, estimate_csv, and "
             "estimate_pdf exports."
         ),
-    )
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Mirrored quantity gate used to enforce trusted quantity lineage.",
-    )
-    trusted_totals: Mapped[bool | None] = mapped_column(
-        Boolean,
-        nullable=True,
-        comment="Mirrored trusted-totals flag used to enforce trusted quantity lineage.",
     )
     estimate_version_id: Mapped[uuid.UUID | None] = mapped_column(
         nullable=True,

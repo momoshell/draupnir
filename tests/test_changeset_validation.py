@@ -178,7 +178,6 @@ async def _seed_revision(
             canonical_json={},
             provenance_json={},
             confidence_json={},
-            confidence_score=1.0,
             warnings_json=[],
             diagnostics_json={},
             result_checksum_sha256="1" * 64,
@@ -196,9 +195,7 @@ async def _seed_revision(
             adapter_run_output_id=adapter_run_output_id,
             revision_sequence=1,
             revision_kind="ingest",
-            review_state="approved",
             canonical_entity_schema_version="1",
-            confidence_score=1.0,
         )
     )
 
@@ -289,7 +286,6 @@ async def _seed_revision(
                 entity_id=revision_entity_business_id,
                 entity_type="line",
                 entity_schema_version="1",
-                confidence_score=1.0,
                 confidence_json={},
                 geometry_json={
                     "type": "line",

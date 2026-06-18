@@ -96,10 +96,7 @@ def _revision(**overrides: Any) -> DrawingRevision:
 def _report(**overrides: Any) -> ValidationReport:
     base = {
         "drawing_revision_id": REVISION_ID,
-        "review_state": "approved",
         "validation_status": "valid",
-        "quantity_gate": "allowed",
-        "effective_confidence": 0.9,
     }
     base.update(overrides)
     return cast(ValidationReport, SimpleNamespace(**base))
@@ -169,21 +166,22 @@ async def test_missing_validation_report_is_not_found() -> None:
 
 
 async def test_gated_report_still_loads_entities_and_records_gate() -> None:
-    # A review-gated/blocked report no longer short-circuits: it loads the manifest
-    # and entities like an allowed gate, recording the gate as informational metadata.
+    # Gating no longer short-circuits and the gate/review columns are gone (Path B 6):
+    # the manifest and entities load unconditionally and the informational gate
+    # metadata always records an "allowed" status with no reason.
     loader = _FakeLoader(
         job=_job(),
         drawing_revision=_revision(),
-        report=_report(quantity_gate="review_gated", review_state="review_required"),
+        report=_report(),
         manifest=_manifest(2),
         entities=[_entity("e1"), _entity("e2")],
     )
     execution = await _build(loader)
     assert [e.entity_id for e in execution.entities] == ["e1", "e2"]
-    # quantity_gate is no longer carried on the execution input (Path B 5c); the
-    # informational gate metadata still reflects the (now-vestigial) report values.
-    assert execution.gate.status == "review_gated"
-    assert execution.gate.reason == "review_required"
+    # quantity_gate is no longer carried on the execution input (Path B 5c) and the
+    # gate is purely informational now that the gate/review columns are dropped.
+    assert execution.gate.status == "allowed"
+    assert execution.gate.reason is None
 
 
 async def test_missing_manifest_is_materialization_error() -> None:

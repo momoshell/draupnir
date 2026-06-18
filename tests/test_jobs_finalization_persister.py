@@ -200,6 +200,5 @@ async def test_finalize_quantity_takeoff_routes_writes_through_persister(monkeyp
     assert job.attempt_token is None  # lease cleared
     # The persister captured a rowset equivalent to the builder output (no DB rows).
     assert persister.quantity_rows is not None
-    assert persister.quantity_rows.takeoff.trusted_totals is None
     assert len(persister.quantity_rows.items) == len(expected.items)
     assert events and events[0]["status"] == "succeeded"

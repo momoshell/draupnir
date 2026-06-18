@@ -165,10 +165,7 @@ async def _persist_quantity_takeoff(
             drawing_revision_id=drawing_revision_id,
             source_job_id=source_job.id,
             source_job_type=JobType.QUANTITY_TAKEOFF.value,
-            review_state="approved",
             validation_status="valid",
-            quantity_gate="allowed",
-            trusted_totals=True,
         )
         item = QuantityItem(
             id=uuid.uuid4(),
@@ -179,9 +176,7 @@ async def _persist_quantity_takeoff(
             quantity_type="length",
             value=12.5,
             unit="m",
-            review_state="approved",
             validation_status="valid",
-            quantity_gate="allowed",
             source_entity_id=None,
             excluded_source_entity_ids_json=[],
         )
@@ -217,8 +212,6 @@ async def _persist_estimate_version(
             drawing_revision_id=drawing_revision_id,
             quantity_takeoff_id=quantity_takeoff_id,
             source_job_id=source_job.id,
-            quantity_gate="allowed",
-            trusted_totals=True,
             currency="GBP",
             subtotal_amount=Decimal("40.00"),
             tax_amount=Decimal("0.00"),
@@ -328,9 +321,7 @@ async def _create_revised_dxf_export_test_lineage(
                 predecessor_revision_id=base_revision.id,
                 revision_sequence=base_revision.revision_sequence + 1,
                 revision_kind="changeset",
-                review_state=base_revision.review_state,
                 canonical_entity_schema_version=base_revision.canonical_entity_schema_version,
-                confidence_score=base_revision.confidence_score,
             )
         )
         await session.commit()
@@ -351,8 +342,6 @@ async def _create_export_job(
     options_json: dict[str, object],
     quantity_takeoff_id: uuid.UUID | None = None,
     estimate_version_id: uuid.UUID | None = None,
-    quantity_gate: str | None = None,
-    trusted_totals: bool | None = None,
 ) -> uuid.UUID:
     session_maker = _get_session_maker()
     export_job_id = uuid.uuid4()
@@ -381,8 +370,6 @@ async def _create_export_job(
                 media_type=media_type,
                 options_json=options_json,
                 quantity_takeoff_id=quantity_takeoff_id,
-                quantity_gate=quantity_gate,
-                trusted_totals=trusted_totals,
                 estimate_version_id=estimate_version_id,
             )
         )
@@ -511,12 +498,6 @@ async def test_process_export_job_supported_kinds_persist_artifact(
         ),
         estimate_version_id=(
             lineage.estimate_version_id if export_kind in {"estimate_csv", "estimate_pdf"} else None
-        ),
-        quantity_gate=(
-            "allowed" if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"} else None
-        ),
-        trusted_totals=(
-            True if export_kind in {"quantity_csv", "estimate_csv", "estimate_pdf"} else None
         ),
     )
 
@@ -1004,8 +985,6 @@ async def test_process_export_job_invalid_input_fails_without_artifact(
         media_type="text/csv",
         options_json={},
         quantity_takeoff_id=lineage.quantity_takeoff_id,
-        quantity_gate="allowed",
-        trusted_totals=True,
     )
 
     async def _raise_invalid_input(

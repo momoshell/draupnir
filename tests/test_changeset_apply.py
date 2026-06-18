@@ -1581,8 +1581,6 @@ async def test_process_changeset_apply_job_persists_changeset_revision_and_valid
     assert persisted_report.drawing_revision_id == persisted_revision.id
     assert persisted_report.project_id == seeded.project.id
     assert persisted_report.validation_status == "valid"
-    assert persisted_report.review_state == "approved"
-    assert persisted_report.quantity_gate == "allowed"
     assert persisted_report.report_json["change_set_id"] == str(seeded.change_set.id)
     assert persisted_report.report_json["predecessor_revision_id"] == str(seeded.base_revision.id)
     assert persisted_report.report_json["provenance"]["pinned_validation_result_id"] == str(
@@ -1991,7 +1989,6 @@ async def _append_competing_revision(*, seeded: _SeededLoaderCase) -> None:
                 canonical_json={"entities": []},
                 provenance_json={"adapter": "test_adapter"},
                 confidence_json={},
-                confidence_score=1.0,
                 warnings_json=[],
                 diagnostics_json=[],
                 result_checksum_sha256="8" * 64,
@@ -2009,9 +2006,7 @@ async def _append_competing_revision(*, seeded: _SeededLoaderCase) -> None:
                 predecessor_revision_id=seeded.base_revision.id,
                 revision_sequence=seeded.base_revision.revision_sequence + 1,
                 revision_kind="reprocess",
-                review_state="approved",
                 canonical_entity_schema_version="1",
-                confidence_score=1.0,
             )
         )
         await session.commit()
@@ -2229,7 +2224,6 @@ async def _seed_loader_case(
         canonical_json={"entities": []},
         provenance_json={"adapter": "test_adapter"},
         confidence_json={},
-        confidence_score=1.0,
         warnings_json=[],
         diagnostics_json=[],
         result_checksum_sha256="2" * 64,
@@ -2247,7 +2241,6 @@ async def _seed_loader_case(
         canonical_json={"entities": []},
         provenance_json={"adapter": "test_adapter"},
         confidence_json={},
-        confidence_score=1.0,
         warnings_json=[],
         diagnostics_json=[],
         result_checksum_sha256="3" * 64,
@@ -2261,9 +2254,7 @@ async def _seed_loader_case(
         adapter_run_output_id=base_adapter_id,
         revision_sequence=1,
         revision_kind="ingest",
-        review_state="approved",
         canonical_entity_schema_version="1",
-        confidence_score=1.0,
     )
     current_revision = base_revision
     if include_current_revision:
@@ -2277,9 +2268,7 @@ async def _seed_loader_case(
             predecessor_revision_id=base_revision_id,
             revision_sequence=2,
             revision_kind="reprocess",
-            review_state="approved",
             canonical_entity_schema_version="1",
-            confidence_score=1.0,
         )
 
     change_set = CadChangeSet(
@@ -2302,7 +2291,6 @@ async def _seed_loader_case(
         entity_id="wall-1",
         entity_type="polyline",
         entity_schema_version="1",
-        confidence_score=1.0,
         confidence_json={},
         geometry_json={"kind": "polyline", "vertices": [{"x": 0.0, "y": 0.0}]},
         properties_json={"description": "Wall"},
@@ -2325,7 +2313,6 @@ async def _seed_loader_case(
         entity_id="door-1",
         entity_type="text",
         entity_schema_version="1",
-        confidence_score=1.0,
         confidence_json={},
         geometry_json={"kind": "point", "x": 1.0, "y": 2.0},
         properties_json={"label": "Door"},
@@ -2415,9 +2402,6 @@ async def _seed_loader_case(
         validation_report_schema_version="0.1",
         canonical_entity_schema_version="1",
         validation_status="valid",
-        review_state="approved",
-        quantity_gate="allowed",
-        effective_confidence=1.0,
         validator_name="test_validation_service",
         validator_version="1",
         report_json={

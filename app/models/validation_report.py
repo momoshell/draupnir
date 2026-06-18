@@ -10,7 +10,6 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
     ForeignKeyConstraint,
     String,
@@ -49,19 +48,6 @@ class ValidationReport(Base):
         CheckConstraint(
             "validation_status IN ('valid', 'valid_with_warnings', 'invalid', 'needs_review')",
             name="ck_validation_reports_status",
-        ),
-        CheckConstraint(
-            "review_state IN "
-            "('approved', 'provisional', 'review_required', 'rejected', 'superseded')",
-            name="ck_validation_reports_review_state",
-        ),
-        CheckConstraint(
-            "quantity_gate IN ('allowed', 'allowed_provisional', 'review_gated', 'blocked')",
-            name="ck_validation_reports_quantity_gate",
-        ),
-        CheckConstraint(
-            "effective_confidence >= 0.0 AND effective_confidence <= 1.0",
-            name="ck_validation_reports_conf_0_1",
         ),
     )
 
@@ -108,22 +94,6 @@ class ValidationReport(Base):
         String(32),
         nullable=False,
         comment="Technical validation status for the drawing revision",
-    )
-    # Path B 5b: no longer derived/persisted (nullable until #491 drops them).
-    review_state: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial review state (no longer derived; dropped in Path B stage 6)",
-    )
-    quantity_gate: Mapped[str | None] = mapped_column(
-        String(32),
-        nullable=True,
-        comment="Vestigial quantity gate (no longer derived; dropped in Path B stage 6)",
-    )
-    effective_confidence: Mapped[float | None] = mapped_column(
-        Float,
-        nullable=True,
-        comment="Vestigial effective confidence (no longer derived; dropped in Path B stage 6)",
     )
     validator_name: Mapped[str] = mapped_column(
         String(128),

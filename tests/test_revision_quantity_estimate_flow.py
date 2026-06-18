@@ -16,7 +16,6 @@ from app.db import session as session_module
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
 from app.models.job import JobType
-from app.models.quantity_takeoff import QuantityGate
 from tests.conftest import requires_database, truncate_projects_cascade_for_cleanup
 from tests.jobs_test_helpers import _create_project, _get_job, _get_job_for_file, _upload_file
 from tests.test_jobs import (
@@ -87,10 +86,10 @@ async def _truncate_and_reset_database_pool() -> None:
 @pytest.mark.parametrize(
     ("review_state", "validation_status", "quantity_gate", "trusted_totals"),
     [
-        ("approved", "valid", QuantityGate.ALLOWED.value, True),
+        ("approved", "valid", "allowed", True),
         # Path B: a review-gated, untrusted revision flows end-to-end (takeoff
         # creation #495 → estimate creation #488) to a persisted estimate version.
-        ("review_required", "needs_review", QuantityGate.REVIEW_GATED.value, False),
+        ("review_required", "needs_review", "review_gated", False),
     ],
 )
 @requires_database

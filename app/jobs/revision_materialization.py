@@ -360,36 +360,8 @@ def _resolve_entity_schema_version(
     return _string_ref(entity_payload_json.get("entity_schema_version")) or default_schema_version
 
 
-def _resolve_entity_confidence_score(
-    entity_payload_json: dict[str, Any],
-) -> float | None:
-    """Resolve the per-entity confidence score from contract payloads, if present.
-
-    Path B 5b: the revision-level confidence_score fallback is gone; the column is
-    populated only from per-entity canonical confidence (and is no longer derived).
-    """
-    confidence_score = _float_value(entity_payload_json.get("confidence_score"))
-    if confidence_score is not None:
-        return confidence_score
-
-    for key in ("confidence_json", "confidence"):
-        confidence_payload = entity_payload_json.get(key)
-        nested_score = _float_value(confidence_payload)
-        if nested_score is not None:
-            return nested_score
-
-        confidence_json = _json_object(confidence_payload)
-        nested_score = _float_value(confidence_json.get("score"))
-        if nested_score is not None:
-            return nested_score
-
-    return None
-
-
 def _resolve_entity_confidence_json(
     entity_payload_json: dict[str, Any],
-    *,
-    confidence_score: float | None,
 ) -> dict[str, Any]:
     """Resolve the entity confidence payload from contract or legacy payloads."""
     for key in ("confidence_json", "confidence"):
@@ -402,7 +374,7 @@ def _resolve_entity_confidence_json(
         if numeric_confidence is not None:
             return {"score": numeric_confidence}
 
-    return {"score": confidence_score}
+    return {}
 
 
 def _build_revision_materialization_rows(
@@ -488,11 +460,7 @@ def _build_revision_materialization_rows(
             default_schema_version=payload.canonical_entity_schema_version,
         )
         parent_entity_ref = _resolve_entity_parent_ref(payload_json)
-        confidence_score = _resolve_entity_confidence_score(payload_json)
-        confidence_json = _resolve_entity_confidence_json(
-            payload_json,
-            confidence_score=confidence_score,
-        )
+        confidence_json = _resolve_entity_confidence_json(payload_json)
         provenance_json = _entity_provenance_json(payload_json)
         layout_ref = _resolve_entity_ref(
             payload_json,
@@ -517,7 +485,6 @@ def _build_revision_materialization_rows(
                 "entity_type": entity_type,
                 "entity_schema_version": entity_schema_version,
                 "parent_entity_ref": parent_entity_ref,
-                "confidence_score": confidence_score,
                 "confidence_json": confidence_json,
                 "geometry_json": _json_object(
                     payload_json.get("geometry_json")
@@ -629,7 +596,6 @@ def _build_changeset_revision_materialization_rows(
                 "entity_type": entity.entity_type,
                 "entity_schema_version": entity.entity_schema_version,
                 "parent_entity_ref": parent_entity_ref,
-                "confidence_score": entity.confidence_score,
                 "confidence_json": _copy_json_mapping(entity.confidence_json),
                 "geometry_json": _copy_json_mapping(entity.geometry_json),
                 "properties_json": _copy_json_mapping(entity.properties_json),

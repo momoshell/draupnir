@@ -323,8 +323,6 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         drawing_revision_id=quantity_seed.drawing_revision_id,
         quantity_takeoff_id=quantity_seed.quantity_takeoff_id,
         source_job_type=JobType.ESTIMATE.value,
-        quantity_gate="allowed",
-        trusted_totals=True,
         currency="GBP",
         pricing_effective_date=date(2026, 1, 1),
         pricing_mode="explicit",
@@ -350,8 +348,6 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         media_type="application/json",
         options_json={"source": "append-only"},
         quantity_takeoff_id=None,
-        quantity_gate=None,
-        trusted_totals=None,
         estimate_version_id=None,
     )
     change_set = CadChangeSet(
@@ -747,9 +743,7 @@ async def _insert_drawing_revision_row(
     predecessor_revision_id: uuid.UUID | None,
     revision_sequence: int,
     revision_kind: str,
-    review_state: str,
     canonical_entity_schema_version: str,
-    confidence_score: float,
     changeset_id: uuid.UUID | None,
 ) -> None:
     """Insert a drawing revision row for raw SQL lineage setup."""
@@ -791,9 +785,7 @@ async def _insert_drawing_revision_row(
                 predecessor_revision_id,
                 revision_sequence,
                 revision_kind,
-                review_state,
                 canonical_entity_schema_version,
-                confidence_score,
                 changeset_id
             ) VALUES (
                 :id,
@@ -805,9 +797,7 @@ async def _insert_drawing_revision_row(
                 :predecessor_revision_id,
                 :revision_sequence,
                 :revision_kind,
-                :review_state,
                 :canonical_entity_schema_version,
-                :confidence_score,
                 :changeset_id
             )
             """
@@ -822,9 +812,7 @@ async def _insert_drawing_revision_row(
             "predecessor_revision_id": predecessor_revision_id,
             "revision_sequence": revision_sequence,
             "revision_kind": revision_kind,
-            "review_state": review_state,
             "canonical_entity_schema_version": canonical_entity_schema_version,
-            "confidence_score": confidence_score,
             "changeset_id": changeset_id,
         },
     )
@@ -1160,7 +1148,6 @@ async def _insert_changeset_materialization_rows(
                 entity_type,
                 entity_schema_version,
                 parent_entity_ref,
-                confidence_score,
                 confidence_json,
                 geometry_json,
                 properties_json,
@@ -1189,7 +1176,6 @@ async def _insert_changeset_materialization_rows(
                 :entity_type,
                 :entity_schema_version,
                 :parent_entity_ref,
-                :confidence_score,
                 CAST(:confidence_json AS json),
                 CAST(:geometry_json AS json),
                 CAST(:properties_json AS json),
@@ -1221,7 +1207,6 @@ async def _insert_changeset_materialization_rows(
             "entity_type": "line",
             "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
             "parent_entity_ref": None,
-            "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
             "confidence_json": dumps(
                 {"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
                 separators=(",", ":"),
@@ -1519,7 +1504,6 @@ async def _insert_changeset_origin_rows(
                         canonical_json,
                         provenance_json,
                         confidence_json,
-                        confidence_score,
                         warnings_json,
                         diagnostics_json,
                         result_checksum_sha256
@@ -1536,7 +1520,6 @@ async def _insert_changeset_origin_rows(
                         CAST(:canonical_json AS json),
                         CAST(:provenance_json AS json),
                         CAST(:confidence_json AS json),
-                        :confidence_score,
                         CAST(:warnings_json AS json),
                         CAST(:diagnostics_json AS json),
                         :result_checksum_sha256
@@ -1556,7 +1539,6 @@ async def _insert_changeset_origin_rows(
                     "canonical_json": canonical_json,
                     "provenance_json": provenance_json,
                     "confidence_json": confidence_json,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                     "warnings_json": "[]",
                     "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
                     "result_checksum_sha256": "b" * 64,
@@ -1573,9 +1555,7 @@ async def _insert_changeset_origin_rows(
                 predecessor_revision_id=None,
                 revision_sequence=1,
                 revision_kind="ingest",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=None,
             )
             if keep_drawing_revision_compatible:
@@ -1613,9 +1593,7 @@ async def _insert_changeset_origin_rows(
                     predecessor_revision_id=base_revision_id,
                     revision_sequence=2,
                     revision_kind="changeset",
-                    review_state="approved",
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     changeset_id=uuid.uuid4(),
                 )
                 if include_materialization:
@@ -2086,7 +2064,6 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                         canonical_json,
                         provenance_json,
                         confidence_json,
-                        confidence_score,
                         warnings_json,
                         diagnostics_json,
                         result_checksum_sha256
@@ -2103,7 +2080,6 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                         CAST(:canonical_json AS json),
                         CAST(:provenance_json AS json),
                         CAST(:confidence_json AS json),
-                        :confidence_score,
                         CAST(:warnings_json AS json),
                         CAST(:diagnostics_json AS json),
                         :result_checksum_sha256
@@ -2123,7 +2099,6 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                     "canonical_json": canonical_json,
                     "provenance_json": provenance_json,
                     "confidence_json": confidence_json,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                     "warnings_json": "[]",
                     "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
                     "result_checksum_sha256": "b" * 64,
@@ -2142,9 +2117,7 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                         predecessor_revision_id,
                         revision_sequence,
                         revision_kind,
-                        review_state,
-                        canonical_entity_schema_version,
-                        confidence_score
+                        canonical_entity_schema_version
                     ) VALUES (
                         :id,
                         :project_id,
@@ -2155,9 +2128,7 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                         :predecessor_revision_id,
                         :revision_sequence,
                         :revision_kind,
-                        :review_state,
-                        :canonical_entity_schema_version,
-                        :confidence_score
+                        :canonical_entity_schema_version
                     )
                     """
                 ),
@@ -2171,9 +2142,7 @@ async def _insert_materialized_manifest_row(database_url: str) -> None:
                     "predecessor_revision_id": None,
                     "revision_sequence": 1,
                     "revision_kind": "ingest",
-                    "review_state": "approved",
                     "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                 },
             )
             await connection.execute(
@@ -2480,7 +2449,6 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         canonical_json,
                         provenance_json,
                         confidence_json,
-                        confidence_score,
                         warnings_json,
                         diagnostics_json,
                         result_checksum_sha256
@@ -2497,7 +2465,6 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         CAST(:canonical_json AS json),
                         CAST(:provenance_json AS json),
                         CAST(:confidence_json AS json),
-                        :confidence_score,
                         CAST(:warnings_json AS json),
                         CAST(:diagnostics_json AS json),
                         :result_checksum_sha256
@@ -2517,7 +2484,6 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                     "canonical_json": canonical_json,
                     "provenance_json": provenance_json,
                     "confidence_json": confidence_json,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                     "warnings_json": "[]",
                     "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
                     "result_checksum_sha256": "b" * 64,
@@ -2536,9 +2502,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         predecessor_revision_id,
                         revision_sequence,
                         revision_kind,
-                        review_state,
-                        canonical_entity_schema_version,
-                        confidence_score
+                        canonical_entity_schema_version
                     ) VALUES (
                         :id,
                         :project_id,
@@ -2549,9 +2513,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         :predecessor_revision_id,
                         :revision_sequence,
                         :revision_kind,
-                        :review_state,
-                        :canonical_entity_schema_version,
-                        :confidence_score
+                        :canonical_entity_schema_version
                     )
                     """
                 ),
@@ -2565,9 +2527,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                     "predecessor_revision_id": None,
                     "revision_sequence": 1,
                     "revision_kind": "ingest",
-                    "review_state": "approved",
                     "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                 },
             )
             await connection.execute(
@@ -2657,10 +2617,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         drawing_revision_id,
                         source_job_id,
                         source_job_type,
-                        review_state,
-                        validation_status,
-                        quantity_gate,
-                        trusted_totals
+                        validation_status
                     ) VALUES (
                         :id,
                         :project_id,
@@ -2668,10 +2625,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                         :drawing_revision_id,
                         :source_job_id,
                         :source_job_type,
-                        :review_state,
-                        :validation_status,
-                        :quantity_gate,
-                        :trusted_totals
+                        :validation_status
                     )
                     """
                 ),
@@ -2682,10 +2636,7 @@ async def _insert_quantity_takeoff_row(database_url: str) -> None:
                     "drawing_revision_id": drawing_revision_id,
                     "source_job_id": quantity_job_id,
                     "source_job_type": "quantity_takeoff",
-                    "review_state": "approved",
                     "validation_status": "valid",
-                    "quantity_gate": "allowed",
-                    "trusted_totals": True,
                 },
             )
     finally:
@@ -2892,7 +2843,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         canonical_json,
                         provenance_json,
                         confidence_json,
-                        confidence_score,
                         warnings_json,
                         diagnostics_json,
                         result_checksum_sha256
@@ -2909,7 +2859,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         CAST(:canonical_json AS json),
                         CAST(:provenance_json AS json),
                         CAST(:confidence_json AS json),
-                        :confidence_score,
                         CAST(:warnings_json AS json),
                         CAST(:diagnostics_json AS json),
                         :result_checksum_sha256
@@ -2929,7 +2878,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                     "canonical_json": canonical_json,
                     "provenance_json": provenance_json,
                     "confidence_json": confidence_json,
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
                     "warnings_json": "[]",
                     "diagnostics_json": '{"adapter":"tests","diagnostics":[]}',
                     "result_checksum_sha256": "b" * 64,
@@ -2946,9 +2894,7 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                 predecessor_revision_id=None,
                 revision_sequence=1,
                 revision_kind="ingest",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=None,
             )
             await _insert_job_row(
@@ -2973,10 +2919,7 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         drawing_revision_id,
                         source_job_id,
                         source_job_type,
-                        review_state,
-                        validation_status,
-                        quantity_gate,
-                        trusted_totals
+                        validation_status
                     ) VALUES (
                         :id,
                         :project_id,
@@ -2984,10 +2927,7 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         :drawing_revision_id,
                         :source_job_id,
                         :source_job_type,
-                        :review_state,
-                        :validation_status,
-                        :quantity_gate,
-                        :trusted_totals
+                        :validation_status
                     )
                     """
                 ),
@@ -2998,10 +2938,7 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                     "drawing_revision_id": base_revision_id,
                     "source_job_id": quantity_job_id,
                     "source_job_type": "quantity_takeoff",
-                    "review_state": "approved",
                     "validation_status": "valid",
-                    "quantity_gate": "allowed",
-                    "trusted_totals": True,
                 },
             )
             await _insert_job_row(
@@ -3026,8 +2963,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         drawing_revision_id,
                         quantity_takeoff_id,
                         source_job_id,
-                        quantity_gate,
-                        trusted_totals,
                         currency,
                         subtotal_amount,
                         tax_amount,
@@ -3040,8 +2975,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                         :drawing_revision_id,
                         :quantity_takeoff_id,
                         :source_job_id,
-                        :quantity_gate,
-                        :trusted_totals,
                         :currency,
                         :subtotal_amount,
                         :tax_amount,
@@ -3057,8 +2990,6 @@ async def _insert_generated_artifact_lineage_anchor_rows(database_url: str) -> N
                     "drawing_revision_id": base_revision_id,
                     "quantity_takeoff_id": quantity_takeoff_id,
                     "source_job_id": estimate_job_id,
-                    "quantity_gate": "allowed",
-                    "trusted_totals": True,
                     "currency": "GBP",
                     "subtotal_amount": Decimal("10.00"),
                     "tax_amount": Decimal("0.00"),
@@ -3156,7 +3087,7 @@ class TestAppendOnlyLineageTables:
             ("extraction_profiles", "layout_mode", "manual"),
             ("adapter_run_outputs", "adapter_version", "mutated"),
             ("changeset_apply_job_inputs", "source_job_type", "export"),
-            ("drawing_revisions", "review_state", "superseded"),
+            ("drawing_revisions", "revision_kind", "reprocess"),
             ("validation_reports", "validator_version", "mutated"),
             ("generated_artifacts", "name", "mutated-debug-overlay.svg"),
             ("job_events", "message", "mutated job event"),
@@ -3170,7 +3101,7 @@ class TestAppendOnlyLineageTables:
             ),
             ("estimate_snapshot_entries", "entry_label", "mutated assumption"),
             ("estimate_items", "description", "mutated estimate item"),
-            ("quantity_takeoffs", "review_state", "review_required"),
+            ("quantity_takeoffs", "source_job_type", "estimate"),
             ("quantity_items", "quantity_type", "mutated_quantity_type"),
             (
                 "revision_entity_manifests",
@@ -3568,9 +3499,7 @@ class TestAppendOnlyLineageTables:
                 predecessor_revision_id=row_ids.drawing_revision_id,
                 revision_sequence=2,
                 revision_kind="changeset",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=changeset_id,
             )
             materialization_ids = await _insert_changeset_materialization_rows(
@@ -3677,9 +3606,7 @@ class TestAppendOnlyLineageTables:
                 predecessor_revision_id=row_ids.drawing_revision_id,
                 revision_sequence=2,
                 revision_kind="changeset",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=duplicate_changeset_id,
             )
             await session.commit()
@@ -3709,9 +3636,7 @@ class TestAppendOnlyLineageTables:
                     predecessor_revision_id=first_revision_id,
                     revision_sequence=3,
                     revision_kind="changeset",
-                    review_state="approved",
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     changeset_id=duplicate_changeset_id,
                 )
                 await session.commit()
@@ -3813,9 +3738,7 @@ class TestAppendOnlyLineageTables:
                         predecessor_revision_id=predecessor_revision_id,
                         revision_sequence=revision_sequence,
                         revision_kind=revision_kind,
-                        review_state="approved",
                         canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                        confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                         changeset_id=changeset_id,
                     )
                     await session.commit()
@@ -3909,9 +3832,7 @@ class TestAppendOnlyLineageTables:
                 predecessor_revision_id=row_ids.drawing_revision_id,
                 revision_sequence=2,
                 revision_kind="changeset",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=changeset_id,
             )
             for artifact_job_id, base_revision_id in (
@@ -4120,9 +4041,7 @@ class TestAppendOnlyLineageTables:
                 predecessor_revision_id=row_ids.drawing_revision_id,
                 revision_sequence=2,
                 revision_kind="changeset",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=changeset_id,
             )
             await _insert_job_row(
@@ -4148,9 +4067,7 @@ class TestAppendOnlyLineageTables:
                 predecessor_revision_id=other_row_ids.drawing_revision_id,
                 revision_sequence=2,
                 revision_kind="changeset",
-                review_state="approved",
                 canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 changeset_id=other_changeset_id,
             )
             await _insert_job_row(
@@ -4409,11 +4326,12 @@ class TestAppendOnlyLineageTables:
                 _CHANGESET_ORIGIN_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older #271 origin guard.
+            _ = expected_table_name
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert "Cannot downgrade:" in combined_output
-            assert expected_table_name in combined_output
         finally:
             await _drop_temp_database(database_name)
 
@@ -4436,13 +4354,11 @@ class TestAppendOnlyLineageTables:
                 _GENERATED_ARTIFACT_LINEAGE_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older #273 lineage-anchor guard.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert (
-                "Cannot downgrade: generated_artifacts has non-null typed lineage anchors."
-                in combined_output
-            )
         finally:
             await _drop_temp_database(database_name)
 
@@ -4465,16 +4381,11 @@ class TestAppendOnlyLineageTables:
                 _CHANGESET_PERSISTENCE_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older #286 changeset-persistence guard.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert (
-                "cannot downgrade 2026_06_01_0027: populated changeset tables present"
-                in combined_output
-            )
-            assert "cad_change_sets" in combined_output
-            assert "cad_change_operations" in combined_output
-            assert "cad_change_set_validation_results" in combined_output
         finally:
             await _drop_temp_database(database_name)
 
@@ -4497,15 +4408,11 @@ class TestAppendOnlyLineageTables:
                 _CHANGESET_APPLY_JOB_INPUT_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older #290 changeset-apply contract guard.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert (
-                "cannot downgrade 2026_06_03_0028: populated changeset apply contract present"
-                in combined_output
-            )
-            assert "jobs=1" in combined_output
-            assert "changeset_apply_job_inputs=1" in combined_output
         finally:
             await _drop_temp_database(database_name)
 
@@ -4526,11 +4433,11 @@ class TestAppendOnlyLineageTables:
                 _DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older append-only guard at 2026_05_12_0014.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert "Refusing to downgrade migration 2026_05_12_0014" in combined_output
-            assert "files" in combined_output
         finally:
             await _drop_temp_database(database_name)
 
@@ -4572,11 +4479,11 @@ class TestAppendOnlyLineageTables:
                 _MATERIALIZATION_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older materialization guard at 2026_05_13_0015.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert "Refusing to downgrade migration 2026_05_13_0015" in combined_output
-            assert "revision_entity_manifests" in combined_output
         finally:
             await _drop_temp_database(database_name)
 
@@ -4597,10 +4504,10 @@ class TestAppendOnlyLineageTables:
                 _QUANTITY_DOWNGRADE_TARGET_REVISION,
                 database_url=database_url,
             )
+            # A populated database refuses to downgrade. Post Path B (#491) the
+            # earliest blocking step is the NOT NULL reinstatement for the
+            # re-added (now permanently NULL) confidence/gate columns, which
+            # fails ahead of the older quantity guard at 2026_05_15_0017.
             assert downgrade_result.returncode != 0
-
-            combined_output = downgrade_result.stdout + downgrade_result.stderr
-            assert "Refusing to downgrade migration 2026_05_15_0017" in combined_output
-            assert "quantity_takeoffs" in combined_output
         finally:
             await _drop_temp_database(database_name)

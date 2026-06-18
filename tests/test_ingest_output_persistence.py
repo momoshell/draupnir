@@ -46,7 +46,6 @@ from tests.test_jobs import (
     _FAKE_RUNNER_ADAPTER_VERSION,
     _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
     _FAKE_RUNNER_CONFIDENCE_SCORE,
-    _FAKE_RUNNER_REVIEW_STATE,
     _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
     _FAKE_RUNNER_VALIDATION_STATUS,
     _build_fake_ingest_payload,
@@ -201,9 +200,6 @@ def _assert_validation_report_json_matches_columns(report: ValidationReport) -> 
     )
     assert report_json["canonical_entity_schema_version"] == report.canonical_entity_schema_version
     assert report_json["validation_status"] == report.validation_status
-    assert report.review_state is None
-    assert report.quantity_gate is None
-    assert report.effective_confidence is None
     assert report_json["validator"] == {
         "name": report.validator_name,
         "version": report.validator_version,
@@ -473,7 +469,6 @@ class TestIngestOutputPersistence:
         assert (
             adapter_output.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
-        assert adapter_output.confidence_score is None
         assert adapter_output.canonical_json == {
             "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
             "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
@@ -541,12 +536,10 @@ class TestIngestOutputPersistence:
         assert drawing_revision.predecessor_revision_id is None
         assert drawing_revision.revision_sequence == 1
         assert drawing_revision.revision_kind == "ingest"
-        assert drawing_revision.review_state is None
         assert (
             drawing_revision.canonical_entity_schema_version
             == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
-        assert drawing_revision.confidence_score is None
 
         assert validation_report.project_id == job.project_id
         assert validation_report.drawing_revision_id == drawing_revision.id
@@ -560,9 +553,6 @@ class TestIngestOutputPersistence:
             == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
         assert validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
-        assert validation_report.review_state is None
-        assert validation_report.quantity_gate is None
-        assert validation_report.effective_confidence is None
         _assert_validation_report_json_matches_columns(validation_report)
         assert validation_report.report_json["summary"]["entity_counts"] == {
             "layouts": 1,
@@ -629,7 +619,6 @@ class TestIngestOutputPersistence:
         assert entity.entity_type == "line"
         assert entity.entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         assert entity.parent_entity_ref is None
-        assert entity.confidence_score == _FAKE_RUNNER_CONFIDENCE_SCORE
         assert entity.confidence_json == {
             "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
             "basis": "adapter",
@@ -893,12 +882,8 @@ class TestIngestOutputPersistence:
         assert len(validation_reports) == 1
         assert len(generated_artifacts) == 1
 
-        drawing_revision = drawing_revisions[0]
         validation_report = validation_reports[0]
-        assert drawing_revision.review_state is None
         assert validation_report.validation_status == "invalid"
-        assert validation_report.review_state is None
-        assert validation_report.quantity_gate is None
         _assert_validation_report_json_matches_columns(validation_report)
         assert validation_report.report_json["findings"] == [
             {
@@ -1125,7 +1110,6 @@ class TestIngestOutputPersistence:
         assert len(layers) == 1
         assert blocks == []
         assert len(entities) == 1
-        assert entities[0].confidence_score == 0.0
         assert entities[0].confidence_json == {"score": 0.0}
         assert entities[0].canonical_entity_json is not None
         assert entities[0].canonical_entity_json["confidence"] == 0.0
@@ -1353,7 +1337,6 @@ class TestIngestOutputPersistence:
                         "generated_at": "2026-01-02T03:04:05+00:00",
                     },
                     confidence_json={"score": _FAKE_RUNNER_CONFIDENCE_SCORE},
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                     warnings_json=[],
                     diagnostics_json={"adapter": _FAKE_RUNNER_ADAPTER_KEY, "diagnostics": []},
                     result_checksum_sha256="0" * 64,
@@ -1370,9 +1353,7 @@ class TestIngestOutputPersistence:
                     predecessor_revision_id=None,
                     revision_sequence=1,
                     revision_kind="ingest",
-                    review_state=_FAKE_RUNNER_REVIEW_STATE,
                     canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    confidence_score=_FAKE_RUNNER_CONFIDENCE_SCORE,
                 )
             )
             await session.commit()
@@ -1480,10 +1461,6 @@ class TestIngestOutputPersistence:
         assert validation_report.report_json["confidence"]["score"] == captured_payloads[
             0
         ].confidence_json.get("score")
-        # Path B 5b: effective_confidence / review_state are no longer persisted as columns.
-        assert validation_report.effective_confidence is None
-        assert validation_report.review_state is None
-        assert validation_report.quantity_gate is None
 
     async def test_reprocess_creates_second_revision_with_predecessor(
         self,
@@ -1573,9 +1550,6 @@ class TestIngestOutputPersistence:
         assert second_validation_report.source_job_id == second_job.id
         assert second_validation_report.drawing_revision_id == second_revision.id
         assert second_validation_report.validation_status == _FAKE_RUNNER_VALIDATION_STATUS
-        assert second_validation_report.review_state is None
-        assert second_validation_report.quantity_gate is None
-        assert second_validation_report.effective_confidence is None
         _assert_debug_overlay_artifact(
             first_generated_artifact,
             job=first_job,
@@ -1637,7 +1611,6 @@ class TestIngestOutputPersistence:
 
         validation_report = validation_reports[0]
         assert validation_report.validation_status == "valid_with_warnings"
-        assert validation_report.quantity_gate is None
 
     async def test_concurrent_reprocess_creates_linear_three_revision_chain(
         self,
