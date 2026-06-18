@@ -154,10 +154,6 @@ def compose_estimate(engine_input: EstimateEngineInput) -> EstimateEngineOutput:
         quantity_takeoff_id=engine_input.quantity_takeoff_id,
         source_job_id=_required_uuid("source_job_id", engine_input.source_job_id),
         currency=engine_input.currency,
-        # Path B 5b: quantity_gate is vestigial and may be NULL; pass it through
-        # unchanged rather than requiring an allowed gate.
-        quantity_gate=engine_input.quantity_gate,
-        trusted_totals=engine_input.trusted_totals,
         subtotal_amount=subtotal_amount,
         tax_amount=tax_amount,
         total_amount=total_amount,

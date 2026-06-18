@@ -26,7 +26,6 @@ def test_allowed_line_length_is_trusted_and_summarizes_bbox() -> None:
         ],
     )
 
-    assert result.trusted_totals is True
     totals = {
         (aggregate.quantity_type, aggregate.context): aggregate.total
         for aggregate in result.aggregates
@@ -85,7 +84,7 @@ def test_closed_polyline_yields_perimeter_and_area() -> None:
     }
 
 
-def test_allowed_provisional_totals_are_not_trusted() -> None:
+def test_allowed_provisional_totals_are_computed() -> None:
     result = compute_quantities(
         RevisionGateMetadata(status="allowed_provisional", reason="needs_review"),
         [
@@ -107,17 +106,14 @@ def test_allowed_provisional_totals_are_not_trusted() -> None:
         ],
     )
 
-    assert result.trusted_totals is False
     totals = {
         (aggregate.quantity_type, aggregate.context): aggregate for aggregate in result.aggregates
     }
     assert totals[("length", None)].total == 5.0
-    assert totals[("length", None)].trusted is False
-    assert totals[("count", "entity_count")].trusted is False
     assert totals[("count", "line_count")].total == 1.0
 
 
-def test_review_gated_totals_are_computed_but_not_trusted() -> None:
+def test_review_gated_totals_are_computed() -> None:
     result = compute_quantities(
         RevisionGateMetadata(status="review_gated", reason="scale_unknown"),
         [
@@ -139,14 +135,12 @@ def test_review_gated_totals_are_computed_but_not_trusted() -> None:
         ],
     )
 
-    # Aggregates are always computed; the gate only marks totals untrusted (Path B 2).
-    assert result.trusted_totals is False
+    # Aggregates are always computed regardless of gate (Path B).
     assert len(result.contributors) == 3
     totals = {
         (aggregate.quantity_type, aggregate.context): aggregate for aggregate in result.aggregates
     }
     assert totals[("length", None)].total == 7.0
-    assert all(aggregate.trusted is False for aggregate in result.aggregates)
 
 
 def test_source_hash_dedups_identical_contributors_and_conflicts_on_mismatch() -> None:

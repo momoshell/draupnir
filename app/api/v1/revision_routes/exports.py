@@ -196,20 +196,6 @@ def _build_export_job_input(
         project_id=revision.project_id,
         source_file_id=revision.source_file_id,
         drawing_revision_id=revision.id,
-        quantity_gate=(
-            estimate_version.quantity_gate
-            if estimate_version is not None
-            else quantity_takeoff.quantity_gate
-            if quantity_takeoff is not None
-            else None
-        ),
-        trusted_totals=(
-            estimate_version.trusted_totals
-            if estimate_version is not None
-            else quantity_takeoff.trusted_totals
-            if quantity_takeoff is not None
-            else None
-        ),
     )
     return ExportJobInput(**payload)
 

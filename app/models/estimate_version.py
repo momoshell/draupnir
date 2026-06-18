@@ -278,9 +278,10 @@ class EstimateVersion(Base):
         nullable=True,
         comment="Vestigial estimate input gate copied from the takeoff (dropped in stage 6)",
     )
-    trusted_totals: Mapped[bool] = mapped_column(
+    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
+    trusted_totals: Mapped[bool | None] = mapped_column(
         Boolean,
-        nullable=False,
+        nullable=True,
         comment="Frozen trusted-input posture copied from the referenced quantity takeoff",
     )
     currency: Mapped[str] = mapped_column(

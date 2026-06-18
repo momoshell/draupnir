@@ -52,8 +52,6 @@ def _estimate_input(**overrides: Any) -> EstimateJobInput:
         "source_file_id": FILE_ID,
         "drawing_revision_id": REVISION_ID,
         "quantity_takeoff_id": TAKEOFF_ID,
-        "quantity_gate": "allowed",
-        "trusted_totals": True,
         "source_job_type": JobType.ESTIMATE.value,
     }
     base.update(overrides)
@@ -66,8 +64,6 @@ def _takeoff(**overrides: Any) -> QuantityTakeoff:
         "project_id": PROJECT_ID,
         "source_file_id": FILE_ID,
         "drawing_revision_id": REVISION_ID,
-        "quantity_gate": "allowed",
-        "trusted_totals": True,
         "source_job_type": JobType.QUANTITY_TAKEOFF.value,
     }
     base.update(overrides)
@@ -141,25 +137,3 @@ def test_validate_quantity_takeoff_missing_raises() -> None:
         validate_quantity_takeoff(None, estimate_input=_estimate_input(), job=_job())
     assert exc.value.details is not None
     assert exc.value.details["reason"] == "missing_quantity_takeoff"
-
-
-def test_validate_quantity_takeoff_gate_mismatch_raises() -> None:
-    with pytest.raises(_EstimateJobInputError) as exc:
-        validate_quantity_takeoff(
-            _takeoff(quantity_gate="blocked"),
-            estimate_input=_estimate_input(),
-            job=_job(),
-        )
-    assert exc.value.details is not None
-    assert exc.value.details["reason"] == "quantity_takeoff_lineage_mismatch"
-
-
-def test_validate_quantity_takeoff_untrusted_totals_raises() -> None:
-    with pytest.raises(_EstimateJobInputError) as exc:
-        validate_quantity_takeoff(
-            _takeoff(trusted_totals=False),
-            estimate_input=_estimate_input(),
-            job=_job(),
-        )
-    assert exc.value.details is not None
-    assert exc.value.details["reason"] == "quantity_takeoff_lineage_mismatch"

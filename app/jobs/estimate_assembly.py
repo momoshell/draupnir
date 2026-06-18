@@ -244,9 +244,7 @@ async def _build_estimate_engine_input(
                 "quantity_type": quantity_item.quantity_type,
                 "value": quantity_item.value,
                 "unit": quantity_item.unit,
-                "review_state": quantity_item.review_state,
                 "validation_status": quantity_item.validation_status,
-                "quantity_gate": quantity_item.quantity_gate,
                 "source_entity_id": quantity_item.source_entity_id,
                 "excluded_source_entity_ids_json": deepcopy(
                     quantity_item.excluded_source_entity_ids_json
@@ -529,8 +527,6 @@ async def _build_estimate_engine_input(
             drawing_revision_id=estimate_input.drawing_revision_id,
             quantity_takeoff_id=quantity_takeoff.id,
             currency=cast(Any, estimate_input.currency),
-            quantity_gate=cast(Any, estimate_input.quantity_gate),
-            trusted_totals=estimate_input.trusted_totals,
             tax_rate=_estimate_tax_rate(estimate_input.assumptions_json),
             quantity_entries=tuple(quantity_entries),
             rate_entries=tuple(rate_entries),

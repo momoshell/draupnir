@@ -134,17 +134,14 @@ def compute_quantities(
                 )
 
     deduped = deduplicate_contributors(candidates)
-    # Always compute aggregates; ``trusted_totals`` is informational provenance
-    # (true only for an ``allowed`` gate) rather than a gate on whether totals exist.
-    trusted_totals = gate.status == "allowed"
-    aggregates = _aggregate(deduped.contributors, trusted=trusted_totals)
+    # Path B 5c: totals are always computed; the retired trusted_totals/gate flag is gone.
+    aggregates = _aggregate(deduped.contributors)
     return QuantityEngineResult(
         gate=gate,
         aggregates=aggregates,
         contributors=deduped.contributors,
         exclusions=tuple(exclusions),
         conflicts=deduped.conflicts,
-        trusted_totals=trusted_totals,
     )
 
 
@@ -170,7 +167,6 @@ def _count_quantities(entity: RevisionEntityInput) -> tuple[GeometryQuantity, Ge
 
 def _aggregate(
     contributors: tuple[QuantityContributor, ...],
-    trusted: bool,
 ) -> tuple[QuantityAggregate, ...]:
     grouped: dict[tuple[QuantityType, str, str | None], list[float]] = {}
     for contributor in contributors:
@@ -184,7 +180,6 @@ def _aggregate(
             context=context,
             total=math.fsum(values),
             contributor_count=len(values),
-            trusted=trusted,
         )
         for (quantity_type, unit, context), values in sorted(grouped.items())
     ]

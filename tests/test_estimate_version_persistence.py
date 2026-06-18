@@ -267,7 +267,6 @@ async def test_estimate_version_schema_matches_contract() -> None:
         "drawing_revision_id",
         "quantity_takeoff_id",
         "source_job_id",
-        "trusted_totals",
         "currency",
         "subtotal_amount",
         "tax_amount",
@@ -276,8 +275,9 @@ async def test_estimate_version_schema_matches_contract() -> None:
     ):
         assert required_column in estimate_columns
         assert estimate_columns[required_column]["nullable"] is False
-    # Path B 5b: quantity_gate is vestigial and nullable.
+    # Path B 5b/5c: quantity_gate and trusted_totals are vestigial and nullable.
     assert estimate_columns["quantity_gate"]["nullable"] is True
+    assert estimate_columns["trusted_totals"]["nullable"] is True
 
     assert ("source_job_id",) in unique_constraints["estimate_versions"]
     assert ("id", "project_id", "drawing_revision_id") in unique_constraints["estimate_versions"]

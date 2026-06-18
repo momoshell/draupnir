@@ -81,8 +81,6 @@ def validate_quantity_takeoff(
         or quantity_takeoff.source_file_id != job.file_id
         or quantity_takeoff.drawing_revision_id != job.base_revision_id
         or quantity_takeoff.id != estimate_input.quantity_takeoff_id
-        or quantity_takeoff.quantity_gate != estimate_input.quantity_gate
-        or quantity_takeoff.trusted_totals is not estimate_input.trusted_totals
         or quantity_takeoff.source_job_type != JobType.QUANTITY_TAKEOFF.value
         or estimate_input.source_job_type != JobType.ESTIMATE.value
     ):

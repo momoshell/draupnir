@@ -141,7 +141,7 @@ async def test_allowed_gate_builds_input_with_mapped_entities() -> None:
     )
     execution = await _build(loader)
     assert execution.drawing_revision_id == REVISION_ID
-    assert execution.quantity_gate == "allowed"
+    assert execution.validation_status == "valid"
     assert [e.entity_id for e in execution.entities] == ["e1", "e2"]
     assert execution.gate.status == "allowed"
 
@@ -180,7 +180,8 @@ async def test_gated_report_still_loads_entities_and_records_gate() -> None:
     )
     execution = await _build(loader)
     assert [e.entity_id for e in execution.entities] == ["e1", "e2"]
-    assert execution.quantity_gate == "review_gated"
+    # quantity_gate is no longer carried on the execution input (Path B 5c); the
+    # informational gate metadata still reflects the (now-vestigial) report values.
     assert execution.gate.status == "review_gated"
     assert execution.gate.reason == "review_required"
 

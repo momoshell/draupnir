@@ -210,8 +210,6 @@ async def build_export_execution_input(
         if (
             export_input.quantity_takeoff_id is not None
             or export_input.estimate_version_id is not None
-            or export_input.quantity_gate is not None
-            or export_input.trusted_totals is not None
         ):
             raise _build_export_job_input_error(
                 "Revision-scoped export input contains unexpected quantity or estimate lineage.",
@@ -259,9 +257,8 @@ async def build_export_execution_input(
             "Export job input is missing its quantity takeoff linkage.",
             details={"export_kind": export_input.export_kind},
         )
-    # Path B 4: exports are no longer gated on quantity_gate / trusted_totals. The
-    # takeoff lineage consistency check below still ensures the persisted input mirrors
-    # the source takeoff's recorded gate/trusted values.
+    # Path B 5c: exports are no longer gated on quantity_gate / trusted_totals, and
+    # those vestigial fields are no longer compared in the lineage check below.
 
     quantity_takeoff = await loader.get_quantity_takeoff(quantity_takeoff_id)
     if quantity_takeoff is None:
@@ -274,8 +271,6 @@ async def build_export_execution_input(
         quantity_takeoff.project_id != job.project_id
         or quantity_takeoff.source_file_id != job.file_id
         or quantity_takeoff.drawing_revision_id != drawing_revision.id
-        or quantity_takeoff.quantity_gate != export_input.quantity_gate
-        or quantity_takeoff.trusted_totals is not export_input.trusted_totals
         or quantity_takeoff.source_job_type != JobType.QUANTITY_TAKEOFF.value
     ):
         raise _build_export_job_input_error(
@@ -283,8 +278,6 @@ async def build_export_execution_input(
             details={
                 "quantity_takeoff_id": str(quantity_takeoff.id),
                 "drawing_revision_id": str(quantity_takeoff.drawing_revision_id),
-                "quantity_gate": quantity_takeoff.quantity_gate,
-                "trusted_totals": quantity_takeoff.trusted_totals,
             },
         )
 
@@ -331,8 +324,6 @@ async def build_export_execution_input(
         or estimate_version.source_file_id != job.file_id
         or estimate_version.drawing_revision_id != drawing_revision.id
         or estimate_version.quantity_takeoff_id != quantity_takeoff.id
-        or estimate_version.quantity_gate != export_input.quantity_gate
-        or estimate_version.trusted_totals is not export_input.trusted_totals
     ):
         raise _build_export_job_input_error(
             "Export job estimate lineage does not match the persisted job input.",
@@ -340,8 +331,6 @@ async def build_export_execution_input(
                 "estimate_version_id": str(estimate_version.id),
                 "drawing_revision_id": str(estimate_version.drawing_revision_id),
                 "quantity_takeoff_id": str(estimate_version.quantity_takeoff_id),
-                "quantity_gate": estimate_version.quantity_gate,
-                "trusted_totals": estimate_version.trusted_totals,
             },
         )
 

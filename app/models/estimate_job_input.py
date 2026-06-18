@@ -159,10 +159,10 @@ class EstimateJobInput(Base):
         nullable=True,
         comment="Vestigial quantity gate copied from the takeoff (dropped in Path B stage 6)",
     )
-    trusted_totals: Mapped[bool] = mapped_column(
+    # Path B 5c: vestigial trusted-totals flag, no longer written (dropped in stage 6).
+    trusted_totals: Mapped[bool | None] = mapped_column(
         Boolean,
-        default=True,
-        nullable=False,
+        nullable=True,
         comment="Persisted trusted-total contract copied from the selected takeoff",
     )
     currency: Mapped[str] = mapped_column(

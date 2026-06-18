@@ -875,14 +875,15 @@ class TestJobsWorkerQuantity:
         assert response.json()["items"] == []
 
     @pytest.mark.parametrize(
-        ("review_state", "validation_status", "quantity_gate", "trusted_totals"),
+        ("review_state", "validation_status", "quantity_gate"),
         [
-            # Path B 5b: review_state / quantity_gate are no longer persisted, so the
-            # gate metadata is NULL and ``trusted_totals`` is always False.
-            ("approved", "valid", "allowed", False),
-            ("provisional", "valid", "allowed_provisional", False),
-            ("review_required", "needs_review", "review_gated", False),
-            ("rejected", "invalid", "blocked", False),
+            # Path B 5b/5c: review_state / quantity_gate / trusted_totals are no longer
+            # derived or persisted (NULL); only validation_status survives. The gate
+            # columns here just drive the (vestigial) fake-ingest params.
+            ("approved", "valid", "allowed"),
+            ("provisional", "valid", "allowed_provisional"),
+            ("review_required", "needs_review", "review_gated"),
+            ("rejected", "invalid", "blocked"),
         ],
     )
     async def test_process_quantity_takeoff_job_persists_expected_takeoff(
@@ -894,7 +895,6 @@ class TestJobsWorkerQuantity:
         review_state: str,
         validation_status: str,
         quantity_gate: str,
-        trusted_totals: bool,
     ) -> None:
         """Quantity worker should persist a populated takeoff for every gate status."""
         _ = self
@@ -947,7 +947,8 @@ class TestJobsWorkerQuantity:
         assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
         assert takeoff.quantity_gate is None
-        assert takeoff.trusted_totals is trusted_totals
+        # Path B 5c: trusted_totals is no longer derived/written (NULL).
+        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert len(items) == 5
@@ -1022,7 +1023,7 @@ class TestJobsWorkerQuantity:
         assert takeoff.review_state is None
         assert takeoff.validation_status == validation_status
         assert takeoff.quantity_gate is None
-        assert takeoff.trusted_totals is False
+        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert all(item.review_state is None for item in items)
@@ -1108,14 +1109,15 @@ class TestJobsWorkerQuantity:
         assert updated_job.error_code is None
         assert len(takeoffs) == 1
         assert takeoffs[0].quantity_gate is None
-        assert takeoffs[0].trusted_totals is False
+        assert takeoffs[0].trusted_totals is None
 
         response = await async_client.get(f"/v1/jobs/{quantity_job.id}/events")
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "succeeded"
-        assert event_payload["quantity_gate"] is None
-        assert event_payload["trusted_totals"] is False
+        # Path B 5c: the job-event payload no longer carries quantity_gate/trusted_totals.
+        assert "quantity_gate" not in event_payload
+        assert "trusted_totals" not in event_payload
 
     async def test_process_quantity_takeoff_job_manifest_dxf_rerun_semantics_are_stable(
         self,
@@ -1587,9 +1589,7 @@ class TestJobsWorkerQuantity:
                     quantity_type="length",
                     value=-1.0,
                     unit="m",
-                    review_state=kwargs["review_state"],
                     validation_status=kwargs["validation_status"],
-                    quantity_gate=kwargs["quantity_gate"],
                     source_entity_id="missing-entity",
                     excluded_source_entity_ids_json=[],
                 )
@@ -1654,7 +1654,7 @@ class TestJobsWorkerQuantity:
         assert len(takeoffs) == 1
         takeoff = takeoffs[0]
         assert takeoff.quantity_gate is None
-        assert takeoff.trusted_totals is False
+        assert takeoff.trusted_totals is None
 
         items = await _get_quantity_items_for_takeoff(takeoff.id)
         assert items, "gated revision should still produce quantity items"
@@ -1664,8 +1664,9 @@ class TestJobsWorkerQuantity:
         assert response.status_code == 200
         event_payload = response.json()["items"][-1]["data_json"]
         assert event_payload["status"] == "succeeded"
-        assert event_payload["trusted_totals"] is False
-        assert event_payload["quantity_gate"] is None
+        # Path B 5c: the job-event payload no longer carries quantity_gate/trusted_totals.
+        assert "trusted_totals" not in event_payload
+        assert "quantity_gate" not in event_payload
 
     async def test_process_quantity_takeoff_job_fails_conflicts_without_rows(
         self,

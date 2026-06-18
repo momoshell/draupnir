@@ -593,13 +593,15 @@ async def test_create_export_persists_pending_job_and_input(
             assert export_input.estimate_version_id is None
         elif case.export_kind == ExportKind.QUANTITY_CSV:
             assert export_input.quantity_takeoff_id == lineage.takeoff_id
-            assert export_input.quantity_gate == QuantityGate.ALLOWED.value
-            assert export_input.trusted_totals is True
+            # Path B 5c: quantity_gate / trusted_totals are no longer copied onto exports.
+            assert export_input.quantity_gate is None
+            assert export_input.trusted_totals is None
             assert export_input.estimate_version_id is None
         else:
             assert export_input.quantity_takeoff_id == lineage.takeoff_id
-            assert export_input.quantity_gate == QuantityGate.ALLOWED.value
-            assert export_input.trusted_totals is True
+            # Path B 5c: quantity_gate / trusted_totals are no longer copied onto exports.
+            assert export_input.quantity_gate is None
+            assert export_input.trusted_totals is None
             assert export_input.estimate_version_id == lineage.estimate_version_id
 
         generated_artifact_count = await session.scalar(
