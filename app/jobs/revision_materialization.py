@@ -20,6 +20,7 @@ from app.cad.changeset import (
     ChangeSetApplySuccess,
 )
 from app.ingestion.canonical import EntityProvenanceError, canonicalize_entity_provenance
+from app.ingestion.entity_geometry import compute_entity_bbox
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.models.revision_materialization import (
     RevisionBlock,
@@ -477,6 +478,12 @@ def _build_revision_materialization_rows(
             explicit_key="block_ref",
             legacy_key="block",
         )
+        geometry_json = _json_object(
+            payload_json.get("geometry_json")
+            if "geometry_json" in payload_json
+            else payload_json.get("geometry")
+        )
+        bbox = compute_entity_bbox(geometry_json)
         entities.append(
             {
                 "id": uuid.uuid4(),
@@ -486,11 +493,11 @@ def _build_revision_materialization_rows(
                 "entity_schema_version": entity_schema_version,
                 "parent_entity_ref": parent_entity_ref,
                 "confidence_json": confidence_json,
-                "geometry_json": _json_object(
-                    payload_json.get("geometry_json")
-                    if "geometry_json" in payload_json
-                    else payload_json.get("geometry")
-                ),
+                "geometry_json": geometry_json,
+                "bbox_min_x": bbox[0] if bbox is not None else None,
+                "bbox_min_y": bbox[1] if bbox is not None else None,
+                "bbox_max_x": bbox[2] if bbox is not None else None,
+                "bbox_max_y": bbox[3] if bbox is not None else None,
                 "properties_json": _json_object(
                     payload_json.get("properties_json")
                     if "properties_json" in payload_json
@@ -588,6 +595,8 @@ def _build_changeset_revision_materialization_rows(
         layer_ref = _string_ref(entity.layer_ref)
         block_ref = _string_ref(entity.block_ref)
         parent_entity_ref = _string_ref(entity.parent_entity_ref)
+        geometry_json = _copy_json_mapping(entity.geometry_json)
+        bbox = compute_entity_bbox(geometry_json)
         entities.append(
             {
                 "id": uuid.uuid4(),
@@ -597,7 +606,11 @@ def _build_changeset_revision_materialization_rows(
                 "entity_schema_version": entity.entity_schema_version,
                 "parent_entity_ref": parent_entity_ref,
                 "confidence_json": _copy_json_mapping(entity.confidence_json),
-                "geometry_json": _copy_json_mapping(entity.geometry_json),
+                "geometry_json": geometry_json,
+                "bbox_min_x": bbox[0] if bbox is not None else None,
+                "bbox_min_y": bbox[1] if bbox is not None else None,
+                "bbox_max_x": bbox[2] if bbox is not None else None,
+                "bbox_max_y": bbox[3] if bbox is not None else None,
                 "properties_json": _copy_json_mapping(entity.properties_json),
                 "provenance_json": _copy_json_mapping(entity.provenance_json),
                 "canonical_entity_json": (

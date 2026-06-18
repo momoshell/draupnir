@@ -277,6 +277,80 @@ class TestRevisionMaterializationApi:
         assert bad.json()["error"]["code"] == "INPUT_INVALID"
         assert "bogus" in bad.json()["error"]["details"]["unknown_fields"]
 
+    async def test_entities_spatial_filter_by_bbox_and_near_point(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Spatial filters select entities by persisted bbox intersection / point proximity."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        async def _run_spatial_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            left = _build_contract_entity(
+                entity_id="left", entity_type="line", layer_ref="A-WALL", source_id="s-left"
+            )
+            left["geometry_json"] = {"start": {"x": 0.0, "y": 0.0}, "end": {"x": 10.0, "y": 10.0}}
+            right = _build_contract_entity(
+                entity_id="right", entity_type="point", layer_ref="A-WALL", source_id="s-right"
+            )
+            right["geometry_json"] = {"position": {"x": 100.0, "y": 100.0}}
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[{"layer_ref": "A-WALL", "name": "A-WALL"}],
+                blocks=[],
+                entities=[left, right],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_spatial_ingestion)
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        base = f"/v1/revisions/{drawing_revisions[0].id}/entities"
+
+        def _ids(response: httpx.Response) -> list[str]:
+            return [item["entity_id"] for item in response.json()["items"]]
+
+        # bbox intersection selects the left line only; its persisted bbox is surfaced.
+        in_box = await async_client.get(
+            base, params={"min_x": -1, "min_y": -1, "max_x": 20, "max_y": 20}
+        )
+        assert in_box.status_code == 200
+        assert _ids(in_box) == ["left"]
+        assert in_box.json()["items"][0]["bbox"] == [0.0, 0.0, 10.0, 10.0]
+
+        # near-point: within 5 of the right point.
+        assert _ids(
+            await async_client.get(base, params={"near_x": 100, "near_y": 100, "radius": 5})
+        ) == ["right"]
+        # a point inside the left bbox (distance 0) matches it.
+        assert _ids(
+            await async_client.get(base, params={"near_x": 5, "near_y": 5, "radius": 1})
+        ) == ["left"]
+        # far from everything.
+        assert (
+            _ids(await async_client.get(base, params={"near_x": 1000, "near_y": 1000, "radius": 1}))
+            == []
+        )
+
+        # validation: partial bbox + non-positive radius.
+        assert (await async_client.get(base, params={"min_x": 0})).status_code == 400
+        assert (
+            await async_client.get(base, params={"near_x": 0, "near_y": 0, "radius": 0})
+        ).status_code == 400
+
     async def test_devices_endpoint_returns_schedule_and_tag_association(
         self,
         async_client: httpx.AsyncClient,

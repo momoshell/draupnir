@@ -690,6 +690,10 @@ class TestLineageDeleteRestrictions:
             "layer_id",
             "block_id",
             "parent_entity_row_id",
+            "bbox_min_x",
+            "bbox_min_y",
+            "bbox_max_x",
+            "bbox_max_y",
         ):
             assert required_column in revision_entity_columns
 
@@ -711,6 +715,7 @@ class TestLineageDeleteRestrictions:
             ("drawing_revision_id", "parent_entity_ref"),
             ("drawing_revision_id", "source_hash"),
             ("drawing_revision_id", "source_identity"),
+            ("drawing_revision_id", "bbox_min_x", "bbox_min_y", "bbox_max_x", "bbox_max_y"),
         ):
             assert index_columns in indexes["revision_entities"]
 
