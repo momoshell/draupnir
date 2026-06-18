@@ -492,6 +492,15 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
             "drawing_revision_id",
             "source_hash",
         ),
+        # Spatial prefilter for bbox-intersection / near-point queries within a revision.
+        Index(
+            "ix_revision_entities_revision_bbox",
+            "drawing_revision_id",
+            "bbox_min_x",
+            "bbox_min_y",
+            "bbox_max_x",
+            "bbox_max_y",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -555,6 +564,12 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
         nullable=True,
         comment="Optional full canonical entity payload retained alongside split contract fields",
     )
+    # Axis-aligned bounding box (drawing coordinate units) for indexed spatial queries.
+    # NULL when the geometry has no recoverable 2-D extent.
+    bbox_min_x: Mapped[float | None] = mapped_column(nullable=True, comment="AABB min x")
+    bbox_min_y: Mapped[float | None] = mapped_column(nullable=True, comment="AABB min y")
+    bbox_max_x: Mapped[float | None] = mapped_column(nullable=True, comment="AABB max x")
+    bbox_max_y: Mapped[float | None] = mapped_column(nullable=True, comment="AABB max y")
     layout_ref: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,

@@ -342,6 +342,10 @@ class RevisionEntitySummary(BaseModel):
     block_ref: str | None = Field(None, description="Raw block reference")
     source_identity: str | None = Field(None, description="Stable source identity")
     source_hash: str | None = Field(None, description="Stable source hash")
+    bbox: list[float] | None = Field(
+        None,
+        description="AABB [min_x, min_y, max_x, max_y] in drawing units; null when no 2-D extent",
+    )
     created_at: datetime = Field(..., description="Materialization timestamp")
     # Heavy blocks — populated only when selected via ``fields=``.
     geometry: dict[str, Any] | None = Field(None, description="Entity geometry payload")

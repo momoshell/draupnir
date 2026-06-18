@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.pagination import DEFAULT_PAGE_SIZE as _DEFAULT_PAGE_SIZE
@@ -223,6 +223,7 @@ def _entity_summary(row: RevisionEntity, *, include: frozenset[str]) -> Revision
         block_ref=row.block_ref,
         source_identity=row.source_identity,
         source_hash=row.source_hash,
+        bbox=_row_bbox(row),
         created_at=row.created_at,
         **{
             name: getattr(row, attr)
@@ -230,6 +231,74 @@ def _entity_summary(row: RevisionEntity, *, include: frozenset[str]) -> Revision
             if name in include
         },
     )
+
+
+def _row_bbox(row: RevisionEntity) -> list[float] | None:
+    """Return the persisted AABB as [min_x, min_y, max_x, max_y], or None if absent."""
+    corners = (row.bbox_min_x, row.bbox_min_y, row.bbox_max_x, row.bbox_max_y)
+    if any(corner is None for corner in corners):
+        return None
+    return [float(corner) for corner in corners if corner is not None]
+
+
+def _raise_spatial_invalid(message: str) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=create_error_response(code=ErrorCode.INPUT_INVALID, message=message, details=None),
+    )
+
+
+def _spatial_conditions(
+    *,
+    min_x: float | None,
+    min_y: float | None,
+    max_x: float | None,
+    max_y: float | None,
+    near_x: float | None,
+    near_y: float | None,
+    radius: float | None,
+) -> list[ColumnElement[bool]]:
+    """Build indexed bbox-intersection / near-point conditions over the persisted AABB.
+
+    Entities with a NULL bbox (no 2-D extent) are excluded from spatial results.
+    """
+    conditions: list[ColumnElement[bool]] = []
+
+    box = (min_x, min_y, max_x, max_y)
+    if any(value is not None for value in box):
+        if any(value is None for value in box):
+            _raise_spatial_invalid("in-bbox requires all of min_x, min_y, max_x, max_y.")
+        assert min_x is not None and min_y is not None and max_x is not None and max_y is not None
+        if min_x > max_x or min_y > max_y:
+            _raise_spatial_invalid("in-bbox requires min_x <= max_x and min_y <= max_y.")
+        conditions += [
+            RevisionEntity.bbox_min_x.is_not(None),
+            RevisionEntity.bbox_min_x <= max_x,
+            RevisionEntity.bbox_max_x >= min_x,
+            RevisionEntity.bbox_min_y <= max_y,
+            RevisionEntity.bbox_max_y >= min_y,
+        ]
+
+    near = (near_x, near_y, radius)
+    if any(value is not None for value in near):
+        if any(value is None for value in near):
+            _raise_spatial_invalid("near-point requires all of near_x, near_y, radius.")
+        assert near_x is not None and near_y is not None and radius is not None
+        if radius <= 0:
+            _raise_spatial_invalid("near-point radius must be > 0.")
+        # Squared point-to-AABB distance (0 inside the box) <= radius^2.
+        dx = func.greatest(
+            RevisionEntity.bbox_min_x - near_x, 0.0, near_x - RevisionEntity.bbox_max_x
+        )
+        dy = func.greatest(
+            RevisionEntity.bbox_min_y - near_y, 0.0, near_y - RevisionEntity.bbox_max_y
+        )
+        conditions += [
+            RevisionEntity.bbox_min_x.is_not(None),
+            (dx * dx + dy * dy) <= radius * radius,
+        ]
+
+    return conditions
 
 
 @materialization_router.get(
@@ -249,6 +318,13 @@ async def list_revision_entities(
     parent_entity_ref: str | None = Query(default=None),
     source_identity: str | None = Query(default=None),
     source_hash: str | None = Query(default=None),
+    min_x: float | None = Query(default=None, description="in-bbox: query box min x"),
+    min_y: float | None = Query(default=None, description="in-bbox: query box min y"),
+    max_x: float | None = Query(default=None, description="in-bbox: query box max x"),
+    max_y: float | None = Query(default=None, description="in-bbox: query box max y"),
+    near_x: float | None = Query(default=None, description="near-point: x (with near_y, radius)"),
+    near_y: float | None = Query(default=None, description="near-point: y (with near_x, radius)"),
+    radius: float | None = Query(default=None, description="near-point: max distance (> 0)"),
     fields: Annotated[
         str | None,
         Query(
@@ -260,9 +336,22 @@ async def list_revision_entities(
         ),
     ] = None,
 ) -> RevisionEntityListResponse:
-    """List compact materialized entity rows; heavy blocks are opt-in via ``fields``."""
+    """List compact materialized entity rows; heavy blocks opt-in via ``fields``.
+
+    Optional spatial filters (over the persisted entity bounding box): ``min_x``/``min_y``/
+    ``max_x``/``max_y`` (AABB intersection) and ``near_x``/``near_y``/``radius`` (point proximity).
+    """
 
     include_fields = _parse_entity_fields(fields)
+    spatial_conditions = _spatial_conditions(
+        min_x=min_x,
+        min_y=min_y,
+        max_x=max_x,
+        max_y=max_y,
+        near_x=near_x,
+        near_y=near_y,
+        radius=radius,
+    )
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
     pagination_cursor = _decode_materialization_cursor(cursor) if cursor else None
 
@@ -283,6 +372,8 @@ async def list_revision_entities(
         query = query.where(RevisionEntity.source_identity == source_identity)
     if source_hash is not None:
         query = query.where(RevisionEntity.source_hash == source_hash)
+    for condition in spatial_conditions:
+        query = query.where(condition)
     if pagination_cursor is not None:
         sequence_index, row_id = pagination_cursor
         query = query.where(
