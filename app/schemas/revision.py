@@ -355,6 +355,30 @@ class RevisionEntitySummary(BaseModel):
     canonical: dict[str, Any] | None = Field(None, description="Raw canonical entity payload")
 
 
+class RevisionScaleRead(BaseModel):
+    """Drawing scale + units for a revision, surfaced from the canonical payload.
+
+    Honest passthrough of what the adapter extracted: ``units`` carries the
+    normalized unit name + conversion provenance (e.g. DXF ``$INSUNITS`` → meters),
+    and ``pdf_scale`` carries the derived PDF page scale (ratio / real-world unit /
+    point→real factor) when present. Values are ``unknown``/null when not available
+    (e.g. unconfirmed PDF scale, or a changeset-origin revision with no adapter run).
+    """
+
+    units: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Canonical units payload: normalized unit name + conversion provenance",
+    )
+    pdf_scale: dict[str, Any] | None = Field(
+        None,
+        description="Derived PDF page scale (ratio, real-world unit, point->real factor), if any",
+    )
+    source_input_family: str | None = Field(
+        None,
+        description="Adapter input family the scale/units came from (e.g. dxf, dwg, pdf_vector)",
+    )
+
+
 class RevisionMaterializationListResponseBase(BaseModel):
     """Shared metadata for revision materialization list responses."""
 
