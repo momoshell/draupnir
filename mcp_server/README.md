@@ -45,8 +45,14 @@ from the running API at startup) and curated with route maps:
 - **Resource templates** — single objects addressed by id (project, file, job,
   entity, changeset, estimate, takeoff, catalog material/rate/formula, adapter
   output) for browsing.
-- **`server_info`** (bespoke) — MCP version + a live API health probe; call it
-  first.
+- **Action tools** — the mutating flows (create project, reprocess, changeset
+  create/validate/apply, quantity takeoff, estimate version, exports, job
+  cancel/retry, …). A fresh `Idempotency-Key` is injected automatically per call.
+- **`server_info`** (bespoke) — MCP version + a live API health probe; call first.
+- **`upload_project_file`** (bespoke) — upload a local file by path (multipart),
+  which starts ingestion. Returns the created file record.
+- **`wait_for_job`** (bespoke) — poll a job until it reaches a terminal state
+  (`succeeded`/`failed`/`cancelled`); use after any action that returns a job.
 
-Not exposed in this layer: mutations (added in #527), the binary artifact
-download, and liveness endpoints (covered by `server_info`).
+Not exposed: the irreversible project delete, the binary artifact download, and
+liveness endpoints (covered by `server_info`).

@@ -29,9 +29,33 @@ _EXPECTED_RESOURCE_TEMPLATES = {
     "get_revision_quantity_takeoff",
 }
 
-# Lists + parameterized queries + computed views → query tools (plus the bespoke server_info).
+# Lists + parameterized queries + computed views → query tools; mutations → action tools;
+# plus the bespoke server_info / upload_project_file / wait_for_job.
 _EXPECTED_TOOLS = {
+    # bespoke
     "server_info",
+    "upload_project_file",
+    "wait_for_job",
+    # mutations / actions (generated)
+    "apply_revision_changeset",
+    "cancel_job",
+    "create_dxf_export",
+    "create_formula",
+    "create_material",
+    "create_project",
+    "create_rate",
+    "create_revised_dxf_export",
+    "create_revision_changeset",
+    "create_revision_estimate_export",
+    "create_revision_estimate_version",
+    "create_revision_json_export",
+    "create_revision_quantity_csv_export",
+    "create_revision_quantity_takeoff",
+    "reprocess_project_file",
+    "retry_job",
+    "update_project",
+    "validate_revision_changeset",
+    # reads (generated)
     "get_revision_adapter_output",
     "get_revision_scale",
     "get_revision_summary",
@@ -63,15 +87,14 @@ _EXPECTED_TOOLS = {
     "list_revision_rooms",
 }
 
-# Mutations (actions land in #527) + binary download + liveness are not exposed.
+# Irreversible delete + binary download + liveness are never exposed. (The binary
+# upload_project_file operation is excluded from generation but re-added as a
+# bespoke path-based tool, so it is intentionally absent from this set.)
 _EXPECTED_EXCLUDED = {
+    "delete_project",
     "download_generated_artifact",
     "get_health",
     "get_system_health",
-    "create_project",
-    "upload_project_file",
-    "create_revision_changeset",
-    "apply_revision_changeset",
 }
 
 
