@@ -11,6 +11,9 @@ from app.api.v1.revision_routes.changesets import (
 from app.api.v1.revision_routes.devices import (
     devices_router,
 )
+from app.api.v1.revision_routes.diff import (
+    diff_router,
+)
 from app.api.v1.revision_routes.estimates import (
     estimates_router,
 )
@@ -49,6 +52,7 @@ revisions_router = APIRouter()
 revisions_router.include_router(file_revisions_router, tags=["Revisions"])
 revisions_router.include_router(scale_router, tags=["Revisions"])
 revisions_router.include_router(summary_router, tags=["Revisions"])
+revisions_router.include_router(diff_router, tags=["Revisions"])
 revisions_router.include_router(adapter_outputs_router, tags=["Adapter Outputs"])
 revisions_router.include_router(changesets_router, tags=["Changesets"])
 revisions_router.include_router(generated_artifacts_router, tags=["Artifacts"])

@@ -300,6 +300,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "revision_scale_api": "db_api",
     "revision_summary_api": "db_api",
     "revision_room_entities_api": "db_api",
+    "revision_diff_api": "db_api",
     "validation_report_api": "db_api",
     "revision_quantity_estimate_flow": "db_api",
     "smoke": "db_api",
