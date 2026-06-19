@@ -140,6 +140,7 @@ def test_operation_id_inventory_is_pinned() -> None:
         "list_revision_legend_devices",
         "list_revision_quantity_takeoff_items",
         "list_revision_quantity_takeoffs",
+        "list_revision_room_entities",
         "list_revision_rooms",
         "reprocess_project_file",
         "retry_job",
