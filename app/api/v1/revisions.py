@@ -33,6 +33,9 @@ from app.api.v1.revision_routes.quantity_takeoffs import (
 from app.api.v1.revision_routes.rooms import (
     rooms_router,
 )
+from app.api.v1.revision_routes.scale import (
+    scale_router,
+)
 from app.api.v1.revision_routes.validation_reports import (
     validation_reports_router,
 )
@@ -41,6 +44,7 @@ revisions_router = APIRouter()
 
 
 revisions_router.include_router(file_revisions_router, tags=["Revisions"])
+revisions_router.include_router(scale_router, tags=["Revisions"])
 revisions_router.include_router(adapter_outputs_router, tags=["Adapter Outputs"])
 revisions_router.include_router(changesets_router, tags=["Changesets"])
 revisions_router.include_router(generated_artifacts_router, tags=["Artifacts"])

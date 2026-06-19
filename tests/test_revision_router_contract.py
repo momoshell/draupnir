@@ -131,6 +131,18 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/scale",
+            "get_revision_scale",
+            "get_revision_scale",
+            "RevisionScaleRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/adapter-output",
             "get_revision_adapter_output",
             "get_revision_adapter_output",
