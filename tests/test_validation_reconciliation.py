@@ -49,6 +49,43 @@ def test_faithful_canonical_reports_no_drift() -> None:
     assert build_reconciliation_check(report)["status"] == "pass"
 
 
+def test_faithful_references_have_no_orphans() -> None:
+    report = build_reconciliation(_faithful())
+    refs = _invariant(report, "references")
+    assert refs["status"] == "match"
+    assert refs["orphan_layer_refs"] == []
+    assert refs["orphan_block_refs"] == []
+    assert refs["dangling_parent_refs"] == []
+
+
+def test_orphan_references_are_reported_but_do_not_gate() -> None:
+    canonical = _faithful()
+    canonical["entities"] = [
+        {"entity_id": "e1", "entity_type": "insert", "layer_ref": "GHOST", "block_ref": "MISSING"},
+        {"entity_id": "e2", "entity_type": "line", "layer_ref": "A-WALL", "parent_entity_ref": "x"},
+    ]
+    report = build_reconciliation(canonical)
+    refs = _invariant(report, "references")
+    assert refs["orphan_layer_refs"] == ["GHOST"]
+    assert refs["orphan_block_refs"] == ["MISSING"]
+    assert refs["dangling_parent_refs"] == ["x"]
+    assert refs["status"] == "orphans_present"
+    # Informational only: orphans never change the verdict (see #535).
+    assert report["status"] == "match"
+    assert build_reconciliation_check(report)["status"] == "pass"
+
+
+def test_references_match_via_shared_resolver_key_precedence() -> None:
+    # Layer declares identity under "ref"; entity points at it via "layer_ref".
+    canonical = _faithful()
+    canonical["layers"] = [{"ref": "L1", "name": "A-WALL"}]
+    canonical["blocks"] = []
+    canonical["entities"] = [{"entity_id": "e1", "entity_type": "line", "layer_ref": "A-WALL"}]
+    refs = _invariant(build_reconciliation(canonical), "references")
+    # "A-WALL" resolves as the layer ref (name precedes ref), so no orphan.
+    assert refs["orphan_layer_refs"] == []
+
+
 def test_faithful_structure_and_extents() -> None:
     report = build_reconciliation(_faithful())
     structure = _invariant(report, "structure")

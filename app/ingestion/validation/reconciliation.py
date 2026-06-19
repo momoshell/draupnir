@@ -19,6 +19,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from app.ingestion.entity_geometry import compute_entity_bbox
+from app.ingestion.ref_resolution import (
+    ENTITY_BLOCK_KEYS,
+    ENTITY_ID_KEYS,
+    ENTITY_LAYER_KEYS,
+    ENTITY_PARENT_KEYS,
+    collection_ref,
+    first_ref,
+)
 
 from .checks._common import _check, _pass_check
 
@@ -34,10 +42,13 @@ def build_reconciliation(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
     """Build the reconciliation report: per-invariant match/drift over the canonical model."""
 
     entities = _as_list(canonical_json.get("entities"))
+    layers = _as_list(canonical_json.get("layers"))
+    blocks = _as_list(canonical_json.get("blocks"))
 
     invariants = [
         _declared_counts(canonical_json),
         _structure(canonical_json, entities),
+        _references(entities, layers, blocks),
         _units(canonical_json),
         _extents(entities),
     ]
@@ -112,6 +123,56 @@ def _structure(
         "block_instances": block_instances,
         "nested_entities": nested,
         "distinct_layer_refs": len(distinct_layers),
+    }
+
+
+def _references(
+    entities: Sequence[Mapping[str, Any]],
+    layers: Sequence[Mapping[str, Any]],
+    blocks: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Report entity references that resolve to no declared definition (informational).
+
+    Uses the shared ref-resolver so the orphan view matches materialization's
+    linkage semantics. Non-gating in v1: surfaced for visibility, but does not
+    change ``validation_status`` (see #535 — gating awaits a deliberate alignment
+    of the materialization / layer-mapping / reconciliation matching rules).
+    """
+
+    layer_refs = {ref for layer in layers if (ref := collection_ref(layer, "layer_ref"))}
+    block_refs = {ref for block in blocks if (ref := collection_ref(block, "block_ref"))}
+    entity_ids = {ref for entity in entities if (ref := first_ref(entity, ENTITY_ID_KEYS))}
+
+    orphan_layers = sorted(
+        {
+            ref
+            for entity in entities
+            if (ref := first_ref(entity, ENTITY_LAYER_KEYS)) and ref not in layer_refs
+        }
+    )
+    orphan_blocks = sorted(
+        {
+            ref
+            for entity in entities
+            if (ref := first_ref(entity, ENTITY_BLOCK_KEYS)) and ref not in block_refs
+        }
+    )
+    dangling_parents = sorted(
+        {
+            ref
+            for entity in entities
+            if (ref := first_ref(entity, ENTITY_PARENT_KEYS)) and ref not in entity_ids
+        }
+    )
+
+    has_orphans = bool(orphan_layers or orphan_blocks or dangling_parents)
+    return {
+        "key": "references",
+        "status": "orphans_present" if has_orphans else "match",
+        "gating": False,
+        "orphan_layer_refs": orphan_layers,
+        "orphan_block_refs": orphan_blocks,
+        "dangling_parent_refs": dangling_parents,
     }
 
 

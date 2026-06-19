@@ -22,6 +22,7 @@ from app.cad.changeset import (
 from app.ingestion.canonical import EntityProvenanceError, canonicalize_entity_provenance
 from app.ingestion.entity_geometry import compute_entity_bbox
 from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.ref_resolution import COLLECTION_REF_FALLBACK_KEYS, string_ref
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntityManifest,
@@ -55,12 +56,8 @@ def _canonical_payload_list(payload: IngestFinalizationPayload, key: str) -> lis
     return list(raw_value) if isinstance(raw_value, list) else []
 
 
-def _string_ref(value: Any) -> str | None:
-    """Normalize a persisted ref string extracted from canonical payloads."""
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
+# Shared with reconciliation so the two never drift on what identifies a ref.
+_string_ref = string_ref
 
 
 def _hash_ref(value: Any) -> str | None:
@@ -394,7 +391,7 @@ def _build_revision_materialization_rows(
                 "layout_ref": _resolve_collection_ref(
                     payload_json,
                     explicit_key="layout_ref",
-                    fallback_keys=("name", "ref", "id"),
+                    fallback_keys=COLLECTION_REF_FALLBACK_KEYS,
                     prefix="layout",
                     sequence_index=index,
                     used_values=used_layout_refs,
@@ -414,7 +411,7 @@ def _build_revision_materialization_rows(
                 "layer_ref": _resolve_collection_ref(
                     payload_json,
                     explicit_key="layer_ref",
-                    fallback_keys=("name", "ref", "id"),
+                    fallback_keys=COLLECTION_REF_FALLBACK_KEYS,
                     prefix="layer",
                     sequence_index=index,
                     used_values=used_layer_refs,
@@ -434,7 +431,7 @@ def _build_revision_materialization_rows(
                 "block_ref": _resolve_collection_ref(
                     payload_json,
                     explicit_key="block_ref",
-                    fallback_keys=("name", "ref", "id"),
+                    fallback_keys=COLLECTION_REF_FALLBACK_KEYS,
                     prefix="block",
                     sequence_index=index,
                     used_values=used_block_refs,
