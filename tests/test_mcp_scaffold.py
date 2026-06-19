@@ -6,7 +6,13 @@ import pytest
 from mcp_server import __version__
 from mcp_server.config import MCPSettings
 from mcp_server.health import build_server_info, probe_api_health
-from mcp_server.server import create_server
+from mcp_server.server import build_server
+
+_MINIMAL_SPEC = {
+    "openapi": "3.1.0",
+    "info": {"title": "Draupnir", "version": "0.1.0"},
+    "paths": {},
+}
 
 
 def _client(handler: httpx.MockTransport) -> httpx.AsyncClient:
@@ -85,7 +91,7 @@ async def test_server_exposes_server_info_tool() -> None:
 
     settings = MCPSettings(api_base_url="http://api.test")
     async with _client(httpx.MockTransport(handler)) as client:
-        server = create_server(settings, client=client)
+        server = build_server(_MINIMAL_SPEC, settings, client)
 
         tools = await server.list_tools()
         names = {tool.name for tool in tools}
