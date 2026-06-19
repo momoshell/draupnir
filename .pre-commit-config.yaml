@@ -40,7 +40,7 @@ repos:
         # Check the whole tree (matches CI's `mypy app tests`) rather than only the
         # changed files: a change in app/ can break an unchanged test's types, which a
         # per-file check would miss locally and only surface in CI.
-        entry: uv run mypy app tests
+        entry: uv run mypy app mcp_server tests
         language: system
         types: [python]
         pass_filenames: false

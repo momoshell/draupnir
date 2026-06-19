@@ -32,10 +32,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra mcp --extra dev --extra test
 
       - name: Run ruff
-        run: uv run ruff check app tests
+        run: uv run ruff check app mcp_server tests
 
   typecheck:
     name: Typecheck
@@ -56,10 +56,10 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra mcp --extra dev --extra test
 
       - name: Run mypy
-        run: uv run mypy app tests
+        run: uv run mypy app mcp_server tests
 
   test-smoke:
     name: Test smoke
@@ -80,7 +80,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra mcp --extra dev --extra test
 
       - name: Run pytest smoke lane
         run: uv run pytest -m "smoke and not integration and not compose_smoke"
@@ -104,7 +104,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra mcp --extra dev --extra test
 
       - name: Run pytest non-integration lane
         run: uv run pytest -m "not integration and not compose_smoke and not smoke"
@@ -146,7 +146,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra dev --extra test
+        run: uv sync --locked --extra db --extra jobs --extra ingestion --extra mcp --extra dev --extra test
 
       - name: Run pytest integration lane
         run: uv run python scripts/profile_integration_lane.py --marker "integration and ${{ matrix.marker }} and not compose_smoke" --durations 50 --durations-min 0.2
