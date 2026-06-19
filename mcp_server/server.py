@@ -19,6 +19,7 @@ from fastmcp.server.providers.openapi import MCPType, RouteMap
 
 from mcp_server.config import MCPSettings
 from mcp_server.health import build_server_info, probe_api_health
+from mcp_server.instructions import INSTRUCTIONS
 from mcp_server.verification import explain_finding_from_report, summarize_verification
 
 SERVER_NAME = "draupnir-mcp"
@@ -195,6 +196,7 @@ def build_server(spec: dict[str, Any], settings: MCPSettings, client: httpx.Asyn
         client=client,
         name=SERVER_NAME,
         route_maps=ROUTE_MAPS,
+        instructions=INSTRUCTIONS,
     )
     _register_bespoke_tools(mcp, settings, client)
     return mcp
