@@ -53,6 +53,10 @@ from the running API at startup) and curated with route maps:
   which starts ingestion. Returns the created file record.
 - **`wait_for_job`** (bespoke) — poll a job until it reaches a terminal state
   (`succeeded`/`failed`/`cancelled`); use after any action that returns a job.
+- **`verify_revision`** (bespoke) — compact verdict on whether a revision is
+  usable: `validation_status`, failed/warning checks, coverage headline, rationale.
+- **`explain_finding`** (bespoke) — drill into one validation finding: its check,
+  severity, affected target, and quantity effect.
 
 Not exposed: the irreversible project delete, the binary artifact download, and
 liveness endpoints (covered by `server_info`).
