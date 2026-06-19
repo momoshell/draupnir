@@ -60,6 +60,7 @@ _EXPECTED_TOOLS = {
     # reads (generated)
     "get_revision_adapter_output",
     "get_revision_diff",
+    "get_revision_entity_source",
     "get_revision_scale",
     "get_revision_summary",
     "get_system_capabilities",

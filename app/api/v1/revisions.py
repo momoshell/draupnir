@@ -39,6 +39,9 @@ from app.api.v1.revision_routes.rooms import (
 from app.api.v1.revision_routes.scale import (
     scale_router,
 )
+from app.api.v1.revision_routes.source import (
+    source_router,
+)
 from app.api.v1.revision_routes.summary import (
     summary_router,
 )
@@ -56,6 +59,9 @@ revisions_router.include_router(diff_router, tags=["Revisions"])
 revisions_router.include_router(adapter_outputs_router, tags=["Adapter Outputs"])
 revisions_router.include_router(changesets_router, tags=["Changesets"])
 revisions_router.include_router(generated_artifacts_router, tags=["Artifacts"])
+# Registered before materialization so /entities/{id}/source wins over the
+# /entities/{entity_id:path} catch-all detail route.
+revisions_router.include_router(source_router, tags=["Entities"])
 revisions_router.include_router(materialization_router, tags=["Entities"])
 revisions_router.include_router(devices_router, tags=["Devices"])
 revisions_router.include_router(rooms_router, tags=["Rooms"])

@@ -326,6 +326,20 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/entities/{entity_id:path}/source",
+            "get_revision_entity_source",
+            "get_revision_entity_source",
+            "RevisionEntitySourceRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("path", "entity_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+                ("dependency", "storage", None, None, None, None, "get_storage"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/layouts",
             "list_revision_layouts",
             "list_revision_layouts",

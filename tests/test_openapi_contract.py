@@ -112,6 +112,7 @@ def test_operation_id_inventory_is_pinned() -> None:
         "get_revision_changeset",
         "get_revision_entity",
         "get_revision_diff",
+        "get_revision_entity_source",
         "get_revision_estimate",
         "get_revision_quantity_takeoff",
         "get_revision_scale",
