@@ -36,6 +36,8 @@ _EXPECTED_TOOLS = {
     "server_info",
     "upload_project_file",
     "wait_for_job",
+    "verify_revision",
+    "explain_finding",
     # mutations / actions (generated)
     "apply_revision_changeset",
     "cancel_job",

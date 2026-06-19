@@ -19,6 +19,7 @@ from fastmcp.server.providers.openapi import MCPType, RouteMap
 
 from mcp_server.config import MCPSettings
 from mcp_server.health import build_server_info, probe_api_health
+from mcp_server.verification import explain_finding_from_report, summarize_verification
 
 SERVER_NAME = "draupnir-mcp"
 OPENAPI_SPEC_PATH = "/openapi.json"
@@ -143,6 +144,47 @@ def _register_bespoke_tools(mcp: FastMCP, settings: MCPSettings, client: httpx.A
             if time.monotonic() >= deadline:
                 return {"timed_out": True, **job}
             await asyncio.sleep(poll_interval_seconds)
+
+    @mcp.tool
+    async def verify_revision(revision_id: str) -> dict[str, Any]:
+        """Return a compact, actionable verdict on whether a revision is usable.
+
+        Aggregates the revision's validation report: ``validation_status``, the
+        failed/warning check keys, an extraction-coverage headline (mapped ratio,
+        top unmapped reasons, review-flagged count), and a one-line rationale. Use
+        ``explain_finding`` to drill into a specific issue.
+        """
+
+        report = await _get_validation_report(client, settings.api_prefix, revision_id)
+        if "error" in report:
+            return {"revision_id": revision_id, **report}
+        return summarize_verification(revision_id, report)
+
+    @mcp.tool
+    async def explain_finding(revision_id: str, finding_id: str) -> dict[str, Any]:
+        """Explain a single validation finding: its check, severity, target, and effect.
+
+        Use after ``verify_revision`` to understand why a revision is flagged and
+        where to investigate (the affected entity/layer/document ref).
+        """
+
+        report = await _get_validation_report(client, settings.api_prefix, revision_id)
+        if "error" in report:
+            return {"revision_id": revision_id, **report}
+        return explain_finding_from_report(report, finding_id)
+
+
+async def _get_validation_report(
+    client: httpx.AsyncClient, api_prefix: str, revision_id: str
+) -> dict[str, Any]:
+    """Fetch a revision's validation report, or a ``{"error": ...}`` dict on 404."""
+
+    response = await client.get(f"{api_prefix}/revisions/{revision_id}/validation-report")
+    if response.status_code == httpx.codes.NOT_FOUND:
+        return {"error": "No validation report for this revision."}
+    response.raise_for_status()
+    report: dict[str, Any] = response.json()
+    return report
 
 
 def build_server(spec: dict[str, Any], settings: MCPSettings, client: httpx.AsyncClient) -> FastMCP:
