@@ -16,6 +16,7 @@ import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
 from app.ingestion.runner import IngestionRunRequest
+from app.ingestion.validation.reconciliation import build_reconciliation
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
@@ -168,6 +169,8 @@ def _replace_fake_canonical_payload(
             **payload.report_json["summary"],
             "entity_counts": entity_counts,
         },
+        # Reconciliation reflects the canonical, so refresh it when the canonical changes.
+        "reconciliation": build_reconciliation(canonical_json),
     }
     result_envelope = {
         "adapter_key": payload.adapter_key,

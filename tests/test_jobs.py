@@ -26,6 +26,7 @@ import app.jobs.worker as worker_module
 from app.core.errors import ErrorCode
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
 from app.ingestion.runner import IngestionRunRequest
+from app.ingestion.validation.reconciliation import build_reconciliation
 from app.models.drawing_revision import DrawingRevision
 from app.models.estimate_job_input import EstimateJobInput, EstimateJobInputCatalogRef
 from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry, EstimateVersion
@@ -449,6 +450,7 @@ def _build_fake_ingest_payload(
             "entity_counts": entity_counts,
         },
         "coverage": coverage_json,
+        "reconciliation": build_reconciliation(canonical_json),
         "checks": [],
         "findings": [],
         "adapter_warnings": warnings_json,

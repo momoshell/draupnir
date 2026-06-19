@@ -39,6 +39,7 @@ _EXPECTED_CHECK_KEYS = [
     "entity_provenance_contract",
     "pdf_scale_presence_calibration_status",
     "ifc_schema_support",
+    "reconciliation",
 ]
 
 
@@ -340,6 +341,10 @@ def test_build_validation_outcome_emits_required_checks_in_deterministic_order()
     }
     assert checks[8]["details"] == {"applicable": False}
     assert checks[9]["details"] == {"applicable": False}
+    # Reconciliation rides last and a coherent canonical reconciles cleanly.
+    assert checks[10]["check_key"] == "reconciliation"
+    assert checks[10]["status"] == "pass"
+    assert outcome.report_json["reconciliation"]["status"] == "match"
 
 
 @pytest.mark.parametrize(
