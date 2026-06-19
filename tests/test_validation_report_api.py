@@ -144,6 +144,16 @@ class TestValidationReportApi:
         assert isinstance(coverage["blocks"]["count"], int)
         assert isinstance(coverage["review_flagged_entities"], int)
 
+        reconciliation = body["reconciliation"]
+        assert reconciliation == validation_report.report_json["reconciliation"]
+        assert reconciliation["status"] in {"match", "drift"}
+        assert {inv["key"] for inv in reconciliation["invariants"]} >= {
+            "declared_counts",
+            "structure",
+            "units",
+            "extents",
+        }
+
     async def test_get_validation_report_does_not_leak_persisted_confidence_gate(
         self,
         async_client: httpx.AsyncClient,

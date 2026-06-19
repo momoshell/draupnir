@@ -33,6 +33,7 @@ from .policy import (
     _apply_placeholder_review_policy,
     _derive_validation_status,
 )
+from .reconciliation import build_reconciliation, build_reconciliation_check
 
 
 def build_validation_outcome(
@@ -144,6 +145,9 @@ def build_validation_outcome(
     )
     checks.append(ifc_schema_check)
 
+    reconciliation = build_reconciliation(canonical_json)
+    checks.append(build_reconciliation_check(reconciliation))
+
     for index, warning in enumerate(adapter_warnings_json, start=1):
         normalized_warning = warning if isinstance(warning, Mapping) else {"value": warning}
         add_finding(
@@ -179,6 +183,7 @@ def build_validation_outcome(
         "provenance": _json_compatible(result.provenance),
         "summary": _build_summary(canonical_json=canonical_json, checks=checks, findings=findings),
         "coverage": _build_coverage(canonical_json),
+        "reconciliation": reconciliation,
         "checks": checks,
         "findings": findings,
         "adapter_warnings": adapter_warnings_json,

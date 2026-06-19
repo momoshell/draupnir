@@ -76,6 +76,28 @@ class ValidationReportCoverage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class ReconciliationInvariant(BaseModel):
+    """One structural invariant in the reconciliation report (match / drift / N/A)."""
+
+    key: str
+    status: str
+    gating: bool
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ValidationReportReconciliation(BaseModel):
+    """Structural fidelity of the canonical model vs the source (declared counts,
+    reference integrity, units, extents)."""
+
+    schema_version: str
+    status: str = Field(..., description="match | drift")
+    drifted_invariants: list[str] = Field(default_factory=list)
+    invariants: list[ReconciliationInvariant] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ValidationReportResponse(BaseModel):
     """Canonical validation report returned by the API."""
 
@@ -89,6 +111,7 @@ class ValidationReportResponse(BaseModel):
     generated_at: datetime
     summary: ValidationReportSummary
     coverage: ValidationReportCoverage | None = None
+    reconciliation: ValidationReportReconciliation | None = None
     checks: list[Any] = Field(default_factory=list)
     findings: list[Any] = Field(default_factory=list)
     adapter_warnings: list[Any] = Field(default_factory=list)
