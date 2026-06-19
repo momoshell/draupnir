@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.revision import RevisionEntityManifestRead
+from app.schemas.revision import RevisionEntityManifestRead, RevisionEntitySummary
 
 
 class RoomBoundsRead(BaseModel):
@@ -37,6 +37,20 @@ class DeviceRoomAssignmentRead(BaseModel):
 
     device_id: str = Field(..., description="Canonical device entity id")
     room_id: str = Field(..., description="Containing room id")
+
+
+class RevisionRoomEntityListResponse(BaseModel):
+    """Entities contained in a given room (centroid-in-polygon, smallest-containing)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    manifest: RevisionEntityManifestRead
+    room: RoomRead = Field(..., description="The resolved room the entities are contained in")
+    items: list[RevisionEntitySummary] = Field(default_factory=list)
+    total: int = Field(
+        ..., ge=0, description="Total entities contained in the room (before pagination)"
+    )
+    next_cursor: str | None = Field(None, description="Opaque cursor for the next page, if any")
 
 
 class RevisionRoomListResponse(BaseModel):
