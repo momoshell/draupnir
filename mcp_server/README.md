@@ -34,9 +34,19 @@ claude mcp add draupnir \
   -- uv run python -m mcp_server
 ```
 
-## Tools
+## Surface
 
-- `server_info` — MCP server version + a live probe of the Draupnir API's system
-  health. Use it first to confirm the server is wired to a reachable, healthy API.
+The tool/resource surface is **generated from the API's OpenAPI spec** (fetched
+from the running API at startup) and curated with route maps:
 
-(Query/resource/action tools are added in later changes — see epic #430.)
+- **Query tools** — every read/list/query endpoint (entities with filters +
+  projection + spatial/in-room, devices, rooms, layers, scale, summary, coverage,
+  quantities, estimates, …) plus `get_system_capabilities`.
+- **Resource templates** — single objects addressed by id (project, file, job,
+  entity, changeset, estimate, takeoff, catalog material/rate/formula, adapter
+  output) for browsing.
+- **`server_info`** (bespoke) — MCP version + a live API health probe; call it
+  first.
+
+Not exposed in this layer: mutations (added in #527), the binary artifact
+download, and liveness endpoints (covered by `server_info`).
