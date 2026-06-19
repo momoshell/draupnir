@@ -23,18 +23,12 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-@scale_router.get(
-    "/revisions/{revision_id}/scale",
-    response_model=RevisionScaleRead,
-)
-async def get_revision_scale(
-    revision_id: UUID,
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> RevisionScaleRead:
-    """Return the drawing scale + units for an active revision.
+async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> RevisionScaleRead:
+    """Resolve the drawing scale + units for an active revision.
 
     Sourced from the revision's adapter-run canonical payload. A revision with no
     adapter run (e.g. changeset-origin) honestly reports ``units = unknown``.
+    Raises a 404 if the revision does not exist / is not visible.
     """
 
     result = await db.execute(
@@ -69,3 +63,20 @@ async def get_revision_scale(
         pdf_scale=_as_dict(pdf_scale) if isinstance(pdf_scale, dict) else None,
         source_input_family=adapter_output.input_family,
     )
+
+
+@scale_router.get(
+    "/revisions/{revision_id}/scale",
+    response_model=RevisionScaleRead,
+)
+async def get_revision_scale(
+    revision_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> RevisionScaleRead:
+    """Return the drawing scale + units for an active revision.
+
+    Sourced from the revision's adapter-run canonical payload. A revision with no
+    adapter run (e.g. changeset-origin) honestly reports ``units = unknown``.
+    """
+
+    return await resolve_revision_scale(revision_id, db)

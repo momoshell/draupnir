@@ -107,6 +107,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "generated_artifact_download_api": DB_API_PYTEST_ARGS,
     "revision_materialization_api": DB_API_PYTEST_ARGS,
     "revision_scale_api": DB_API_PYTEST_ARGS,
+    "revision_summary_api": DB_API_PYTEST_ARGS,
     "validation_report_api": DB_API_PYTEST_ARGS,
     "revision_quantity_estimate_flow": DB_API_PYTEST_ARGS,
     "smoke": DB_API_PYTEST_ARGS,
