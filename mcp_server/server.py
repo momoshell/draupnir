@@ -1,11 +1,16 @@
 """Draupnir MCP server construction.
 
-Builds the FastMCP server by **generating** the tool/resource surface from the
-Draupnir API's OpenAPI spec (fetched at startup from the running API), plus the
-foundational ``server_info`` tool. Action tools (mutations) are layered on in a
-later change (#527); here the surface is read-only.
+Generates the MCP tool/resource surface from the Draupnir API's OpenAPI spec
+(fetched from the running API at startup) via FastMCP.from_openapi, curated with
+ordered route maps, plus a few bespoke tools (``server_info``, a path-based
+``upload_project_file``, and a ``wait_for_job`` poller). Idempotency keys are
+injected automatically on mutating requests.
 """
 
+import asyncio
+import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -17,28 +22,44 @@ from mcp_server.health import build_server_info, probe_api_health
 
 SERVER_NAME = "draupnir-mcp"
 OPENAPI_SPEC_PATH = "/openapi.json"
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
 # Ordered route maps (first match wins) that curate the generated surface:
-#   1. Mutations are excluded — actions land in #527 (this layer is read-only).
-#   2. The binary artifact download is not a useful MCP result.
-#   3. Liveness endpoints are covered by ``server_info``.
-#   4. GETs addressing a single object by id (path ends in a path param) become
-#      browseable resource templates; every other GET is a query tool.
+#   - Mutations become tools, EXCEPT the irreversible project delete and the binary
+#     file upload (replaced by a path-based bespoke tool).
+#   - The binary artifact download is excluded; liveness is covered by server_info.
+#   - GETs addressing a single object by id (path ends in a path param) become
+#     browseable resource templates; every other GET is a query tool.
 ROUTE_MAPS: list[RouteMap] = [
-    RouteMap(methods=["POST", "PUT", "PATCH", "DELETE"], mcp_type=MCPType.EXCLUDE),
+    RouteMap(methods=["DELETE"], mcp_type=MCPType.EXCLUDE),
+    RouteMap(methods=["POST"], pattern=r"/projects/\{[^/]+\}/files$", mcp_type=MCPType.EXCLUDE),
     RouteMap(methods=["GET"], pattern=r"/download$", mcp_type=MCPType.EXCLUDE),
     RouteMap(methods=["GET"], pattern=r"/health$", mcp_type=MCPType.EXCLUDE),
     RouteMap(methods=["GET"], pattern=r"\}$", mcp_type=MCPType.RESOURCE_TEMPLATE),
     RouteMap(methods=["GET"], mcp_type=MCPType.TOOL),
+    RouteMap(methods=["POST", "PUT", "PATCH"], mcp_type=MCPType.TOOL),
 ]
 
 
+async def inject_idempotency_key(request: httpx.Request) -> None:
+    """httpx request hook: stamp a fresh Idempotency-Key on mutations that lack one.
+
+    Each tool call is one logical operation, so a fresh key per mutating request is
+    the correct default; a caller that supplies its own key is left untouched.
+    """
+
+    if request.method in _MUTATING_METHODS and "Idempotency-Key" not in request.headers:
+        request.headers["Idempotency-Key"] = str(uuid.uuid4())
+
+
 def build_api_client(settings: MCPSettings) -> httpx.AsyncClient:
-    """Build the shared HTTP client pointed at the Draupnir API."""
+    """Build the shared HTTP client pointed at the Draupnir API (with idempotency hook)."""
 
     return httpx.AsyncClient(
         base_url=settings.api_base_url,
         timeout=settings.request_timeout_seconds,
+        event_hooks={"request": [inject_idempotency_key]},
     )
 
 
@@ -57,8 +78,8 @@ async def fetch_openapi_spec(client: httpx.AsyncClient) -> dict[str, Any]:
     return spec
 
 
-def _register_server_info(mcp: FastMCP, settings: MCPSettings, client: httpx.AsyncClient) -> None:
-    """Register the bespoke identity/health tool on the server."""
+def _register_bespoke_tools(mcp: FastMCP, settings: MCPSettings, client: httpx.AsyncClient) -> None:
+    """Register tools that aren't a 1:1 mapping of an API operation."""
 
     @mcp.tool
     async def server_info() -> dict[str, Any]:
@@ -71,6 +92,58 @@ def _register_server_info(mcp: FastMCP, settings: MCPSettings, client: httpx.Asy
         api_health = await probe_api_health(client, settings.api_prefix)
         return build_server_info(settings, api_health)
 
+    @mcp.tool
+    async def upload_project_file(
+        project_id: str,
+        file_path: str,
+        extraction_profile: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a local drawing file to a project, which starts ingestion.
+
+        ``file_path`` is a path on the machine running this MCP server. Returns the
+        created file record (including its id); poll the resulting ingest job with
+        ``wait_for_job``.
+        """
+
+        path = Path(file_path)
+        if not path.is_file():
+            return {"error": f"File not found: {file_path}"}
+        data = {"extraction_profile": extraction_profile} if extraction_profile else None
+        with path.open("rb") as handle:
+            response = await client.post(
+                f"{settings.api_prefix}/projects/{project_id}/files",
+                files={"file": (path.name, handle.read(), "application/octet-stream")},
+                data=data,
+            )
+        response.raise_for_status()
+        result: dict[str, Any] = response.json()
+        return result
+
+    @mcp.tool
+    async def wait_for_job(
+        job_id: str,
+        timeout_seconds: float = 120.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        """Poll a job until it reaches a terminal state (succeeded/failed/cancelled).
+
+        Returns the final job record with a ``timed_out`` flag. Use after any action
+        that returns a job (upload/ingest, reprocess, changeset apply, exports, …).
+        """
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            response = await client.get(f"{settings.api_prefix}/jobs/{job_id}")
+            if response.status_code == httpx.codes.NOT_FOUND:
+                return {"error": "Job not found", "job_id": job_id, "timed_out": False}
+            response.raise_for_status()
+            job: dict[str, Any] = response.json()
+            if job.get("status") in TERMINAL_JOB_STATES:
+                return {"timed_out": False, **job}
+            if time.monotonic() >= deadline:
+                return {"timed_out": True, **job}
+            await asyncio.sleep(poll_interval_seconds)
+
 
 def build_server(spec: dict[str, Any], settings: MCPSettings, client: httpx.AsyncClient) -> FastMCP:
     """Build the MCP server from an OpenAPI spec + a client (pure; injectable for tests)."""
@@ -81,7 +154,7 @@ def build_server(spec: dict[str, Any], settings: MCPSettings, client: httpx.Asyn
         name=SERVER_NAME,
         route_maps=ROUTE_MAPS,
     )
-    _register_server_info(mcp, settings, client)
+    _register_bespoke_tools(mcp, settings, client)
     return mcp
 
 
