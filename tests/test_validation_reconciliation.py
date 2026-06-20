@@ -138,3 +138,44 @@ def test_unknown_units_and_degenerate_extents_are_informational_only() -> None:
     # Informational invariants never gate the verdict.
     assert report["status"] == "match"
     assert build_reconciliation_check(report)["status"] == "pass"
+
+
+def test_census_absent_is_not_applicable() -> None:
+    report = build_reconciliation(_faithful())
+    assert _invariant(report, "census")["status"] == "not_applicable"
+    assert report["status"] == "match"
+
+
+def test_census_complete_when_nothing_dropped() -> None:
+    canonical = _faithful()
+    canonical["census"] = {
+        "raw_object_total": 5,
+        "drawable_candidates": 2,
+        "materialized": 2,
+        "dropped": {"total": 0},
+        "unsupported_classes": [],
+    }
+    census = _invariant(build_reconciliation(canonical), "census")
+    assert census["status"] == "complete"
+    assert census["materialized"] == 2
+    assert census["dropped"] == 0
+
+
+def test_census_incomplete_is_reported_but_does_not_gate() -> None:
+    canonical = _faithful()
+    canonical["census"] = {
+        "raw_object_total": 5,
+        "drawable_candidates": 3,
+        "materialized": 2,
+        "dropped": {"total": 1},
+        "unsupported_classes": [{"dxfname": "ACAD_PROXY_ENTITY", "is_zombie": True}],
+    }
+    report = build_reconciliation(canonical)
+    census = _invariant(report, "census")
+    assert census["status"] == "incomplete"
+    assert census["dropped"] == 1
+    assert census["unsupported_classes"] == 1
+    # Descriptive only — extraction loss never flips the verdict in v1.
+    assert census["gating"] is False
+    assert report["status"] == "match"
+    assert build_reconciliation_check(report)["status"] == "pass"

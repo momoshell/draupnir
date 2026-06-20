@@ -3681,6 +3681,61 @@ async def test_libredwg_adapter_warns_on_non_default_orientation(
 
 
 @pytest.mark.asyncio
+async def test_libredwg_adapter_emits_source_census(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical carries a per-type census of what dwgread surfaced vs kept (#563)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "CLASSES": [
+                {"dxfname": "MATERIAL", "cppname": "AcDbMaterial", "is_zombie": 0},
+                {
+                    "dxfname": "ACAD_PROXY_ENTITY",
+                    "cppname": "AcDbProxyEntity",
+                    "is_zombie": 1,
+                },
+            ],
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+                {"type": "SPLINE", "handle": "2B", "layer": "Walls"},
+                {"type": "VIEWPORT", "handle": "V1"},
+            ],
+        },
+    )
+
+    census = cast(dict[str, Any], result.canonical["census"])
+    assert census["source"] == "dwgread"
+    assert census["raw_object_total"] == 3
+    assert census["raw_objects"] == {"LINE": 1, "SPLINE": 1, "VIEWPORT": 1}
+    # SPLINE is a drawable candidate we don't map; VIEWPORT is a skipped non-drawable.
+    assert census["drawable_candidates"] == 2
+    assert census["materialized"] == 1
+    assert census["dropped"]["total"] == 1
+    assert census["dropped"]["unsupported_drawables"] == 1
+    assert census["dropped"]["unsupported_types"] == ("SPLINE",)
+    # the zombie class is a reader blind spot, surfaced as a warning + census entry
+    assert [c["dxfname"] for c in census["unsupported_classes"]] == ["ACAD_PROXY_ENTITY"]
+    assert census["unsupported_classes"][0]["is_zombie"] is True
+
+    warnings = {w.code: w for w in result.warnings}
+    assert "libredwg.unsupported_classes" in warnings
+    assert warnings["libredwg.unsupported_classes"].details["count"] == 1
+
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["census"] == census
+    diagnostic_details = cast(Mapping[str, Any], result.diagnostics[0].details)
+    assert diagnostic_details["census"] == census
+
+
+@pytest.mark.asyncio
 async def test_libredwg_adapter_keeps_units_unconfirmed_when_header_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
