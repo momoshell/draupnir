@@ -9,6 +9,7 @@ import re
 import resource
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ _BINARY_NAME = "dwgread"
 _LICENSE_PROBE_NAME = "libredwg-distribution-review"
 _SCHEMA_VERSION = "0.1"
 _INTERPRETATION_SCHEMA_VERSION = "0.1"
+_CENSUS_SCHEMA_VERSION = "0.1"
 _PROCESS_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_TERMINATE_GRACE_SECONDS = 0.2
 _PROCESS_KILL_GRACE_SECONDS = 0.2
@@ -405,6 +407,9 @@ class LibreDWGAdapter(IngestionAdapter):
             interpretation_summary = canonical_metadata.get("interpretation")
             if isinstance(interpretation_summary, Mapping):
                 diagnostic_details["interpretation"] = dict(interpretation_summary)
+            census_summary = canonical_metadata.get("census")
+            if isinstance(census_summary, Mapping):
+                diagnostic_details["census"] = dict(census_summary)
 
         return AdapterResult(
             canonical=canonical_result.canonical,
@@ -789,6 +794,7 @@ def _build_canonical_output(
     malformed_insert_handles: set[str] = set()
     drawable_candidate_count = 0
     skipped_non_drawable_count = 0
+    raw_histogram: Counter[str] = Counter()
     units = _resolve_units(run_result.output_payload)
     orientation = _resolve_orientation(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
@@ -823,6 +829,9 @@ def _build_canonical_output(
         record_type = _extract_record_type(record)
         if record_type is None:
             continue
+        # Per-type census of everything dwgread surfaced — the "what is on the drawing"
+        # reference the dispositions below are measured against (#563).
+        raw_histogram[record_type] += 1
         if _is_non_drawable_object_type(record_type):
             # Non-drawable OBJECTS-section records carry no geometry; skip them so they
             # neither become canonical unknown entities nor count toward the
@@ -976,6 +985,18 @@ def _build_canonical_output(
         "units": _units_summary(units),
         "interpretation": _interpretation_summary(units, orientation),
     }
+    census = _build_source_census(
+        raw_histogram=raw_histogram,
+        payload=run_result.output_payload,
+        drawable_candidates=drawable_candidate_count,
+        unsupported_drawables=unsupported_drawable_count,
+        malformed_drawables=malformed_drawable_count,
+        unsupported_hatches=unsupported_hatch_count,
+        malformed_hatches=malformed_hatch_count,
+        malformed_inserts=malformed_insert_count,
+        unsupported_types=unsupported_types,
+    )
+    metadata["census"] = census
     # Confirm block-transform validity for the downstream validation check only when every
     # captured block reference is within the supported transform subset; otherwise leave the
     # hint unset so the reference stays review-gated.
@@ -996,6 +1017,9 @@ def _build_canonical_output(
         warnings.append(_units_unconfirmed_warning())
     if orientation.rotated:
         warnings.append(_orientation_unmodeled_warning(orientation))
+    unsupported_classes = cast("tuple[_JSONDict, ...]", census["unsupported_classes"])
+    if unsupported_classes:
+        warnings.append(_unsupported_classes_warning(unsupported_classes))
     parse_error_counts = _count_source_parse_errors(run_result.stderr.text)
     if parse_error_counts:
         ranked = sorted(parse_error_counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1143,6 +1167,7 @@ def _build_canonical_output(
         "canonical_entity_schema_version": _SCHEMA_VERSION,
         "units": dict(units.payload),
         "interpretation": _interpretation_summary(units, orientation),
+        "census": census,
         "coordinate_system": {
             "name": "local",
             "type": "cartesian",
@@ -1343,6 +1368,100 @@ def _interpretation_summary(
             "confirmed": orientation.confirmed,
         },
     }
+
+
+def _build_source_census(
+    *,
+    raw_histogram: Counter[str],
+    payload: Any,
+    drawable_candidates: int,
+    unsupported_drawables: int,
+    malformed_drawables: int,
+    unsupported_hatches: int,
+    malformed_hatches: int,
+    malformed_inserts: int,
+    unsupported_types: set[str],
+) -> _JSONDict:
+    """Build the source census: what dwgread surfaced vs what we materialized (#563).
+
+    The raw per-type histogram is the "what is on the drawing" reference; the dispositions
+    record how many drawable records failed to map (dropped) and ``unsupported_classes``
+    captures reader blind spots — classes LibreDWG could not resolve (zombies) or proxies —
+    that never reach the OBJECTS stream at all. Descriptive: silent loss becomes a number.
+    """
+
+    dropped_total = (
+        unsupported_drawables
+        + malformed_drawables
+        + unsupported_hatches
+        + malformed_hatches
+        + malformed_inserts
+    )
+    return {
+        "schema_version": _CENSUS_SCHEMA_VERSION,
+        "source": "dwgread",
+        "raw_object_total": sum(raw_histogram.values()),
+        "raw_objects": dict(sorted(raw_histogram.items())),
+        "drawable_candidates": drawable_candidates,
+        "materialized": max(0, drawable_candidates - dropped_total),
+        "dropped": {
+            "total": dropped_total,
+            "unsupported_drawables": unsupported_drawables,
+            "malformed_drawables": malformed_drawables,
+            "unsupported_hatches": unsupported_hatches,
+            "malformed_hatches": malformed_hatches,
+            "malformed_inserts": malformed_inserts,
+            "unsupported_types": tuple(sorted(unsupported_types)),
+        },
+        "unsupported_classes": _extract_unsupported_classes(payload),
+    }
+
+
+def _extract_unsupported_classes(payload: Any) -> tuple[_JSONDict, ...]:
+    """Classes LibreDWG could not natively resolve — zombies or proxies (#563).
+
+    These are the reader's blind spots: entities of such a class are dropped or degraded
+    before the OBJECTS stream, so a per-type histogram alone would not reveal them.
+    """
+
+    if not isinstance(payload, Mapping):
+        return ()
+    classes = payload.get("CLASSES")
+    if not isinstance(classes, (list, tuple)):
+        return ()
+    flagged: list[_JSONDict] = []
+    for entry in classes:
+        if not isinstance(entry, Mapping):
+            continue
+        dxfname = entry.get("dxfname")
+        cppname = entry.get("cppname")
+        zombie_value = _coerce_float(entry.get("is_zombie"))
+        is_zombie = bool(zombie_value) if zombie_value is not None else False
+        is_proxy = isinstance(dxfname, str) and "PROXY" in dxfname.upper()
+        if is_zombie or is_proxy:
+            flagged.append(
+                {
+                    "dxfname": dxfname if isinstance(dxfname, str) else None,
+                    "cppname": cppname if isinstance(cppname, str) else None,
+                    "is_zombie": is_zombie,
+                    "is_proxy": is_proxy,
+                }
+            )
+    return tuple(flagged)
+
+
+def _unsupported_classes_warning(classes: tuple[_JSONDict, ...]) -> AdapterWarning:
+    return AdapterWarning(
+        code="libredwg.unsupported_classes",
+        message=(
+            "LibreDWG could not natively resolve some object classes (proxy/zombie); "
+            "entities of those classes may be missing or degraded."
+        ),
+        details={
+            "count": len(classes),
+            "classes": tuple(c.get("dxfname") for c in classes[:10]),
+        },
+    )
 
 
 def _orientation_unmodeled_warning(orientation: _OrientationResolution) -> AdapterWarning:

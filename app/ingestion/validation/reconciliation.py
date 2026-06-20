@@ -50,6 +50,7 @@ def build_reconciliation(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
         _structure(canonical_json, entities),
         _references(entities, layers, blocks),
         _units(canonical_json),
+        _census(canonical_json),
         _extents(entities),
     ]
 
@@ -187,6 +188,40 @@ def _units(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
         "status": "match" if resolved else "unresolved",
         "gating": False,
         "normalized": normalized,
+    }
+
+
+def _census(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
+    """Report the source census: what the reader surfaced vs what we materialized (#563).
+
+    Descriptive (non-gating): turns silent extraction loss into a number. ``incomplete``
+    means the adapter dropped drawable records or LibreDWG could not resolve some classes
+    (proxy/zombie reader blind spots); neither flips ``validation_status`` in v1.
+    """
+
+    census = canonical_json.get("census")
+    if not isinstance(census, Mapping):
+        return {
+            "key": "census",
+            "status": "not_applicable",
+            "gating": False,
+            "reason": "Adapter did not emit a source census.",
+        }
+
+    dropped = census.get("dropped")
+    dropped_total = int(dropped.get("total") or 0) if isinstance(dropped, Mapping) else 0
+    unsupported_classes = census.get("unsupported_classes")
+    classes_count = _len(unsupported_classes)
+    has_loss = dropped_total > 0 or classes_count > 0
+    return {
+        "key": "census",
+        "status": "incomplete" if has_loss else "complete",
+        "gating": False,
+        "raw_object_total": int(census.get("raw_object_total") or 0),
+        "drawable_candidates": int(census.get("drawable_candidates") or 0),
+        "materialized": int(census.get("materialized") or 0),
+        "dropped": dropped_total,
+        "unsupported_classes": classes_count,
     }
 
 
