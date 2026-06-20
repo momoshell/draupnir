@@ -50,6 +50,7 @@ _DESCRIPTOR = get_descriptor(InputFamily.DWG)
 _BINARY_NAME = "dwgread"
 _LICENSE_PROBE_NAME = "libredwg-distribution-review"
 _SCHEMA_VERSION = "0.1"
+_INTERPRETATION_SCHEMA_VERSION = "0.1"
 _PROCESS_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_TERMINATE_GRACE_SECONDS = 0.2
 _PROCESS_KILL_GRACE_SECONDS = 0.2
@@ -239,6 +240,23 @@ class _UnitsResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class _OrientationResolution:
+    """Resolved angular-measurement basis from the dwgread ``HEADER`` (#562).
+
+    dwgread reports header angle vars (``ANGBASE`` in radians, ``ANGDIR`` 0=ccw/1=cw)
+    but never rotates geometry to them — canonical geometry stays in raw WCS. We pin
+    them explicitly so a non-default orientation surfaces instead of being silently
+    ignored. True north (``$GEODATA``) is a follow-up; ``north_degrees`` stays ``None``.
+    """
+
+    angbase_degrees: float
+    angdir: int
+    north_degrees: float | None
+    rotated: bool
+    confirmed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _LiveFileLimit:
     path: Path
     limit_bytes: int
@@ -384,6 +402,9 @@ class LibreDWGAdapter(IngestionAdapter):
             units_summary = canonical_metadata.get("units")
             if isinstance(units_summary, Mapping):
                 diagnostic_details["units"] = dict(units_summary)
+            interpretation_summary = canonical_metadata.get("interpretation")
+            if isinstance(interpretation_summary, Mapping):
+                diagnostic_details["interpretation"] = dict(interpretation_summary)
 
         return AdapterResult(
             canonical=canonical_result.canonical,
@@ -769,6 +790,7 @@ def _build_canonical_output(
     drawable_candidate_count = 0
     skipped_non_drawable_count = 0
     units = _resolve_units(run_result.output_payload)
+    orientation = _resolve_orientation(run_result.output_payload)
     records = _iter_object_records(run_result.output_payload)
     # Resolve handle-referenced layer / block names onto records before mapping so the
     # canonical entities, layer table, and block table all carry real names (#layers/blocks).
@@ -952,6 +974,7 @@ def _build_canonical_output(
             "skipped_non_drawable": skipped_non_drawable_count,
         },
         "units": _units_summary(units),
+        "interpretation": _interpretation_summary(units, orientation),
     }
     # Confirm block-transform validity for the downstream validation check only when every
     # captured block reference is within the supported transform subset; otherwise leave the
@@ -971,6 +994,8 @@ def _build_canonical_output(
     warnings: list[AdapterWarning] = []
     if not units.confirmed:
         warnings.append(_units_unconfirmed_warning())
+    if orientation.rotated:
+        warnings.append(_orientation_unmodeled_warning(orientation))
     parse_error_counts = _count_source_parse_errors(run_result.stderr.text)
     if parse_error_counts:
         ranked = sorted(parse_error_counts.items(), key=lambda item: (-item[1], item[0]))
@@ -1117,6 +1142,7 @@ def _build_canonical_output(
         "schema_version": _SCHEMA_VERSION,
         "canonical_entity_schema_version": _SCHEMA_VERSION,
         "units": dict(units.payload),
+        "interpretation": _interpretation_summary(units, orientation),
         "coordinate_system": {
             "name": "local",
             "type": "cartesian",
@@ -1245,6 +1271,93 @@ def _extract_insunits_code(payload: Any) -> int | None:
     if coerced is None or not math.isfinite(coerced) or not coerced.is_integer():
         return None
     return int(coerced)
+
+
+def _resolve_orientation(payload: Any) -> _OrientationResolution:
+    """Resolve the angular-measurement basis from the dwgread ``HEADER`` (#562).
+
+    ``ANGBASE`` is stored in radians (converted to degrees here); ``ANGDIR`` is 0 for
+    counter-clockwise (default) or 1 for clockwise. We only *record* these — geometry is
+    never rotated to them — so a non-default basis is surfaced rather than silently dropped.
+    """
+
+    default = _OrientationResolution(
+        angbase_degrees=0.0, angdir=0, north_degrees=None, rotated=False, confirmed=False
+    )
+    if not isinstance(payload, Mapping):
+        return default
+    header = _mapping_get(payload, "HEADER")
+    if not isinstance(header, Mapping):
+        return default
+
+    angbase_rad = _coerce_float(_mapping_get(header, "ANGBASE"))
+    angdir_raw = _coerce_float(_mapping_get(header, "ANGDIR"))
+    confirmed = angbase_rad is not None and angdir_raw is not None
+    angbase_degrees = (
+        _normalize_angle_degrees(math.degrees(angbase_rad))
+        if angbase_rad is not None and math.isfinite(angbase_rad)
+        else 0.0
+    )
+    angdir = int(angdir_raw) if angdir_raw is not None and math.isfinite(angdir_raw) else 0
+    rotated = abs(angbase_degrees) > 1e-9 or angdir != 0
+    return _OrientationResolution(
+        angbase_degrees=angbase_degrees,
+        angdir=angdir,
+        north_degrees=None,
+        rotated=rotated,
+        confirmed=confirmed,
+    )
+
+
+def _interpretation_summary(
+    units: _UnitsResolution, orientation: _OrientationResolution
+) -> _JSONDict:
+    """Pin every non-trivial interpretation dwgread leaves to the consumer (#562).
+
+    dwgread emits raw values + header codes and applies no transforms; the canonical owns
+    length scaling, angle conversion, and orientation. Recording each with its source +
+    confidence makes "is this scaled / oriented right?" answerable instead of implicit.
+    """
+
+    return {
+        "schema_version": _INTERPRETATION_SCHEMA_VERSION,
+        "length": {
+            "source": "INSUNITS",
+            "normalized": units.payload.get("normalized"),
+            "confirmed": units.confirmed,
+        },
+        "angle": {
+            # dwgread emits arc angles in radians regardless of AUNITS (a display-only
+            # setting); the canonical *_angle_degrees fields are converted to degrees (#546).
+            "source": "dwgread",
+            "stored_unit": "radians",
+            "canonical_unit": "degrees",
+            "confirmed": True,
+        },
+        "orientation": {
+            "source": "HEADER",
+            "angbase_degrees": orientation.angbase_degrees,
+            "angdir": orientation.angdir,
+            "north_degrees": orientation.north_degrees,
+            "rotated": orientation.rotated,
+            "confirmed": orientation.confirmed,
+        },
+    }
+
+
+def _orientation_unmodeled_warning(orientation: _OrientationResolution) -> AdapterWarning:
+    return AdapterWarning(
+        code="libredwg.orientation_unmodeled",
+        message=(
+            "Drawing declares a non-default angular basis (ANGBASE/ANGDIR); canonical "
+            "geometry is in raw WCS and is not rotated to it."
+        ),
+        details={
+            "angbase_degrees": orientation.angbase_degrees,
+            "angdir": orientation.angdir,
+            "north_degrees": orientation.north_degrees,
+        },
+    )
 
 
 def _units_summary(units: _UnitsResolution) -> _JSONDict:

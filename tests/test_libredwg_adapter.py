@@ -279,6 +279,26 @@ def test_extract_angle_degrees_radians_default_and_degrees_hint() -> None:
     assert extract({"start_angle": 45, "angle_units": "deg"}) == 45.0
 
 
+def test_resolve_orientation_pins_angbase_angdir() -> None:
+    resolve = adapter_module._resolve_orientation
+    # no header → unconfirmed default, not rotated
+    bare = resolve({})
+    assert bare.confirmed is False
+    assert bare.rotated is False
+    assert bare.angbase_degrees == 0.0 and bare.angdir == 0
+    # default basis present → confirmed, not rotated
+    default = resolve({"HEADER": {"ANGBASE": 0.0, "ANGDIR": 0}})
+    assert default.confirmed is True
+    assert default.rotated is False
+    # ANGBASE stored in radians → converted to degrees; non-default ⇒ rotated
+    rotated = resolve({"HEADER": {"ANGBASE": math.radians(90), "ANGDIR": 0}})
+    assert round(rotated.angbase_degrees, 6) == 90.0
+    assert rotated.rotated is True
+    # clockwise angle direction is also non-default
+    cw = resolve({"HEADER": {"ANGBASE": 0.0, "ANGDIR": 1}})
+    assert cw.angdir == 1 and cw.rotated is True
+
+
 def _assert_arc_wrapper_entity(entity: Mapping[str, Any]) -> None:
     assert entity["entity_type"] == "arc"
     assert entity["kind"] == "arc"
@@ -3577,6 +3597,87 @@ async def test_libredwg_adapter_confirms_and_scales_explicit_supported_units(
 
     units_check = _units_check(result)
     assert units_check["status"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_pins_interpretation_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical carries an interpretation block pinning length/angle/orientation (#562)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4, "ANGBASE": 0.0, "ANGDIR": 0},
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                }
+            ],
+        },
+    )
+
+    interpretation = cast(dict[str, Any], result.canonical["interpretation"])
+    assert interpretation["length"] == {
+        "source": "INSUNITS",
+        "normalized": "meter",
+        "confirmed": True,
+    }
+    assert interpretation["angle"] == {
+        "source": "dwgread",
+        "stored_unit": "radians",
+        "canonical_unit": "degrees",
+        "confirmed": True,
+    }
+    assert interpretation["orientation"] == {
+        "source": "HEADER",
+        "angbase_degrees": 0.0,
+        "angdir": 0,
+        "north_degrees": None,
+        "rotated": False,
+        "confirmed": True,
+    }
+    # mirrored onto metadata + extract diagnostics
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    assert metadata["interpretation"] == interpretation
+    diagnostic_details = cast(Mapping[str, Any], result.diagnostics[0].details)
+    assert diagnostic_details["interpretation"] == interpretation
+    # default basis ⇒ no unmodeled-orientation warning
+    assert "libredwg.orientation_unmodeled" not in [w.code for w in result.warnings]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_warns_on_non_default_orientation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-default ANGBASE/ANGDIR surfaces as a warning, not silent drift (#562)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4, "ANGBASE": math.radians(90), "ANGDIR": 1},
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                }
+            ],
+        },
+    )
+
+    interpretation = cast(dict[str, Any], result.canonical["interpretation"])
+    assert interpretation["orientation"]["rotated"] is True
+    assert round(interpretation["orientation"]["angbase_degrees"], 6) == 90.0
+    assert interpretation["orientation"]["angdir"] == 1
+
+    warnings = {w.code: w for w in result.warnings}
+    assert "libredwg.orientation_unmodeled" in warnings
+    assert warnings["libredwg.orientation_unmodeled"].details["angdir"] == 1
 
 
 @pytest.mark.asyncio
