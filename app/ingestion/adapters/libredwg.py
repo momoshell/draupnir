@@ -2903,7 +2903,13 @@ def _extract_angle_degrees(record: Mapping[str, Any], *candidates: str) -> float
     angle = _coerce_float(value)
     if angle is None or not math.isfinite(angle):
         return None
-    return _normalize_angle_degrees(angle)
+    # dwgread emits arc angles in RADIANS by default (no `angle_units`); honor an explicit
+    # degrees hint when present, else convert so the canonical *_angle_degrees fields (and
+    # derived points / DXF export group codes 50/51) are truly degrees. (#546)
+    units = record.get("angle_units")
+    if isinstance(units, str) and units.strip().lower().startswith("deg"):
+        return _normalize_angle_degrees(angle)
+    return _normalize_angle_degrees(math.degrees(angle))
 
 
 def _normalize_angle_degrees(angle: float) -> float:
