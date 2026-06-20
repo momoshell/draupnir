@@ -590,6 +590,59 @@ async def test_ezdxf_adapter_normalizes_non_meter_line_geometry_to_meters(
 
 
 @pytest.mark.asyncio
+async def test_ezdxf_adapter_attaches_entity_style_and_linetype_table(
+    tmp_path: Path,
+) -> None:
+    """DXF entities carry the same style block as DWG; ByLayer inheritance + dashed (#574)."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "styled.dxf"
+    document = cast(Any, ezdxf).new(setup=True)  # standard linetypes incl. DASHED
+    document.layers.add("PHANTOM", color=5, linetype="DASHED", lineweight=13)
+    msp = document.modelspace()
+    # ByLayer line on a dashed layer → inherits DASHED + color 5 + lw 0.13
+    msp.add_line((0.0, 0.0), (1.0, 0.0), dxfattribs={"layer": "PHANTOM"})
+    # explicit color + continuous linetype + explicit lineweight
+    msp.add_line(
+        (0.0, 0.0),
+        (2.0, 0.0),
+        dxfattribs={"layer": "0", "color": 1, "linetype": "Continuous", "lineweight": 25},
+    )
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    linetypes = {
+        _mapping(lt)["name"]: _mapping(lt)["dashed"]
+        for lt in _mapping_tuple(result.canonical["linetypes"])
+    }
+    assert linetypes.get("DASHED") is True
+    assert linetypes.get("Continuous") is False
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    by_layer_style = _mapping(_mapping(entities[0])["style"])
+    assert _mapping(by_layer_style["linetype"]) == {
+        "name": "DASHED",
+        "by_layer": True,
+        "dashed": True,
+        "scale": 1.0,
+    }
+    by_layer_color = _mapping(by_layer_style["color"])
+    assert by_layer_color["index"] == 5
+    assert by_layer_color["by_layer"] is True
+    assert _mapping(by_layer_style["lineweight"]) == {"raw": 13, "mm": 0.13}
+
+    explicit_style = _mapping(_mapping(entities[1])["style"])
+    explicit_color = _mapping(explicit_style["color"])
+    assert explicit_color["index"] == 1
+    assert explicit_color["by_layer"] is False
+    assert _mapping(explicit_style["linetype"])["dashed"] is False
+    assert _mapping(explicit_style["lineweight"]) == {"raw": 25, "mm": 0.25}
+
+
+@pytest.mark.asyncio
 async def test_ezdxf_adapter_emits_closed_lwpolyline_perimeter_geometry(
     tmp_path: Path,
 ) -> None:

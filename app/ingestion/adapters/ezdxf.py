@@ -158,6 +158,11 @@ class EzdxfAdapter:
                 )
             )
 
+        # Presentation-style context for per-entity color/linetype/lineweight with ByLayer
+        # inheritance + dashed detection — same `style` shape as the DWG adapter (#574).
+        linetype_table, linetype_dashed = _linetype_table(document)
+        layer_styles = _layer_style_table(document)
+
         extract_started_at = time.monotonic()
         for index, entity in enumerate(modelspace_entities, start=1):
             budget.check()
@@ -300,6 +305,9 @@ class EzdxfAdapter:
             if isinstance(layer_name, str) and layer_name:
                 used_layers.add(layer_name)
 
+            canonical_entity["style"] = _resolve_entity_style(
+                entity, linetypes=linetype_dashed, layers=layer_styles
+            )
             canonical_entities.append(canonical_entity)
             _emit_progress(
                 options.on_progress,
@@ -347,6 +355,7 @@ class EzdxfAdapter:
             },
             "layouts": _layouts_payload(document),
             "layers": _layers_payload(document, used_layers=used_layers),
+            "linetypes": linetype_table,
             "blocks": _blocks_payload(document, units=units_payload),
             "entities": tuple(canonical_entities),
             "xrefs": xrefs,
@@ -569,6 +578,122 @@ def _xrefs_payload(document: Any) -> tuple[dict[str, JSONValue], ...]:
             }
         )
     return tuple(xrefs)
+
+
+def _linetype_table(document: Any) -> tuple[tuple[dict[str, JSONValue], ...], dict[str, bool]]:
+    """Build the canonical LTYPE table + a name→dashed map (#574).
+
+    A linetype is dashed when its pattern length > 0 (Continuous/ByLayer/ByBlock are 0),
+    mirroring the libredwg adapter's ``pattern_len > 0`` rule (#573).
+    """
+    table: list[dict[str, JSONValue]] = []
+    dashed_by_name: dict[str, bool] = {}
+    for ltype in getattr(document, "linetypes", ()):
+        name = _optional_string(getattr(ltype.dxf, "name", None))
+        if name is None:
+            continue
+        pattern_len = _linetype_pattern_len(ltype)
+        dashed = pattern_len > 0
+        table.append({"name": name, "pattern_len": pattern_len, "dashed": dashed})
+        dashed_by_name[name.lower()] = dashed
+    return tuple(table), dashed_by_name
+
+
+def _linetype_pattern_len(ltype: Any) -> float:
+    """Total dash-pattern length (group code 40); 0.0 for solid lines, > 0 for dashed.
+
+    Mirrors the libredwg adapter's ``pattern_len`` (#573). ezdxf does not surface this on
+    ``dxf.length``, so it is read from the linetype's pattern tags.
+    """
+    pattern = getattr(ltype, "pattern_tags", None)
+    for tag in getattr(pattern, "tags", ()):
+        if getattr(tag, "code", None) == 40:
+            try:
+                return float(tag.value)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _layer_style_table(document: Any) -> dict[str, dict[str, JSONValue]]:
+    """Map layer name → its color/linetype/lineweight for ByLayer style resolution."""
+    table: dict[str, dict[str, JSONValue]] = {}
+    for layer in getattr(document, "layers", ()):
+        name = _optional_string(getattr(layer.dxf, "name", None))
+        if name is None:
+            continue
+        table[name] = {
+            "color": int(getattr(layer, "color", 256)),
+            "rgb": _rgb_hex(getattr(layer, "rgb", None)),
+            "linetype": _optional_string(getattr(layer.dxf, "linetype", None)),
+            "lineweight": int(getattr(layer.dxf, "lineweight", -3)),
+        }
+    return table
+
+
+def _rgb_hex(rgb: Any) -> str | None:
+    """Format an ezdxf ``(r, g, b)`` tuple as ``RRGGBB`` hex, or None."""
+    if isinstance(rgb, (tuple, list)) and len(rgb) == 3:
+        try:
+            return "".join(f"{int(c):02x}" for c in rgb)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _resolve_entity_style(
+    entity: Any,
+    *,
+    linetypes: dict[str, bool],
+    layers: dict[str, dict[str, JSONValue]],
+) -> dict[str, JSONValue]:
+    """Resolve an entity's effective style (color/linetype/lineweight) with ByLayer inheritance.
+
+    Emits the same ``style`` shape as the libredwg adapter (#573) so the API/MCP surface is
+    adapter-agnostic. ACI color 256 = ByLayer, 0 = ByBlock; lineweight < 0 = ByLayer/ByBlock/
+    Default; linetype name ``BYLAYER`` inherits the owning layer's linetype.
+    """
+    dxf = entity.dxf
+    layer_name = _optional_string(getattr(dxf, "layer", None))
+    layer = layers.get(layer_name) if layer_name is not None else None
+
+    color_index = int(getattr(dxf, "color", 256))
+    color_by_layer = color_index == 256
+    color_by_block = color_index == 0
+    rgb = _rgb_hex(getattr(entity, "rgb", None))
+    if color_by_layer and layer is not None:
+        color_index = cast(int, layer.get("color", color_index))
+        rgb = rgb or cast("str | None", layer.get("rgb"))
+
+    raw_lt = _optional_string(getattr(dxf, "linetype", None))
+    lt_by_layer = raw_lt is None or raw_lt.upper() == "BYLAYER"
+    effective_lt = (
+        cast("str | None", layer.get("linetype")) if lt_by_layer and layer is not None else raw_lt
+    )
+    dashed = linetypes.get(effective_lt.lower()) if effective_lt is not None else None
+
+    raw_lw = int(getattr(dxf, "lineweight", -1))
+    lw_by_layer = raw_lw < 0
+    if lw_by_layer and layer is not None:
+        layer_lw = cast(int, layer.get("lineweight", -3))
+        raw_lw = layer_lw if layer_lw >= 0 else -1
+    lw_mm = raw_lw / 100.0 if raw_lw >= 0 else None
+
+    return {
+        "color": {
+            "index": color_index,
+            "rgb": rgb,
+            "by_layer": color_by_layer,
+            "by_block": color_by_block,
+        },
+        "linetype": {
+            "name": effective_lt,
+            "by_layer": lt_by_layer,
+            "dashed": dashed,
+            "scale": float(getattr(dxf, "ltscale", 1.0) or 1.0),
+        },
+        "lineweight": {"raw": raw_lw if raw_lw >= 0 else None, "mm": lw_mm},
+    }
 
 
 def _line_entity_payload(
