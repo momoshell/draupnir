@@ -277,6 +277,26 @@ def _resolve_entity_source_hash(entity_payload_json: dict[str, Any]) -> str | No
     return _hash_ref(provenance.get("source_hash"))
 
 
+def _resolve_entity_on_sheet(entity_payload_json: dict[str, Any]) -> bool | None:
+    """Project the printed-sheet membership tag (#568) into the queryable column (#569).
+
+    ``properties.sheet_membership.on_sheet`` is True/False/None; None (undetermined or no
+    viewports) stays NULL so the column never fabricates a claim.
+    """
+    properties = (
+        entity_payload_json.get("properties_json")
+        if "properties_json" in entity_payload_json
+        else entity_payload_json.get("properties")
+    )
+    if not isinstance(properties, dict):
+        return None
+    membership = properties.get("sheet_membership")
+    if not isinstance(membership, dict):
+        return None
+    value = membership.get("on_sheet")
+    return value if isinstance(value, bool) else None
+
+
 def _resolve_entity_ref(
     entity_payload_json: dict[str, Any],
     *,
@@ -495,6 +515,7 @@ def _build_revision_materialization_rows(
                 "bbox_min_y": bbox[1] if bbox is not None else None,
                 "bbox_max_x": bbox[2] if bbox is not None else None,
                 "bbox_max_y": bbox[3] if bbox is not None else None,
+                "on_sheet": _resolve_entity_on_sheet(payload_json),
                 "properties_json": _json_object(
                     payload_json.get("properties_json")
                     if "properties_json" in payload_json
