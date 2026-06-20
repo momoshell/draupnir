@@ -299,6 +299,86 @@ def test_resolve_orientation_pins_angbase_angdir() -> None:
     assert cw.angdir == 1 and cw.rotated is True
 
 
+def test_resolve_entity_styles_color_linetype_lineweight_with_bylayer() -> None:
+    """Style resolution: explicit values, ByLayer inheritance, dashed via LTYPE (#573)."""
+    records = (
+        {"type": "LTYPE", "name": "Continuous", "handle": [0, 1, 1, 1], "pattern_len": 0.0},
+        {"type": "LTYPE", "name": "HIDDEN", "handle": [0, 1, 2, 2], "pattern_len": 12.5},
+        {
+            "type": "LAYER",
+            "name": "Walls",
+            "handle": [0, 1, 10, 10],
+            "ltype": [5, 1, 1, 1],  # Continuous
+            "color": {"index": 5, "rgb": "c20000ff"},
+            "linewt": 13,
+        },
+        {
+            "type": "LAYER",
+            "name": "Phantom",
+            "handle": [0, 1, 11, 11],
+            "ltype": [5, 1, 2, 2],  # HIDDEN (dashed)
+            "color": {"index": 256},
+            "linewt": 9,
+        },
+        # ByLayer line on Walls → inherits Continuous, color 5, lw 0.13
+        {"type": "LINE", "handle": [0, 2, 100], "layer": "Walls", "color": {"index": 256}},
+        # ByLayer line on Phantom → inherits dashed HIDDEN
+        {"type": "LINE", "handle": [0, 2, 101], "layer": "Phantom", "color": {"index": 256}},
+        # explicit color + explicit dashed linetype + explicit lineweight
+        {
+            "type": "LINE",
+            "handle": [0, 2, 102],
+            "layer": "Walls",
+            "color": {"index": 1, "rgb": "c2ff0000"},
+            "ltype": [5, 1, 2, 2],
+            "linewt": 25,
+        },
+    )
+    adapter_module._resolve_handle_named_refs(records)  # real pipeline runs this first
+    ltype_table, by_handle = adapter_module._resolve_entity_styles(records)
+
+    def _style(record: Mapping[str, Any]) -> dict[str, Any]:
+        handle = adapter_module._extract_handle(record)
+        assert handle is not None
+        return cast(dict[str, Any], by_handle[handle])
+
+    # LTYPE table carries the dashed flag (pattern_len > 0)
+    dashed_names = {t["name"]: t["dashed"] for t in ltype_table}
+    assert dashed_names == {"Continuous": False, "HIDDEN": True}
+
+    walls_line = _style(records[4])
+    assert walls_line["linetype"] == {
+        "name": "Continuous",
+        "by_layer": True,
+        "dashed": False,
+        "scale": 1.0,
+    }
+    assert walls_line["color"] == {
+        "index": 5,
+        "rgb": "c20000ff",
+        "by_layer": True,
+        "by_block": False,
+    }
+    assert walls_line["lineweight"] == {"raw": 13, "mm": 0.13}
+
+    phantom_line = _style(records[5])["linetype"]
+    assert phantom_line["name"] == "HIDDEN"
+    assert phantom_line["dashed"] is True
+    assert phantom_line["by_layer"] is True
+
+    explicit = _style(records[6])
+    assert explicit["color"] == {
+        "index": 1,
+        "rgb": "c2ff0000",
+        "by_layer": False,
+        "by_block": False,
+    }
+    assert explicit["linetype"]["name"] == "HIDDEN"
+    assert explicit["linetype"]["by_layer"] is False
+    assert explicit["linetype"]["dashed"] is True
+    assert explicit["lineweight"] == {"raw": 25, "mm": 0.25}
+
+
 def _assert_arc_wrapper_entity(entity: Mapping[str, Any]) -> None:
     assert entity["entity_type"] == "arc"
     assert entity["kind"] == "arc"
@@ -3738,6 +3818,57 @@ async def test_libredwg_adapter_extracts_paperspace_viewport_windows(
     assert w["max_x"] == pytest.approx(52.0)
     assert w["min_y"] == pytest.approx(12.0)
     assert w["max_y"] == pytest.approx(32.0)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_attaches_entity_style_and_linetype_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entities carry a resolved style block; canonical carries the LTYPE table (#573)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {"type": "LTYPE", "name": "Continuous", "handle": [0, 1, 1, 1], "pattern_len": 0.0},
+                {"type": "LTYPE", "name": "HIDDEN", "handle": [0, 1, 2, 2], "pattern_len": 12.5},
+                {
+                    "type": "LAYER",
+                    "name": "Phantom",
+                    "handle": [0, 1, 11, 11],
+                    "ltype": [5, 1, 2, 2],  # dashed by layer
+                    "color": {"index": 5, "rgb": "c20000ff"},
+                    "linewt": 13,
+                },
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Phantom",
+                    "color": {"index": 256},  # ByLayer → inherits dashed HIDDEN + color 5
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+
+    linetypes = {
+        lt["name"]: lt["dashed"] for lt in cast(list[dict[str, Any]], result.canonical["linetypes"])
+    }
+    assert linetypes == {"Continuous": False, "HIDDEN": True}
+
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    style = cast(dict[str, Any], entities[0]["style"])
+    assert style["linetype"] == {
+        "name": "HIDDEN",
+        "by_layer": True,
+        "dashed": True,
+        "scale": 1.0,
+    }
+    color = cast(dict[str, Any], style["color"])
+    assert color["index"] == 5
+    assert color["by_layer"] is True
+    assert style["lineweight"] == {"raw": 13, "mm": 0.13}
 
 
 @pytest.mark.asyncio
