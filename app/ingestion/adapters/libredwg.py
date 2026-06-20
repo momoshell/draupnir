@@ -802,6 +802,9 @@ def _build_canonical_output(
     # Resolve handle-referenced layer / block names onto records before mapping so the
     # canonical entities, layer table, and block table all carry real names (#layers/blocks).
     _resolve_handle_named_refs(records)
+    # Resolve per-entity presentation style (color / linetype / lineweight) + the LTYPE table,
+    # following ByLayer inheritance — dashed (pattern_len>0) marks non-wall boundaries (#573).
+    ltype_table, style_by_handle = _resolve_entity_styles(records)
     block_header_names = _build_block_header_name_map(records)
     block_definitions = _build_block_definition_map(records)
     block_definition_child_ids = _collect_block_definition_child_ids(block_definitions)
@@ -959,6 +962,17 @@ def _build_canonical_output(
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
         _record_unknown(record, reason="unsupported_drawable_record")
+
+    # Attach resolved presentation style by source handle — one central injection rather than
+    # threading it through every entity builder (#573).
+    if style_by_handle:
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            entity_handle = entity.get("source_entity_handle")
+            style = style_by_handle.get(entity_handle) if isinstance(entity_handle, str) else None
+            if style is not None:
+                entity["style"] = style
 
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
@@ -1180,6 +1194,7 @@ def _build_canonical_output(
             "items": _build_viewports(records, units=units),
         },
         "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
+        "linetypes": ltype_table,
         "blocks": tuple(_finalize_block_payloads(block_payloads, blocks_seen)),
         "entities": tuple(entities),
         "xrefs": (),
@@ -3102,6 +3117,145 @@ def _resolve_handle_named_refs(records: tuple[Mapping[str, Any], ...]) -> None:
             resolved = block_names.get(key) if key is not None else None
             if resolved is not None:
                 record["block_header_name"] = resolved
+
+
+def _resolve_entity_styles(
+    records: tuple[Mapping[str, Any], ...],
+) -> tuple[tuple[_JSONDict, ...], dict[str, _JSONDict]]:
+    """Resolve per-entity presentation style + the LTYPE table (#573).
+
+    dwgread emits per-entity ``color`` / ``linewt`` / ``ltype_scale`` and an explicit ``ltype``
+    handle only when non-default; most entities are *ByLayer* (color index 256, no ``ltype``),
+    inheriting from the owning LAYER (which carries its own ``ltype`` / ``color`` / ``linewt``).
+    Linetype identity lives in the LTYPE table, where ``pattern_len > 0`` marks a dashed
+    (non-continuous) line — semantically a non-wall boundary for room derivation (#554).
+
+    Returns ``(ltype_table, style_by_handle)``: the canonical LTYPE table and a map from each
+    drawable record's handle (``_extract_handle``) to its resolved ``style`` block. Effective
+    color/linetype/lineweight fall back through ByLayer to the owning layer.
+    """
+
+    ltype_by_handle: dict[str, _JSONDict] = {}
+    ltype_by_name: dict[str, _JSONDict] = {}
+    layer_style_by_handle: dict[str, _JSONDict] = {}
+    layer_name_to_handle: dict[str, str] = {}
+
+    for record in records:
+        record_type = _extract_record_type(record)
+        if record_type == "LTYPE":
+            handle_key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name")
+            pattern_len = _coerce_float(_first_value(record, "pattern_len")) or 0.0
+            entry: _JSONDict = {"name": name, "pattern_len": pattern_len, "dashed": pattern_len > 0}
+            if handle_key is not None:
+                ltype_by_handle[handle_key] = entry
+            if name is not None:
+                ltype_by_name[name.lower()] = entry
+        elif record_type == "LAYER":
+            handle_key = _handle_abs_key(record.get("handle"))
+            name = _first_string(record, "name")
+            if handle_key is not None:
+                layer_style_by_handle[handle_key] = {
+                    "ltype": _handle_abs_key(record.get("ltype")),
+                    "color": record.get("color"),
+                    "linewt": _coerce_float(_first_value(record, "linewt")),
+                }
+            if name is not None and handle_key is not None:
+                layer_name_to_handle[name] = handle_key
+
+    ltype_table = tuple(
+        {"name": e["name"], "pattern_len": e["pattern_len"], "dashed": e["dashed"]}
+        for e in ltype_by_handle.values()
+        if e.get("name") is not None
+    )
+
+    style_by_handle: dict[str, _JSONDict] = {}
+    for record in records:
+        if _is_non_drawable_object_type(_extract_record_type(record) or ""):
+            continue
+        handle = _extract_handle(record)
+        if handle is None:
+            continue
+        # Owning layer style (for ByLayer inheritance). ``_resolve_handle_named_refs`` runs first
+        # and rewrites ``layer`` to the resolved NAME, so prefer the name→handle map; fall back to
+        # a raw ``layer`` handle ref only when the name is absent/unmapped.
+        layer_name = _extract_layer_name(record)
+        layer_handle = layer_name_to_handle.get(layer_name) if layer_name is not None else None
+        if layer_handle is None:
+            layer_handle = _handle_abs_key(record.get("layer"))
+        layer_style = layer_style_by_handle.get(layer_handle) if layer_handle else None
+        style_by_handle[handle] = _build_entity_style(
+            record, layer_style=layer_style, ltype_by_handle=ltype_by_handle
+        )
+
+    return ltype_table, style_by_handle
+
+
+def _build_entity_style(
+    record: Mapping[str, Any],
+    *,
+    layer_style: _JSONDict | None,
+    ltype_by_handle: dict[str, _JSONDict],
+) -> _JSONDict:
+    color = _resolve_color(record.get("color"), layer_style)
+    linetype = _resolve_linetype(record, layer_style=layer_style, ltype_by_handle=ltype_by_handle)
+    lineweight = _resolve_lineweight(_coerce_float(_first_value(record, "linewt")), layer_style)
+    return {"color": color, "linetype": linetype, "lineweight": lineweight}
+
+
+def _resolve_color(color: Any, layer_style: _JSONDict | None) -> _JSONDict:
+    """Resolve an ACI/RGB color, following ByLayer (index 256) / ByBlock (index 0)."""
+    index = color.get("index") if isinstance(color, Mapping) else None
+    rgb = color.get("rgb") if isinstance(color, Mapping) else None
+    by_layer = index == 256
+    by_block = index == 0
+    if by_layer and isinstance(layer_style, Mapping):
+        layer_color = layer_style.get("color")
+        if isinstance(layer_color, Mapping):
+            index = layer_color.get("index")
+            rgb = layer_color.get("rgb")
+    return {
+        "index": index if isinstance(index, int) else None,
+        "rgb": rgb if isinstance(rgb, str) else None,
+        "by_layer": by_layer,
+        "by_block": by_block,
+    }
+
+
+def _resolve_linetype(
+    record: Mapping[str, Any],
+    *,
+    layer_style: _JSONDict | None,
+    ltype_by_handle: dict[str, _JSONDict],
+) -> _JSONDict:
+    """Resolve effective linetype; ByLayer entities inherit the owning layer's linetype."""
+    own = _handle_abs_key(record.get("ltype"))
+    by_layer = own is None
+    handle = own
+    if handle is None and isinstance(layer_style, Mapping):
+        layer_ltype = layer_style.get("ltype")
+        handle = layer_ltype if isinstance(layer_ltype, str) else None
+    entry = ltype_by_handle.get(handle) if handle is not None else None
+    scale = _coerce_float(_first_value(record, "ltype_scale"))
+    return {
+        "name": entry.get("name") if entry else None,
+        "by_layer": by_layer,
+        "dashed": bool(entry.get("dashed")) if entry else None,
+        "scale": scale if scale is not None else 1.0,
+    }
+
+
+def _resolve_lineweight(raw: float | None, layer_style: _JSONDict | None) -> _JSONDict:
+    """Resolve lineweight. dwgread ``linewt`` < 0 is ByLayer/ByBlock/Default; else 1/100 mm.
+
+    The mm value is a best-effort interpretation of the raw enum as hundredths of a mm.
+    """
+    by_layer = raw is None or raw < 0
+    if by_layer and isinstance(layer_style, Mapping):
+        layer_raw = layer_style.get("linewt")
+        raw = layer_raw if isinstance(layer_raw, (int, float)) and layer_raw >= 0 else None
+    mm = raw / 100.0 if isinstance(raw, (int, float)) and raw >= 0 else None
+    return {"raw": int(raw) if isinstance(raw, (int, float)) and raw >= 0 else None, "mm": mm}
 
 
 def _extract_layout_name(record: Mapping[str, Any]) -> str | None:
