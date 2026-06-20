@@ -263,6 +263,22 @@ def _assert_circle_wrapper_entity(entity: Mapping[str, Any]) -> None:
     }
 
 
+def test_extract_angle_degrees_radians_default_and_degrees_hint() -> None:
+    def extract(record: Mapping[str, Any]) -> float:
+        value = adapter_module._extract_angle_degrees(record, "start_angle")
+        assert value is not None
+        return value
+
+    # dwgread default: radians → converted to degrees
+    assert round(extract({"start_angle": math.pi / 2}), 6) == 90.0
+    assert round(extract({"start_angle": math.radians(135)}), 6) == 135.0
+    # radians wrap normalizes into [0, 360)
+    assert round(extract({"start_angle": 2 * math.pi}), 6) == 0.0
+    # explicit degrees hint → used as-is (no conversion)
+    assert extract({"start_angle": 90, "angle_units": "degrees"}) == 90.0
+    assert extract({"start_angle": 45, "angle_units": "deg"}) == 45.0
+
+
 def _assert_arc_wrapper_entity(entity: Mapping[str, Any]) -> None:
     assert entity["entity_type"] == "arc"
     assert entity["kind"] == "arc"
@@ -900,9 +916,9 @@ async def test_libredwg_adapter_handles_objects_variants_and_type_markers(
                             "record": {
                                 "center_point": [10, 20, 0],
                                 "radius": "5",
-                                "startangle": "45",
-                                "endangle": "135",
-                                "angle_units": "degrees",
+                                # dwgread emits radians, no angle_units; 45°/135° arc.
+                                "startangle": str(math.radians(45)),
+                                "endangle": str(math.radians(135)),
                                 "orientation": "counterclockwise",
                             },
                         },
@@ -1320,8 +1336,9 @@ async def test_libredwg_adapter_maps_arc_entities_into_canonical_payload(
                         "layer": "Curves",
                         "center": {"x": 10, "y": 20, "z": 0},
                         "radius": 5,
-                        "start_angle": 45,
-                        "end_angle": 135,
+                        # dwgread emits arc angles in radians (no angle_units); 45°/135° arc.
+                        "start_angle": math.radians(45),
+                        "end_angle": math.radians(135),
                     }
                 ]
             }
