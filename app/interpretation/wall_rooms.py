@@ -41,6 +41,21 @@ WALL_LAYER_KEYWORDS = ("wall",)
 WALL_ROOM_CONFIDENCE = 0.8
 GAP_CLOSED_ROOM_CONFIDENCE = 0.6
 
+# Robust gap-close defaults for real drawings, where wall runs are many short segments
+# with small endpoint near-misses + door openings. Validated on 670003/680003 (#554).
+DEFAULT_WALL_SNAP_TOLERANCE = 0.1
+DEFAULT_WALL_MIN_AREA = 1.0
+
+# A candidate layer is selected as wall linework when its polygonized enclosed area is at
+# least this fraction of the best-scoring layer's — so the architecture layer that actually
+# forms rooms is picked over annotation/device/legend layers that form little or none.
+_WALL_YIELD_RATIO = 0.2
+
+# How wall layers were chosen, for provenance.
+SELECTION_LAYER_NAME = "layer_name"
+SELECTION_POLYGONIZE_YIELD = "polygonize_yield"
+SELECTION_NONE = "none"
+
 _Segment = tuple[Point, Point]
 
 
@@ -51,6 +66,7 @@ class WallRoomInterpretation:
     rooms: list[Room]
     device_assignments: list[DeviceRoomAssignment]
     wall_layers: tuple[str, ...]
+    selection_method: str = SELECTION_LAYER_NAME
 
 
 def is_wall_layer(layer_ref: str | None) -> bool:
@@ -70,18 +86,82 @@ def detect_wall_layers(entities: Sequence[EntityRow]) -> set[str]:
     }
 
 
+def _layer_polygon_yield(
+    entities: Sequence[EntityRow], layer: str, *, snap_tolerance: float, min_area: float
+) -> float:
+    """Total enclosed area a single layer's linework polygonizes into (with gap-closing)."""
+    segments, _ = _snap_segments(wall_segments(entities, layer_refs={layer}), snap_tolerance)
+    return float(sum(face.area for face in polygonize(segments) if face.area >= min_area))
+
+
+def select_wall_layers(
+    entities: Sequence[EntityRow],
+    *,
+    snap_tolerance: float = DEFAULT_WALL_SNAP_TOLERANCE,
+    min_area: float = DEFAULT_WALL_MIN_AREA,
+) -> tuple[set[str], str]:
+    """Choose the wall/architecture layers to polygonize, with the method used.
+
+    Named ``*wall*`` layers win when present (explicit convention). Otherwise — the common
+    real-world case, where the architecture layer is named by a CAD standard (``A210``,
+    ``Z000``, …) — layers are scored by how much enclosed area their linework polygonizes
+    into, and those reaching ``_WALL_YIELD_RATIO`` of the best score are selected. Annotation,
+    device-leader, and legend layers self-exclude because they don't form closed faces.
+    """
+    named = detect_wall_layers(entities)
+    if named:
+        return named, SELECTION_LAYER_NAME
+
+    layers = {entity.layer_ref for entity in entities if entity.layer_ref is not None}
+    scores = {
+        layer: _layer_polygon_yield(
+            entities, layer, snap_tolerance=snap_tolerance, min_area=min_area
+        )
+        for layer in layers
+    }
+    best = max(scores.values(), default=0.0)
+    if best <= 0.0:
+        return set(), SELECTION_NONE
+    threshold = best * _WALL_YIELD_RATIO
+    selected = {layer for layer, score in scores.items() if score >= threshold}
+    return selected, SELECTION_POLYGONIZE_YIELD
+
+
 def wall_segments(
     entities: Sequence[EntityRow],
     *,
     layer_refs: set[str] | None = None,
+    exclude_dashed: bool = True,
 ) -> list[_Segment]:
-    """Collect line/polyline segments from the wall-layer entities."""
+    """Collect line/polyline segments from the wall-layer entities.
+
+    ``exclude_dashed`` drops segments whose entity carries a dashed linetype (#573/#574):
+    structural grids, match/property/hidden lines are typically dashed and are not walls, so
+    excluding them keeps the solid architecture (e.g. a dashed grid layer that polygonizes
+    into building-spanning faces no longer competes with the real wall layer). Entities with
+    no style metadata are kept (we never drop geometry on absent information).
+    """
     segments: list[_Segment] = []
     for entity in entities:
         if layer_refs is not None and entity.layer_ref not in layer_refs:
             continue
+        if exclude_dashed and _entity_is_dashed(entity):
+            continue
         segments.extend(_segments_from_entity(entity))
     return segments
+
+
+def _entity_is_dashed(entity: EntityRow) -> bool:
+    """Whether an entity's resolved linetype is dashed; False when style is absent/unknown.
+
+    Read opportunistically (``style`` is an optional enrichment on RevisionEntity, not part of
+    the EntityRow protocol), so interpretation degrades gracefully without linetype data.
+    """
+    style = getattr(entity, "style", None)
+    if not isinstance(style, Mapping):
+        return False
+    linetype = style.get("linetype")
+    return bool(linetype.get("dashed")) if isinstance(linetype, Mapping) else False
 
 
 def build_rooms_from_walls(
@@ -132,7 +212,12 @@ def interpret_wall_rooms(
     wall-layer names; ``snap_tolerance`` / ``min_area`` tune the gap-closing and
     sliver-dropping robustness (see :func:`build_rooms_from_walls`).
     """
-    wall_layers = layer_refs if layer_refs is not None else detect_wall_layers(entities)
+    if layer_refs is not None:
+        wall_layers, selection_method = layer_refs, SELECTION_LAYER_NAME
+    else:
+        wall_layers, selection_method = select_wall_layers(
+            entities, snap_tolerance=snap_tolerance, min_area=min_area
+        )
     rooms = build_rooms_from_walls(
         entities,
         layer_refs=wall_layers,
@@ -145,6 +230,7 @@ def interpret_wall_rooms(
         rooms=rooms,
         device_assignments=assignments,
         wall_layers=tuple(sorted(wall_layers)),
+        selection_method=selection_method,
     )
 
 
