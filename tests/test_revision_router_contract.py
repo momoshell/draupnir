@@ -399,6 +399,7 @@ def test_revision_router_routes_match_baseline_contract() -> None:
                 ("query", "parent_entity_ref", False, None, None, None, None),
                 ("query", "source_identity", False, None, None, None, None),
                 ("query", "source_hash", False, None, None, None, None),
+                ("query", "on_sheet", False, None, None, None, None),
                 ("query", "min_x", False, None, None, None, None),
                 ("query", "min_y", False, None, None, None, None),
                 ("query", "max_x", False, None, None, None, None),

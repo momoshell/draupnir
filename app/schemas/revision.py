@@ -319,6 +319,10 @@ class RevisionEntityRead(BaseModel):
         None,
         description="Resolved materialized parent entity row identifier",
     )
+    on_sheet: bool | None = Field(
+        None,
+        description="Printed-sheet membership; null when undetermined (no viewports / no extent)",
+    )
     created_at: datetime = Field(..., description="Materialization timestamp")
 
 
@@ -345,6 +349,10 @@ class RevisionEntitySummary(BaseModel):
     bbox: list[float] | None = Field(
         None,
         description="AABB [min_x, min_y, max_x, max_y] in drawing units; null when no 2-D extent",
+    )
+    on_sheet: bool | None = Field(
+        None,
+        description="Printed-sheet membership; null when undetermined (no viewports / no extent)",
     )
     created_at: datetime = Field(..., description="Materialization timestamp")
     # Heavy blocks — populated only when selected via ``fields=``.

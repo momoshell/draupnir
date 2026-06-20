@@ -570,6 +570,12 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
     bbox_min_y: Mapped[float | None] = mapped_column(nullable=True, comment="AABB min y")
     bbox_max_x: Mapped[float | None] = mapped_column(nullable=True, comment="AABB max x")
     bbox_max_y: Mapped[float | None] = mapped_column(nullable=True, comment="AABB max y")
+    # Printed-sheet membership (#569): True = inside a paperspace viewport window, False =
+    # off-sheet (title block / key-plan / off-sheet model content), NULL = undetermined
+    # (no viewports, or no recoverable extent). Projected from properties.sheet_membership.
+    on_sheet: Mapped[bool | None] = mapped_column(
+        nullable=True, index=True, comment="Printed-sheet membership; NULL when undetermined"
+    )
     layout_ref: Mapped[str | None] = mapped_column(
         String(255),
         nullable=True,

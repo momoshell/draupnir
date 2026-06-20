@@ -224,6 +224,7 @@ def _entity_summary(row: RevisionEntity, *, include: frozenset[str]) -> Revision
         source_identity=row.source_identity,
         source_hash=row.source_hash,
         bbox=_row_bbox(row),
+        on_sheet=row.on_sheet,
         created_at=row.created_at,
         **{
             name: getattr(row, attr)
@@ -318,6 +319,14 @@ async def list_revision_entities(
     parent_entity_ref: str | None = Query(default=None),
     source_identity: str | None = Query(default=None),
     source_hash: str | None = Query(default=None),
+    on_sheet: bool | None = Query(
+        default=None,
+        description=(
+            "Printed-sheet filter: true = on the printed sheet (inside a paperspace viewport), "
+            "false = off-sheet (title block / key-plan / off-sheet model). Omit for all. "
+            "Rows with undetermined membership (NULL) are excluded when this is set."
+        ),
+    ),
     min_x: float | None = Query(default=None, description="in-bbox: query box min x"),
     min_y: float | None = Query(default=None, description="in-bbox: query box min y"),
     max_x: float | None = Query(default=None, description="in-bbox: query box max x"),
@@ -372,6 +381,8 @@ async def list_revision_entities(
         query = query.where(RevisionEntity.source_identity == source_identity)
     if source_hash is not None:
         query = query.where(RevisionEntity.source_hash == source_hash)
+    if on_sheet is not None:
+        query = query.where(RevisionEntity.on_sheet.is_(on_sheet))
     for condition in spatial_conditions:
         query = query.where(condition)
     if pagination_cursor is not None:

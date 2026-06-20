@@ -351,6 +351,80 @@ class TestRevisionMaterializationApi:
             await async_client.get(base, params={"near_x": 0, "near_y": 0, "radius": 0})
         ).status_code == 400
 
+    async def test_entities_printed_sheet_filter_by_on_sheet(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`on_sheet` projects the membership tag to a column + filters the printed sheet (#569)."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        def _with_membership(entity: dict[str, Any], on_sheet: bool | None) -> dict[str, Any]:
+            membership: dict[str, Any] = {"schema_version": "0.1", "on_sheet": on_sheet}
+            props = {**entity["properties_json"], "sheet_membership": membership}
+            entity["properties_json"] = props
+            return entity
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            on = _with_membership(
+                _build_contract_entity(
+                    entity_id="on", entity_type="line", layer_ref="A-WALL", source_id="s-on"
+                ),
+                True,
+            )
+            off = _with_membership(
+                _build_contract_entity(
+                    entity_id="off", entity_type="line", layer_ref="Z2020T", source_id="s-off"
+                ),
+                False,
+            )
+            undet = _with_membership(
+                _build_contract_entity(
+                    entity_id="undet", entity_type="line", layer_ref="A-WALL", source_id="s-und"
+                ),
+                None,
+            )
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[
+                    {"layer_ref": "A-WALL", "name": "A-WALL"},
+                    {"layer_ref": "Z2020T", "name": "Z2020T"},
+                ],
+                blocks=[],
+                entities=[on, off, undet],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        base = f"/v1/revisions/{drawing_revisions[0].id}/entities"
+
+        def _ids(response: httpx.Response) -> list[str]:
+            return sorted(item["entity_id"] for item in response.json()["items"])
+
+        # column projected onto the compact spine (no fields= needed)
+        all_rows = await async_client.get(base)
+        by_id = {i["entity_id"]: i["on_sheet"] for i in all_rows.json()["items"]}
+        assert by_id == {"on": True, "off": False, "undet": None}
+
+        # printed-sheet filter: on / off / (NULL excluded from both)
+        assert _ids(await async_client.get(base, params={"on_sheet": "true"})) == ["on"]
+        assert _ids(await async_client.get(base, params={"on_sheet": "false"})) == ["off"]
+        # omitted → all three (full modelspace)
+        assert _ids(all_rows) == ["off", "on", "undet"]
+
     async def test_devices_endpoint_returns_schedule_and_tag_association(
         self,
         async_client: httpx.AsyncClient,
