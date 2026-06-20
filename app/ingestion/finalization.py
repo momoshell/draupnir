@@ -13,6 +13,7 @@ from uuid import UUID
 from app.core.clock import utcnow as _clock_utcnow
 from app.ingestion.block_expansion import expand_block_instances
 from app.ingestion.contracts import AdapterResult, InputFamily
+from app.ingestion.sheet_membership import tag_sheet_membership
 from app.ingestion.validation import (
     VALIDATION_REPORT_SCHEMA_VERSION,
     build_validation_outcome,
@@ -95,6 +96,10 @@ def build_ingest_finalization_payload(
     # Expand block instances into world-placed geometry before validation/materialization
     # so the spatial model is complete (block-heavy / Revit-exported drawings). (#541)
     canonical_json = expand_block_instances(canonical_json)
+    # Tag entities with printed-sheet membership from the viewport windows — after block
+    # expansion so world-placed block geometry is tagged too. Off-sheet content is tagged,
+    # never dropped (#568).
+    canonical_json = tag_sheet_membership(canonical_json)
     revision_kind = resolve_revision_kind(context.job_id, initial_job_id=context.initial_job_id)
     provenance_records = [_json_compatible(record) for record in result.provenance]
     diagnostics = [_json_compatible(diagnostic) for diagnostic in result.diagnostics]
