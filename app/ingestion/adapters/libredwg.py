@@ -10,7 +10,7 @@ import resource
 import shutil
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -53,6 +53,7 @@ _LICENSE_PROBE_NAME = "libredwg-distribution-review"
 _SCHEMA_VERSION = "0.1"
 _INTERPRETATION_SCHEMA_VERSION = "0.1"
 _CENSUS_SCHEMA_VERSION = "0.1"
+_VIEWPORTS_SCHEMA_VERSION = "0.1"
 _PROCESS_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_TERMINATE_GRACE_SECONDS = 0.2
 _PROCESS_KILL_GRACE_SECONDS = 0.2
@@ -1174,6 +1175,10 @@ def _build_canonical_output(
             "source": "libredwg_dwgread_json",
         },
         "layouts": tuple({"name": layout_name} for layout_name in sorted(layouts_seen)),
+        "viewports": {
+            "schema_version": _VIEWPORTS_SCHEMA_VERSION,
+            "items": _build_viewports(records, units=units),
+        },
         "layers": tuple({"name": layer_name} for layer_name in sorted(layers_seen)),
         "blocks": tuple(_finalize_block_payloads(block_payloads, blocks_seen)),
         "entities": tuple(entities),
@@ -1504,6 +1509,72 @@ def _units_notes(units: _UnitsResolution) -> tuple[str, ...]:
 
 def _units_basis_suffix(units: _UnitsResolution) -> str:
     return "units_meter" if units.confirmed else "units_unconfirmed"
+
+
+def _build_viewports(
+    records: Sequence[Mapping[str, Any]], *, units: _UnitsResolution
+) -> tuple[_JSONDict, ...]:
+    """Extract paperspace VIEWPORTs with their modelspace windows (#548 leaf 1).
+
+    A viewport's printed crop is the drawing's own answer for "what is on the sheet" — no
+    hardcoded boundary. Each VIEWPORT carries ``VIEWCTR`` (modelspace point it looks at) +
+    ``VIEWSIZE`` (modelspace height shown) + paper ``width``/``height`` (aspect). The
+    modelspace window is the rectangle centered at VIEWCTR, height VIEWSIZE, width
+    VIEWSIZE * (paper_width / paper_height), scaled to canonical units. ``twist_angle`` and
+    ``clip_boundary`` are captured for the general (rotated / non-rectangular) case (leaf 2);
+    degenerate (zero/non-finite VIEWSIZE) viewports — e.g. the paperspace overview vp — are
+    skipped. Pure read; no entity tagging yet (#568).
+    """
+
+    viewports: list[_JSONDict] = []
+    for record in records:
+        if _extract_record_type(record) != "VIEWPORT":
+            continue
+        view_size = _coerce_float(_first_value(record, "VIEWSIZE", "view_size"))
+        if view_size is None or not math.isfinite(view_size) or view_size <= 0:
+            continue
+        center = _coerce_point(_first_value(record, "VIEWCTR", "view_center"))
+        if center is None:
+            continue
+        paper_w = _coerce_float(_first_value(record, "width")) or 0.0
+        paper_h = _coerce_float(_first_value(record, "height")) or 0.0
+        aspect = paper_w / paper_h if paper_h > 0 else 1.0
+
+        cx, cy = center[0] * units.scale, center[1] * units.scale
+        half_h = view_size * units.scale / 2.0
+        half_w = half_h * aspect
+        twist = _coerce_float(_first_value(record, "twist_angle")) or 0.0
+        clip = _first_value(record, "clip_boundary")
+        viewports.append(
+            {
+                "model_window": {
+                    "min_x": cx - half_w,
+                    "min_y": cy - half_h,
+                    "max_x": cx + half_w,
+                    "max_y": cy + half_h,
+                },
+                "view_center": {"x": cx, "y": cy},
+                "view_height": view_size * units.scale,
+                "paper_size": {"width": paper_w, "height": paper_h},
+                "twist_degrees": _normalize_angle_degrees(math.degrees(twist)),
+                "rectangular": not _is_nonempty_clip_boundary(clip),
+                "source_handle": _extract_handle(record),
+            }
+        )
+    return tuple(viewports)
+
+
+def _is_nonempty_clip_boundary(clip: Any) -> bool:
+    """Whether a viewport has a real (non-rectangular) clip boundary.
+
+    dwgread encodes the boundary as a handle reference ``[code, ...absref]`` where the
+    leading element is the handle *type code* (e.g. 5 = soft pointer), not a value. A null
+    reference like ``[5, 0, 0, 0]`` means no clip (rectangular); the boundary is real only
+    when some element after the code is non-zero.
+    """
+    if isinstance(clip, (list, tuple)):
+        return any(_coerce_float(part) not in (None, 0.0) for part in clip[1:])
+    return bool(clip)
 
 
 def _scale_value(value: float, scale: float) -> float:

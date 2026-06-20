@@ -3681,6 +3681,66 @@ async def test_libredwg_adapter_warns_on_non_default_orientation(
 
 
 @pytest.mark.asyncio
+async def test_libredwg_adapter_extracts_paperspace_viewport_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical carries paperspace viewports with computed modelspace windows (#548 leaf 1)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},  # mm → conversion_factor 0.001
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "layer": "Walls",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+                {
+                    # main plan viewport: VIEWCTR (32000,22000) mm, VIEWSIZE 20000 mm,
+                    # paper aspect 2:1 → model window 40m wide by 20m tall, centered (32,22)m
+                    "type": "VIEWPORT",
+                    "handle": "VP1",
+                    "VIEWCTR": [32000.0, 22000.0, 0.0],
+                    "VIEWSIZE": 20000.0,
+                    "width": 800.0,
+                    "height": 400.0,
+                    "twist_angle": 0.0,
+                    "clip_boundary": [5, 0, 0, 0],
+                },
+                {
+                    # degenerate active vp: VIEWSIZE 0 → skipped
+                    "type": "VIEWPORT",
+                    "handle": "VP2",
+                    "VIEWCTR": [0.0, 0.0, 0.0],
+                    "VIEWSIZE": 0.0,
+                    "width": 12.0,
+                    "height": 9.0,
+                },
+            ],
+        },
+    )
+
+    viewports = cast(dict[str, Any], result.canonical["viewports"])
+    assert viewports["schema_version"] == "0.1"
+    items = viewports["items"]
+    assert len(items) == 1  # degenerate VIEWSIZE=0 skipped
+    vp = items[0]
+    assert vp["source_handle"] is not None
+    assert vp["view_center"] == {"x": pytest.approx(32.0), "y": pytest.approx(22.0)}
+    assert vp["view_height"] == pytest.approx(20.0)
+    assert vp["rectangular"] is True
+    assert vp["twist_degrees"] == pytest.approx(0.0)
+    w = vp["model_window"]
+    # 40m wide (20m tall x 2:1 aspect), centered (32,22)m
+    assert w["min_x"] == pytest.approx(12.0)
+    assert w["max_x"] == pytest.approx(52.0)
+    assert w["min_y"] == pytest.approx(12.0)
+    assert w["max_y"] == pytest.approx(32.0)
+
+
+@pytest.mark.asyncio
 async def test_libredwg_adapter_emits_source_census(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
