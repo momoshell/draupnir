@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from sqlalchemy import (
@@ -637,3 +638,17 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
             "parent_entity_ref within the same drawing revision"
         ),
     )
+
+    @property
+    def style(self) -> Mapping[str, Any] | None:
+        """Presentation style (color/linetype/lineweight) from the canonical entity (#573/#574).
+
+        Lives in ``canonical_entity_json`` (no dedicated columns); exposed read-only so the
+        interpretation tier can reason about linetype (e.g. exclude dashed non-wall lines).
+        """
+        canonical = self.canonical_entity_json
+        if isinstance(canonical, Mapping):
+            style = canonical.get("style")
+            if isinstance(style, Mapping):
+                return style
+        return None

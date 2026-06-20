@@ -139,16 +139,18 @@ async def test_rooms_endpoint_returns_named_rooms_and_assignments(rooms_app: Fas
     assert body["summary"] == {"rooms": 1, "named_rooms": 1, "assigned_devices": 1}
 
 
-async def test_rooms_endpoint_forced_wall_strategy_finds_nothing_for_room_layer(
+async def test_rooms_endpoint_forced_wall_strategy_polygonizes_closed_boundary(
     rooms_app: FastAPI,
 ) -> None:
-    # The fixture only has an A-ROOM polyline; forcing wall_polygonize yields no rooms.
+    # The fixture's A-ROOM polyline is a closed boundary. Wall-polygonization now selects
+    # face-forming layers by polygonization yield (#554) — not only "wall"-named layers — so
+    # forcing wall_polygonize recovers the closed face. (AUTO still prefers the explicit layer.)
     response = await _get_rooms(rooms_app, "?strategy=wall_polygonize")
     assert response.status_code == 200
     body = response.json()
     assert body["strategy"] == "wall_polygonize"
-    assert body["items"] == []
-    assert body["assignments"] == []
+    assert len(body["items"]) == 1
+    assert body["items"][0]["area"] == 100.0
 
 
 async def test_rooms_endpoint_rejects_out_of_range_min_area(rooms_app: FastAPI) -> None:

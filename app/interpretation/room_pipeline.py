@@ -19,7 +19,11 @@ from app.interpretation.explicit_rooms import interpret_explicit_rooms
 from app.interpretation.ifc_rooms import interpret_ifc_rooms
 from app.interpretation.models import EntityRow
 from app.interpretation.rooms import DevicePlacement, DeviceRoomAssignment, Room, RoomLabel
-from app.interpretation.wall_rooms import interpret_wall_rooms
+from app.interpretation.wall_rooms import (
+    DEFAULT_WALL_MIN_AREA,
+    DEFAULT_WALL_SNAP_TOLERANCE,
+    interpret_wall_rooms,
+)
 
 ROOM_STRATEGY_AUTO = "auto"
 ROOM_STRATEGY_IFC = "ifc_space"
@@ -81,12 +85,15 @@ def interpret_rooms(
                 source_layers=explicit.boundary_layers,
             )
 
+    # Real drawings need gap-closing + sliver-dropping to polygonize cleanly; when the caller
+    # didn't specify, fall back to the validated robust defaults (#554) rather than 0 (which
+    # yields no rooms on Revit-style exports). Explicit non-zero caller values still win.
     walls = interpret_wall_rooms(
         entities,
         devices=devices,
         labels=labels,
-        snap_tolerance=snap_tolerance,
-        min_area=min_area,
+        snap_tolerance=snap_tolerance or DEFAULT_WALL_SNAP_TOLERANCE,
+        min_area=min_area or DEFAULT_WALL_MIN_AREA,
     )
     return RoomInterpretation(
         rooms=walls.rooms,
