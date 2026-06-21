@@ -13,17 +13,11 @@ from app.api.v1.revision_lineage import (
     _get_active_validation_report,
     _manifest_counts,
 )
-from app.api.v1.revision_routes.rooms import (
-    _ROOM_GEOMETRY_ENTITY_TYPES,
-    _device_placements,
-    _room_labels,
-)
+from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.api.v1.revision_routes.scale import resolve_revision_scale
 from app.db.session import get_db
-from app.interpretation.devices import enumerate_devices, load_tag_candidates
+from app.interpretation.devices import enumerate_devices
 from app.interpretation.layer_roles import classify_layer_role
-from app.interpretation.loaders import load_revision_entities_by_type
-from app.interpretation.room_pipeline import ROOM_STRATEGY_AUTO, interpret_rooms
 from app.models.revision_materialization import RevisionLayer
 from app.schemas.revision_summary import RevisionSummaryRead
 from app.schemas.validation_report import ValidationReportCoverage
@@ -66,17 +60,9 @@ async def get_revision_summary(
     # Devices (mirrors /devices default enumeration).
     devices = await enumerate_devices(db, revision_id)
 
-    # Rooms (mirrors /rooms default: auto strategy + printed-sheet scope, #583).
-    room_entities = await load_revision_entities_by_type(
-        db, revision_id, _ROOM_GEOMETRY_ENTITY_TYPES, exclude_off_sheet=True
-    )
-    candidates = await load_tag_candidates(db, revision_id, tag_layers=None, exclude_off_sheet=True)
-    rooms_result = interpret_rooms(
-        room_entities,
-        devices=_device_placements(devices),
-        labels=_room_labels(candidates),
-        strategy=ROOM_STRATEGY_AUTO,
-    )
+    # Rooms — go through the SAME resolver as /rooms (its defaults: auto strategy + printed-sheet
+    # scope + all-text labels) so the two endpoints can never disagree on room counts (#584).
+    rooms_result = await _resolve_rooms(db, revision_id)
     named_rooms = sum(1 for room in rooms_result.rooms if room.name is not None)
 
     # Scale/units (A3) + the extraction-coverage block (validation report).
