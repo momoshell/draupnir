@@ -14,6 +14,7 @@ from app.core.errors import ErrorCode
 from app.ingestion.adapters import libredwg as libredwg_adapter
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.interpretation.loaders import load_revision_entities_by_type
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.cad_changeset import CadChangeSet
@@ -424,6 +425,72 @@ class TestRevisionMaterializationApi:
         assert _ids(await async_client.get(base, params={"on_sheet": "false"})) == ["off"]
         # omitted → all three (full modelspace)
         assert _ids(all_rows) == ["off", "on", "undet"]
+
+    async def test_room_loader_exclude_off_sheet_keeps_on_and_undetermined(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`load_revision_entities_by_type(exclude_off_sheet=True)` drops only KNOWN off-sheet
+        entities (on_sheet IS FALSE) and keeps on-sheet (True) AND undetermined (NULL) — so a
+        drawing without viewports degrades gracefully instead of emptying (#583)."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        def _with_membership(entity: dict[str, Any], on_sheet: bool | None) -> dict[str, Any]:
+            membership: dict[str, Any] = {"schema_version": "0.1", "on_sheet": on_sheet}
+            entity["properties_json"] = {
+                **entity["properties_json"],
+                "sheet_membership": membership,
+            }
+            return entity
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            ents = [
+                _with_membership(
+                    _build_contract_entity(
+                        entity_id=eid, entity_type="line", layer_ref="A-WALL", source_id=f"s-{eid}"
+                    ),
+                    flag,
+                )
+                for eid, flag in (("on", True), ("off", False), ("undet", None))
+            ]
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[{"layer_ref": "A-WALL", "name": "A-WALL"}],
+                blocks=[],
+                entities=ents,
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            scoped = await load_revision_entities_by_type(
+                session, revision_id, ("line",), exclude_off_sheet=True
+            )
+            full = await load_revision_entities_by_type(session, revision_id, ("line",))
+
+        assert sorted(e.entity_id for e in scoped) == [
+            "on",
+            "undet",
+        ]  # off-sheet dropped, NULL kept
+        assert sorted(e.entity_id for e in full) == ["off", "on", "undet"]  # full modelspace
 
     async def test_devices_endpoint_returns_schedule_and_tag_association(
         self,

@@ -158,3 +158,70 @@ async def test_rooms_endpoint_forced_wall_strategy_polygonizes_closed_boundary(
 async def test_rooms_endpoint_rejects_out_of_range_min_area(rooms_app: FastAPI) -> None:
     response = await _get_rooms(rooms_app, "?min_area=-1")
     assert response.status_code == 422
+
+
+@pytest.fixture
+def rooms_app_capture_scope(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[FastAPI, dict[str, Any]]]:
+    """Like ``rooms_app`` but records the ``exclude_off_sheet`` kwarg each loader receives,
+    so the #583 ``scope`` route param wiring can be asserted without a DB."""
+    seen: dict[str, Any] = {}
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_entities(
+        db: Any, revision_id: uuid.UUID, entity_types: Sequence[str], **kw: Any
+    ) -> list[SimpleNamespace]:
+        seen["entities"] = kw.get("exclude_off_sheet")
+        return [_entity("room-1", "A-ROOM", _closed_polyline(SQUARE))]
+
+    async def _fake_devices(db: Any, revision_id: uuid.UUID, **_: Any) -> list[Device]:
+        return []
+
+    async def _fake_text(db: Any, revision_id: uuid.UUID, **kw: Any) -> list[_TagCandidate]:
+        seen["labels"] = kw.get("exclude_off_sheet")
+        return [_TagCandidate(entity_id="t1", text="Kitchen", layer_ref="A-ANNO", x=5.0, y=5.0)]
+
+    monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
+    monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
+    monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_text)
+    yield app, seen
+    app.dependency_overrides.clear()
+
+
+async def test_rooms_scope_defaults_to_printed_sheet(
+    rooms_app_capture_scope: tuple[FastAPI, dict[str, Any]],
+) -> None:
+    """Default scope (#583) excludes off-sheet entities for BOTH geometry and labels."""
+    application, seen = rooms_app_capture_scope
+    transport = ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/v1/revisions/{REVISION_ID}/rooms")
+    assert response.status_code == 200
+    assert seen["entities"] is True
+    assert seen["labels"] is True
+
+
+async def test_rooms_scope_modelspace_keeps_full_extent(
+    rooms_app_capture_scope: tuple[FastAPI, dict[str, Any]],
+) -> None:
+    application, seen = rooms_app_capture_scope
+    transport = ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/v1/revisions/{REVISION_ID}/rooms?scope=modelspace")
+    assert response.status_code == 200
+    assert seen["entities"] is False
+    assert seen["labels"] is False
+
+
+async def test_rooms_scope_invalid_value_is_422(rooms_app: FastAPI) -> None:
+    response = await _get_rooms(rooms_app, "?scope=bogus")
+    assert response.status_code == 422
