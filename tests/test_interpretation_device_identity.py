@@ -488,16 +488,39 @@ def test_source_layers_none_layer_ref() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_tag_abbreviation_beats_symbol_family() -> None:
-    """When both tag-abbreviation and symbol-family match, tag-abbreviation wins."""
+def test_symbol_family_beats_tag_abbreviation() -> None:
+    """ICON-FIRST (#545): when both the legend symbol-family and a tag-abbreviation match, the
+    symbol family wins the type — the placed icon is the authoritative graphic identity, and a
+    nearby tag is the weaker signal (a stray tag must not retype the icon)."""
     legend = _legend(
-        _entry(abbreviation="FAP", symbol_family="FAP-Block", type_name="Fire Alarm Panel via Tag"),
+        _entry(
+            abbreviation="FAP",
+            symbol_family="FAP-Block",
+            type_name="Fire Alarm Panel",
+        ),
     )
     device = _device(block_ref="FAP-Block", tag=_tag("FAP"))
     results = resolve_device_identities([device], legend)
     r = results[0]
-    assert r.basis == BASIS_TAG_ABBREVIATION
+    assert r.basis == BASIS_SYMBOL_FAMILY
     assert r.status == STATUS_RESOLVED
+    assert r.type_name == "Fire Alarm Panel"
+
+
+def test_icon_family_type_wins_over_unrelated_proximity_tag() -> None:
+    """Real-data scenario (670003): a Smoke Detector icon family carrying a stray, unrelated
+    'AHU' proximity tag must resolve to the FAMILY type, not the tag — the tag is a different
+    legend abbreviation entirely. Guards the #545 'everything typed AHU' regression."""
+    legend = _legend(
+        _entry(symbol_family="Smoke Detector with Beaconrfa", type_name="Smoke Detector"),
+        _entry(abbreviation="AHU"),  # Source-C abbreviation only, no type_name
+    )
+    device = _device(block_ref="Smoke Detector with Beaconrfa", tag=_tag("AHU"))
+    results = resolve_device_identities([device], legend)
+    r = results[0]
+    assert r.kind == KIND_DEVICE
+    assert r.basis == BASIS_SYMBOL_FAMILY
+    assert r.type_name == "Smoke Detector"
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +576,29 @@ def test_classify_architecture_window() -> None:
 def test_classify_architecture_curtain() -> None:
     device = _device(block_ref="Curtain Wall Type B", layer_ref="A-GLAZ")
     assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_architecture_rvt_master_container() -> None:
+    """The linked Revit model master/container block (block_ref ends '_rvt-N') is the nesting
+    root, not a device — even when a stray tag is attached (#545 false-positive guard)."""
+    device = _device(
+        block_ref="3356-MPA-ZZ-ZZ-M3-A-0001_NEWPLANTROOM_rvt-1",
+        layer_ref="0",
+        tag=_tag("AHU"),
+    )
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_annotation_titleblock_beats_device_by_tag() -> None:
+    """A titleblock/drawing-number annotation block carrying a stray tag classifies as
+    annotation, NOT a device (annotation precedence beats device-by-tag, #545)."""
+    legend = _legend(_entry(abbreviation="AHU"))
+    device = _device(
+        block_ref="RUK-Annotation-TitleblockA0 - AEC Drawing No",
+        layer_ref="0",
+        tag=_tag("AHU"),
+    )
+    assert classify_instance_kind(device, legend) == KIND_ANNOTATION
 
 
 def test_architecture_resolve_type_name_is_none_for_all_patterns() -> None:
