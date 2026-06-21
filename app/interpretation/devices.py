@@ -179,17 +179,27 @@ async def enumerate_devices(
     *,
     device_layers: Sequence[str] | None = None,
     max_depth: int = _MAX_DEVICE_NESTING_DEPTH,
+    exclude_off_sheet: bool = False,
 ) -> list[Device]:
     """Enumerate device instances by walking the block-instance tree from top-level INSERTs.
 
     Each INSERT (at any depth) is emitted with its world position; recursion descends into the
     block it places, composing transforms, guarded against cycles, the depth cap, and a total cap.
+
+    ``exclude_off_sheet`` scopes the walk to the printed sheet (#588): only the ROOT INSERTs carry
+    a sheet-membership tag (#569), and a nested child belongs to the same printed sheet as the
+    root it descends from, so dropping off-sheet roots cascades to their whole subtree. Undetermined
+    (NULL) roots are kept, so a drawing without viewports is unaffected.
     """
 
     block_defs = await _load_block_defs(db, revision_id)
 
     roots = await load_revision_entities_by_type(
-        db, revision_id, ("insert",), layer_refs=device_layers
+        db,
+        revision_id,
+        ("insert",),
+        layer_refs=device_layers,
+        exclude_off_sheet=exclude_off_sheet,
     )
 
     devices: list[Device] = []

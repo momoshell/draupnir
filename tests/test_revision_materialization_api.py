@@ -14,6 +14,7 @@ from app.core.errors import ErrorCode
 from app.ingestion.adapters import libredwg as libredwg_adapter
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunRequest
+from app.interpretation.devices import enumerate_devices
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.jobs.worker import process_ingest_job
 from app.models.adapter_run_output import AdapterRunOutput
@@ -491,6 +492,74 @@ class TestRevisionMaterializationApi:
             "undet",
         ]  # off-sheet dropped, NULL kept
         assert sorted(e.entity_id for e in full) == ["off", "on", "undet"]  # full modelspace
+
+    async def test_enumerate_devices_exclude_off_sheet_drops_off_sheet_roots(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """enumerate_devices(exclude_off_sheet=True) drops INSERTs whose ROOT is off-sheet and
+        keeps on-sheet (True) + undetermined (NULL) — the device-walk counterpart of #583 (#588).
+        Nested children inherit their root's membership, so filtering roots cascades."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        def _with_membership(entity: dict[str, Any], on_sheet: bool | None) -> dict[str, Any]:
+            membership: dict[str, Any] = {"schema_version": "0.1", "on_sheet": on_sheet}
+            entity["properties_json"] = {
+                **entity["properties_json"],
+                "sheet_membership": membership,
+            }
+            return entity
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            inserts = [
+                _with_membership(
+                    _build_contract_entity(
+                        entity_id=eid,
+                        entity_type="insert",
+                        layer_ref="E-DEVICE",
+                        block_ref=f"BLK-{eid}",
+                        source_id=f"s-{eid}",
+                    ),
+                    flag,
+                )
+                for eid, flag in (("on", True), ("off", False), ("undet", None))
+            ]
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[{"layer_ref": "E-DEVICE", "name": "E-DEVICE"}],
+                blocks=[
+                    {"block_ref": f"BLK-{eid}", "name": f"BLK-{eid}"}
+                    for eid in ("on", "off", "undet")
+                ],
+                entities=inserts,
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            scoped = await enumerate_devices(session, revision_id, exclude_off_sheet=True)
+            full = await enumerate_devices(session, revision_id)
+
+        assert sorted(d.entity_id for d in scoped) == ["on", "undet"]  # off-sheet root dropped
+        assert sorted(d.entity_id for d in full) == ["off", "on", "undet"]  # full modelspace
 
     async def test_devices_endpoint_returns_schedule_and_tag_association(
         self,

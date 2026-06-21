@@ -440,6 +440,7 @@ def test_revision_router_routes_match_baseline_contract() -> None:
                 ("query", "max_tag_distance", False, None, None, None, None),
                 ("query", "max_depth", False, 8, 0, 8, None),
                 ("query", "kind", False, "all", None, None, None),
+                ("query", "scope", False, "sheet", None, None, None),
                 ("dependency", "db", None, None, None, None, "get_db"),
             ),
         ),
