@@ -49,6 +49,14 @@ class Room:
     confidence: float | None = None
     number: str | None = None
     location: Point | None = None
+    # All label anchor points for a (possibly merged) label-only room (#581). A room labelled
+    # several times under one number — e.g. the 3 arms of a U-shaped space with no internal
+    # walls — is one room; its anchors retain every placement so device proximity covers the
+    # whole room. ``location`` stays the representative point. Empty for polygon rooms.
+    anchors: tuple[Point, ...] = ()
+    # Wall-aware duplicate-number flag (#581): the same number was found in regions separated
+    # by walls (>=2 distinct polygon rooms) — a likely numbering error surfaced, not merged.
+    needs_review: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,8 +118,14 @@ def room_from_label(
     name: str | None = None,
     number: str | None = None,
     confidence: float | None = None,
+    anchors: tuple[Point, ...] | None = None,
+    needs_review: bool = False,
 ) -> Room:
-    """Build a label-derived room: a name/number at a location, with no boundary (#549)."""
+    """Build a label-derived room: a name/number at a location, with no boundary (#549).
+
+    ``anchors`` defaults to ``(location,)`` so device proximity has at least the label point;
+    a merged room (#581) passes every placement's point.
+    """
     return Room(
         id=room_id,
         name=name,
@@ -122,6 +136,8 @@ def room_from_label(
         confidence=confidence,
         number=number,
         location=location,
+        anchors=anchors if anchors is not None else (location,),
+        needs_review=needs_review,
     )
 
 
@@ -198,10 +214,77 @@ def assign_devices_to_label_rooms(
     for device in devices:
         if device.device_id in already_assigned:
             continue
-        nearest = min(label_rooms, key=lambda room: _distance(device.point, room.location))
-        if nearest.location is not None and _distance(device.point, nearest.location) <= radius:
+        # Distance to a room is the distance to its NEAREST anchor (#581): a merged U-shaped
+        # room covers several placements, so a device near any arm belongs to it.
+        nearest = min(label_rooms, key=lambda room: _nearest_anchor_distance(device.point, room))
+        if _nearest_anchor_distance(device.point, nearest) <= radius:
             assignments.append(DeviceRoomAssignment(device_id=device.device_id, room_id=nearest.id))
     return assignments
+
+
+def merge_label_room_group(group: Sequence[Room]) -> Room:
+    """Merge same-number label-only rooms into one, unioning their anchor points (#581).
+
+    Name is the first non-null in the group; ``location`` becomes the first anchor; ``anchors``
+    is the de-duplicated union of every member's anchors (so device proximity covers all
+    placements). Keeps the first room's id (callers may re-id). ``needs_review`` is preserved
+    if any member carried it.
+    """
+    first = group[0]
+    name = next((room.name for room in group if room.name is not None), None)
+    anchors: list[Point] = []
+    for room in group:
+        for anchor in _room_anchors(room):
+            if anchor not in anchors:
+                anchors.append(anchor)
+    return room_from_label(
+        first.id,
+        source=first.source,
+        location=anchors[0] if anchors else (first.location or (0.0, 0.0)),
+        name=name,
+        number=first.number,
+        confidence=first.confidence,
+        anchors=tuple(anchors),
+        needs_review=any(room.needs_review for room in group),
+    )
+
+
+def dedupe_label_rooms_by_number(rooms: Sequence[Room]) -> list[Room]:
+    """Merge label-only rooms sharing a room number into one room each (#581).
+
+    Same-number labels are one room placed several times (e.g. the arms of a U-shaped space
+    with no internal walls); the merge retains every placement as an anchor. Rooms without a
+    number pass through unchanged. Output preserves first-appearance order and is deterministic.
+    """
+    groups: dict[str, list[Room]] = {}
+    slot_of_number: dict[str, int] = {}
+    result: list[Room] = []
+    for room in rooms:
+        if room.number is None:
+            result.append(room)
+            continue
+        if room.number not in groups:
+            groups[room.number] = [room]
+            slot_of_number[room.number] = len(result)
+            result.append(room)  # tentative; replaced below if the group grows
+        else:
+            groups[room.number].append(room)
+    for number, group in groups.items():
+        if len(group) > 1:
+            result[slot_of_number[number]] = merge_label_room_group(group)
+    return result
+
+
+def _room_anchors(room: Room) -> tuple[Point, ...]:
+    """A label room's anchor points: its explicit anchors, else its single location."""
+    if room.anchors:
+        return room.anchors
+    return (room.location,) if room.location is not None else ()
+
+
+def _nearest_anchor_distance(point: Point, room: Room) -> float:
+    """Distance from ``point`` to the closest of ``room``'s anchor points (inf if none)."""
+    return min((_distance(point, anchor) for anchor in _room_anchors(room)), default=float("inf"))
 
 
 def _distance(point: Point, other: Point | None) -> float:

@@ -46,6 +46,20 @@ class RoomRead(BaseModel):
     location: RoomLocationRead | None = Field(
         None, description="Label point for label-only rooms; null when a polygon is present"
     )
+    anchors: list[RoomLocationRead] = Field(
+        default_factory=list,
+        description=(
+            "All label anchor points for a (possibly merged) label-only room (#581); a room "
+            "labelled several times under one number keeps every placement. Empty for polygons."
+        ),
+    )
+    needs_review: bool = Field(
+        False,
+        description=(
+            "The same room number was found in regions separated by walls (a likely numbering "
+            "error) — surfaced for review, not silently merged (#581)."
+        ),
+    )
     confidence: float | None = Field(
         None,
         ge=0.0,

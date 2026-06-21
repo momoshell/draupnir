@@ -26,6 +26,7 @@ from app.interpretation.rooms import (
     Room,
     RoomLabel,
     assign_devices_to_label_rooms,
+    dedupe_label_rooms_by_number,
 )
 from app.interpretation.wall_rooms import (
     DEFAULT_WALL_MIN_AREA,
@@ -108,30 +109,65 @@ def interpret_rooms(
 def _enrich_with_labels(
     base: RoomInterpretation, labels: Sequence[RoomLabel]
 ) -> RoomInterpretation:
-    """Stamp label name/number onto containing polygon rooms; append unmatched as label rooms."""
+    """Stamp label name/number onto containing polygon rooms, flag cross-wall duplicate numbers,
+    and append unmatched label identities — deduped by number into one room each (#549, #581)."""
     identities = identify_rooms_from_labels(labels)
     if not identities:
         return base
 
     rooms = list(base.rooms)
-    unmatched: list[Room] = []
-    for identity in identities:
-        location = identity.location
-        target = _containing_polygon_room(location, rooms) if location is not None else None
-        if target is None:
-            unmatched.append(identity)
-            continue
-        index = rooms.index(target)
-        rooms[index] = replace(
-            target,
-            name=target.name if target.name is not None else identity.name,
-            number=target.number if target.number is not None else identity.number,
+    # Resolve containment ONCE against the original geometry (stamping below changes only
+    # name/number, never the polygon, so containment is unaffected).
+    pairs = [
+        (
+            identity,
+            _containing_polygon_room(identity.location, rooms)
+            if identity.location is not None
+            else None,
         )
+        for identity in identities
+    ]
 
-    if not unmatched:
+    # (a) Stamp name/number onto containing polygon rooms (first identity per room wins). Keyed
+    # by room id so multiple identities landing in one room can't trip object-identity lookups.
+    stamp: dict[str, tuple[str | None, str | None]] = {}
+    for identity, target in pairs:
+        if target is not None and target.id not in stamp:
+            stamp[target.id] = (identity.name, identity.number)
+    rooms = [
+        replace(
+            room,
+            name=room.name if room.name is not None else stamp[room.id][0],
+            number=room.number if room.number is not None else stamp[room.id][1],
+        )
+        if room.id in stamp
+        else room
+        for room in rooms
+    ]
+
+    # (b) Wall-aware: a number whose labels land in >=2 distinct polygon rooms is a cross-wall
+    # duplicate (a likely numbering error) — flag those rooms for review, never silently merge.
+    polygons_by_number: dict[str, set[str]] = {}
+    for identity, target in pairs:
+        if identity.number is not None and target is not None:
+            polygons_by_number.setdefault(identity.number, set()).add(target.id)
+    flagged = {number for number, ids in polygons_by_number.items() if len(ids) > 1}
+    if flagged:
+        rooms = [replace(r, needs_review=True) if r.number in flagged else r for r in rooms]
+
+    # (c) Label-only identities: drop those whose number a polygon room already carries, then
+    # merge same-number placements into one room with all anchors (#581 — U-shape).
+    numbered_polygons = {r.number for r in rooms if r.polygon is not None and r.number is not None}
+    label_only = [
+        identity
+        for identity, target in pairs
+        if target is None and (identity.number is None or identity.number not in numbered_polygons)
+    ]
+    merged = dedupe_label_rooms_by_number(label_only)
+    if not merged:
         return replace(base, rooms=rooms)
     # Re-id the appended label rooms so ids stay unique + stable within the merged list.
-    appended = [replace(room, id=f"label-room-{index}") for index, room in enumerate(unmatched)]
+    appended = [replace(room, id=f"label-room-{index}") for index, room in enumerate(merged)]
     return replace(base, rooms=[*rooms, *appended])
 
 

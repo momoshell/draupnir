@@ -309,6 +309,8 @@ def _room_read(room: Room) -> RoomRead:
         area=room.area,
         bounds=bounds,
         location=location,
+        anchors=[RoomLocationRead(x=ax, y=ay) for ax, ay in room.anchors],
+        needs_review=room.needs_review,
         confidence=room.confidence,
     )
 
