@@ -8,7 +8,7 @@ import json
 import time
 from dataclasses import dataclass
 from itertools import pairwise
-from math import isfinite, sqrt
+from math import hypot, isfinite, sqrt
 from pathlib import Path
 from typing import Any, cast
 
@@ -36,7 +36,7 @@ from app.ingestion.contracts import (
     ProvenanceRecord,
 )
 from app.ingestion.registry import evaluate_availability, get_descriptor
-from app.ingestion.units_inference import extent_from_bboxes, infer_units
+from app.ingestion.units_inference import DimensionObservation, extent_from_bboxes, infer_units
 
 _DESCRIPTOR = get_descriptor(InputFamily.DXF)
 _CANONICAL_SCHEMA_VERSION = "0.1"
@@ -280,6 +280,37 @@ class EzdxfAdapter:
                     invalid_geometry_entities += 1
                 else:
                     supported_entities += 1
+            elif entity_type == "DIMENSION":
+                try:
+                    canonical_entity = _dimension_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                except Exception as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="malformed_dimension",
+                            message=(
+                                "DXF DIMENSION entity was malformed and was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
+                else:
+                    supported_entities += 1
             else:
                 canonical_entity = _unknown_entity_payload(
                     entity,
@@ -359,6 +390,7 @@ class EzdxfAdapter:
                 source_value=_source_int,
                 warnings=warnings,
                 warning_code_prefix="ezdxf",
+                dimension_observations=_dimension_observations_from_entities(canonical_entities),
             )
 
         canonical: dict[str, JSONValue] = {
@@ -524,11 +556,15 @@ def _apply_unit_inference(
     source_value: int,
     warnings: list[AdapterWarning],
     warning_code_prefix: str,
+    dimension_observations: tuple[DimensionObservation, ...] = (),
 ) -> None:
-    """Attempt extent-based unit inference and mutate *units_payload* in-place.
+    """Attempt unit inference and mutate *units_payload* in-place.
 
     Only called on the UNCONFIRMED path (confirmed=False).  The confirmed path
     is never mutated so its exact byte output is preserved.
+
+    Tier-1 (dimension-text) runs first via dimension_observations; Tier-2
+    (extent magnitude) is the fallback.
     """
     # In the ezdxf canonical schema the bbox lives under entity["geometry"]["bbox"].
     bboxes: list[dict[str, object]] = []
@@ -541,7 +577,11 @@ def _apply_unit_inference(
             bboxes.append(bbox)
 
     extent = extent_from_bboxes(bboxes)
-    result = infer_units(declared_code=source_value if source_value else None, extent=extent)
+    result = infer_units(
+        declared_code=source_value if source_value else None,
+        extent=extent,
+        dimension_observations=dimension_observations,
+    )
 
     if result.confidence == "inferred":
         units_payload["confidence"] = "inferred"
@@ -549,9 +589,8 @@ def _apply_unit_inference(
         units_payload["normalized"] = result.normalized
         units_payload["source"] = "$INSUNITS"
         units_payload["basis"] = result.basis
-        if extent is not None:
-            units_payload["inference"] = {
-                "extent": {"width": extent.width, "height": extent.height},
+        if extent is not None or dimension_observations:
+            inference_block: dict[str, JSONValue] = {
                 "candidates": tuple(
                     {
                         "normalized": c.normalized,
@@ -561,7 +600,11 @@ def _apply_unit_inference(
                     for c in result.candidates
                 ),
                 "basis": result.basis,
+                "dimension_observation_count": len(dimension_observations),
             }
+            if extent is not None:
+                inference_block["extent"] = {"width": extent.width, "height": extent.height}
+            units_payload["inference"] = inference_block
         if result.contradicts_declared:
             units_payload["contradiction"] = {
                 "declared_normalized": result.declared_normalized,
@@ -779,6 +822,211 @@ def _resolve_entity_style(
         },
         "lineweight": {"raw": raw_lw if raw_lw >= 0 else None, "mm": lw_mm},
     }
+
+
+def _dimension_dimlfac(entity: Any) -> float:
+    """Resolve the DIMLFAC display scale factor for a DIMENSION entity.
+
+    Uses ezdxf's DimStyleOverride.get(), which merges entity-level override
+    attributes -> named dimstyle -> header defaults in one call.  The
+    entity.dxf.get("dimlfac") branch is intentionally absent: dimlfac is not a
+    direct DIMENSION dxf attribute and always raises DXFAttributeError there.
+    Never raises.
+    """
+    try:
+        val = entity.override().get("dimlfac")
+        if val is not None and isinstance(val, (int, float)) and not isinstance(val, bool):
+            f = float(val)
+            if isfinite(f) and f > 0:
+                return f
+    except Exception:
+        pass
+
+    return 1.0
+
+
+def _dimension_stated_override(text: str | None) -> float | None:
+    """Parse the drafter text override to a float, or return None if unusable.
+
+    '<>' or '' means measured-only (no drafter override).  Non-numeric strings
+    are also unusable.
+    """
+    if text is None or text.strip() in ("<>", ""):
+        return None
+    try:
+        return float(text.strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _dimension_entity_payload(
+    entity: Any,
+    *,
+    layout_name: str,
+    units: dict[str, JSONValue],
+) -> dict[str, JSONValue]:
+    """Build a canonical entity payload for a DXF DIMENSION entity.
+
+    Mirrors the structure of _line_entity_payload; bbox spans defpoint2/defpoint3
+    (the linear extension-line definition points).
+    """
+    native_type = "DIMENSION"
+    handle = _entity_handle(entity)
+    layer_name = _entity_layer(entity)
+
+    # Raw dimension type; base type = dimtype & 7.
+    dimtype_raw = int(getattr(entity.dxf, "dimtype", 0))
+    dimtype_base = dimtype_raw & 7
+    # base 0 = rotated/horizontal/vertical linear, 1 = aligned linear => is_linear
+    is_linear = dimtype_base in (0, 1)
+
+    # Extension-line definition points (defpoint2/defpoint3 for linear dims).
+    dp2_raw = getattr(entity.dxf, "defpoint2", None)
+    dp3_raw = getattr(entity.dxf, "defpoint3", None)
+
+    def _safe_pt(pt: Any) -> tuple[float, float, float]:
+        x = float(getattr(pt, "x", 0.0))
+        y = float(getattr(pt, "y", 0.0))
+        z = float(getattr(pt, "z", 0.0))
+        return x, y, z
+
+    p2x, p2y, p2z = _safe_pt(dp2_raw) if dp2_raw is not None else (0.0, 0.0, 0.0)
+    p3x, p3y, p3z = _safe_pt(dp3_raw) if dp3_raw is not None else (0.0, 0.0, 0.0)
+    raw_span = hypot(p3x - p2x, p3y - p2y)
+
+    defpoint2_payload: dict[str, JSONValue] = {"x": p2x, "y": p2y, "z": p2z}
+    defpoint3_payload: dict[str, JSONValue] = {"x": p3x, "y": p3y, "z": p3z}
+
+    text_override_raw = _optional_string(getattr(entity.dxf, "text", None))
+    dimlfac = _dimension_dimlfac(entity)
+
+    # Scale defpoints to meters when a confirmed conversion factor is available.
+    dp2_scaled = _scaled_point_payload(None, units=units, point_payload=defpoint2_payload)
+    dp3_scaled = _scaled_point_payload(None, units=units, point_payload=defpoint3_payload)
+
+    entity_id = _entity_id(
+        native_type=native_type,
+        handle=handle,
+        layout_name=layout_name,
+        layer_name=layer_name,
+        geometry={"defpoint2": dp2_scaled, "defpoint3": dp3_scaled},
+    )
+
+    bbox = _bbox_payload(dp2_scaled, dp3_scaled)
+
+    adapter_native: dict[str, JSONValue] = {
+        "layer": layer_name,
+        "linetype": _optional_string(getattr(entity.dxf, "linetype", None)),
+        "dimension": {
+            "dimtype_base": dimtype_base,
+            "is_linear": is_linear,
+            "text_override": text_override_raw,
+            "raw_span": raw_span,
+            "dimlfac": dimlfac,
+            "defpoint2": {"x": p2x, "y": p2y, "z": p2z},
+            "defpoint3": {"x": p3x, "y": p3y, "z": p3z},
+        },
+    }
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": "dimension",
+        "entity_schema_version": _CANONICAL_SCHEMA_VERSION,
+        "geometry": {
+            "defpoint2": dp2_scaled,
+            "defpoint3": dp3_scaled,
+            "bbox": bbox,
+            "units": dict(units),
+            "geometry_summary": {
+                "kind": "dimension",
+                "raw_span": raw_span,
+                "is_linear": is_linear,
+            },
+        },
+        "properties": {
+            "source_type": native_type,
+            "source_handle": handle or None,
+            "quantity_hints": {
+                "span": raw_span,
+                "count": 1.0,
+            },
+            "adapter_native": {"ezdxf": adapter_native},
+        },
+        "provenance": _entity_provenance(
+            native_type=native_type,
+            handle=handle,
+            layout_name=layout_name,
+            layer_name=layer_name,
+            entity_id=entity_id,
+            geometry={"defpoint2": dp2_scaled, "defpoint3": dp3_scaled},
+        ),
+        "confidence": 0.99,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "kind": "dimension",
+        "handle": handle,
+        "layer": layer_name,
+        "layout": layout_name,
+    }
+
+
+def _dimension_observations_from_entities(
+    entities: list[dict[str, JSONValue]],
+) -> tuple[DimensionObservation, ...]:
+    """Walk canonical entities and build DimensionObservation tuples for Tier-1 inference.
+
+    Only processes entities with entity_type=="dimension" that carry the
+    adapter_native.ezdxf.dimension sub-block populated by _dimension_entity_payload.
+    """
+    observations: list[DimensionObservation] = []
+    for entity in entities:
+        if entity.get("entity_type") != "dimension":
+            continue
+        try:
+            props = entity.get("properties")
+            if not isinstance(props, dict):
+                continue
+            adapter_native = props.get("adapter_native")
+            if not isinstance(adapter_native, dict):
+                continue
+            ezdxf_block = adapter_native.get("ezdxf")
+            if not isinstance(ezdxf_block, dict):
+                continue
+            dim_block = ezdxf_block.get("dimension")
+            if not isinstance(dim_block, dict):
+                continue
+
+            raw_span_val = dim_block.get("raw_span")
+            dimlfac_val = dim_block.get("dimlfac")
+            is_linear_val = dim_block.get("is_linear")
+            text_override_val = dim_block.get("text_override")
+
+            if not isinstance(raw_span_val, (int, float)) or isinstance(raw_span_val, bool):
+                continue
+            if not isinstance(dimlfac_val, (int, float)) or isinstance(dimlfac_val, bool):
+                continue
+            if not isinstance(is_linear_val, bool):
+                continue
+
+            stated_override = _dimension_stated_override(
+                text_override_val if isinstance(text_override_val, str) else None
+            )
+            observations.append(
+                DimensionObservation(
+                    raw_span=float(raw_span_val),
+                    stated_override=stated_override,
+                    dimlfac=float(dimlfac_val),
+                    is_linear=bool(is_linear_val),
+                )
+            )
+        except Exception:
+            continue
+
+    return tuple(observations)
 
 
 def _line_entity_payload(
