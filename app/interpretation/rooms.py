@@ -9,6 +9,7 @@ FastAPI concerns, so every function is unit-testable with fakes.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -174,6 +175,39 @@ def assign_devices_to_rooms(
         if room is not None:
             assignments.append(DeviceRoomAssignment(device_id=device.device_id, room_id=room.id))
     return assignments
+
+
+def assign_devices_to_label_rooms(
+    devices: Sequence[DevicePlacement],
+    rooms: Sequence[Room],
+    *,
+    already_assigned: set[str],
+    radius: float,
+) -> list[DeviceRoomAssignment]:
+    """Assign yet-unassigned devices to the nearest label-only room within ``radius`` (#555).
+
+    Label-derived rooms have a location but no polygon, so containment can't apply. This is a
+    deliberate heuristic for the no-polygon case: a device with no containing polygon room is
+    attached to the nearest labeled room point within ``radius``. Polygon containment (when
+    available) always takes precedence — devices already assigned are skipped.
+    """
+    label_rooms = [room for room in rooms if room.polygon is None and room.location is not None]
+    if not label_rooms:
+        return []
+    assignments: list[DeviceRoomAssignment] = []
+    for device in devices:
+        if device.device_id in already_assigned:
+            continue
+        nearest = min(label_rooms, key=lambda room: _distance(device.point, room.location))
+        if nearest.location is not None and _distance(device.point, nearest.location) <= radius:
+            assignments.append(DeviceRoomAssignment(device_id=device.device_id, room_id=nearest.id))
+    return assignments
+
+
+def _distance(point: Point, other: Point | None) -> float:
+    if other is None:
+        return float("inf")
+    return math.hypot(point[0] - other[0], point[1] - other[1])
 
 
 def _smallest_containing_room(point: Point, rooms: Sequence[Room]) -> Room | None:
