@@ -245,3 +245,38 @@ def test_device_tag_layer_text_does_not_become_a_room() -> None:
     assert len(label_rooms) == 1
     assert label_rooms[0].name == "AHU Plant"
     assert label_rooms[0].number == "0.9.04"
+
+
+def test_devices_assigned_to_label_only_room_by_proximity() -> None:
+    # No geometry → label-only rooms; a device near a labeled room point is assigned to it.
+    labels = [
+        RoomLabel("PH Plantroom", (10.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (10.0, 10.0), layer="A-IDEN"),
+        RoomLabel("Telco Intake", (50.0, 50.4), layer="A-IDEN"),
+        RoomLabel("0.9.09", (50.0, 50.0), layer="A-IDEN"),
+    ]
+    devices = [
+        DevicePlacement("cam-1", (11.0, 11.0)),  # near PH Plantroom
+        DevicePlacement("cam-2", (51.0, 49.0)),  # near Telco Intake
+        DevicePlacement("cam-far", (500.0, 500.0)),  # beyond radius of any room
+    ]
+    result = interpret_rooms([], devices=devices, labels=labels)
+    rooms_by_number = {room.number: room.id for room in result.rooms if room.number}
+    assigned = {a.device_id: a.room_id for a in result.device_assignments}
+    assert assigned["cam-1"] == rooms_by_number["0.9.01"]
+    assert assigned["cam-2"] == rooms_by_number["0.9.09"]
+    assert "cam-far" not in assigned  # beyond the heuristic radius → unassigned
+
+
+def test_polygon_containment_wins_over_label_proximity() -> None:
+    # A device inside a wall polygon is assigned by containment, not nearest label room.
+    entities = _square_wall_lines()  # SQUARE 0..10
+    labels = [
+        RoomLabel("Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN"),
+    ]
+    devices = [DevicePlacement("d1", (5.0, 5.0))]
+    result = interpret_rooms(entities, devices=devices, labels=labels)
+    assigned = {a.device_id: a.room_id for a in result.device_assignments}
+    target = next(r for r in result.rooms if r.polygon is not None and r.name == "Plant")
+    assert assigned["d1"] == target.id

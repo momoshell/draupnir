@@ -25,6 +25,7 @@ from app.interpretation.rooms import (
     DeviceRoomAssignment,
     Room,
     RoomLabel,
+    assign_devices_to_label_rooms,
 )
 from app.interpretation.wall_rooms import (
     DEFAULT_WALL_MIN_AREA,
@@ -43,6 +44,10 @@ ROOM_STRATEGIES = (
     ROOM_STRATEGY_EXPLICIT,
     ROOM_STRATEGY_WALLS,
 )
+
+# Heuristic max distance from a device to a label-only room's point for nearest-room
+# assignment (#555). Generous, since a polygon-less room has no boundary to contain points.
+DEFAULT_DEVICE_LABEL_ROOM_RADIUS = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +91,18 @@ def interpret_rooms(
         snap_tolerance=snap_tolerance,
         min_area=min_area,
     )
-    return _enrich_with_labels(base, room_labels)
+    enriched = _enrich_with_labels(base, room_labels)
+    # Devices land in their containing polygon room (done by the strategy); any left over are
+    # attached to the nearest label-only room — the no-polygon case (#555).
+    extra = assign_devices_to_label_rooms(
+        devices,
+        enriched.rooms,
+        already_assigned={a.device_id for a in enriched.device_assignments},
+        radius=DEFAULT_DEVICE_LABEL_ROOM_RADIUS,
+    )
+    if not extra:
+        return enriched
+    return replace(enriched, device_assignments=[*enriched.device_assignments, *extra])
 
 
 def _enrich_with_labels(
