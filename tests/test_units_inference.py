@@ -23,8 +23,9 @@ import pytest
 
 from app.ingestion.adapters._units import METER_SCALE
 from app.ingestion.units_inference import (
+    DimensionObservation,
     Extent,
-    UnitCandidate,  # noqa: F401 — imported to confirm it is exportable
+    UnitCandidate,  # noqa: F401 -- imported to confirm it is exportable
     UnitInferenceResult,
     extent_from_bboxes,
     infer_units,
@@ -47,7 +48,7 @@ def _infer(
         declared_code=declared_code,
         extent=Extent(width=width, height=height),
         text_height_samples=text_height_samples,
-        dimension_observations=dimension_observations,
+        dimension_observations=dimension_observations,  # type: ignore[arg-type]
     )
 
 
@@ -565,10 +566,312 @@ class TestDeclaredCuratedOutOfRangeExtent:
     """declared_code resolves to a curated unit even when extent is out of range."""
 
     def test_declared_code_resolves_despite_out_of_range_extent(self) -> None:
-        # Extent 1e10 x 5e9 → out of all bands → basis="extent_out_of_range", confidence="unknown".
-        # declared_code=6 (meter) is in METER_SCALE → declared_normalized is still resolved.
+        # Extent 1e10 x 5e9 -> out of all bands -> basis="extent_out_of_range".
+        # declared_code=6 (meter) is in METER_SCALE -> declared_normalized still resolved.
         result = infer_units(declared_code=6, extent=Extent(1e10, 5e9))
 
         assert result.confidence == "unknown"
         assert result.basis == "extent_out_of_range"
         assert result.declared_normalized == "meter"
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 -- DimensionObservation inference (issue #558, P2)
+# ---------------------------------------------------------------------------
+
+
+def _obs(
+    stated_override: float | None,
+    raw_span: float = 1000.0,
+    dimlfac: float = 1.0,
+    is_linear: bool = True,
+) -> DimensionObservation:
+    """Factory shorthand for DimensionObservation in tests."""
+    return DimensionObservation(
+        raw_span=raw_span,
+        stated_override=stated_override,
+        dimlfac=dimlfac,
+        is_linear=is_linear,
+    )
+
+
+def _infer_dim(
+    obs: tuple[DimensionObservation | object, ...],
+    *,
+    declared_code: int | None = None,
+    extent: Extent | None = None,
+) -> UnitInferenceResult:
+    """Call infer_units with dimension_observations and optional extent."""
+    return infer_units(
+        declared_code=declared_code,
+        extent=extent,
+        dimension_observations=obs,  # type: ignore[arg-type]
+    )
+
+
+class TestTier1BasicBands:
+    """Single in-band observation drives the correct unit."""
+
+    def test_override_30000_infers_millimeter(self) -> None:
+        # display_value = 30000.0; log10(30000) ~ 4.477
+        # mm band [3.0, 5.477] midpoint ~ 4.239 -> score ~ 1.238 - 0.238 = 1.0
+        # cm band [2.0, 4.477] upper boundary -> score = 0 (boundary hit)
+        # mm wins by score.
+        result = _infer_dim((_obs(30_000.0, raw_span=30_000.0),))
+        assert result.normalized == "millimeter"
+        assert result.conversion_factor == pytest.approx(0.001)
+        assert result.confidence == "inferred"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_override_3600_infers_millimeter(self) -> None:
+        # display_value = 3600.0; log10(3600) ~ 3.556
+        # Both mm band [3.0, 5.477] and cm band [2.0, 4.477] are in-band.
+        # New algorithm: pick highest-priority in-band unit -> millimeter wins.
+        # (3600 mm = 3.6 m = a standard wall/door height in construction drawings.)
+        result = _infer_dim((_obs(3600.0, raw_span=3600.0),))
+        assert result.normalized == "millimeter"
+        assert result.conversion_factor == pytest.approx(0.001)
+        assert result.confidence == "inferred"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_override_2400_infers_millimeter(self) -> None:
+        # display_value = 2400.0; log10(2400) ~ 3.380
+        # Both mm band [3.0, 5.477] and cm band [2.0, 4.477] are in-band.
+        # Highest-priority in-band unit -> millimeter.
+        result = _infer_dim((_obs(2400.0, raw_span=2400.0),))
+        assert result.normalized == "millimeter"
+        assert result.conversion_factor == pytest.approx(0.001)
+
+    def test_override_900_infers_centimeter(self) -> None:
+        # display_value = 900.0; log10(900) ~ 2.954
+        # mm band floor is log10(1000)=3.0, so 900 < 1000 -> mm band out-of-band.
+        # Only cm band is in-band -> centimeter.
+        result = _infer_dim((_obs(900.0, raw_span=900.0),))
+        assert result.normalized == "centimeter"
+        assert result.conversion_factor == pytest.approx(0.01)
+
+    def test_mixed_mm_tuple_median_millimeter(self) -> None:
+        # Realistic mm drawing: 900 (cm), 2400 (mm), 3600 (mm), 18000 (mm).
+        # Votes: cm, mm, mm, mm -> median of [mm, mm, mm, cm] sorted by priority
+        # -> [mm, mm, mm, cm] -> even count, pick lower index of two middles:
+        # index 1 (mm) and index 2 (mm) -> mm wins.
+        result = _infer_dim(
+            (
+                _obs(900.0, raw_span=900.0),
+                _obs(2400.0, raw_span=2400.0),
+                _obs(3600.0, raw_span=3600.0),
+                _obs(18000.0, raw_span=18000.0),
+            )
+        )
+        assert result.normalized == "millimeter"
+        assert result.basis == "dimension_text:median"
+
+    def test_override_360_infers_centimeter(self) -> None:
+        # display_value = 360.0; log10(360) ~ 2.556
+        # cm band [2.0, 4.477] -> in-band; mm band [3.0, 5.477] -> out-of-band.
+        # Sole candidate: centimeter.
+        result = _infer_dim((_obs(360.0),))
+        assert result.normalized == "centimeter"
+        assert result.conversion_factor == pytest.approx(0.01)
+        assert result.confidence == "inferred"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_override_3p6_infers_meter(self) -> None:
+        # display_value = 3.6; log10(3.6) ~ 0.556
+        # meter band [0.0, 2.477] -> in-band; cm and mm bands -> out-of-band.
+        result = _infer_dim((_obs(3.6),))
+        assert result.normalized == "meter"
+        assert result.conversion_factor == pytest.approx(1.0)
+        assert result.confidence == "inferred"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_single_obs_basis_is_single(self) -> None:
+        result = _infer_dim((_obs(30_000.0),))
+        assert result.basis == "dimension_text:single"
+
+    def test_multiple_obs_basis_is_median(self) -> None:
+        result = _infer_dim((_obs(30_000.0), _obs(30_000.0)))
+        assert result.basis == "dimension_text:median"
+
+
+class TestTier1OutranksTier2:
+    """Tier-1 result is returned even when extent disagrees."""
+
+    def test_obs_mm_extent_meter_returns_mm(self) -> None:
+        # One obs voting mm (display_value=30000); extent of 80 x 50 would infer meter alone.
+        result = _infer_dim(
+            (_obs(30_000.0),),
+            extent=Extent(80.0, 50.0),
+        )
+        assert result.normalized == "millimeter"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_obs_mm_extent_none_returns_mm(self) -> None:
+        result = _infer_dim((_obs(30_000.0),), extent=None)
+        assert result.normalized == "millimeter"
+        assert result.basis.startswith("dimension_text:")
+
+    def test_obs_mm_degenerate_extent_returns_mm(self) -> None:
+        # Extent(40000, 0) is degenerate -- would yield unknown from Tier-2.
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(40_000.0, 0.0),
+            dimension_observations=(_obs(30_000.0),),
+        )
+        assert result.normalized == "millimeter"
+        assert result.basis.startswith("dimension_text:")
+
+
+class TestTier1SkipConditions:
+    """Unusable observations fall through to Tier-2 / unknown."""
+
+    def test_measured_only_skipped_falls_back(self) -> None:
+        # stated_override=None -> unusable -> falls back to Tier-2 extent.
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=(_obs(None),),
+        )
+        # Tier-2 extent infers meter.
+        assert result.normalized == "meter"
+        assert not result.basis.startswith("dimension_text:")
+
+    def test_non_linear_skipped(self) -> None:
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=(_obs(3600.0, is_linear=False),),
+        )
+        assert result.normalized == "meter"
+        assert not result.basis.startswith("dimension_text:")
+
+    def test_only_unusable_tuple_behaves_like_empty(self) -> None:
+        base = infer_units(declared_code=None, extent=Extent(80.0, 50.0))
+        with_unusable = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=(
+                _obs(None),  # no override
+                _obs(3600.0, is_linear=False),  # non-linear
+            ),
+        )
+        assert base == with_unusable
+
+    def test_empty_tuple_no_tier1(self) -> None:
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=(),
+        )
+        assert result.normalized == "meter"
+        assert not result.basis.startswith("dimension_text:")
+
+
+class TestTier1Dimlfac:
+    """DIMLFAC scales the override before band scoring."""
+
+    def test_dimlfac_100_override_3600(self) -> None:
+        # display_value = 3600.0 / 100.0 = 36.0; log10(36) ~ 1.556
+        # meter band [0.0, 2.477] -> in-band (score = half_width - |1.556 - mid|).
+        # cm band [2.0, 4.477] -> 1.556 < 2.0 -> out-of-band.
+        # mm band [3.0, 5.477] -> out-of-band.
+        # Winner: meter.
+        result = _infer_dim((_obs(3600.0, dimlfac=100.0),))
+        assert result.normalized == "meter"
+        assert result.conversion_factor == pytest.approx(1.0)
+
+
+class TestTier1CandidatesShape:
+    """candidates tuple only contains distinct voted units in _TIEBREAK order."""
+
+    def test_single_vote_one_candidate(self) -> None:
+        result = _infer_dim((_obs(3600.0),))
+        assert len(result.candidates) >= 1
+        assert result.candidates[0].normalized == result.normalized
+        assert result.candidates[0].band_label == "dimension_override"
+
+    def test_candidates_in_tiebreak_order(self) -> None:
+        # Two obs: one votes mm (display=30000), one votes cm (display=360).
+        result = _infer_dim((_obs(30_000.0), _obs(360.0)))
+        names = [c.normalized for c in result.candidates]
+        # mm has higher priority than cm in _TIEBREAK -> mm first.
+        assert names.index("millimeter") < names.index("centimeter")
+
+
+class TestTier1Determinism:
+    """Permuting observations must not change the result."""
+
+    @pytest.mark.parametrize(
+        "obs_list",
+        [
+            [_obs(30_000.0), _obs(30_000.0), _obs(360.0)],
+            [_obs(30_000.0), _obs(360.0), _obs(3.6)],
+            [_obs(30_000.0), _obs(30_000.0), _obs(30_000.0)],
+        ],
+    )
+    def test_permutation_invariant(self, obs_list: list[DimensionObservation]) -> None:
+        from itertools import permutations as _perms
+
+        base = _infer_dim(tuple(obs_list))
+        for perm in _perms(obs_list):
+            assert _infer_dim(tuple(perm)) == base, f"Differed on permutation {perm!r}"
+
+
+class TestTier1NeverConfirmed:
+    """Tier-1 results must never have confidence='confirmed'."""
+
+    @pytest.mark.parametrize(
+        "obs_tuple",
+        [
+            (_obs(30_000.0),),
+            (_obs(360.0),),
+            (_obs(3.6),),
+            (_obs(30_000.0), _obs(360.0)),
+            (_obs(3600.0, dimlfac=100.0),),
+            (_obs(None),),  # unusable -> falls back
+        ],
+    )
+    def test_never_confirmed(self, obs_tuple: tuple[DimensionObservation, ...]) -> None:
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=obs_tuple,
+        )
+        assert result.confidence in ("inferred", "unknown")
+
+
+class TestTier1NeverRaises:
+    """Garbage input must never raise."""
+
+    @pytest.mark.parametrize(
+        "bad_obs",
+        [
+            _obs(float("nan")),
+            _obs(float("inf")),
+            _obs(-1.0),
+            _obs(0.0),
+            _obs(3600.0, raw_span=0.0),
+            _obs(3600.0, raw_span=float("nan")),
+            _obs(3600.0, dimlfac=0.0),
+            _obs(3600.0, dimlfac=float("nan")),
+            _obs(3600.0, dimlfac=-1.0),
+        ],
+    )
+    def test_never_raises_on_bad_obs(self, bad_obs: DimensionObservation) -> None:
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(80.0, 50.0),
+            dimension_observations=(bad_obs,),
+        )
+        assert result.confidence in ("inferred", "unknown")
+
+    def test_non_dimobs_entries_skipped(self) -> None:
+        # P1 seam backward-compat: non-DimensionObservation entries silently skipped.
+        result = infer_units(
+            declared_code=None,
+            extent=Extent(20_000.0, 15_000.0),
+            dimension_observations=("a", object(), 42),  # type: ignore[arg-type]
+        )
+        # Only extent available -> Tier-2 result, no exception.
+        assert result.confidence in ("inferred", "unknown")
+        assert not result.basis.startswith("dimension_text:")

@@ -1,19 +1,19 @@
-"""Pure unit-inference engine — Tier-2 geometry plausibility (issue #558, P1).
+"""Pure unit-inference engine -- Tier-1 dimension-text + Tier-2 geometry plausibility (#558 P2).
 
-Implements magnitude-band inference from drawing extent only.  No DB, ORM,
-FastAPI, or SQLAlchemy imports.  Domain knowledge (unit names and meter-scale
-factors) is imported exclusively from :mod:`app.ingestion.adapters._units`;
-this module never duplicates that table.
+Implements dimension-text-override inference (Tier-1) and magnitude-band
+inference from drawing extent (Tier-2).  No DB, ORM, FastAPI, or SQLAlchemy
+imports.  Domain knowledge (unit names and meter-scale factors) is imported
+exclusively from :mod:`app.ingestion.adapters._units`; this module never
+duplicates that table.
 
 Architecture constraints (ADR-004 / interpretation purity seam):
-- Inferred values are never "confirmed" — confidence is only "inferred" or
+- Inferred values are never "confirmed" -- confidence is only "inferred" or
   "unknown".
 - Identical inputs always produce identical outputs (determinism invariant).
 - Never raises on degenerate input (None extent, NaN/inf, exotic codes).
 
-Tier-1 (dimension-observation) logic belongs to #601/#602 and is represented
-here only as declared-but-unused seam parameters so the P2/P3 consumers can
-call the same signature without change.
+Tier-1 (dimension-observation) runs first and outranks Tier-2 (extent) when
+at least one usable, in-band DimensionObservation is present.
 """
 
 from __future__ import annotations
@@ -27,6 +27,32 @@ from app.ingestion.adapters._units import METER_SCALE, UNIT_NAMES
 # ---------------------------------------------------------------------------
 # Public dataclasses — frozen P1 contract consumed by P2/P3
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DimensionObservation:
+    """One dimension entity's measurement data for Tier-1 unit inference.
+
+    Adapter-agnostic: no ezdxf types.  Reused by #602 without change.
+
+    Attributes
+    ----------
+    raw_span:
+        Euclidean distance between defpoint2 and defpoint3 in raw drawing
+        units (the physical extent the dimension annotates).
+    stated_override:
+        Drafter's NUMERIC typed override text value.  None means the label
+        is measured-only or non-numeric and this observation is UNUSABLE.
+    dimlfac:
+        DIMLFAC display linear scale factor; default 1.0.
+    is_linear:
+        False for angular/radial/etc. dimensions that are skipped.
+    """
+
+    raw_span: float
+    stated_override: float | None
+    dimlfac: float = 1.0
+    is_linear: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +191,131 @@ def _resolve_declared(declared_code: int | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Tier-1 helper -- dimension-text override inference
+# ---------------------------------------------------------------------------
+
+
+def _infer_from_dimensions(
+    observations: tuple[DimensionObservation, ...],
+    *,
+    declared_code: int | None,
+    declared_normalized: str | None,
+) -> UnitInferenceResult | None:
+    """Infer unit from drafter dimension-text overrides (Tier-1).
+
+    Returns a UnitInferenceResult when at least one usable observation casts a
+    vote, or None to signal fall-through to Tier-2 (extent).
+
+    Never raises.  Non-DimensionObservation entries are silently skipped.
+
+    Algorithm
+    ---------
+    1. Filter to usable observations: DimensionObservation instances with
+       is_linear=True, finite+positive stated_override, finite+non-negative raw_span
+       (zero is allowed -- raw_span is kept for audit/P3 but not used in the vote),
+       finite+positive dimlfac.
+    2. For each usable observation compute display_value = stated_override / dimlfac
+       and find ALL in-band _BANDS entries.  Pick the one with the highest
+       construction priority (_TIEBREAK: mm=0 > cm=1 > m=2) as the vote for that
+       observation.  When multiple bands match, millimeter always wins over centimeter
+       (deliberate construction-CAD bias -- see comment in the loop).
+    3. Aggregate all votes via median: map to _TIEBREAK priority, sort, pick middle
+       (even count -> lower _TIEBREAK index of two middles = higher priority).
+    4. Build result with basis "dimension_text:single" or "dimension_text:median".
+    """
+    # --- usable filter ---
+    usable: list[DimensionObservation] = []
+    for obs in observations:
+        if not isinstance(obs, DimensionObservation):
+            continue  # backward-compat: skip non-DimensionObservation entries
+        if not obs.is_linear:
+            continue
+        if obs.stated_override is None:
+            continue
+        if not (math.isfinite(obs.stated_override) and obs.stated_override > 0):
+            continue
+        if not (math.isfinite(obs.raw_span) and obs.raw_span >= 0):
+            continue
+        if not (math.isfinite(obs.dimlfac) and obs.dimlfac > 0):
+            continue
+        usable.append(obs)
+
+    if not usable:
+        return None
+
+    # --- per-observation vote ---
+    votes: list[int] = []  # one winning code per in-band usable observation
+    for obs in usable:
+        display_value = obs.stated_override / obs.dimlfac  # type: ignore[operator]
+        if display_value <= 0 or not math.isfinite(display_value):
+            continue
+        log_dv = math.log10(display_value)
+        # Collect ALL in-band codes, then pick the one with the highest construction
+        # priority (lowest _TIEBREAK index: mm=0 > cm=1 > m=2).  This encodes a
+        # deliberate bias: in the mm/cm magnitude overlap, prefer millimeter, because
+        # construction CAD drawings overwhelmingly default to mm and genuine cm drawings
+        # are rare.  Do NOT use the band score to choose -- score-based selection
+        # mis-maps common mm values (e.g. 3600, 2400) to centimeter.
+        in_band_codes: list[int] = []
+        for band_log, code, _band_label in _BANDS:
+            if _band_score(log_dv, band_log) is not None:
+                in_band_codes.append(code)
+        if in_band_codes:
+            # Lower _TIEBREAK index = higher priority (mm wins over cm wins over m).
+            best_code = min(in_band_codes, key=lambda c: _TIEBREAK[c])
+            votes.append(best_code)
+
+    if not votes:
+        return None
+
+    # --- median aggregate (permutation-invariant) ---
+    # Sort votes by _TIEBREAK priority index so that ties resolve deterministically.
+    sorted_votes = sorted(votes, key=lambda c: _TIEBREAK[c])
+    n = len(sorted_votes)
+    # Even count: pick the higher-priority (lower _TIEBREAK index) of the two middles.
+    winner_code = sorted_votes[n // 2] if n % 2 == 1 else sorted_votes[n // 2 - 1]
+
+    winner_name = UNIT_NAMES[winner_code]
+    winner_factor = METER_SCALE[winner_code]
+    basis = "dimension_text:single" if n == 1 else "dimension_text:median"
+
+    # Distinct voted units as candidates in _TIEBREAK order.
+    seen: set[int] = set()
+    candidate_codes: list[int] = []
+    for code in sorted_votes:
+        if code not in seen:
+            seen.add(code)
+            candidate_codes.append(code)
+    candidates = tuple(
+        UnitCandidate(
+            normalized=UNIT_NAMES[code],
+            conversion_factor=METER_SCALE[code],
+            band_label="dimension_override",
+        )
+        for code in candidate_codes
+    )
+
+    # Contradiction check (same logic as Tier-2 path).
+    contradicts_declared = False
+    if declared_code is not None and declared_code in METER_SCALE:
+        declared_factor = METER_SCALE[declared_code]
+        ratio = winner_factor / declared_factor
+        inverse_threshold = 1.0 / _CONTRADICTION_RATIO_THRESHOLD
+        if ratio >= _CONTRADICTION_RATIO_THRESHOLD or ratio <= inverse_threshold:
+            contradicts_declared = True
+
+    return UnitInferenceResult(
+        normalized=winner_name,
+        conversion_factor=winner_factor,
+        confidence="inferred",
+        basis=basis,
+        contradicts_declared=contradicts_declared,
+        declared_normalized=declared_normalized,
+        candidates=candidates,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -218,10 +369,10 @@ def infer_units(
     *,
     declared_code: int | None,
     extent: Extent | None,
-    text_height_samples: tuple[float, ...] = (),  # UNUSED in P1 — declared seam
-    dimension_observations: tuple[object, ...] = (),  # UNUSED in P1 — declared seam
+    text_height_samples: tuple[float, ...] = (),  # UNUSED in P2 -- declared seam for P3
+    dimension_observations: tuple[DimensionObservation, ...] = (),  # Tier-1 (P2)
 ) -> UnitInferenceResult:
-    """Infer the drawing's native unit from extent magnitude only (P1).
+    """Infer the drawing's native unit from dimension overrides (Tier-1) or extent (Tier-2).
 
     Parameters
     ----------
@@ -230,9 +381,10 @@ def infer_units(
     extent:
         Raw bounding box in native units; None when unavailable.
     text_height_samples:
-        Reserved for Tier-1 text-height inference (P3); ignored in P1.
+        Reserved for Tier-1 text-height inference (P3); ignored in P2.
     dimension_observations:
-        Reserved for Tier-1 dimension-observation inference (P2); ignored in P1.
+        DimensionObservation entries for Tier-1 inference.  Non-DimensionObservation
+        entries are silently skipped for backward compatibility with P1 seam callers.
 
     Returns
     -------
@@ -240,12 +392,19 @@ def infer_units(
         ``confidence`` is ``"inferred"`` when a band match is found, otherwise
         ``"unknown"``.  Never raises; always returns a well-formed result.
     """
-    # Prevent any accidental use of the seam parameters from affecting output.
-    # The arguments are received but intentionally not read beyond this point.
-    _ = text_height_samples
-    _ = dimension_observations
+    _ = text_height_samples  # seam -- P3 will use this
 
     declared_normalized = _resolve_declared(declared_code)
+
+    # Tier-1: dimension-text override inference.  Runs first and outranks Tier-2
+    # when at least one usable, in-band observation is present.
+    tier1 = _infer_from_dimensions(
+        dimension_observations,
+        declared_code=declared_code,
+        declared_normalized=declared_normalized,
+    )
+    if tier1 is not None:
+        return tier1
 
     # Guard: missing or degenerate extent → unknown.
     if extent is None:

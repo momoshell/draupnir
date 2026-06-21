@@ -1581,3 +1581,357 @@ async def test_ezdxf_adapter_confirmed_units_exact_dict_equality(
         "conversion_target": "meter",
         "conversion_factor": pytest.approx(0.001),
     }
+
+
+# ---------------------------------------------------------------------------
+# P2 -- DIMENSION extraction + Tier-1 unit inference (#558)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_dimension_extracted_as_first_class_entity(
+    tmp_path: Path,
+) -> None:
+    """DIMENSION entity extracted as entity_type='dimension' with correct dimension sub-block."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-extraction.dxf"
+    # units=0 (unconfirmed); no setup=True so Standard dimstyle has dimlfac=None -> 1.0.
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    # 18000-mm span linear dim with explicit text override (clearly millimeter-band).
+    dim = msp.add_linear_dim(base=(0.0, -1000.0), p1=(0.0, 0.0), p2=(18000.0, 0.0), text="18000")
+    dim.render()
+    # Building-scale lines to fill out the drawing.
+    msp.add_line((0.0, 0.0, 0.0), (18000.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 12000.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    entities = cast("tuple[object, ...]", result.canonical["entities"])
+    dim_entities = [
+        _mapping(e) for e in entities if isinstance(e, dict) and e.get("entity_type") == "dimension"
+    ]
+    assert len(dim_entities) >= 1, "Expected at least one 'dimension' entity"
+
+    dim_entity = dim_entities[0]
+    assert dim_entity["entity_type"] == "dimension"
+    assert dim_entity["entity_schema_version"] == "0.1"
+    assert dim_entity["confidence"] == 0.99
+
+    props = _mapping(dim_entity["properties"])
+    adapter_native = _mapping(props["adapter_native"])
+    ez = _mapping(adapter_native["ezdxf"])
+    dim_block = _mapping(ez["dimension"])
+
+    assert dim_block["raw_span"] == pytest.approx(18000.0)
+    assert dim_block["text_override"] == "18000"
+    assert dim_block["is_linear"] is True
+    assert dim_block["dimtype_base"] == 0
+
+    # Verify the entity is counted as supported (no unsupported_entity warnings for it).
+    warning_codes = [w.code for w in result.warnings]
+    assert "malformed_dimension" not in warning_codes
+
+    # Verify diagnostics reflect it as supported.
+    diagnostics_details = {d.code: d.details for d in result.diagnostics}
+    entity_diag = _mapping(diagnostics_details["dxf_entities_extracted"])
+    assert cast(int, entity_diag["supported_entity_count"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_tier1_fires_dimension_text_override(
+    tmp_path: Path,
+) -> None:
+    """Tier-1 inference fires from '18000' text override and yields millimeter.
+
+    18000 (log10=4.255) scores highest in the millimeter band
+    (center=4.239) vs centimeter (center=3.239).
+    """
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-tier1.dxf"
+    # units=0 (unconfirmed); no setup=True so Standard dimstyle has dimlfac=None -> 1.0.
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    dim = msp.add_linear_dim(base=(0.0, -1000.0), p1=(0.0, 0.0), p2=(18000.0, 0.0), text="18000")
+    dim.render()
+    msp.add_line((0.0, 0.0, 0.0), (18000.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 12000.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    assert units["conversion_factor"] == pytest.approx(0.001)
+    basis = cast(str, units["basis"])
+    assert basis.startswith("dimension_text:")
+
+    inference = _mapping(units["inference"])
+    assert cast(int, inference["dimension_observation_count"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_tier1_outranks_tier2_extent(
+    tmp_path: Path,
+) -> None:
+    """Tier-1 wins even when Tier-2 alone would yield a different band.
+
+    Geometry spans ~3 raw units (meter-band by Tier-2), but the '18000' text
+    override (dimlfac=1, log10=4.255) places the inference in millimeter-band
+    by Tier-1.  Tier-1 must win over Tier-2.
+    """
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-tier1-outranks.dxf"
+    # units=0 (unconfirmed); no setup=True so Standard dimstyle has dimlfac=None -> 1.0.
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    # 3 raw units span -- Tier-2 alone would call this meter-scale.
+    # text="18000" forces Tier-1 into millimeter-band.
+    dim = msp.add_linear_dim(base=(0.0, -2.0), p1=(0.0, 0.0), p2=(3.0, 0.0), text="18000")
+    dim.render()
+    msp.add_line((0.0, 0.0, 0.0), (3.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 2.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    # Tier-1 wins: millimeter (from text override), not meter (from extent geometry).
+    assert units["normalized"] == "millimeter"
+    basis = cast(str, units["basis"])
+    assert basis.startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_measured_only_dim_does_not_fire_tier1(
+    tmp_path: Path,
+) -> None:
+    """A measured-only dim (text='<>') provides no Tier-1 vote; basis is extent or unknown."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-measured-only.dxf"
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    # text="<>" means measured-only; no drafter override.
+    dim = msp.add_linear_dim(base=(0.0, -1000.0), p1=(0.0, 0.0), p2=(3600.0, 0.0), text="<>")
+    dim.render()
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    # May or may not be inferred (Tier-2 might still fire from geometry),
+    # but if inferred, must NOT use dimension_text basis.
+    if "basis" in units:
+        basis = cast(str, units["basis"])
+        assert not basis.startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_non_linear_dim_extracted_but_no_tier1_vote(
+    tmp_path: Path,
+) -> None:
+    """Radial dims produce entity_type='dimension' with is_linear=False and cast no Tier-1 vote."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-radial.dxf"
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    # add_radius_dim creates a radius dimension (dimtype_base=4, is_linear=False).
+    msp.add_circle((0.0, 0.0), radius=1800.0)
+    dim = msp.add_radius_dim(center=(0.0, 0.0), radius=1800.0, angle=45.0, text="R1800")
+    dim.render()
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    entities = cast("tuple[object, ...]", result.canonical["entities"])
+    dim_entities = [
+        _mapping(e) for e in entities if isinstance(e, dict) and e.get("entity_type") == "dimension"
+    ]
+    assert len(dim_entities) >= 1
+
+    dim_entity = dim_entities[0]
+    props = _mapping(dim_entity["properties"])
+    adapter_native = _mapping(props["adapter_native"])
+    ez = _mapping(adapter_native["ezdxf"])
+    dim_block = _mapping(ez["dimension"])
+    assert dim_block["is_linear"] is False
+
+    # Tier-1 must not have fired because the only dim is non-linear.
+    units = _mapping(result.canonical["units"])
+    if "basis" in units:
+        basis = cast(str, units["basis"])
+        assert not basis.startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_confirmed_units_unchanged_with_dim_present(
+    tmp_path: Path,
+) -> None:
+    """Confirmed INSUNITS (mm, code=4) + a DIMENSION entity -> exact confirmed dict unchanged."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "confirmed-with-dim.dxf"
+    document = cast(Any, ezdxf).new(units=4)
+    msp = document.modelspace()
+    dim = msp.add_linear_dim(base=(0.0, -1000.0), p1=(0.0, 0.0), p2=(3600.0, 0.0), text="3600")
+    dim.render()
+    msp.add_line((0.0, 0.0, 0.0), (3600.0, 0.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units == {
+        "normalized": "meter",
+        "source": "$INSUNITS",
+        "source_value": 4,
+        "conversion_target": "meter",
+        "conversion_factor": pytest.approx(0.001),
+    }
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_malformed_dimension_degrades_to_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DIMENSION entity that raises during extraction degrades to unknown + warning."""
+    adapter = _load_ezdxf_adapter()
+
+    # Monkeypatch _dimension_entity_payload to always raise so we can verify the
+    # try/except fallback path without synthesizing a genuinely malformed DXF.
+    import app.ingestion.adapters.ezdxf as _mod
+
+    original = _mod._dimension_entity_payload
+
+    def _always_raise(entity: Any, **kwargs: Any) -> Any:
+        raise ValueError("synthetic malformed dimension")
+
+    monkeypatch.setattr(_mod, "_dimension_entity_payload", _always_raise)
+
+    try:
+        fake_document = _FakeDocument(
+            entities=(
+                _FakeEntity(
+                    entity_type="DIMENSION",
+                    handle="D1",
+                    layer="0",
+                    layout_name="Model",
+                ),
+            ),
+            units=0,
+        )
+        monkeypatch.setattr(adapter, "_read_document", lambda _path: fake_document)
+
+        result = await adapter.ingest(
+            build_contract_source(file_path=_FIXTURE_PATH, original_name="malformed-dim.dxf"),
+            AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+        )
+
+        entities = cast("tuple[object, ...]", result.canonical["entities"])
+        assert len(entities) == 1
+        entity = _mapping(entities[0])
+        assert entity["entity_type"] == "unknown"
+
+        warning_codes = [w.code for w in result.warnings]
+        assert "malformed_dimension" in warning_codes
+    finally:
+        monkeypatch.setattr(_mod, "_dimension_entity_payload", original)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_tier1_3600_infers_millimeter(
+    tmp_path: Path,
+) -> None:
+    """Tier-1 inference with text='3600' (a typical wall span) yields millimeter.
+
+    3600 (log10 ~ 3.556) falls in both the mm band [3.0, 5.477] and cm band
+    [2.0, 4.477].  The construction-default bias picks millimeter (higher
+    priority) over centimeter.
+    """
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-3600-mm.dxf"
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    dim = msp.add_linear_dim(base=(0.0, -1000.0), p1=(0.0, 0.0), p2=(3600.0, 0.0), text="3600")
+    dim.render()
+    msp.add_line((0.0, 0.0, 0.0), (3600.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 2400.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    assert units["conversion_factor"] == pytest.approx(0.001)
+    basis = cast(str, units["basis"])
+    assert basis.startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_dimlfac_override_resolver(
+    tmp_path: Path,
+) -> None:
+    """Per-dimension DIMLFAC override is resolved via DimStyleOverride.get().
+
+    A dim with override={"dimlfac": 100.0} and text="3600" has
+    display_value = 3600 / 100 = 36.0 (log10 ~ 1.556 -> meter band only).
+    """
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "dim-dimlfac-override.dxf"
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    dim = msp.add_linear_dim(
+        base=(0.0, -1000.0),
+        p1=(0.0, 0.0),
+        p2=(3600.0, 0.0),
+        text="3600",
+        override={"dimlfac": 100.0},
+    )
+    dim.render()
+    msp.add_line((0.0, 0.0, 0.0), (3600.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 2.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    # Confirm the dimlfac=100 was read: display_value = 3600 / 100 = 36 -> meter band.
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "meter"
+    assert units["conversion_factor"] == pytest.approx(1.0)
+
+    entities = cast("tuple[object, ...]", result.canonical["entities"])
+    dim_entities = [
+        _mapping(e) for e in entities if isinstance(e, dict) and e.get("entity_type") == "dimension"
+    ]
+    assert len(dim_entities) >= 1
+    props = _mapping(dim_entities[0]["properties"])
+    dim_block = _mapping(_mapping(_mapping(props["adapter_native"])["ezdxf"])["dimension"])
+    assert dim_block["dimlfac"] == pytest.approx(100.0)
