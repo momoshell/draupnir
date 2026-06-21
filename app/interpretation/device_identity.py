@@ -284,7 +284,8 @@ def _resolve_device(
     """
     # Priority 1 — block_ref in by_symbol_family (the legend ICON family — authoritative type).
     block_ref = device.block_ref or ""
-    if block_ref and block_ref in by_family:
+    is_legend_family = bool(block_ref) and block_ref in by_family
+    if is_legend_family and by_family[block_ref].type_name is not None:
         entry = by_family[block_ref]
         layers = _source_layers(device)
         return DeviceIdentity(
@@ -298,6 +299,25 @@ def _resolve_device(
             source_layers=layers,
             confidence=None,
             competing_type_names=entry.competing_type_names,
+        )
+
+    # Placeholder legend family (in by_symbol_family but type_name=None, e.g. Revit "Family - ___"):
+    # it IS a device (a legend family) but the block carries no human name. We do NOT borrow a type
+    # from a nearby tag — on real drawings those tags are mis-associated noise (#590). Stay
+    # UNRESOLVED, preserving the raw tag (if any) as the abbreviation. Never guess.
+    if is_legend_family:
+        layers = _source_layers(device, include_tag_layer=device.tag is not None)
+        return DeviceIdentity(
+            entity_id=device.entity_id,
+            kind=KIND_DEVICE,
+            status=STATUS_UNRESOLVED,
+            type_name=None,
+            abbreviation=device.tag.text if device.tag is not None else None,
+            description=None,
+            basis=BASIS_UNRESOLVED_TAG if device.tag is not None else BASIS_NONE,
+            source_layers=layers,
+            confidence=None,
+            competing_type_names=(),
         )
 
     # Priority 2 — tag.text in by_abbreviation (normalized: strip + upper for lookup only).

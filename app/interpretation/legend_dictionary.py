@@ -130,12 +130,45 @@ class LegendDictionary:
 # Source A — block families
 # ---------------------------------------------------------------------------
 
+# Revit/DWG block names arrive wrapped in export cruft, e.g.
+#   "Smoke Detector with Beaconrfa - Smoke Detector with Beaconrfa-2364563-03_ Ss_...Legend Stage 4"
+# The human type is the leading family name; the rest is a duplicated type, a GUID, a Uniclass
+# classification and the legend-export stage marker. These patterns strip that cruft so the
+# DEVICE type_name is human-readable, while symbol_family keeps the RAW block name (the
+# instance's block_ref is matched against it verbatim — never clean the lookup key). #590.
+_LEGEND_STAGE_TAIL_RE = re.compile(r"_legend stage\s+\d+\s*$", re.IGNORECASE)
+_GUID_TAIL_RE = re.compile(r"-\d{5,}.*$")  # "-2364563-03_ Ss_75…" GUID + classification tail
+
+
+def _clean_family_type_name(raw: str) -> str | None:
+    """Reduce a raw Revit/DWG block name to a human device type, or None if it is a placeholder.
+
+    Deterministic, conservative: strip the legend-stage marker and the GUID/classification tail,
+    collapse Revit's duplicated ``"Family - Type"`` form when both halves are identical, and
+    return None for the generic placeholder family (``"Family - ___"``) so it stays UNRESOLVED
+    rather than being typed with junk (never guess — #590 / legend-is-ground-truth).
+    """
+    name = _LEGEND_STAGE_TAIL_RE.sub("", raw.strip()).strip()
+    name = _GUID_TAIL_RE.sub("", name).strip()
+    # Collapse "FamilyName - TypeName" when the two halves are identical (case-insensitive).
+    if " - " in name:
+        left, _, right = name.partition(" - ")
+        if left.strip().casefold() == right.strip().casefold():
+            name = left.strip()
+    # Placeholder detection: alnum-core empty, or the Revit default generic "Family".
+    core = re.sub(r"[^0-9A-Za-z]", "", name)
+    if not core or core.casefold() == "family":
+        return None
+    return name or None
+
 
 def from_block_families(inputs: Sequence[FamilyInput]) -> list[LegendEntry]:
-    """Source A: one entry per distinct family name; type_name IS the family name.
+    """Source A: one entry per distinct family name; type_name is the HUMANIZED family name.
 
     Block-family names are the highest-authority type identifier available from geometry.
-    Duplicates (same family_name appearing multiple times) are deduped.
+    ``symbol_family`` keeps the raw name (the lookup key against a placed instance's block_ref);
+    ``type_name`` is cleaned for display (None when the family is a generic placeholder).
+    Duplicates (same raw family_name) are deduped.
     """
     seen: set[str] = set()
     entries: list[LegendEntry] = []
@@ -148,7 +181,7 @@ def from_block_families(inputs: Sequence[FamilyInput]) -> list[LegendEntry]:
             LegendEntry(
                 abbreviation=None,
                 symbol_family=name,
-                type_name=name,
+                type_name=_clean_family_type_name(name),
                 description=None,
                 sources=(LEGEND_SOURCE_FAMILY,),
                 confidence=None,

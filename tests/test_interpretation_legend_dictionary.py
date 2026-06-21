@@ -49,11 +49,58 @@ def test_family_basic() -> None:
     assert e.competing_type_names == ()
 
 
-def test_family_long_name_preserved() -> None:
-    """Family names like 'Smoke Detector with Beaconrfa … -Legend Stage 4' pass through intact."""
-    name = "Smoke Detector with Beaconrfa -Legend Stage 4"
-    entries = from_block_families([FamilyInput(name)])
-    assert entries[0].type_name == name
+def test_family_symbol_family_keeps_raw_name() -> None:
+    """symbol_family MUST stay the raw block name — it is the lookup key matched against a
+    placed instance's block_ref. Only type_name is humanized (#590)."""
+    raw = (
+        "Smoke Detector with Beaconrfa - Smoke Detector with Beaconrfa"
+        "-2364563-03_ Ss_75_50_28_29-FIRE DETN _ ALM SYS_Legend Stage 4"
+    )
+    e = from_block_families([FamilyInput(raw)])[0]
+    assert e.symbol_family == raw  # raw key preserved
+    assert e.type_name == "Smoke Detector with Beaconrfa"  # cleaned for display
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_type"),
+    [
+        # Doubled "Family - Type" + GUID + Uniclass + stage marker → collapsed human name.
+        (
+            "Fire Alarm Sounder - Fire Alarm Sounder-2362494-03_ Ss_75_50_28_29"
+            "-FIRE DETN _ ALM SYS_Legend Stage 4",
+            "Fire Alarm Sounder",
+        ),
+        (
+            "Fire Bicon annotation - Fire Bicon annotation-8466721-03_ Ss_..._Legend Stage 4",
+            "Fire Bicon annotation",
+        ),
+        # Already-clean names are unchanged.
+        ("Manual Call Point", "Manual Call Point"),
+        # GUID tail with no doubling still strips.
+        ("Heat Detector-998877-03_ Ss", "Heat Detector"),
+    ],
+)
+def test_family_type_name_cleaned(raw: str, expected_type: str) -> None:
+    e = from_block_families([FamilyInput(raw)])[0]
+    assert e.symbol_family == raw
+    assert e.type_name == expected_type
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Family - ___-8465483-03_ Ss_75_50_28_29-FIRE DETN _ ALM SYS_Legend Stage 4",
+        "Family - ___",
+        "Family",
+        "____-12345",
+    ],
+)
+def test_family_placeholder_type_name_is_none(raw: str) -> None:
+    """Generic Revit placeholder families have NO human type → type_name None (kept as a
+    symbol_family entry so the instance still classifies device, but stays UNRESOLVED)."""
+    e = from_block_families([FamilyInput(raw)])[0]
+    assert e.symbol_family == raw  # still a lookup key (instance still classifies as device)
+    assert e.type_name is None  # honest unknown — never guessed
 
 
 def test_family_deduplication() -> None:
