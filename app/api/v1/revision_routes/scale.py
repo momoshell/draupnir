@@ -1,5 +1,6 @@
 """Revision drawing-scale / units read route."""
 
+from collections.abc import Mapping
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -21,6 +22,43 @@ scale_router = APIRouter()
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+_UNITS_CONFIDENCE_VALUES = frozenset({"declared", "confirmed", "inferred", "unknown"})
+
+
+def _units_confidence(units: Mapping[str, Any]) -> str:
+    """Derive the unit-certainty label from the persisted units block (#557).
+
+    An adapter that records its own ``confidence`` (e.g. the inferred path, #558) wins. Otherwise
+    derive: a normalized unit means the adapter confirmed it (DWG ``$INSUNITS`` only emits a unit
+    when confirmed); a missing/``unknown`` normalized unit is honestly ``unknown``.
+    """
+    explicit = units.get("confidence")
+    if isinstance(explicit, str) and explicit in _UNITS_CONFIDENCE_VALUES:
+        return explicit
+    normalized = units.get("normalized")
+    if not isinstance(normalized, str) or normalized == "unknown":
+        return "unknown"
+    return "confirmed"
+
+
+def _real_world_dimensions_available(
+    units: Mapping[str, Any], pdf_scale: Mapping[str, Any] | None
+) -> bool:
+    """True when real measurements can be quoted: a usable unit conversion factor (DWG) or a
+    detected PDF point->real factor (#557). Honest False when neither is present."""
+    units_ok = _units_confidence(units) != "unknown" and _positive_number(
+        units.get("conversion_factor")
+    )
+    # The PDF point->real factor is the unambiguous "can convert" signal (present iff a scale
+    # ratio + real unit were detected); key on it rather than the variably-typed flag.
+    pdf_ok = isinstance(pdf_scale, Mapping) and _positive_number(pdf_scale.get("points_to_real"))
+    return bool(units_ok or pdf_ok)
+
+
+def _positive_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
 
 
 async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> RevisionScaleRead:
@@ -53,14 +91,22 @@ async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> Revisio
             raise_not_found("Drawing revision", str(revision_id))
         # Active revision with no adapter run (changeset-origin): scale is unavailable.
         return RevisionScaleRead(
-            units={"normalized": "unknown"}, pdf_scale=None, source_input_family=None
+            units={"normalized": "unknown"},
+            units_confidence="unknown",
+            real_world_dimensions_available=False,
+            pdf_scale=None,
+            source_input_family=None,
         )
 
     canonical = _as_dict(adapter_output.canonical_json)
-    pdf_scale = canonical.get("pdf_scale")
+    pdf_scale_raw = canonical.get("pdf_scale")
+    pdf_scale = _as_dict(pdf_scale_raw) if isinstance(pdf_scale_raw, dict) else None
+    units = _as_dict(canonical.get("units")) or {"normalized": "unknown"}
     return RevisionScaleRead(
-        units=_as_dict(canonical.get("units")) or {"normalized": "unknown"},
-        pdf_scale=_as_dict(pdf_scale) if isinstance(pdf_scale, dict) else None,
+        units=units,
+        units_confidence=_units_confidence(units),  # type: ignore[arg-type]
+        real_world_dimensions_available=_real_world_dimensions_available(units, pdf_scale),
+        pdf_scale=pdf_scale,
         source_input_family=adapter_output.input_family,
     )
 
