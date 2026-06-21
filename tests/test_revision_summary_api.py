@@ -137,6 +137,59 @@ class TestRevisionSummaryApi:
         expected_by_type = (report.get("coverage") or {}).get("entities", {}).get("by_type", {})
         assert summary["entities_by_type"] == expected_by_type
 
+    async def test_summary_room_counts_match_rooms_when_labels_off_tag_layer(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression for #584: /summary and /rooms must agree even when room labels sit on a
+        non-device-tag layer. The old /summary path built labels from the device-tag loader and
+        missed them, reporting a different room count than /rooms (which uses all text)."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        def _text(entity_id: str, layer: str, text: str, x: float, y: float) -> dict[str, Any]:
+            entity = _build_contract_entity(
+                entity_id=entity_id,
+                entity_type="text",
+                layer_ref=layer,
+                source_id=f"s-{entity_id}",
+            )
+            entity["geometry_json"] = {"type": "text", "text": text, "insertion": {"x": x, "y": y}}
+            return entity
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[
+                    {"layer_ref": "A-IDEN", "name": "A-IDEN"},  # room-label layer (no tag token)
+                    {"layer_ref": "Device Tags", "name": "Device Tags"},  # matches a tag token
+                ],
+                blocks=[],
+                entities=[
+                    _text("rname", "A-IDEN", "PH Plantroom", 5.0, 5.4),
+                    _text("rnum", "A-IDEN", "0.9.01", 5.0, 5.0),
+                    _text("dtag", "Device Tags", "H", 50.0, 50.0),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        revision = await self._ingest(async_client)
+        rid = revision.id
+
+        summary = (await async_client.get(f"/v1/revisions/{rid}/summary")).json()
+        rooms = (await async_client.get(f"/v1/revisions/{rid}/rooms")).json()
+
+        # Meaningful (not 0==0): the fixture yields a real named, numbered label room.
+        assert rooms["summary"]["named_rooms"] >= 1
+        assert summary["room_count"] == rooms["summary"]["rooms"]
+        assert summary["named_room_count"] == rooms["summary"]["named_rooms"]
+
     async def test_missing_revision_returns_not_found(
         self,
         async_client: httpx.AsyncClient,
