@@ -1,7 +1,7 @@
 """Room-containment interpretation route (tier-3, derived from the canonical model)."""
 
 from collections.abc import Sequence
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -55,6 +55,12 @@ rooms_router = APIRouter()
 # Entity types that can form room geometry: closed polylines / wall linework, plus
 # IFC products (IfcSpace footprints carry their geometry on an ifc_product entity).
 _ROOM_GEOMETRY_ENTITY_TYPES = ("polyline", "line", "ifc_product")
+
+# Room interpretation scope (#583). "sheet" (default) restricts geometry + labels to the
+# printed sheet (drops off-sheet title-block/key-plan content known to be off-sheet, keeping
+# on-sheet and undetermined entities); "modelspace" interprets the full modelspace.
+RoomScope = Literal["sheet", "modelspace"]
+_DEFAULT_ROOM_SCOPE: RoomScope = "sheet"
 _MAX_NESTING_DEPTH = 8
 
 
@@ -71,6 +77,7 @@ async def list_revision_rooms(
     snap_tolerance: Annotated[float, Query(ge=0.0)] = 0.0,
     min_area: Annotated[float, Query(ge=0.0)] = 0.0,
     max_depth: Annotated[int, Query(ge=0, le=_MAX_NESTING_DEPTH)] = _MAX_NESTING_DEPTH,
+    scope: Annotated[RoomScope, Query()] = _DEFAULT_ROOM_SCOPE,
 ) -> RevisionRoomListResponse:
     """Derive rooms and assign devices to them by boundary containment.
 
@@ -80,6 +87,8 @@ async def list_revision_rooms(
     assigned to the smallest room whose polygon contains its world position, and
     each room is named from the room-tag text inside it. ``snap_tolerance`` and
     ``min_area`` tune the wall-polygonize robustness (gap-closing, sliver dropping).
+    ``scope`` restricts interpretation to the printed sheet (``sheet``, default) or the
+    full ``modelspace`` (#583).
     """
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
     result = await _resolve_rooms(
@@ -91,6 +100,7 @@ async def list_revision_rooms(
         snap_tolerance=snap_tolerance,
         min_area=min_area,
         max_depth=max_depth,
+        exclude_off_sheet=scope == "sheet",
     )
 
     named_rooms = sum(1 for room in result.rooms if room.name is not None)
@@ -129,6 +139,7 @@ async def list_revision_room_entities(
     snap_tolerance: Annotated[float, Query(ge=0.0)] = 0.0,
     min_area: Annotated[float, Query(ge=0.0)] = 0.0,
     max_depth: Annotated[int, Query(ge=0, le=_MAX_NESTING_DEPTH)] = _MAX_NESTING_DEPTH,
+    scope: Annotated[RoomScope, Query()] = _DEFAULT_ROOM_SCOPE,
     fields: Annotated[
         str | None,
         Query(
@@ -161,6 +172,7 @@ async def list_revision_room_entities(
         snap_tolerance=snap_tolerance,
         min_area=min_area,
         max_depth=max_depth,
+        exclude_off_sheet=scope == "sheet",
     )
 
     room = next((candidate for candidate in result.rooms if candidate.id == room_id), None)
@@ -199,6 +211,9 @@ async def list_revision_room_entities(
         query = query.where(RevisionEntity.entity_type == entity_type)
     if layer_ref is not None:
         query = query.where(RevisionEntity.layer_ref == layer_ref)
+    if scope == "sheet":
+        # Match the room-derivation scope: don't list entities known to be off-sheet (#583).
+        query = query.where(RevisionEntity.on_sheet.isnot(False))
 
     rows = (await db.execute(query)).scalars().all()
     contained = [
@@ -234,10 +249,18 @@ async def _resolve_rooms(
     snap_tolerance: float = 0.0,
     min_area: float = 0.0,
     max_depth: int = _MAX_NESTING_DEPTH,
+    exclude_off_sheet: bool = True,
 ) -> RoomInterpretation:
-    """Load the room-geometry inputs and run the room interpretation pipeline."""
+    """Load the room-geometry inputs and run the room interpretation pipeline.
+
+    ``exclude_off_sheet`` (default True) scopes room geometry + labels to the printed sheet
+    (#583): off-sheet title-block/key-plan linework otherwise degrades polygonization and
+    merges rooms. Devices are NOT scoped here — that nested-walk scoping is #588.
+    """
     resolved_strategy = strategy if strategy in ROOM_STRATEGIES else ROOM_STRATEGY_AUTO
-    entities = await load_revision_entities_by_type(db, revision_id, _ROOM_GEOMETRY_ENTITY_TYPES)
+    entities = await load_revision_entities_by_type(
+        db, revision_id, _ROOM_GEOMETRY_ENTITY_TYPES, exclude_off_sheet=exclude_off_sheet
+    )
     devices = await enumerate_devices(
         db, revision_id, device_layers=device_layer, max_depth=max_depth
     )
@@ -245,9 +268,11 @@ async def _resolve_rooms(
     # otherwise use all text (room labels live on a room-label layer, not a device-tag layer)
     # and let the pipeline auto-scope to the number-bearing layer (#549).
     label_candidates = (
-        await load_tag_candidates(db, revision_id, tag_layers=tag_layer)
+        await load_tag_candidates(
+            db, revision_id, tag_layers=tag_layer, exclude_off_sheet=exclude_off_sheet
+        )
         if tag_layer
-        else await load_text_candidates(db, revision_id)
+        else await load_text_candidates(db, revision_id, exclude_off_sheet=exclude_off_sheet)
     )
     return interpret_rooms(
         entities,

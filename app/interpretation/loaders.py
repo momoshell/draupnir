@@ -26,9 +26,16 @@ async def load_revision_entities_by_type(
     entity_types: Sequence[str],
     *,
     layer_refs: Sequence[str] | None = None,
+    exclude_off_sheet: bool = False,
     ordered: bool = True,
 ) -> list[RevisionEntity]:
-    """Load a revision's entities of the given type(s), optionally restricted to layer refs."""
+    """Load a revision's entities of the given type(s), optionally restricted to layer refs.
+
+    When ``exclude_off_sheet`` is set, entities KNOWN to be off the printed sheet
+    (``on_sheet IS FALSE``, #569) are dropped while on-sheet (True) and undetermined
+    (NULL — e.g. a drawing with no viewports) entities are kept, so the filter degrades
+    gracefully instead of emptying drawings whose sheet membership couldn't be determined.
+    """
 
     query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
@@ -36,6 +43,8 @@ async def load_revision_entities_by_type(
     )
     if layer_refs is not None:
         query = query.where(RevisionEntity.layer_ref.in_(list(layer_refs)))
+    if exclude_off_sheet:
+        query = query.where(RevisionEntity.on_sheet.isnot(False))
     if ordered:
         query = query.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
     return list((await db.execute(query)).scalars().all())

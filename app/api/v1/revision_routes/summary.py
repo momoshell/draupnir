@@ -66,11 +66,11 @@ async def get_revision_summary(
     # Devices (mirrors /devices default enumeration).
     devices = await enumerate_devices(db, revision_id)
 
-    # Rooms (mirrors /rooms default auto strategy).
+    # Rooms (mirrors /rooms default: auto strategy + printed-sheet scope, #583).
     room_entities = await load_revision_entities_by_type(
-        db, revision_id, _ROOM_GEOMETRY_ENTITY_TYPES
+        db, revision_id, _ROOM_GEOMETRY_ENTITY_TYPES, exclude_off_sheet=True
     )
-    candidates = await load_tag_candidates(db, revision_id, tag_layers=None)
+    candidates = await load_tag_candidates(db, revision_id, tag_layers=None, exclude_off_sheet=True)
     rooms_result = interpret_rooms(
         room_entities,
         devices=_device_placements(devices),

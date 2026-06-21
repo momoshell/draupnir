@@ -266,11 +266,14 @@ async def load_tag_candidates(
     revision_id: UUID,
     *,
     tag_layers: Sequence[str] | None,
+    exclude_off_sheet: bool = False,
 ) -> list[_TagCandidate]:
     base = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
     )
+    if exclude_off_sheet:
+        base = base.where(RevisionEntity.on_sheet.isnot(False))
     if tag_layers:
         query = base.where(RevisionEntity.layer_ref.in_(list(tag_layers)))
     else:
@@ -287,25 +290,25 @@ async def load_tag_candidates(
     return _rows_to_candidates(rows)
 
 
-async def load_text_candidates(db: AsyncSession, revision_id: UUID) -> list[_TagCandidate]:
+async def load_text_candidates(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    exclude_off_sheet: bool = False,
+) -> list[_TagCandidate]:
     """Load every text entity (with layer) — the room-label source (#549).
 
     Room names + numbers live on a room-label layer that isn't a device-tag layer, so room
     interpretation needs all text, not the tag-filtered subset; the room pipeline then scopes
-    to the number-bearing layer itself.
+    to the number-bearing layer itself. ``exclude_off_sheet`` drops off-sheet labels (#583).
     """
-    rows = (
-        (
-            await db.execute(
-                select(RevisionEntity).where(
-                    RevisionEntity.drawing_revision_id == revision_id,
-                    RevisionEntity.entity_type == "text",
-                )
-            )
-        )
-        .scalars()
-        .all()
+    query = select(RevisionEntity).where(
+        RevisionEntity.drawing_revision_id == revision_id,
+        RevisionEntity.entity_type == "text",
     )
+    if exclude_off_sheet:
+        query = query.where(RevisionEntity.on_sheet.isnot(False))
+    rows = (await db.execute(query)).scalars().all()
     return _rows_to_candidates(rows)
 
 
