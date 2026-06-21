@@ -280,3 +280,85 @@ def test_polygon_containment_wins_over_label_proximity() -> None:
     assigned = {a.device_id: a.room_id for a in result.device_assignments}
     target = next(r for r in result.rooms if r.polygon is not None and r.name == "Plant")
     assert assigned["d1"] == target.id
+
+
+# --- #581: dedupe rooms by number (U-shape) + wall-aware confirmation ---
+
+
+def _square_wall_lines_at(dx: float, dy: float) -> list[_FakeEntity]:
+    square = [(x + dx, y + dy) for x, y in SQUARE]
+    closed = [*square, square[0]]
+    return [_wall_line(closed[i], closed[i + 1]) for i in range(len(square))]
+
+
+def test_same_number_label_rooms_merge_into_one_with_all_anchors() -> None:
+    # A U-shaped room labelled in each of its 3 arms (no internal walls → no polygon): one
+    # number, three placements → ONE room retaining all three anchor points (#581).
+    labels = [
+        RoomLabel("AHU Plant", (10.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (10.0, 10.0), layer="A-IDEN"),
+        RoomLabel("AHU Plant", (30.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (30.0, 10.0), layer="A-IDEN"),
+        RoomLabel("AHU Plant", (50.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (50.0, 10.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms([], devices=[], labels=labels)
+    ahu = [room for room in result.rooms if room.number == "0.9.04"]
+    assert len(ahu) == 1
+    assert ahu[0].name == "AHU Plant"
+    assert set(ahu[0].anchors) == {(10.0, 10.0), (30.0, 10.0), (50.0, 10.0)}
+    assert ahu[0].needs_review is False  # label-only → no wall evidence → merge, no flag
+
+
+def test_device_near_any_arm_assigned_to_merged_room() -> None:
+    # Device proximity uses the NEAREST anchor, so a device by any arm of the merged U-shape
+    # room is assigned to it (#581).
+    labels = [
+        RoomLabel("AHU Plant", (10.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (10.0, 10.0), layer="A-IDEN"),
+        RoomLabel("AHU Plant", (50.0, 10.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (50.0, 10.0), layer="A-IDEN"),
+    ]
+    devices = [DevicePlacement("cam-far-arm", (50.5, 10.0))]  # near the SECOND arm only
+    result = interpret_rooms([], devices=devices, labels=labels)
+    ahu = next(room for room in result.rooms if room.number == "0.9.04")
+    assigned = {a.device_id: a.room_id for a in result.device_assignments}
+    assert assigned["cam-far-arm"] == ahu.id
+
+
+def test_same_number_across_walls_is_flagged_not_merged() -> None:
+    # The same number inside TWO wall-bounded rooms (separated by walls) is a likely numbering
+    # error: surface both for review, do NOT silently merge them (#581).
+    entities = [*_square_wall_lines(), *_square_wall_lines_at(100.0, 100.0)]
+    labels = [
+        RoomLabel("AHU Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("AHU Plant", (105.0, 105.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (105.0, 105.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    numbered = [room for room in result.rooms if room.number == "0.9.04"]
+    assert len(numbered) == 2  # NOT merged — two distinct wall-bounded rooms
+    assert all(room.polygon is not None for room in numbered)
+    assert all(room.needs_review for room in numbered)  # both flagged for review
+
+
+def test_dedupe_label_rooms_by_number_unit() -> None:
+    from app.interpretation.rooms import (
+        dedupe_label_rooms_by_number,
+        room_from_label,
+    )
+
+    rooms = [
+        room_from_label("a", source="label_cluster", location=(0.0, 0.0), number="1", name="Lab"),
+        room_from_label("b", source="label_cluster", location=(9.0, 0.0), number="1"),
+        room_from_label("c", source="label_cluster", location=(5.0, 5.0), number="2", name="WC"),
+        room_from_label("d", source="label_cluster", location=(7.0, 7.0), name="Hall"),  # no num
+    ]
+    deduped = dedupe_label_rooms_by_number(rooms)
+    by_number = {room.number: room for room in deduped if room.number}
+    assert len(deduped) == 3  # 1 (merged), 2, and the name-only Hall
+    assert set(by_number["1"].anchors) == {(0.0, 0.0), (9.0, 0.0)}
+    assert by_number["1"].name == "Lab"  # first non-null name retained
+    assert by_number["2"].anchors == ((5.0, 5.0),)
+    assert any(room.number is None and room.name == "Hall" for room in deduped)
