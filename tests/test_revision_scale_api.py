@@ -238,6 +238,110 @@ class TestRevisionScaleApi:
         assert body["units_confidence"] == "inferred"
         assert body["real_world_dimensions_available"] is True
 
+    async def test_contradicted_units_voids_units_signal(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A units block with a truthy contradiction (#558) → real_world_dimensions_available
+        False and units_contradicted True, even when confidence and conversion_factor are valid."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        contradicted_units = {
+            "normalized": "meter",
+            "confidence": "confirmed",
+            "conversion_target": "meter",
+            "conversion_factor": 1.0,
+            "contradiction": {
+                "declared_normalized": "meter",
+                "inferred_normalized": "millimeter",
+            },
+        }
+        monkeypatch.setattr(
+            worker_module,
+            "run_ingestion",
+            _fake_runner_with_canonical(units=contradicted_units, pdf_scale=None),
+        )
+
+        revision, _adapter_output = await self._ingest_revision(
+            async_client, filename="plan.dxf", media_type="application/dxf"
+        )
+
+        body = (await async_client.get(f"/v1/revisions/{revision.id}/scale")).json()
+        assert body["real_world_dimensions_available"] is False
+        assert body["units_contradicted"] is True
+
+    async def test_non_contradicted_units_remain_available(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The same units block WITHOUT contradiction → real_world_dimensions_available True,
+        units_contradicted False. No regression against #557 confirmed behaviour."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        clean_units = {
+            "normalized": "meter",
+            "confidence": "confirmed",
+            "conversion_target": "meter",
+            "conversion_factor": 1.0,
+        }
+        monkeypatch.setattr(
+            worker_module,
+            "run_ingestion",
+            _fake_runner_with_canonical(units=clean_units, pdf_scale=None),
+        )
+
+        revision, _adapter_output = await self._ingest_revision(
+            async_client, filename="plan.dxf", media_type="application/dxf"
+        )
+
+        body = (await async_client.get(f"/v1/revisions/{revision.id}/scale")).json()
+        assert body["real_world_dimensions_available"] is True
+        assert body["units_contradicted"] is False
+
+    async def test_pdf_signal_independent_of_units_contradiction(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A contradicted units block does NOT suppress a genuine PDF points_to_real signal (#558):
+        real_world_dimensions_available stays True when PDF scale is detected."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        contradicted_units = {
+            "normalized": "meter",
+            "confidence": "confirmed",
+            "conversion_target": "meter",
+            "conversion_factor": 1.0,
+            "contradiction": {
+                "declared_normalized": "meter",
+                "inferred_normalized": "millimeter",
+            },
+        }
+        monkeypatch.setattr(
+            worker_module,
+            "run_ingestion",
+            _fake_runner_with_canonical(units=contradicted_units, pdf_scale=_PDF_SCALE),
+        )
+
+        revision, _adapter_output = await self._ingest_revision(
+            async_client, filename="plan.pdf", media_type="application/pdf"
+        )
+
+        body = (await async_client.get(f"/v1/revisions/{revision.id}/scale")).json()
+        assert body["real_world_dimensions_available"] is True
+        assert body["units_contradicted"] is True
+
     async def test_missing_revision_returns_not_found(
         self,
         async_client: httpx.AsyncClient,

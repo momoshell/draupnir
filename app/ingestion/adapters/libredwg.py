@@ -46,6 +46,7 @@ from app.ingestion.contracts import (
     ProvenanceRecord,
 )
 from app.ingestion.registry import evaluate_availability, get_descriptor
+from app.ingestion.units_inference import extent_from_bboxes, infer_units
 
 _DESCRIPTOR = get_descriptor(InputFamily.DWG)
 _BINARY_NAME = "dwgread"
@@ -1027,9 +1028,38 @@ def _build_canonical_output(
     if not entities:
         metadata["empty_entities_reason"] = "no_drawable_candidates_detected"
 
+    # --- Unit inference (UNCONFIRMED path only) ---
+    # When INSUNITS is missing/0/exotic, attempt to infer the native unit from
+    # the aggregate entity extent.  Mutates units.payload in-place; the confirmed
+    # path (units.confirmed=True) is never touched so its output is unchanged.
+    inference_contradiction_warning: AdapterWarning | None = None
+    if not units.confirmed:
+        _apply_dwg_unit_inference(
+            units.payload,
+            entities,
+            declared_code=_extract_insunits_code(run_result.output_payload),
+        )
+        if units.payload.get("contradiction"):
+            contradiction = units.payload["contradiction"]
+            if isinstance(contradiction, dict):
+                inference_contradiction_warning = AdapterWarning(
+                    code="libredwg.units_contradiction",
+                    message=(
+                        "Inferred unit contradicts the declared INSUNITS code; "
+                        "geometry quantities require review."
+                    ),
+                    details={
+                        "declared_normalized": contradiction.get("declared_normalized"),
+                        "inferred_normalized": contradiction.get("inferred_normalized"),
+                        "basis": contradiction.get("basis"),
+                    },
+                )
+
     warnings: list[AdapterWarning] = []
     if not units.confirmed:
         warnings.append(_units_unconfirmed_warning())
+    if inference_contradiction_warning is not None:
+        warnings.append(inference_contradiction_warning)
     if orientation.rotated:
         warnings.append(_orientation_unmodeled_warning(orientation))
     unsupported_classes = cast("tuple[_JSONDict, ...]", census["unsupported_classes"])
@@ -1270,6 +1300,56 @@ def _units_unconfirmed_warning() -> AdapterWarning:
         message="LibreDWG JSON output does not confirm drawing units for canonical quantities.",
         details={"normalized_units": "unknown"},
     )
+
+
+def _apply_dwg_unit_inference(
+    units_payload: _JSONDict,
+    entities: list[JSONValue],
+    *,
+    declared_code: int | None,
+) -> None:
+    """Attempt extent-based unit inference and mutate *units_payload* in-place.
+
+    Only called on the UNCONFIRMED path (confirmed=False).  Shares the same
+    ``infer_units`` engine as the DXF adapter — prevents DXF/DWG inference drift
+    (the same lesson as #369 for the conversion table).
+    """
+    bboxes: list[dict[str, object]] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        bbox = entity.get("bbox")
+        if isinstance(bbox, dict):
+            bboxes.append(bbox)
+
+    extent = extent_from_bboxes(bboxes)
+    result = infer_units(declared_code=declared_code, extent=extent)
+
+    if result.confidence == "inferred":
+        units_payload["confidence"] = "inferred"
+        units_payload["conversion_factor"] = result.conversion_factor
+        units_payload["normalized"] = result.normalized
+        units_payload["source"] = "INSUNITS"
+        units_payload["basis"] = result.basis
+        if extent is not None:
+            units_payload["inference"] = {
+                "extent": {"width": extent.width, "height": extent.height},
+                "candidates": tuple(
+                    {
+                        "normalized": c.normalized,
+                        "conversion_factor": c.conversion_factor,
+                        "band_label": c.band_label,
+                    }
+                    for c in result.candidates
+                ),
+                "basis": result.basis,
+            }
+        if result.contradicts_declared:
+            units_payload["contradiction"] = {
+                "declared_normalized": result.declared_normalized,
+                "inferred_normalized": result.normalized,
+                "basis": result.basis,
+            }
 
 
 def _resolve_units(payload: Any) -> _UnitsResolution:
