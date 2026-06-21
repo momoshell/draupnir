@@ -3944,6 +3944,8 @@ async def test_libredwg_adapter_keeps_units_unconfirmed_when_header_missing(
         },
     )
 
+    # A single 5-unit line is a degenerate 1-D extent (height=0) — not a scale-inferable
+    # 2-D drawing — so inference stays honestly unknown and units remain unconfirmed (#600).
     assert result.canonical["units"] == {"normalized": "unknown"}
     assert "libredwg.units_unconfirmed" in [warning.code for warning in result.warnings]
 
@@ -3980,6 +3982,8 @@ async def test_libredwg_adapter_degrades_ambiguous_units_to_unconfirmed(
         },
     )
 
+    # A single 5-unit line is a degenerate 1-D extent → inference stays unknown; units
+    # remain unconfirmed (#600 — no over-confident guess from non-2-D geometry).
     assert result.canonical["units"] == {"normalized": "unknown"}
     assert "libredwg.units_unconfirmed" in [warning.code for warning in result.warnings]
 
@@ -4501,4 +4505,134 @@ async def test_libredwg_adapter_surfaces_dwgread_parse_errors_as_counted_warning
         "Invalid MTEXT.class_version #": 3,
         "Unknown class FOO": 1,
     }
-    assert details["stderr_truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Unit inference — unconfirmed INSUNITS path (#558, P1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_infers_millimeter_from_building_scale_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INSUNITS missing + building-scale entities (~40 000 raw units) → inferred millimeter."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 40_000, "y": 0, "z": 0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "1B",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    assert units["conversion_factor"] == pytest.approx(0.001)
+    assert "basis" in units
+    assert "millimeter" in units["basis"]
+    inference = cast(dict[str, Any], units["inference"])
+    assert inference["extent"]["width"] == pytest.approx(40_000.0)
+    assert inference["extent"]["height"] == pytest.approx(20_000.0)
+    assert len(inference["candidates"]) >= 1
+    assert inference["candidates"][0]["normalized"] == "millimeter"
+    assert "contradiction" not in units
+    assert "libredwg.units_unconfirmed" in [w.code for w in result.warnings]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_confirmed_units_unchanged_by_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed INSUNITS=4 (millimeter) must not acquire inference keys."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 40_000, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    # Confirmed path: exact payload, no inference enrichment.
+    assert units == {
+        "normalized": "meter",
+        "source": "INSUNITS",
+        "source_value": 4,
+        "conversion_target": "meter",
+        "conversion_factor": 0.001,
+    }
+    assert "confidence" not in units
+    assert "inference" not in units
+    assert "contradiction" not in units
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_emits_contradiction_when_declared_contradicts_extent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declared gigameter (code=17, not in confirmed subset) + mm-scale geometry → contradiction.
+
+    INSUNITS=17 (gigameter, 1e9 m) is in METER_SCALE but NOT in _CONFIRMED_INSUNITS_CODES,
+    so libredwg stays on the unconfirmed path while infer_units can compare declared vs
+    inferred and detect the contradiction (ratio >> 10).
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 17},  # gigameter — not in confirmed subset
+            "OBJECTS": [
+                {
+                    "type": "LINE",
+                    "handle": "1A",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 40_000, "y": 0, "z": 0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "1B",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    # Inference fires (unconfirmed) and detects contradiction.
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    contradiction = cast(dict[str, Any], units["contradiction"])
+    assert contradiction["declared_normalized"] == "gigameter"
+    assert contradiction["inferred_normalized"] == "millimeter"
+    assert "basis" in contradiction
+
+    warning_codes = [w.code for w in result.warnings]
+    assert "libredwg.units_unconfirmed" in warning_codes
+    assert "libredwg.units_contradiction" in warning_codes
+
+    contradiction_warning = next(
+        w for w in result.warnings if w.code == "libredwg.units_contradiction"
+    )
+    cw_details = cast(Mapping[str, Any], contradiction_warning.details)
+    assert cw_details["declared_normalized"] == "gigameter"
+    assert cw_details["inferred_normalized"] == "millimeter"

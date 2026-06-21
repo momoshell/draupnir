@@ -36,6 +36,7 @@ from app.ingestion.contracts import (
     ProvenanceRecord,
 )
 from app.ingestion.registry import evaluate_availability, get_descriptor
+from app.ingestion.units_inference import extent_from_bboxes, infer_units
 
 _DESCRIPTOR = get_descriptor(InputFamily.DXF)
 _CANONICAL_SCHEMA_VERSION = "0.1"
@@ -343,6 +344,23 @@ class EzdxfAdapter:
             percent=1.0,
         )
 
+        # --- Unit inference (UNCONFIRMED path only) ---
+        # When $INSUNITS is missing/0/exotic (confirmed=False), attempt to infer
+        # the native unit from the aggregate entity extent.  The confirmed path
+        # (conversion_factor already set) is left byte-for-byte unchanged.
+        if units_review_required:
+            _sv = units_payload.get("source_value")
+            _source_int = (
+                int(_sv) if isinstance(_sv, (int, float)) and not isinstance(_sv, bool) else 0
+            )
+            _apply_unit_inference(
+                units_payload=units_payload,
+                entities=canonical_entities,
+                source_value=_source_int,
+                warnings=warnings,
+                warning_code_prefix="ezdxf",
+            )
+
         canonical: dict[str, JSONValue] = {
             "canonical_entity_schema_version": _CANONICAL_SCHEMA_VERSION,
             "schema_version": _CANONICAL_SCHEMA_VERSION,
@@ -497,6 +515,73 @@ def _units_payload(document: Any) -> dict[str, JSONValue]:
 
 def _normalized_unit_name(source_value: int) -> str:
     return unit_name(source_value)
+
+
+def _apply_unit_inference(
+    *,
+    units_payload: dict[str, JSONValue],
+    entities: list[dict[str, JSONValue]],
+    source_value: int,
+    warnings: list[AdapterWarning],
+    warning_code_prefix: str,
+) -> None:
+    """Attempt extent-based unit inference and mutate *units_payload* in-place.
+
+    Only called on the UNCONFIRMED path (confirmed=False).  The confirmed path
+    is never mutated so its exact byte output is preserved.
+    """
+    # In the ezdxf canonical schema the bbox lives under entity["geometry"]["bbox"].
+    bboxes: list[dict[str, object]] = []
+    for entity in entities:
+        geometry = entity.get("geometry")
+        if not isinstance(geometry, dict):
+            continue
+        bbox = geometry.get("bbox")
+        if isinstance(bbox, dict):
+            bboxes.append(bbox)
+
+    extent = extent_from_bboxes(bboxes)
+    result = infer_units(declared_code=source_value if source_value else None, extent=extent)
+
+    if result.confidence == "inferred":
+        units_payload["confidence"] = "inferred"
+        units_payload["conversion_factor"] = result.conversion_factor
+        units_payload["normalized"] = result.normalized
+        units_payload["source"] = "$INSUNITS"
+        units_payload["basis"] = result.basis
+        if extent is not None:
+            units_payload["inference"] = {
+                "extent": {"width": extent.width, "height": extent.height},
+                "candidates": tuple(
+                    {
+                        "normalized": c.normalized,
+                        "conversion_factor": c.conversion_factor,
+                        "band_label": c.band_label,
+                    }
+                    for c in result.candidates
+                ),
+                "basis": result.basis,
+            }
+        if result.contradicts_declared:
+            units_payload["contradiction"] = {
+                "declared_normalized": result.declared_normalized,
+                "inferred_normalized": result.normalized,
+                "basis": result.basis,
+            }
+            warnings.append(
+                AdapterWarning(
+                    code=f"{warning_code_prefix}.units_contradiction",
+                    message=(
+                        "Inferred unit contradicts the declared $INSUNITS code; "
+                        "geometry quantities require review."
+                    ),
+                    details={
+                        "declared_normalized": result.declared_normalized,
+                        "inferred_normalized": result.normalized,
+                        "basis": result.basis,
+                    },
+                )
+            )
 
 
 def _units_are_normalized_to_meter(units: dict[str, JSONValue]) -> bool:

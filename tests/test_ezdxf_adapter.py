@@ -1370,3 +1370,214 @@ async def test_ezdxf_adapter_honors_cancellation_checkpoints() -> None:
         )
 
     assert cancellation.calls >= 3
+
+
+# ---------------------------------------------------------------------------
+# Unit inference — unconfirmed INSUNITS path (#558, P1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_infers_millimeter_from_building_scale_geometry(
+    tmp_path: Path,
+) -> None:
+    """INSUNITS=0 (unitless) + building-scale entities → inferred millimeter."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "unconfirmed-mm.dxf"
+    # units=0 → unitless / unconfirmed
+    document = cast(Any, ezdxf).new(units=0)
+    msp = document.modelspace()
+    # ~40 m x 20 m floor plan drawn in mm: 40 000 x 20 000 raw units
+    msp.add_line((0.0, 0.0, 0.0), (40_000.0, 0.0, 0.0))
+    msp.add_line((0.0, 0.0, 0.0), (0.0, 20_000.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    assert units["conversion_factor"] == pytest.approx(0.001)
+    assert "basis" in units
+    basis = cast(str, units["basis"])
+    assert "millimeter" in basis
+    inference = _mapping(units["inference"])
+    extent_block = _mapping(inference["extent"])
+    assert extent_block["width"] == pytest.approx(40_000.0)
+    assert extent_block["height"] == pytest.approx(20_000.0)
+    candidates = cast("tuple[object, ...]", inference["candidates"])
+    assert len(candidates) >= 1
+    first_candidate = _mapping(candidates[0])
+    assert first_candidate["normalized"] == "millimeter"
+    # contradiction not present — no declared code to contradict
+    assert "contradiction" not in units
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_confirmed_units_unchanged_by_inference(
+    tmp_path: Path,
+) -> None:
+    """Confirmed INSUNITS (millimeter, code=4) must not acquire inference keys."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "confirmed-mm.dxf"
+    document = cast(Any, ezdxf).new(units=4)
+    document.modelspace().add_line((0.0, 0.0, 0.0), (40_000.0, 0.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["normalized"] == "meter"
+    assert units["source_value"] == 4
+    assert units["conversion_factor"] == pytest.approx(0.001)
+    # No inference keys on the confirmed path.
+    assert "confidence" not in units
+    assert "inference" not in units
+    assert "contradiction" not in units
+    assert "basis" not in units
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_unknown_confidence_when_no_usable_bboxes(
+    tmp_path: Path,
+) -> None:
+    """INSUNITS=0 with an empty modelspace → no inference, units stays normalized=unitless."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "empty-unconfirmed.dxf"
+    document = cast(Any, ezdxf).new(units=0)
+    # No entities → no bboxes → extent=None → inference result confidence="unknown"
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    # No inferred keys when extent is unavailable.
+    assert units["normalized"] == "unitless"
+    assert "confidence" not in units
+    assert "inference" not in units
+
+
+# ---------------------------------------------------------------------------
+# P1 additions — contradiction path + confirmed-path full-dict equality (#600)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_emits_contradiction_when_inferred_contradicts_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unconfirmed units with a METER_SCALE declared code + mm-scale geometry → contradiction.
+
+    ezdxf confirms every METER_SCALE code, so the unconfirmed path is only reachable
+    when conversion_factor is None (e.g. codes 0, 8, 9 not in METER_SCALE).  The
+    contradiction gate in infer_units also requires the declared_code to be in
+    METER_SCALE (so _resolve_declared returns a name).  To exercise the contradiction
+    wiring we monkeypatch _units_payload to return a payload that is simultaneously
+    unconfirmed (conversion_factor=None → units_review_required=True) and carries a
+    declared source_value that IS in METER_SCALE (17 = gigameter, 1 GHz of meters),
+    matching the libredwg pattern where code 17 is in METER_SCALE but outside the
+    confirmed subset.
+    """
+    adapter = _load_ezdxf_adapter()
+
+    # Synthesize: unconfirmed payload (conversion_factor=None) but source_value=17
+    # (gigameter) which IS in METER_SCALE so infer_units can compare factors.
+    # mm-scale geometry (40 000 x 20 000) → infer_units infers millimeter (0.001).
+    # ratio = 0.001 / 1e9 << 0.1 → contradicts.
+    fake_units: dict[str, Any] = {
+        "normalized": "gigameter",
+        "source": "$INSUNITS",
+        "source_value": 17,
+        "conversion_target": "meter",
+        "conversion_factor": None,
+    }
+    fake_document = _FakeDocument(
+        entities=(
+            _FakeEntity(
+                entity_type="LINE",
+                handle="A1",
+                layer="0",
+                layout_name="Model",
+                start=_fake_point(0.0, 0.0, 0.0),
+                end=_fake_point(40_000.0, 0.0, 0.0),
+            ),
+            _FakeEntity(
+                entity_type="LINE",
+                handle="A2",
+                layer="0",
+                layout_name="Model",
+                start=_fake_point(0.0, 0.0, 0.0),
+                end=_fake_point(0.0, 20_000.0, 0.0),
+            ),
+        ),
+        units=17,
+    )
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: fake_document)
+    monkeypatch.setattr(
+        "app.ingestion.adapters.ezdxf._units_payload",
+        lambda _doc: dict(fake_units),
+    )
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="gigameter-contradiction.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units["confidence"] == "inferred"
+    assert units["normalized"] == "millimeter"
+    contradiction = _mapping(units["contradiction"])
+    assert contradiction["declared_normalized"] == "gigameter"
+    assert contradiction["inferred_normalized"] == "millimeter"
+    assert "basis" in contradiction
+
+    warning_codes = [w.code for w in result.warnings]
+    assert "units_unconfirmed" in warning_codes
+    assert "ezdxf.units_contradiction" in warning_codes
+
+    contradiction_warning = next(
+        w for w in result.warnings if w.code == "ezdxf.units_contradiction"
+    )
+    cw_details = _mapping(contradiction_warning.details)
+    assert cw_details["declared_normalized"] == "gigameter"
+    assert cw_details["inferred_normalized"] == "millimeter"
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_confirmed_units_exact_dict_equality(
+    tmp_path: Path,
+) -> None:
+    """Confirmed INSUNITS must produce an exact units dict — no extra keys on the confirmed path.
+
+    This is a stricter sibling of test_ezdxf_adapter_confirmed_units_unchanged_by_inference:
+    instead of checking key absence individually, it asserts full dict equality so that
+    accidentally adding an extra key to the confirmed path fails immediately.
+    """
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "confirmed-mm-exact.dxf"
+    document = cast(Any, ezdxf).new(units=4)  # millimeter, code 4
+    document.modelspace().add_line((0.0, 0.0, 0.0), (40_000.0, 0.0, 0.0))
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    units = _mapping(result.canonical["units"])
+    assert units == {
+        "normalized": "meter",
+        "source": "$INSUNITS",
+        "source_value": 4,
+        "conversion_target": "meter",
+        "conversion_factor": pytest.approx(0.001),
+    }

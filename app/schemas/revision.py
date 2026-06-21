@@ -393,6 +393,15 @@ class RevisionScaleRead(BaseModel):
             "— do not assume dimensions when this is False."
         ),
     )
+    units_contradicted: bool = Field(
+        False,
+        description=(
+            "True when the units block carries a contradiction sub-block (#558): a declared or "
+            "confirmed unit that a later inference engine contradicts. When True, the units signal "
+            "is voided and real_world_dimensions_available is False (unless a PDF scale is "
+            "present). Consumers must not treat a contradicted unit as reliable."
+        ),
+    )
     pdf_scale: dict[str, Any] | None = Field(
         None,
         description="Derived PDF page scale (ratio, real-world unit, point->real factor), if any",

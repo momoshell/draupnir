@@ -43,13 +43,29 @@ def _units_confidence(units: Mapping[str, Any]) -> str:
     return "confirmed"
 
 
+def _is_contradicted(units: Mapping[str, Any]) -> bool:
+    """Return True when the units block carries a truthy contradiction sub-block (#558).
+
+    Defensive: any truthy value means contradicted; missing/falsy means not. Never raises on a
+    malformed block — a confirmed unit that a later engine contradicts must not keep reporting
+    real_world_dimensions_available=True.
+    """
+    return bool(units.get("contradiction"))
+
+
 def _real_world_dimensions_available(
     units: Mapping[str, Any], pdf_scale: Mapping[str, Any] | None
 ) -> bool:
     """True when real measurements can be quoted: a usable unit conversion factor (DWG) or a
-    detected PDF point->real factor (#557). Honest False when neither is present."""
-    units_ok = _units_confidence(units) != "unknown" and _positive_number(
-        units.get("conversion_factor")
+    detected PDF point->real factor (#557). Honest False when neither is present.
+
+    A contradiction on the units block (#558) voids the units signal only; the PDF signal is
+    independent and unchanged.
+    """
+    units_ok = (
+        _units_confidence(units) != "unknown"
+        and _positive_number(units.get("conversion_factor"))
+        and not _is_contradicted(units)
     )
     # The PDF point->real factor is the unambiguous "can convert" signal (present iff a scale
     # ratio + real unit were detected); key on it rather than the variably-typed flag.
@@ -94,6 +110,7 @@ async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> Revisio
             units={"normalized": "unknown"},
             units_confidence="unknown",
             real_world_dimensions_available=False,
+            units_contradicted=False,
             pdf_scale=None,
             source_input_family=None,
         )
@@ -106,6 +123,7 @@ async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> Revisio
         units=units,
         units_confidence=_units_confidence(units),  # type: ignore[arg-type]
         real_world_dimensions_available=_real_world_dimensions_available(units, pdf_scale),
+        units_contradicted=_is_contradicted(units),
         pdf_scale=pdf_scale,
         source_input_family=adapter_output.input_family,
     )
