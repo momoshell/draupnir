@@ -38,7 +38,7 @@ from app.interpretation.legend_dictionary import LegendDictionary, LegendEntry
 # ---------------------------------------------------------------------------
 
 #: Consumers can record this to know which classification logic produced an output.
-RULE_VERSION: str = "1"
+RULE_VERSION: str = "2"
 
 # ---------------------------------------------------------------------------
 # Kind constants
@@ -74,12 +74,17 @@ BASIS_NONE: str = "none"
 
 ARCHITECTURE_FAMILY_PATTERNS: tuple[str, ...] = (
     "Room Tag",
+    "Room Name",
     "Grid",
     "Mullion",
     "Door",
     "Gate",
     "Window",
     "Curtain",
+    "Placeholder",  # MPA_Placeholder / MPA_StructuralPlaceholder (RC columns)
+    "Column",
+    "Louvre",
+    "Hardscape",
 )
 
 # ---------------------------------------------------------------------------
@@ -136,14 +141,16 @@ def classify_instance_kind(
 ) -> str:
     """Classify a device instance into a coarse kind (deterministic, first match wins).
 
-    Precedence:
+    Precedence (legend ICON membership is the strong device signal; a mere nearby TAG must
+    not promote an architectural family — mullions/columns/grids carry stray tags on real
+    drawings, #545 real-data finding):
     1. legend_exemplar — layer_ref contains legend_layer_match (case-insensitive).
-    2. device (legend-resolvable) — normalized tag.text in by_abbreviation() OR block_ref in
-       by_symbol_family(); legend membership is the primary signal (ADR-002).
-    3. architecture    — block_ref matches any ARCHITECTURE_FAMILY_PATTERNS.
-    4. device (tagged) — tag present but not legend-resolvable (still a candidate device).
-    5. annotation      — block_ref matches any _ANNOTATION_FAMILY_PATTERNS.
-    6. unknown         — else.
+    2. device (legend icon) — block_ref in by_symbol_family() (a legend-defined device family).
+    3. architecture    — block_ref matches any ARCHITECTURE_FAMILY_PATTERNS (beats proximity tags).
+    4. device (legend key) — normalized tag.text in by_abbreviation() (a legend-key abbreviation).
+    5. device (tagged) — any tag present (non-architecture, not legend-resolvable).
+    6. annotation      — block_ref matches any _ANNOTATION_FAMILY_PATTERNS.
+    7. unknown         — else.
     """
     # 1. Legend exemplar guard — keyed ONLY on layer_ref, never on block_ref.
     if device.layer_ref is not None and legend_layer_match.lower() in device.layer_ref.lower():
@@ -151,22 +158,26 @@ def classify_instance_kind(
 
     block_ref = device.block_ref or ""
     block_ref_lower = block_ref.lower()
-
-    # 2. Device — legend membership (primary device signal per ADR-002).
-    # Tag lookup is normalized (strip + upper) so raw lowercase/padded tags hit uppercase keys.
     by_abbr = legend.by_abbreviation()
     by_family = legend.by_symbol_family()
-    if device.tag is not None and device.tag.text.strip().upper() in by_abbr:
-        return KIND_DEVICE
+
+    # 2. Device — legend ICON family. Strong identity: the family IS a legend-defined device
+    # family. by_symbol_family carries ONLY legend families (the route scopes Source A to the
+    # legend), so this never matches architecture.
     if block_ref and block_ref in by_family:
         return KIND_DEVICE
 
-    # 3. Architecture — block_ref substring match (case-insensitive).
+    # 3. Architecture — family pattern. Beats a nearby/legend-key TAG: a Rectangular Mullion
+    # with a stray "H"/"AHU" tag is still a mullion, not a device.
     for pattern in ARCHITECTURE_FAMILY_PATTERNS:
         if pattern.lower() in block_ref_lower:
             return KIND_ARCHITECTURE
 
-    # 4. Device — any tag present (tagged but not legend-resolvable).
+    # 4. Device — legend KEY abbreviation (normalized strip+upper for the uppercase keys).
+    if device.tag is not None and device.tag.text.strip().upper() in by_abbr:
+        return KIND_DEVICE
+
+    # 5. Device — any tag present (non-architecture, not legend-resolvable).
     if device.tag is not None:
         return KIND_DEVICE
 

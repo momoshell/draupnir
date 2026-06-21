@@ -772,40 +772,57 @@ def test_lowercase_tag_classify_as_device_via_abbreviation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 2 — legend membership beats architecture (ADR-002 precedence correction)
+# Precedence (corrected from real-data #545 finding): a legend-ICON family
+# (Source A, scoped to legend-marked families) beats architecture; a stray
+# legend-KEY *tag* does NOT — mullions/columns carry spurious nearby tags.
 # ---------------------------------------------------------------------------
 
 
-def test_legend_resolvable_tag_beats_architectural_block_ref() -> None:
-    """A device with an architectural block_ref but a legend-resolvable tag → kind=device."""
-    legend = _legend(_entry(abbreviation="MDH", type_name="Magnetic Door Holder"))
+def test_legend_icon_family_beats_architectural_block_ref() -> None:
+    """A block whose family IS a legend device family → kind=device, even if the family
+    name contains an architecture substring (the legend icon is the strong signal)."""
+    legend = _legend(_entry(symbol_family="Magnetic Door Holder", type_name="Magnetic Door Holder"))
     device = _device(
-        entity_id="d-arch-tag",
+        entity_id="d-icon",
         block_ref="Magnetic Door Holder",
         layer_ref="E-FIRE",
-        tag=_tag("MDH"),
+        tag=None,
     )
     kind = classify_instance_kind(device, legend)
-    assert kind == KIND_DEVICE, (
-        "Legend-resolvable tag must override architectural block_ref substring match"
-    )
+    assert kind == KIND_DEVICE, "A legend-icon family must override an architecture substring"
 
 
-def test_legend_resolvable_tag_beats_architectural_block_ref_full_resolve() -> None:
-    """Full resolve: block_ref with 'Door' in name + legend-resolvable tag → resolved device."""
-    legend = _legend(_entry(abbreviation="MDH", type_name="Magnetic Door Holder"))
+def test_legend_icon_family_beats_architectural_block_ref_full_resolve() -> None:
+    """Full resolve: a legend-icon family is a resolved device (basis=symbol_family)."""
+    legend = _legend(_entry(symbol_family="Magnetic Door Holder", type_name="Magnetic Door Holder"))
     device = _device(
-        entity_id="d-arch-full",
+        entity_id="d-icon-full",
         block_ref="Magnetic Door Holder",
         layer_ref="E-FIRE",
-        tag=_tag("MDH"),
+        tag=None,
     )
     results = resolve_device_identities([device], legend)
     r = results[0]
     assert r.kind == KIND_DEVICE
     assert r.status == STATUS_RESOLVED
     assert r.type_name == "Magnetic Door Holder"
-    assert r.basis == BASIS_TAG_ABBREVIATION
+    assert r.basis == BASIS_SYMBOL_FAMILY
+
+
+def test_architecture_beats_legend_key_tag() -> None:
+    """A stray legend-KEY tag on an architectural family does NOT promote it to a device —
+    a mullion/column carrying a nearby 'H'/'MDH' tag is still architecture (#545)."""
+    legend = _legend(_entry(abbreviation="MDH", type_name="Magnetic Door Holder"))
+    device = _device(
+        entity_id="d-arch-tag",
+        block_ref="Rectangular Door Mullion",
+        layer_ref="A-GLAZ",
+        tag=_tag("MDH"),
+    )
+    kind = classify_instance_kind(device, legend)
+    assert kind == KIND_ARCHITECTURE, (
+        "An architecture family must not be promoted by a stray legend-key tag"
+    )
 
 
 def test_architectural_block_ref_without_legend_hit_stays_architecture() -> None:

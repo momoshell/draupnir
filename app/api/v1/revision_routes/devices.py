@@ -68,6 +68,12 @@ _MAX_NESTING_DEPTH = 8
 
 _VALID_KIND_VALUES = {"all", "device", "architecture"}
 
+# Legend-defined device families carry this export marker in their block name (e.g.
+# "Smoke Detector with Beaconrfa - …-Legend Stage 4"). Native architecture (mullions,
+# columns, grids) does not. Source A (the legend icon families) is scoped to families
+# carrying this marker, so architecture instances aren't treated as legend devices (#545).
+_LEGEND_FAMILY_MARKER = "legend stage"
+
 
 @devices_router.get(
     "/revisions/{revision_id}/devices",
