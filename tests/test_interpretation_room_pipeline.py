@@ -196,4 +196,52 @@ def test_room_labels_from_tag_candidates() -> None:
         _TagCandidate(entity_id="t1", text="Kitchen", layer_ref="A-ANNO", x=5.0, y=6.0),
     ]
     labels = _room_labels(candidates)
-    assert labels == [RoomLabel(text="Kitchen", point=(5.0, 6.0))]
+    assert labels == [RoomLabel(text="Kitchen", point=(5.0, 6.0), layer="A-ANNO")]
+
+
+# --- label enrichment + label-only rooms (#549) ---
+
+
+def test_labels_stamp_name_and_number_onto_containing_polygon_room() -> None:
+    # A wall square room with a name + number label (on a room-label layer) inside it.
+    entities = _square_wall_lines()
+    labels = [
+        RoomLabel("PH Plantroom", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    named = [room for room in result.rooms if room.name == "PH Plantroom"]
+    assert len(named) == 1
+    assert named[0].number == "0.9.01"
+    assert named[0].polygon is not None  # stamped onto the wall polygon
+
+
+def test_label_only_room_surfaced_when_no_polygon() -> None:
+    # No geometry → no polygon; the label cluster still yields a named, numbered room.
+    labels = [
+        RoomLabel("Telco Intake", (50.0, 50.4), layer="A-IDEN"),
+        RoomLabel("0.9.09", (50.0, 50.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms([], devices=[], labels=labels)
+    label_rooms = [room for room in result.rooms if room.source == "label_cluster"]
+    assert len(label_rooms) == 1
+    room = label_rooms[0]
+    assert room.name == "Telco Intake"
+    assert room.number == "0.9.09"
+    assert room.polygon is None
+    assert room.location == (50.0, 50.0)
+
+
+def test_device_tag_layer_text_does_not_become_a_room() -> None:
+    # Device-tag letters on a non-room-label layer must not be paired as room names.
+    labels = [
+        RoomLabel("AHU Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("S", (5.1, 5.0), layer="Z000"),  # nearer device tag on another layer
+        RoomLabel("DC", (5.2, 5.0), layer="Z000"),
+    ]
+    result = interpret_rooms([], devices=[], labels=labels)
+    label_rooms = [room for room in result.rooms if room.source == "label_cluster"]
+    assert len(label_rooms) == 1
+    assert label_rooms[0].name == "AHU Plant"
+    assert label_rooms[0].number == "0.9.04"

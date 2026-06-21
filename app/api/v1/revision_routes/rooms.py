@@ -24,6 +24,7 @@ from app.interpretation.devices import (
     _TagCandidate,
     enumerate_devices,
     load_tag_candidates,
+    load_text_candidates,
 )
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.interpretation.room_pipeline import (
@@ -45,6 +46,7 @@ from app.schemas.rooms import (
     RevisionRoomEntityListResponse,
     RevisionRoomListResponse,
     RoomBoundsRead,
+    RoomLocationRead,
     RoomRead,
 )
 
@@ -166,6 +168,17 @@ async def list_revision_room_entities(
         raise_not_found("Room", room_id)
     assert room is not None
 
+    # A label-derived room (#549) has a name/number + location but no boundary, so it
+    # contains no geometry — return an empty (but valid) page rather than querying a polygon.
+    if room.bounds is None or room.polygon is None:
+        return RevisionRoomEntityListResponse(
+            manifest=RevisionEntityManifestRead.model_validate(manifest),
+            room=_room_read(room),
+            items=[],
+            total=0,
+            next_cursor=None,
+        )
+
     # Indexed prefilter: only entities whose bbox-centroid falls in the room's AABB can be
     # contained in (or nested within) the room. The Python pass below refines to the polygon.
     centroid_x = (RevisionEntity.bbox_min_x + RevisionEntity.bbox_max_x) / 2
@@ -228,11 +241,18 @@ async def _resolve_rooms(
     devices = await enumerate_devices(
         db, revision_id, device_layers=device_layer, max_depth=max_depth
     )
-    candidates = await load_tag_candidates(db, revision_id, tag_layers=tag_layer)
+    # Room naming/identification: an explicit ``tag_layer`` scopes the room-label source;
+    # otherwise use all text (room labels live on a room-label layer, not a device-tag layer)
+    # and let the pipeline auto-scope to the number-bearing layer (#549).
+    label_candidates = (
+        await load_tag_candidates(db, revision_id, tag_layers=tag_layer)
+        if tag_layer
+        else await load_text_candidates(db, revision_id)
+    )
     return interpret_rooms(
         entities,
         devices=_device_placements(devices),
-        labels=_room_labels(candidates),
+        labels=_room_labels(label_candidates),
         strategy=resolved_strategy,
         snap_tolerance=snap_tolerance,
         min_area=min_area,
@@ -241,17 +261,29 @@ async def _resolve_rooms(
 
 def _room_read(room: Room) -> RoomRead:
     """Serialize an interpreted room to its public read model."""
-    return RoomRead(
-        id=room.id,
-        name=room.name,
-        source=room.source,
-        area=room.area,
-        bounds=RoomBoundsRead(
+    bounds = (
+        RoomBoundsRead(
             min_x=room.bounds[0],
             min_y=room.bounds[1],
             max_x=room.bounds[2],
             max_y=room.bounds[3],
-        ),
+        )
+        if room.bounds is not None
+        else None
+    )
+    location = (
+        RoomLocationRead(x=room.location[0], y=room.location[1])
+        if room.location is not None
+        else None
+    )
+    return RoomRead(
+        id=room.id,
+        name=room.name,
+        number=room.number,
+        source=room.source,
+        area=room.area,
+        bounds=bounds,
+        location=location,
         confidence=room.confidence,
     )
 
@@ -280,7 +312,8 @@ def _device_placements(devices: Sequence[Device]) -> list[DevicePlacement]:
 
 
 def _room_labels(candidates: Sequence[_TagCandidate]) -> list[RoomLabel]:
-    """Adapt tag-text candidates into room labels (text + placement)."""
+    """Adapt text candidates into room labels (text + placement + layer)."""
     return [
-        RoomLabel(text=candidate.text, point=(candidate.x, candidate.y)) for candidate in candidates
+        RoomLabel(text=candidate.text, point=(candidate.x, candidate.y), layer=candidate.layer_ref)
+        for candidate in candidates
     ]

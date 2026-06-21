@@ -284,6 +284,32 @@ async def load_tag_candidates(
     if not rows and tag_layers is None:
         rows = (await db.execute(base)).scalars().all()
 
+    return _rows_to_candidates(rows)
+
+
+async def load_text_candidates(db: AsyncSession, revision_id: UUID) -> list[_TagCandidate]:
+    """Load every text entity (with layer) — the room-label source (#549).
+
+    Room names + numbers live on a room-label layer that isn't a device-tag layer, so room
+    interpretation needs all text, not the tag-filtered subset; the room pipeline then scopes
+    to the number-bearing layer itself.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(RevisionEntity).where(
+                    RevisionEntity.drawing_revision_id == revision_id,
+                    RevisionEntity.entity_type == "text",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return _rows_to_candidates(rows)
+
+
+def _rows_to_candidates(rows: Sequence[RevisionEntity]) -> list[_TagCandidate]:
     candidates: list[_TagCandidate] = []
     for row in rows:
         text = _entity_text(row)
