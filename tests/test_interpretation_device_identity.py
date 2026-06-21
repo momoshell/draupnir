@@ -311,6 +311,37 @@ def test_resolve_symbol_family_no_tag_layer_in_source_layers() -> None:
     assert results[0].source_layers == ("P-FIRE",)
 
 
+def test_resolve_placeholder_family_is_device_but_unresolved() -> None:
+    """A placeholder family (symbol_family present, type_name None — e.g. Revit 'Family - ___')
+    still classifies as a DEVICE (it is a legend family) but its TYPE is unknown: it must NOT
+    report STATUS_RESOLVED with a null type — it stays unresolved (#590, never guess)."""
+    legend = _legend(_entry(symbol_family="Family - ___", type_name=None))
+    device = _device(entity_id="d-placeholder", block_ref="Family - ___", tag=None)
+    results = resolve_device_identities([device], legend)
+    r = results[0]
+    assert r.kind == KIND_DEVICE  # still a device (legend icon family)
+    assert r.status != STATUS_RESOLVED
+    assert r.type_name is None
+
+
+def test_resolve_placeholder_family_does_not_borrow_type_from_tag() -> None:
+    """A placeholder family stays UNRESOLVED even with a nearby tag — it must NOT borrow a type
+    from a (possibly mis-associated) proximity tag (#590). The raw tag is preserved as the
+    abbreviation; type_name stays None. The placed icon is unnamed, so we don't guess."""
+    legend = _legend(
+        _entry(symbol_family="Family - ___", type_name=None),
+        _entry(abbreviation="AHU", type_name="AHU"),
+    )
+    device = _device(entity_id="d-ph-tag", block_ref="Family - ___", tag=_tag("AHU"))
+    results = resolve_device_identities([device], legend)
+    r = results[0]
+    assert r.kind == KIND_DEVICE
+    assert r.status == STATUS_UNRESOLVED
+    assert r.type_name is None
+    assert r.abbreviation == "AHU"  # raw tag preserved, NOT promoted to a type
+    assert r.basis == BASIS_UNRESOLVED_TAG
+
+
 # ---------------------------------------------------------------------------
 # resolve_device_identities — Priority 3: unresolved tag
 # ---------------------------------------------------------------------------
