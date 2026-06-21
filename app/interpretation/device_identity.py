@@ -85,6 +85,7 @@ ARCHITECTURE_FAMILY_PATTERNS: tuple[str, ...] = (
     "Column",
     "Louvre",
     "Hardscape",
+    "_rvt",  # linked Revit model master/container block (nesting root) — never a device
 )
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,8 @@ _ANNOTATION_FAMILY_PATTERNS: tuple[str, ...] = (
     "Elevation Marker",
     "Revision Cloud",
     "Title Block",
+    "Titleblock",  # RUK-Annotation-TitleblockA0 (no space variant)
+    "Annotation",  # generic annotation/drawing-number blocks
 )
 
 
@@ -147,9 +150,10 @@ def classify_instance_kind(
     1. legend_exemplar — layer_ref contains legend_layer_match (case-insensitive).
     2. device (legend icon) — block_ref in by_symbol_family() (a legend-defined device family).
     3. architecture    — block_ref matches any ARCHITECTURE_FAMILY_PATTERNS (beats proximity tags).
-    4. device (legend key) — normalized tag.text in by_abbreviation() (a legend-key abbreviation).
-    5. device (tagged) — any tag present (non-architecture, not legend-resolvable).
-    6. annotation      — block_ref matches any _ANNOTATION_FAMILY_PATTERNS.
+    4. annotation      — block_ref matches any _ANNOTATION_FAMILY_PATTERNS (beats device-by-tag,
+       so a tagged titleblock/drawing-number block isn't promoted by a stray nearby tag).
+    5. device (legend key) — normalized tag.text in by_abbreviation() (a legend-key abbreviation).
+    6. device (tagged) — any tag present (non-architecture, non-annotation, not legend-resolvable).
     7. unknown         — else.
     """
     # 1. Legend exemplar guard — keyed ONLY on layer_ref, never on block_ref.
@@ -173,20 +177,21 @@ def classify_instance_kind(
         if pattern.lower() in block_ref_lower:
             return KIND_ARCHITECTURE
 
-    # 4. Device — legend KEY abbreviation (normalized strip+upper for the uppercase keys).
-    if device.tag is not None and device.tag.text.strip().upper() in by_abbr:
-        return KIND_DEVICE
-
-    # 5. Device — any tag present (non-architecture, not legend-resolvable).
-    if device.tag is not None:
-        return KIND_DEVICE
-
-    # 5. Annotation — block_ref substring match (case-insensitive).
+    # 4. Annotation — block_ref substring match. Beats device-by-tag so a tagged titleblock /
+    #    drawing-number block is not promoted to a device by a stray nearby tag.
     for pattern in _ANNOTATION_FAMILY_PATTERNS:
         if pattern.lower() in block_ref_lower:
             return KIND_ANNOTATION
 
-    # 6. Fallthrough.
+    # 5. Device — legend KEY abbreviation (normalized strip+upper for the uppercase keys).
+    if device.tag is not None and device.tag.text.strip().upper() in by_abbr:
+        return KIND_DEVICE
+
+    # 6. Device — any tag present (non-architecture, non-annotation, not legend-resolvable).
+    if device.tag is not None:
+        return KIND_DEVICE
+
+    # 7. Fallthrough.
     return KIND_UNKNOWN
 
 
@@ -269,26 +274,15 @@ def _resolve_device(
     by_abbr: dict[str, LegendEntry],
     by_family: dict[str, LegendEntry],
 ) -> DeviceIdentity:
-    """Apply the four-step resolution priority for kind=device."""
-    # Priority 1 — tag.text in by_abbreviation (normalized: strip + upper for lookup only).
-    normalized_tag = device.tag.text.strip().upper() if device.tag is not None else None
-    if normalized_tag is not None and normalized_tag in by_abbr:
-        entry = by_abbr[normalized_tag]
-        layers = _source_layers(device, include_tag_layer=True)
-        return DeviceIdentity(
-            entity_id=device.entity_id,
-            kind=KIND_DEVICE,
-            status=STATUS_RESOLVED,
-            type_name=entry.type_name,
-            abbreviation=entry.abbreviation,
-            description=entry.description,
-            basis=BASIS_TAG_ABBREVIATION,
-            source_layers=layers,
-            confidence=None,
-            competing_type_names=entry.competing_type_names,
-        )
+    """Apply the resolution priority for kind=device.
 
-    # Priority 2 — block_ref in by_symbol_family.
+    Priority is ICON-FAMILY-FIRST (real-data #545 finding): the legend symbol family is the
+    authoritative graphic identity of a placed device, so it wins the type. A nearby tag is a
+    weaker signal — on real drawings a stray ``AHU``/``H`` tag sits near many unrelated blocks,
+    so resolving type from the tag first mistyped every icon device as its neighbour's tag.
+    The tag is the fallback type only when the family is not a legend family.
+    """
+    # Priority 1 — block_ref in by_symbol_family (the legend ICON family — authoritative type).
     block_ref = device.block_ref or ""
     if block_ref and block_ref in by_family:
         entry = by_family[block_ref]
@@ -301,6 +295,24 @@ def _resolve_device(
             abbreviation=entry.abbreviation,
             description=entry.description,
             basis=BASIS_SYMBOL_FAMILY,
+            source_layers=layers,
+            confidence=None,
+            competing_type_names=entry.competing_type_names,
+        )
+
+    # Priority 2 — tag.text in by_abbreviation (normalized: strip + upper for lookup only).
+    normalized_tag = device.tag.text.strip().upper() if device.tag is not None else None
+    if normalized_tag is not None and normalized_tag in by_abbr:
+        entry = by_abbr[normalized_tag]
+        layers = _source_layers(device, include_tag_layer=True)
+        return DeviceIdentity(
+            entity_id=device.entity_id,
+            kind=KIND_DEVICE,
+            status=STATUS_RESOLVED,
+            type_name=entry.type_name,
+            abbreviation=entry.abbreviation,
+            description=entry.description,
+            basis=BASIS_TAG_ABBREVIATION,
             source_layers=layers,
             confidence=None,
             competing_type_names=entry.competing_type_names,
