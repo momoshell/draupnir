@@ -1,7 +1,7 @@
 """Device / fixture-schedule interpretation route (tier-3, derived from the canonical model)."""
 
 from collections import Counter
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -66,7 +66,13 @@ devices_router = APIRouter()
 
 _MAX_NESTING_DEPTH = 8
 
-_VALID_KIND_VALUES = {"all", "device", "architecture"}
+DeviceKind = Literal["all", "device", "architecture"]
+
+# Device interpretation scope (#588). "sheet" (default) restricts the device walk + tag
+# association to the printed sheet (drops block instances whose ROOT INSERT is off-sheet,
+# keeping on-sheet and undetermined); "modelspace" walks the full modelspace.
+DeviceScope = Literal["sheet", "modelspace"]
+_DEFAULT_DEVICE_SCOPE: DeviceScope = "sheet"
 
 # Legend-defined device families carry this export marker in their block name (e.g.
 # "Smoke Detector with Beaconrfa - …-Legend Stage 4"). Native architecture (mullions,
@@ -88,7 +94,8 @@ async def list_revision_devices(
     tag_layer: Annotated[list[str] | None, Query()] = None,
     max_tag_distance: Annotated[float | None, Query(gt=0.0)] = None,
     max_depth: Annotated[int, Query(ge=0, le=_MAX_NESTING_DEPTH)] = _MAX_NESTING_DEPTH,
-    kind: Annotated[str, Query()] = "all",
+    kind: Annotated[DeviceKind, Query()] = "all",
+    scope: Annotated[DeviceScope, Query()] = _DEFAULT_DEVICE_SCOPE,
 ) -> RevisionDeviceListResponse:
     """List device instances (the block-instance tree) with nearest-tag association + schedule.
 
@@ -99,27 +106,28 @@ async def list_revision_devices(
     text) within an optional ``max_tag_distance``.
 
     ``kind`` filters returned items: ``device`` (fire/BMS/etc.), ``architecture`` (doors/windows),
-    or ``all`` (default, includes every kind). Invalid values return 422. Legend summary and
+    or ``all`` (default, includes every kind). ``scope`` restricts the walk + tag association to the
+    printed sheet (``sheet``, default) or the full ``modelspace`` (#588). Legend summary and
     schedule_by_type always reflect the full resolved set.
     """
-    if kind not in _VALID_KIND_VALUES:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=422,
-            detail=f"kind must be one of {sorted(_VALID_KIND_VALUES)!r}; got {kind!r}",
-        )
+    exclude_off_sheet = scope == "sheet"
 
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
 
-    # Enumerate the full device set (pre-page) and build the raw schedule.
+    # Enumerate the device set (pre-page) and build the raw schedule.
     devices = await enumerate_devices(
-        db, revision_id, device_layers=device_layer, max_depth=max_depth
+        db,
+        revision_id,
+        device_layers=device_layer,
+        max_depth=max_depth,
+        exclude_off_sheet=exclude_off_sheet,
     )
     schedule = schedule_from_devices(devices)
 
-    # Build tag candidates over the full revision.
-    candidates = await load_tag_candidates(db, revision_id, tag_layers=tag_layer)
+    # Build tag candidates (scoped to the same printed sheet as the device walk).
+    candidates = await load_tag_candidates(
+        db, revision_id, tag_layers=tag_layer, exclude_off_sheet=exclude_off_sheet
+    )
 
     # Attach tags to ALL devices (needed for legend + identity resolution).
     all_tagged = attach_tags(devices, candidates, max_distance=max_tag_distance)

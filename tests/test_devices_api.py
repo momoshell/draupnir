@@ -257,6 +257,71 @@ async def test_devices_kind_default_is_all(devices_app: FastAPI) -> None:
     assert response.json()["kind"] == "all"
 
 
+@pytest.fixture
+def devices_capture_scope(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[FastAPI, dict[str, Any]]]:
+    """Like ``devices_app`` but records the ``exclude_off_sheet`` kwarg each loader receives,
+    so the #588 ``scope`` route-param wiring can be asserted without a DB."""
+    seen: dict[str, Any] = {}
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_devices(db: Any, revision_id: uuid.UUID, **kw: Any) -> list[Device]:
+        seen["devices"] = kw.get("exclude_off_sheet")
+        return list(_ALL_DEVICES)
+
+    async def _fake_tags(db: Any, revision_id: uuid.UUID, **kw: Any) -> list[_TagCandidate]:
+        seen["tags"] = kw.get("exclude_off_sheet")
+        return list(_TAG_CANDIDATES)
+
+    async def _fake_legend_texts(db: Any, revision_id: uuid.UUID, **_: Any) -> list[str]:
+        return list(_LEGEND_PROSE_TEXTS)
+
+    monkeypatch.setattr(devices_route, "_get_active_revision_manifest_or_409", _fake_manifest)
+    monkeypatch.setattr(devices_route, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(devices_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(devices_route, "load_legend_text_candidates", _fake_legend_texts)
+    yield app, seen
+    app.dependency_overrides.clear()
+
+
+async def test_devices_scope_defaults_to_printed_sheet(
+    devices_capture_scope: tuple[FastAPI, dict[str, Any]],
+) -> None:
+    """Default scope (#588) excludes off-sheet for BOTH the device walk and tag association."""
+    application, seen = devices_capture_scope
+    transport = ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/v1/revisions/{REVISION_ID}/devices")
+    assert response.status_code == 200
+    assert seen["devices"] is True
+    assert seen["tags"] is True
+
+
+async def test_devices_scope_modelspace_keeps_full_walk(
+    devices_capture_scope: tuple[FastAPI, dict[str, Any]],
+) -> None:
+    application, seen = devices_capture_scope
+    transport = ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/v1/revisions/{REVISION_ID}/devices?scope=modelspace")
+    assert response.status_code == 200
+    assert seen["devices"] is False
+    assert seen["tags"] is False
+
+
+async def test_devices_scope_invalid_returns_422(devices_app: FastAPI) -> None:
+    response = await _get_devices(devices_app, "?scope=bogus")
+    assert response.status_code == 422
+
+
 async def test_devices_semantics_kind_values_are_valid(devices_app: FastAPI) -> None:
     """Every semantics.kind must be one of the KIND_* constants."""
     from app.interpretation.device_identity import (

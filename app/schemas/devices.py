@@ -21,9 +21,11 @@ class DeviceTagRead(BaseModel):
 
 
 class DeviceSemanticsRead(BaseModel):
-    """Legend-resolved identity for one placed block instance."""
+    """Legend-resolved identity for one placed block instance.
 
-    model_config = ConfigDict(from_attributes=True)
+    Built by the route via explicit kwargs (it crosses the frozen-dataclass boundary), so no
+    ``from_attributes`` — it would be inert here (#588).
+    """
 
     entity_id: str
     kind: str
