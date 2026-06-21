@@ -106,6 +106,8 @@ def rooms_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI
     monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
     monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
     monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
+    # Room labels now come from all text (#549); device-tag source kept for the override path.
+    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
     monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
 
     yield app

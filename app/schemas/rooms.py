@@ -16,14 +16,36 @@ class RoomBoundsRead(BaseModel):
     max_y: float
 
 
-class RoomRead(BaseModel):
-    """A derived room with its geometry summary, name, and provenance."""
+class RoomLocationRead(BaseModel):
+    """A label-derived room's point location (when it has no polygon)."""
 
-    id: str = Field(..., description="Room id (boundary entity id, or synthesized for wall faces)")
-    name: str | None = Field(None, description="Room name from the tag text inside it, if any")
-    source: str = Field(..., description="Provenance: explicit_layer | wall_polygonize")
-    area: float = Field(..., ge=0.0, description="Polygon area in drawing units")
-    bounds: RoomBoundsRead = Field(..., description="Axis-aligned bounding box")
+    x: float
+    y: float
+
+
+class RoomRead(BaseModel):
+    """A derived room with its (optional) geometry, name/number, and provenance.
+
+    Label-derived rooms (#549) have a ``number`` and a ``location`` but no polygon, so
+    ``area`` / ``bounds`` are null; geometric rooms carry ``area`` / ``bounds`` and may
+    have ``number`` stamped from a contained label.
+    """
+
+    id: str = Field(..., description="Room id (boundary entity id, or synthesized)")
+    name: str | None = Field(None, description="Room name from the tag text, if resolved")
+    number: str | None = Field(None, description="Room number from the tag (e.g. 0.9.01), if any")
+    source: str = Field(
+        ..., description="Provenance: explicit_layer | wall_polygonize | label_cluster"
+    )
+    area: float | None = Field(
+        None, ge=0.0, description="Polygon area in drawing units; null for label-only rooms"
+    )
+    bounds: RoomBoundsRead | None = Field(
+        None, description="Axis-aligned bounding box; null for label-only rooms"
+    )
+    location: RoomLocationRead | None = Field(
+        None, description="Label point for label-only rooms; null when a polygon is present"
+    )
     confidence: float | None = Field(
         None,
         ge=0.0,

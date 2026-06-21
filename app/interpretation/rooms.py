@@ -9,6 +9,7 @@ FastAPI concerns, so every function is unit-testable with fakes.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -22,31 +23,44 @@ from app.interpretation.geometry import (
     polygon_area,
 )
 
+# A room-number token: dot-separated alphanumeric segments (≥2 segments so plain words
+# aren't matched), required to contain a digit (filters non-numeric dotted text like "U.S").
+# Matches ``0.9.01``, ``G.04``, ``A1.02``.
+_ROOM_NUMBER_RE = re.compile(r"\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b")
+
 
 @dataclass(frozen=True, slots=True)
 class Room:
-    """A room/space candidate with its geometry and (optional) resolved name.
+    """A room/space candidate with (optional) geometry, name, and number.
 
-    ``confidence`` is an optional provenance caveat in ``[0, 1]`` for heuristic
-    sources (e.g. wall-derived rooms); ``None`` means "not scored" (e.g. an
-    explicit room-boundary polygon, taken at face value).
+    Geometry is optional: a label-derived room (#549) has a ``location`` (the label
+    point) but no ``polygon`` / ``area`` / ``bounds``. ``confidence`` is an optional
+    provenance caveat in ``[0, 1]`` for heuristic sources (e.g. wall-derived rooms);
+    ``None`` means "not scored" (e.g. an explicit room-boundary polygon).
     """
 
     id: str
     name: str | None
     source: str
-    polygon: Polygon
-    area: float
-    bounds: BoundingBox
+    polygon: Polygon | None
+    area: float | None
+    bounds: BoundingBox | None
     confidence: float | None = None
+    number: str | None = None
+    location: Point | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class RoomLabel:
-    """A placed room-tag text (e.g. a "Room Tag" insert) at a world point."""
+    """A placed room-tag text (e.g. a "Room Tag" insert) at a world point.
+
+    ``layer`` (when known) lets label-room identification scope to the room-label layer
+    and avoid pairing room numbers with device-tag text on other layers (#549).
+    """
 
     text: str
     point: Point
+    layer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +86,7 @@ def room_from_polygon(
     source: str,
     name: str | None = None,
     confidence: float | None = None,
+    number: str | None = None,
 ) -> Room:
     """Build a :class:`Room`, deriving area and bounds from the polygon."""
     return Room(
@@ -82,7 +97,44 @@ def room_from_polygon(
         area=polygon_area(polygon),
         bounds=bounding_box(polygon),
         confidence=confidence,
+        number=number,
     )
+
+
+def room_from_label(
+    room_id: str,
+    *,
+    source: str,
+    location: Point,
+    name: str | None = None,
+    number: str | None = None,
+    confidence: float | None = None,
+) -> Room:
+    """Build a label-derived room: a name/number at a location, with no boundary (#549)."""
+    return Room(
+        id=room_id,
+        name=name,
+        source=source,
+        polygon=None,
+        area=None,
+        bounds=None,
+        confidence=confidence,
+        number=number,
+        location=location,
+    )
+
+
+def parse_room_number(text: str) -> str | None:
+    """Extract a room-number token (e.g. ``0.9.01``, ``G.04``) from a label, or ``None``.
+
+    Returns the first dotted alphanumeric token that contains a digit, so non-numeric
+    dotted text (e.g. ``U.S``) is not mistaken for a room number.
+    """
+    for match in _ROOM_NUMBER_RE.finditer(text):
+        token = match.group(0)
+        if any(char.isdigit() for char in token):
+            return token
+    return None
 
 
 def assign_labels_to_rooms(
@@ -125,8 +177,17 @@ def assign_devices_to_rooms(
 
 
 def _smallest_containing_room(point: Point, rooms: Sequence[Room]) -> Room | None:
-    """Return the smallest-area room whose polygon contains ``point``, or ``None``."""
-    containing = [room for room in rooms if point_in_polygon(point, room.polygon)]
+    """Return the smallest-area room whose polygon contains ``point``, or ``None``.
+
+    Label-derived rooms (no polygon) can't contain points and are skipped.
+    """
+    containing = [
+        room
+        for room in rooms
+        if room.polygon is not None
+        and room.area is not None
+        and point_in_polygon(point, room.polygon)
+    ]
     if not containing:
         return None
-    return min(containing, key=lambda room: room.area)
+    return min(containing, key=lambda room: room.area if room.area is not None else 0.0)
