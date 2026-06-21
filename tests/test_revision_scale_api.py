@@ -110,6 +110,9 @@ class TestRevisionScaleApi:
         assert body["units"]["conversion_factor"] == 0.001
         assert body["pdf_scale"] is None
         assert body["source_input_family"] == adapter_output.input_family
+        # #557: a resolved $INSUNITS unit is confirmed → real-world dimensions available.
+        assert body["units_confidence"] == "confirmed"
+        assert body["real_world_dimensions_available"] is True
 
     async def test_pdf_revision_exposes_pdf_scale(
         self,
@@ -140,6 +143,10 @@ class TestRevisionScaleApi:
         assert body["pdf_scale"] == _PDF_SCALE
         assert body["source_input_family"] == adapter_output.input_family
         assert adapter_output.input_family == "pdf_vector"
+        # #557: drawing units are unknown, but a detected PDF point->real factor makes
+        # real-world dimensions available; unit confidence still reflects the unknown unit.
+        assert body["units_confidence"] == "unknown"
+        assert body["real_world_dimensions_available"] is True
 
     async def test_revision_without_units_payload_reports_unknown(
         self,
@@ -168,6 +175,68 @@ class TestRevisionScaleApi:
         body = response.json()
         assert body["units"] == {"normalized": "unknown"}
         assert body["pdf_scale"] is None
+        # #557: no unit and no PDF factor → honest unknown, no real-world dimensions.
+        assert body["units_confidence"] == "unknown"
+        assert body["real_world_dimensions_available"] is False
+
+    async def test_unconfirmed_insunits_dwg_reports_unknown_unavailable(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A DWG whose units couldn't be confirmed ($INSUNITS=0/missing) resolves to unknown →
+        no silent assumption: confidence unknown, real-world dimensions unavailable (#557)."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        monkeypatch.setattr(
+            worker_module,
+            "run_ingestion",
+            _fake_runner_with_canonical(units={"normalized": "unknown"}, pdf_scale=None),
+        )
+
+        revision, _adapter_output = await self._ingest_revision(
+            async_client, filename="plan.dxf", media_type="application/dxf"
+        )
+
+        body = (await async_client.get(f"/v1/revisions/{revision.id}/scale")).json()
+        assert body["units_confidence"] == "unknown"
+        assert body["real_world_dimensions_available"] is False
+
+    async def test_adapter_declared_unit_confidence_is_passed_through(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Forward-compat (#558): when the adapter records its own ``confidence`` on the units
+        block (e.g. an inferred unit), the route surfaces it verbatim rather than re-deriving."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+        inferred_units = {
+            "normalized": "millimeter",
+            "source": "inferred",
+            "confidence": "inferred",
+            "conversion_target": "meter",
+            "conversion_factor": 0.001,
+        }
+        monkeypatch.setattr(
+            worker_module,
+            "run_ingestion",
+            _fake_runner_with_canonical(units=inferred_units, pdf_scale=None),
+        )
+
+        revision, _adapter_output = await self._ingest_revision(
+            async_client, filename="plan.dxf", media_type="application/dxf"
+        )
+
+        body = (await async_client.get(f"/v1/revisions/{revision.id}/scale")).json()
+        assert body["units_confidence"] == "inferred"
+        assert body["real_world_dimensions_available"] is True
 
     async def test_missing_revision_returns_not_found(
         self,

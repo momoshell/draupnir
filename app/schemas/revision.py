@@ -1,7 +1,7 @@
 """Pydantic schemas for revision discoverability endpoints."""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -376,6 +376,22 @@ class RevisionScaleRead(BaseModel):
     units: dict[str, Any] = Field(
         default_factory=dict,
         description="Canonical units payload: normalized unit name + conversion provenance",
+    )
+    units_confidence: Literal["declared", "confirmed", "inferred", "unknown"] = Field(
+        "unknown",
+        description=(
+            "How certain the unit is (#557): 'confirmed' (e.g. DWG $INSUNITS resolved to a known "
+            "unit), 'inferred' (heuristic, #558), 'declared' (stated but unvalidated), or "
+            "'unknown' (no usable unit). Derived from the units block + its source."
+        ),
+    )
+    real_world_dimensions_available: bool = Field(
+        False,
+        description=(
+            "Whether real-world measurements can be quoted for this revision (#557): a usable "
+            "unit conversion factor (DWG) or a detected PDF point->real factor. False is honest "
+            "— do not assume dimensions when this is False."
+        ),
     )
     pdf_scale: dict[str, Any] | None = Field(
         None,
