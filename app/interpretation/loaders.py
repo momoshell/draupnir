@@ -41,6 +41,44 @@ async def load_revision_entities_by_type(
     return list((await db.execute(query)).scalars().all())
 
 
+async def load_legend_text_candidates(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    legend_layers: list[str] | None = None,
+) -> list[str]:
+    """Load raw text strings from legend/key layers for Source B prose input.
+
+    Matches text entities on layers containing LEGEND or KEY (case-insensitive),
+    or restricted to ``legend_layers`` when provided. Returns raw text strings only.
+    """
+    query = select(RevisionEntity).where(
+        RevisionEntity.drawing_revision_id == revision_id,
+        RevisionEntity.entity_type == "text",
+    )
+    if legend_layers:
+        query = query.where(RevisionEntity.layer_ref.in_(list(legend_layers)))
+    else:
+        from sqlalchemy import or_
+
+        query = query.where(
+            or_(
+                RevisionEntity.layer_ref.ilike("%LEGEND%"),
+                RevisionEntity.layer_ref.ilike("%KEY%"),
+            )
+        )
+
+    rows = list((await db.execute(query)).scalars().all())
+
+    texts: list[str] = []
+    for row in rows:
+        geometry = row.geometry_json or {}
+        text = geometry.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return texts
+
+
 async def load_adapter_text_blocks(
     db: AsyncSession,
     revision: DrawingRevision,

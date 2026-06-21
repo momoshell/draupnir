@@ -20,6 +20,23 @@ class DeviceTagRead(BaseModel):
     distance: float = Field(..., ge=0.0, description="Distance from the device placement")
 
 
+class DeviceSemanticsRead(BaseModel):
+    """Legend-resolved identity for one placed block instance."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    entity_id: str
+    kind: str
+    status: str
+    type_name: str | None
+    abbreviation: str | None
+    description: str | None
+    basis: str
+    source_layers: list[str]
+    confidence: float | None
+    competing_type_names: list[str]
+
+
 class DeviceRead(BaseModel):
     """A device instance (INSERT) with its resolved type, placement, and associated tag."""
 
@@ -32,6 +49,7 @@ class DeviceRead(BaseModel):
     layer_ref: str | None = Field(None, description="Device layer")
     position: dict[str, float] | None = Field(None, description="World placement (x, y)")
     tag: DeviceTagRead | None = Field(None, description="Nearest associated tag text, if any")
+    semantics: DeviceSemanticsRead = Field(..., description="Legend-resolved identity")
 
 
 class DeviceScheduleEntry(BaseModel):
@@ -53,6 +71,13 @@ class RevisionDeviceListResponse(BaseModel):
     association: dict[str, Any] = Field(
         ..., description="The association parameters used (tag layers, max distance, filters)"
     )
+    legend: dict[str, Any] = Field(
+        ..., description="Legend summary: legend_size, sources, resolved_count, unresolved_count"
+    )
+    schedule_by_type: list[dict[str, Any]] = Field(
+        ..., description="Device counts by type_name (incl. unresolved and architecture buckets)"
+    )
+    kind: str = Field(..., description="Kind filter applied (device/architecture/all)")
 
 
 class LegendDeviceRead(BaseModel):
