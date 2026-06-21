@@ -22,6 +22,14 @@ ROOM_SOURCE_LABEL = "label_cluster"
 # Sized for the typical name-above-number tag stack (~one text height, ~0.5 m on 1:50 sheets).
 DEFAULT_LABEL_CLUSTER_RADIUS = 1.5
 
+# Multi-line room names (#582): a name can span several stacked text lines above the number
+# (e.g. "Combined Air" / "Plantroom" / "0.9.05"). Gather every name line that sits in the band
+# above the number — within the cluster radius, at/above the number's baseline, and horizontally
+# aligned with it — then join top-to-bottom into the full name. A single-line name yields a
+# one-element stack (unchanged), and a non-stacked / side-placed name falls back to nearest.
+_NAME_STACK_VERTICAL_EPS = 0.1  # a name may sit fractionally below the number's baseline
+_NAME_STACK_HORIZONTAL_ALIGN = 1.0  # max |dx| to count a line as part of the same tag stack
+
 # Heuristic confidence for a label-only room (no geometry to corroborate the identity).
 LABEL_ROOM_CONFIDENCE = 0.7
 
@@ -81,15 +89,14 @@ def identify_rooms_from_labels(
     used_names: set[int] = set()
     paired: list[Room] = []
     for number, number_label in numbers:
-        name_label, name_index = _nearest_name(number_label, names, used_names, cluster_radius)
-        if name_index is not None:
-            used_names.add(name_index)
+        name, name_indices = _gather_name_lines(number_label, names, used_names, cluster_radius)
+        used_names.update(name_indices)
         paired.append(
             room_from_label(
                 "",
                 source=ROOM_SOURCE_LABEL,
                 location=number_label.point,
-                name=name_label.text.strip() if name_label is not None else None,
+                name=name,
                 number=number,
                 confidence=LABEL_ROOM_CONFIDENCE,
             )
@@ -120,6 +127,44 @@ def identify_rooms_from_labels(
         )
         for index, room in enumerate(rooms)
     ]
+
+
+def _gather_name_lines(
+    number_label: RoomLabel,
+    names: Sequence[RoomLabel],
+    used: set[int],
+    radius: float,
+) -> tuple[str | None, list[int]]:
+    """Gather the stacked name line(s) above ``number_label`` into the full room name (#582).
+
+    A name line joins the stack when it is unused, within ``radius`` of the number, at/above the
+    number's baseline, and horizontally aligned with it. Lines are joined top-to-bottom (e.g.
+    ``Combined Air`` + ``Plantroom``). When no line sits in that band — a side-placed or
+    non-stacked name — fall back to the single nearest name in any direction (unchanged #549).
+    """
+    nx, ny = number_label.point
+    stack: list[tuple[float, int, str]] = []
+    for index, name_label in enumerate(names):
+        if index in used:
+            continue
+        x, y = name_label.point
+        dy = y - ny
+        if dy <= -_NAME_STACK_VERTICAL_EPS:  # below the number baseline → not part of the stack
+            continue
+        if abs(x - nx) > _NAME_STACK_HORIZONTAL_ALIGN:  # off to the side → different label
+            continue
+        if math.hypot(x - nx, dy) > radius:  # beyond the cluster band
+            continue
+        stack.append((y, index, name_label.text.strip()))
+    if stack:
+        stack.sort(key=lambda item: item[0], reverse=True)  # topmost line first
+        name = " ".join(text for _, _, text in stack if text)
+        return (name or None), [index for _, index, _ in stack]
+
+    nearest_label, nearest_index = _nearest_name(number_label, names, used, radius)
+    if nearest_label is None or nearest_index is None:
+        return None, []
+    return nearest_label.text.strip(), [nearest_index]
 
 
 def _nearest_name(

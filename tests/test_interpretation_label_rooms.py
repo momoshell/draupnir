@@ -65,6 +65,42 @@ def test_duplicate_numbers_become_distinct_rooms() -> None:
     assert len({room.id for room in rooms}) == 3
 
 
+def test_multi_line_name_joined_top_to_bottom() -> None:
+    # "Combined Air" / "Plantroom" / "0.9.05" stacked above the number (the 670003 case):
+    # both name lines join into the full name, top line first.
+    labels = [
+        RoomLabel("Combined Air", (35.88, 20.99), layer="F810A"),
+        RoomLabel("Plantroom", (36.04, 20.76), layer="F810A"),
+        RoomLabel("0.9.05", (36.23, 20.37), layer="F810A"),
+    ]
+    rooms = identify_rooms_from_labels(labels)
+    room = next(room for room in rooms if room.number == "0.9.05")
+    assert room.name == "Combined Air Plantroom"
+
+
+def test_single_line_name_unaffected_by_multiline_gather() -> None:
+    labels = [
+        RoomLabel("PH Plantroom", (30.7, 25.3), layer="F810A"),
+        RoomLabel("0.9.01", (31.1, 24.9), layer="F810A"),
+    ]
+    rooms = identify_rooms_from_labels(labels)
+    assert next(room for room in rooms if room.number == "0.9.01").name == "PH Plantroom"
+
+
+def test_side_placed_name_does_not_join_unrelated_lines() -> None:
+    # A name far to the side (large |dx|) is NOT part of the stack; the directly-above line wins,
+    # and the side name is its own name-only room.
+    labels = [
+        RoomLabel("Office", (40.0, 20.4), layer="F810A"),  # ~4 units to the side of the number
+        RoomLabel("Store", (36.1, 20.7), layer="F810A"),  # directly above the number
+        RoomLabel("0.9.07", (36.2, 20.4), layer="F810A"),
+    ]
+    rooms = identify_rooms_from_labels(labels)
+    by_number = {room.number: room.name for room in rooms}
+    assert by_number["0.9.07"] == "Store"  # the aligned line, not "Office"
+    assert any(room.name == "Office" and room.number is None for room in rooms)
+
+
 def test_inline_name_and_number_in_one_label() -> None:
     rooms = identify_rooms_from_labels([RoomLabel("PH Plantroom 0.9.01", (5.0, 5.0))])
     assert len(rooms) == 1
