@@ -26,6 +26,10 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 _UNITS_CONFIDENCE_VALUES = frozenset({"declared", "confirmed", "inferred", "unknown"})
 
+# Real-world units the PDF scale factor can be normalized to metres against; mirrors the
+# pymupdf adapter's emitted `real_world_unit` values.
+_PDF_REAL_WORLD_UNITS = frozenset({"millimeter", "centimeter", "meter"})
+
 
 def _units_confidence(units: Mapping[str, Any]) -> str:
     """Derive the unit-certainty label from the persisted units block (#557).
@@ -68,8 +72,14 @@ def _real_world_dimensions_available(
         and not _is_contradicted(units)
     )
     # The PDF point->real factor is the unambiguous "can convert" signal (present iff a scale
-    # ratio + real unit were detected); key on it rather than the variably-typed flag.
-    pdf_ok = isinstance(pdf_scale, Mapping) and _positive_number(pdf_scale.get("points_to_real"))
+    # ratio + real unit were detected). Require BOTH the factor AND a known real-world unit so
+    # the signal stays consistent with what consumers can actually convert: without the unit the
+    # factor cannot be normalized to metres, so it is honestly not convertible (ADR-004).
+    pdf_ok = (
+        isinstance(pdf_scale, Mapping)
+        and _positive_number(pdf_scale.get("points_to_real"))
+        and pdf_scale.get("real_world_unit") in _PDF_REAL_WORLD_UNITS
+    )
     return bool(units_ok or pdf_ok)
 
 
