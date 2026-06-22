@@ -123,6 +123,7 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("unsupported_block_transforms", 0)
     merged_counts.setdefault("malformed_inserts", 0)
     merged_counts.setdefault("skipped_non_drawable", 0)
+    merged_counts.setdefault("supported_dimensions", 0)
     return merged_counts
 
 
@@ -4636,3 +4637,786 @@ async def test_libredwg_adapter_emits_contradiction_when_declared_contradicts_ex
     cw_details = cast(Mapping[str, Any], contradiction_warning.details)
     assert cw_details["declared_normalized"] == "gigameter"
     assert cw_details["inferred_normalized"] == "millimeter"
+
+
+# ---------------------------------------------------------------------------
+# DIMENSION extraction + Tier-1 unit inference tests (#602)
+# ---------------------------------------------------------------------------
+
+
+def _dim_linear_record(
+    *,
+    handle: str = "D1",
+    user_text: str = "3600",
+    xline1: list[float] | None = None,
+    xline2: list[float] | None = None,
+    layer: str = "Dim",
+) -> dict[str, Any]:
+    """Build a minimal DIMENSION_LINEAR dict for the dict-based harness."""
+    record: dict[str, Any] = {
+        "type": "DIMENSION_LINEAR",
+        "handle": handle,
+        "layer": layer,
+        "user_text": user_text,
+    }
+    record["xline1_pt"] = xline1 if xline1 is not None else [0.0, 0.0, 0.0]
+    record["xline2_pt"] = xline2 if xline2 is not None else [3600.0, 0.0, 0.0]
+    return record
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_extracts_dimension_linear_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DIMENSION_LINEAR with numeric user_text is extracted as a canonical dimension entity."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+
+    assert dim["entity_type"] == "dimension"
+    assert dim["kind"] == "dimension"
+    assert dim["is_linear"] is True
+    assert dim["text_override"] == "3600"
+    assert dim["raw_span"] == pytest.approx(3600.0)
+
+    props = cast(dict[str, Any], dim["properties"])
+    libredwg_native = cast(dict[str, Any], props["adapter_native"]["libredwg"])
+    assert libredwg_native["kind"] == "DIMENSION_LINEAR"
+    assert libredwg_native["is_linear"] is True
+    assert libredwg_native["raw_span"] == pytest.approx(3600.0)
+    assert libredwg_native["text_override"] == "3600"
+    assert libredwg_native["dimlfac"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_linear_drives_tier1_unit_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DIMENSION_LINEAR user_text='3600' with span=3600 -> Tier-1 infers millimeter."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            # No HEADER -> unconfirmed INSUNITS path
+            "OBJECTS": [
+                _dim_linear_record(user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                # Building-scale LINE to give the drawing plausible 2-D extent
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert units["confidence"] == "inferred"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+    inference = cast(dict[str, Any], units["inference"])
+    assert inference["dimension_observation_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_tier1_outranks_extent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier-1 (dimension text) outranks Tier-2 (extent) when they disagree."""
+    # Extent alone (two lines spanning ~40x20 units) would look like meter scale,
+    # but the dim text '3600' on a span of 3600 clearly signals millimeter.
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                # Small extent that alone would look like meter-scale
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 40, "y": 0, "z": 0},
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L2",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_text", ["<>", "<", ""])
+async def test_libredwg_adapter_dimension_measured_only_no_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+    user_text: str,
+) -> None:
+    """Measured-only user_text ('<>', '<', '') -> stated_override=None -> no Tier-1 vote."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(user_text=user_text, xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    # No Tier-1 vote -> falls back to extent (which for a 1-D + dim entity may be unknown)
+    # The key contract is that the basis does NOT start with "dimension_text:".
+    basis = units.get("basis", "")
+    assert not cast(str, basis).startswith("dimension_text:"), (
+        f"Expected no Tier-1 basis for user_text={user_text!r}, got basis={basis!r}"
+    )
+
+    # The dimension entity is still extracted.
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    # text_override carries the raw string
+    assert dim["text_override"] == user_text if user_text else dim["text_override"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record_type",
+    ["DIMENSION_RADIUS", "DIMENSION_ANG2LN"],
+)
+async def test_libredwg_adapter_nonlinear_dimension_extracted_no_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+    record_type: str,
+) -> None:
+    """Non-linear DIMENSION types are extracted but do not produce a Tier-1 vote."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": record_type,
+                    "handle": "D1",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [0.0, 0.0, 0.0],
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    assert dim["is_linear"] is False
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    basis = units.get("basis", "")
+    assert not cast(str, basis).startswith("dimension_text:"), (
+        f"Non-linear dim should not trigger Tier-1; got basis={basis!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_confirmed_insunits_with_dim_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmed INSUNITS (4=mm) path is byte-for-byte unchanged even when a dim is present."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 4},
+            "OBJECTS": [
+                _dim_linear_record(user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+    # Confirmed path: units block must be the exact confirmed shape.
+    assert result.canonical["units"] == {
+        "normalized": "meter",
+        "source": "INSUNITS",
+        "source_value": 4,
+        "conversion_target": "meter",
+        "conversion_factor": 0.001,
+    }
+    assert "libredwg.units_unconfirmed" not in [w.code for w in result.warnings]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_malformed_dimension_degrades_gracefully(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DIMENSION_LINEAR with missing xline points degrades to unknown + warning; ingest succeeds.
+
+    Verifies defensive parsing -- no crash even on completely broken geometry.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "D1",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    # xline1_pt / xline2_pt intentionally absent
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+    # Ingest must succeed (no exception).
+    assert result is not None
+    # The malformed dim should NOT appear as a canonical dimension entity.
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 0
+    # A malformed-drawable warning should be present.
+    warning_codes = [w.code for w in result.warnings]
+    assert "libredwg.malformed_drawable_record" in warning_codes
+
+
+# ---------------------------------------------------------------------------
+# P0 cases for #602 -- DIMENSION_ALIGNED + Tier-1 edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_aligned_is_linear_drives_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DIMENSION_ALIGNED with user_text='3600' over a 3600-unit span -> is_linear=True,
+    Tier-1 infers millimeter with basis starting 'dimension_text:'.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_ALIGNED",
+                    "handle": "DA1",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [0.0, 0.0, 0.0],
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+
+    assert dim["is_linear"] is True
+    assert dim["text_override"] == "3600"
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert units["confidence"] == "inferred"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_raw_span_zero_still_fires_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xline1_pt == xline2_pt yields raw_span=0.0; entity IS produced and Tier-1 still fires.
+
+    The engine requires raw_span >= 0 (zero is allowed).  This test guards against a future
+    raw_span > 0 filter silently breaking the text-only vote path.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "D0",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [100.0, 200.0, 0.0],
+                    "xline2_pt": [100.0, 200.0, 0.0],  # identical -> span=0
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    assert dim["raw_span"] == pytest.approx(0.0)
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_user_text_key_absent_no_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A linear dim dict with NO user_text key -> text_override=None, no Tier-1 vote."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "D2",
+                    "layer": "Dim",
+                    # user_text key intentionally absent
+                    "xline1_pt": [0.0, 0.0, 0.0],
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    assert dim["text_override"] is None
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    basis = units.get("basis", "")
+    assert not cast(str, basis).startswith("dimension_text:"), (
+        f"Expected no Tier-1 vote when user_text absent; got basis={basis!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_user_text_with_unit_suffix_no_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """user_text='3600mm' fails float parse -> stated_override=None -> no Tier-1 vote.
+
+    The entity is still extracted with text_override='3600mm'.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(
+                    user_text="3600mm",
+                    xline1=[0.0, 0.0, 0.0],
+                    xline2=[3600.0, 0.0, 0.0],
+                ),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    assert dim["text_override"] == "3600mm"
+
+    props = cast(dict[str, Any], dim["properties"])
+    stated_override = props["adapter_native"]["stated_override"]
+    assert stated_override is None
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    basis = units.get("basis", "")
+    assert not cast(str, basis).startswith("dimension_text:"), (
+        f"Expected no Tier-1 vote for '3600mm'; got basis={basis!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_user_text_whitespace_fires_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """user_text='  3600  ' (leading/trailing whitespace) -> parses to 3600.0 -> Tier-1 fires."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(
+                    user_text="  3600  ",
+                    xline1=[0.0, 0.0, 0.0],
+                    xline2=[3600.0, 0.0, 0.0],
+                ),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+
+    props = cast(dict[str, Any], dim_entities[0]["properties"])
+    stated_override = props["adapter_native"]["stated_override"]
+    assert stated_override == pytest.approx(3600.0)
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_xline_2element_list_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xline points given as [x, y] (no Z) -> extraction succeeds, Z defaults to 0, span correct."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "D2E",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [0.0, 0.0],  # 2-element, no Z
+                    "xline2_pt": [3600.0, 0.0],  # 2-element, no Z
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    dim = dim_entities[0]
+    assert dim["raw_span"] == pytest.approx(3600.0)
+    # Z defaults to 0 -- verify via geometry block
+    geom = cast(dict[str, Any], dim["geometry"])
+    assert geom["xline1_pt"]["z"] == pytest.approx(0.0)
+    assert geom["xline2_pt"]["z"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_partially_none_coord_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """xline with a None component ([0.0, None, 0.0]) -> _coerce_point returns None ->
+    _build_dimension_entity returns None -> _record_unknown(reason='malformed_dimension').
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "DNone",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [0.0, None, 0.0],  # None in Y -> _coerce_float returns None
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+    assert result is not None
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 0
+    warning_codes = [w.code for w in result.warnings]
+    assert "libredwg.malformed_drawable_record" in warning_codes
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_multiple_linear_dims_median_vote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three DIMENSION_LINEAR dims with user_text='3600' -> median vote -> millimeter,
+    basis='dimension_text:median', dimension_observation_count >= 2.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(
+                    handle="D1", user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]
+                ),
+                _dim_linear_record(
+                    handle="D2", user_text="3600", xline1=[0, 100, 0], xline2=[3600, 100, 0]
+                ),
+                _dim_linear_record(
+                    handle="D3", user_text="3600", xline1=[0, 200, 0], xline2=[3600, 200, 0]
+                ),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert units["basis"] == "dimension_text:median"
+
+    inference = cast(dict[str, Any], units["inference"])
+    assert inference["dimension_observation_count"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_supported_dimensions_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After extracting N dims, metadata entity_counts['supported_dimensions'] == N."""
+    n = 3
+    objects: list[dict[str, Any]] = [
+        _dim_linear_record(
+            handle=f"D{i}", user_text="3600", xline1=[0, i * 100, 0], xline2=[3600, i * 100, 0]
+        )
+        for i in range(n)
+    ]
+    objects.append(
+        {
+            "type": "LINE",
+            "handle": "L1",
+            "start": {"x": 0, "y": 0, "z": 0},
+            "end": {"x": 0, "y": 20_000, "z": 0},
+        }
+    )
+    result = await _ingest_output_payload(monkeypatch, {"OBJECTS": objects})
+
+    metadata = cast(dict[str, Any], result.canonical["metadata"])
+    entity_counts = cast(dict[str, int], metadata["entity_counts"])
+    assert entity_counts["supported_dimensions"] == n
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_tier1_contradiction_via_dim_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unconfirmed declared INSUNITS (gigameter, code 17) contradicts Tier-1 mm vote from a
+    dim user_text='3600' -> units['contradiction'] present AND libredwg.units_contradiction warning.
+
+    Mirrors test_libredwg_adapter_emits_contradiction_when_declared_contradicts_extent but
+    the inference signal is dimension text rather than extent.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "HEADER": {"INSUNITS": 17},  # gigameter -- not in _CONFIRMED_INSUNITS_CODES
+            "OBJECTS": [
+                _dim_linear_record(user_text="3600", xline1=[0, 0, 0], xline2=[3600, 0, 0]),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert units["normalized"] == "millimeter"
+    assert units["confidence"] == "inferred"
+    assert cast(str, units["basis"]).startswith("dimension_text:")
+
+    contradiction = cast(dict[str, Any], units["contradiction"])
+    assert contradiction["declared_normalized"] == "gigameter"
+    assert contradiction["inferred_normalized"] == "millimeter"
+
+    warning_codes = [w.code for w in result.warnings]
+    assert "libredwg.units_contradiction" in warning_codes
+
+    contradiction_warning = next(
+        w for w in result.warnings if w.code == "libredwg.units_contradiction"
+    )
+    cw_details = cast(Mapping[str, Any], contradiction_warning.details)
+    assert cw_details["declared_normalized"] == "gigameter"
+    assert cw_details["inferred_normalized"] == "millimeter"
+
+
+# ---------------------------------------------------------------------------
+# P1 additions: extended non-linear parametrize + engine edge cases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "record_type",
+    [
+        "DIMENSION_RADIUS",
+        "DIMENSION_ANG2LN",
+        "DIMENSION_ANG3PT",
+        "DIMENSION_DIAMETER",
+        "DIMENSION_ORDINATE",
+    ],
+)
+async def test_libredwg_adapter_all_nonlinear_types_is_linear_false(
+    monkeypatch: pytest.MonkeyPatch,
+    record_type: str,
+) -> None:
+    """All non-linear DIMENSION sub-types produce is_linear=False and no Tier-1 vote."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": record_type,
+                    "handle": "D1",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [0.0, 0.0, 0.0],
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 1
+    assert dim_entities[0]["is_linear"] is False
+
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert not cast(str, units.get("basis", "")).startswith("dimension_text:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_text", ["0", "-3600"])
+async def test_libredwg_adapter_dimension_zero_or_negative_text_no_tier1(
+    monkeypatch: pytest.MonkeyPatch,
+    user_text: str,
+) -> None:
+    """user_text='0'/'-3600' -> stated_override <= 0 -> engine filter excludes -> no Tier-1."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _dim_linear_record(
+                    user_text=user_text,
+                    xline1=[0.0, 0.0, 0.0],
+                    xline2=[3600.0, 0.0, 0.0],
+                ),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 0, "y": 20_000, "z": 0},
+                },
+            ],
+        },
+    )
+    units = cast(dict[str, Any], result.canonical["units"])
+    assert not cast(str, units.get("basis", "")).startswith("dimension_text:"), (
+        f"Expected no Tier-1 vote for user_text={user_text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_dimension_inf_coord_degrades(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dimension with an inf coordinate fails _point_is_finite -> entity None -> malformed."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "DIMENSION_LINEAR",
+                    "handle": "DInf",
+                    "layer": "Dim",
+                    "user_text": "3600",
+                    "xline1_pt": [math.inf, 0.0, 0.0],
+                    "xline2_pt": [3600.0, 0.0, 0.0],
+                },
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 5, "y": 0, "z": 0},
+                },
+            ],
+        },
+    )
+    assert result is not None
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    dim_entities = [e for e in entities if e.get("entity_type") == "dimension"]
+    assert len(dim_entities) == 0
+    warning_codes = [w.code for w in result.warnings]
+    assert "libredwg.malformed_drawable_record" in warning_codes
