@@ -305,7 +305,7 @@ async def test_service_takeoff_response_has_required_top_level_keys(
     assert response.status_code == 200
     body = response.json()
     # extra='forbid' on ServiceTakeoffResponse -- assert all expected keys are present.
-    expected_keys = {"manifest", "items", "summary", "scale", "unscaled"}
+    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
     assert expected_keys == set(body.keys())
 
 
@@ -707,7 +707,280 @@ async def test_service_takeoff_extra_field_rejected(
     response = await _get_takeoff(takeoff_app_confirmed_scale)
     assert response.status_code == 200
     body = response.json()
-    expected_keys = {"manifest", "items", "summary", "scale", "unscaled"}
+    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
+    assert expected_keys == set(body.keys()), (
+        f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PDF-specific response tests: length_provisional + SERVICE_UNKNOWN suppression
+# ---------------------------------------------------------------------------
+
+
+def _inputs_pdf_with_unknown_and_resolved(scale: ScaleContext) -> ServiceTakeoffInputs:
+    """PDF inputs: one resolved VAC run + one unknown-service run.
+
+    Both have confirmed scale lengths so the coordinator produces real_length_m.
+    The route must suppress lengths only on the SERVICE_UNKNOWN line.
+    """
+    from app.interpretation.routed_runs import RoutedEntity
+    from app.interpretation.run_service_identity import TagPlacement
+    from app.interpretation.service_legend import ServiceEntry, ServiceLegend
+
+    color_red: dict[str, Any] = {"index": 1, "rgb": "#ff0000"}
+    color_grey: dict[str, Any] = {"index": None, "rgb": "#888888"}
+
+    geom_vac = _line_entity_geometry(0.0, 0.0, 1000.0, 0.0)  # length 1000 -> 1.0 m
+    geom_unk = _line_entity_geometry(0.0, 500.0, 1000.0, 500.0)  # length 1000 -> 1.0 m (suppress)
+
+    routed_entities = [
+        RoutedEntity(
+            entity_id="pdf-vac",
+            entity_type="line",
+            layer_ref=None,  # PDF: layer_ref normalised to None
+            color=color_red,
+            geometry=geom_vac,
+        ),
+        RoutedEntity(
+            entity_id="pdf-unk",
+            entity_type="line",
+            layer_ref=None,
+            color=color_grey,
+            geometry=geom_unk,
+        ),
+    ]
+
+    entry_red = ServiceEntry(
+        colour_key="#ff0000",
+        colour_index=1,
+        colour_rgb="#ff0000",
+        discipline="medical-gas",
+        abbreviation="VAC",
+        description="Vacuum",
+        sources=("swatch",),
+        confidence=None,
+        competing_disciplines=(),
+    )
+    legend = ServiceLegend(entries=(entry_red,))
+
+    tag_placements = [
+        TagPlacement(text="50 mm VAC", point=(500.0, 0.0), layer_ref=None),
+    ]
+
+    geometry_by_entity_id: dict[str, Any] = {
+        "pdf-vac": geom_vac,
+        "pdf-unk": geom_unk,
+    }
+
+    return ServiceTakeoffInputs(
+        routed_entities=routed_entities,
+        legend=legend,
+        tag_placements=tag_placements,
+        geometry_by_entity_id=geometry_by_entity_id,
+        scale=scale,
+        rise_entities=[],
+        drop_entities=[],
+        input_family="pdf_vector",
+    )
+
+
+def _inputs_dwg_with_unknown(scale: ScaleContext) -> ServiceTakeoffInputs:
+    """DWG inputs: one unknown-service run with confirmed scale.
+
+    The route must NOT suppress lengths for DWG.
+    """
+    from app.interpretation.routed_runs import RoutedEntity
+    from app.interpretation.service_legend import ServiceLegend
+
+    color: dict[str, Any] = {"index": 3, "rgb": "#00ff00"}
+    geom = _line_entity_geometry(0.0, 0.0, 1000.0, 0.0)
+
+    routed_entities = [
+        RoutedEntity(
+            entity_id="dwg-unk",
+            entity_type="line",
+            layer_ref="Pipes",
+            color=color,
+            geometry=geom,
+        ),
+    ]
+
+    return ServiceTakeoffInputs(
+        routed_entities=routed_entities,
+        legend=ServiceLegend(entries=()),
+        tag_placements=[],
+        geometry_by_entity_id={"dwg-unk": geom},
+        scale=scale,
+        rise_entities=[],
+        drop_entities=[],
+        input_family="dwg",
+    )
+
+
+@pytest.fixture
+def takeoff_app_pdf(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """App patched with a PDF-vector revision: one VAC run + one unknown run,
+    confirmed scale."""
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_inputs(
+        db: Any,
+        revision_id: uuid.UUID,
+        *,
+        layer_refs: Any = None,
+        tag_layers: Any = None,
+        legend_layers: Any = None,
+        exclude_off_sheet: bool = True,
+    ) -> ServiceTakeoffInputs:
+        return _inputs_pdf_with_unknown_and_resolved(_CONFIRMED_SCALE)
+
+    async def _fake_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> _FakeRoomInterpretation:
+        return _no_rooms()
+
+    monkeypatch.setattr(
+        service_takeoff_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(service_takeoff_route, "load_service_takeoff_inputs", _fake_inputs)
+    monkeypatch.setattr(service_takeoff_route, "_resolve_rooms", _fake_rooms)
+
+    yield app
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def takeoff_app_dwg_unknown(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """App patched with a DWG revision: one unknown-service run, confirmed scale."""
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_inputs(
+        db: Any,
+        revision_id: uuid.UUID,
+        *,
+        layer_refs: Any = None,
+        tag_layers: Any = None,
+        legend_layers: Any = None,
+        exclude_off_sheet: bool = True,
+    ) -> ServiceTakeoffInputs:
+        return _inputs_dwg_with_unknown(_CONFIRMED_SCALE)
+
+    async def _fake_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> _FakeRoomInterpretation:
+        return _no_rooms()
+
+    monkeypatch.setattr(
+        service_takeoff_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(service_takeoff_route, "load_service_takeoff_inputs", _fake_inputs)
+    monkeypatch.setattr(service_takeoff_route, "_resolve_rooms", _fake_rooms)
+
+    yield app
+    app.dependency_overrides.clear()
+
+
+async def test_pdf_response_length_provisional_true(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """PDF-vector revision -> length_provisional=True in response."""
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["length_provisional"] is True
+
+
+async def test_pdf_unknown_service_length_suppressed(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """PDF SERVICE_UNKNOWN line has real_length_m=None and drawing_length=0.0;
+    run_count and identity_status are preserved."""
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    unknown_items = [i for i in items if i["service"] == "unknown"]
+    assert len(unknown_items) >= 1, f"Expected at least one unknown item; got: {items}"
+
+    for item in unknown_items:
+        assert item["real_length_m"] is None, (
+            f"PDF SERVICE_UNKNOWN real_length_m must be None; got {item['real_length_m']}"
+        )
+        assert item["drawing_length"] == pytest.approx(0.0), (
+            f"PDF SERVICE_UNKNOWN drawing_length must be 0.0; got {item['drawing_length']}"
+        )
+        assert item["run_count"] >= 1, "run_count must be preserved even when length suppressed"
+        assert "identity_status" in item
+
+
+async def test_pdf_resolved_service_length_preserved(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """PDF resolved-service (VAC) line keeps its real_length_m."""
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    vac_items = [i for i in items if i["service"] == "VAC"]
+    assert len(vac_items) >= 1, f"Expected at least one VAC item; got: {items}"
+
+    for item in vac_items:
+        assert item["real_length_m"] is not None, (
+            f"PDF resolved-service real_length_m must not be None; got {item}"
+        )
+        assert item["real_length_m"] > 0.0
+
+
+async def test_dwg_response_length_provisional_false(
+    takeoff_app_dwg_unknown: FastAPI,
+) -> None:
+    """DWG revision -> length_provisional=False."""
+    response = await _get_takeoff(takeoff_app_dwg_unknown)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["length_provisional"] is False
+
+
+async def test_dwg_unknown_service_length_not_suppressed(
+    takeoff_app_dwg_unknown: FastAPI,
+) -> None:
+    """DWG SERVICE_UNKNOWN line retains its real_length_m (suppression is PDF-only)."""
+    response = await _get_takeoff(takeoff_app_dwg_unknown)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    unknown_items = [i for i in items if i["service"] == "unknown"]
+    assert len(unknown_items) >= 1, f"Expected at least one unknown item; got: {items}"
+
+    for item in unknown_items:
+        assert item["real_length_m"] is not None, (
+            f"DWG SERVICE_UNKNOWN real_length_m must be preserved; got {item}"
+        )
+        assert item["real_length_m"] > 0.0
+
+
+async def test_extra_forbid_still_holds_with_length_provisional(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """extra='forbid' still holds after adding length_provisional: no unexpected keys."""
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
     assert expected_keys == set(body.keys()), (
         f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
     )

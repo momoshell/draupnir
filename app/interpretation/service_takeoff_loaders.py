@@ -22,6 +22,7 @@ scale, never raise.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -52,7 +53,7 @@ from app.interpretation.service_legend import (
 # Input-family constant (ADR-003: branch on family, never on hardcoded colours/layers)
 # ---------------------------------------------------------------------------
 
-_INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
+INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
 
 # ---------------------------------------------------------------------------
 # PDF scale normalisation — metres per detected real-world unit (ADR-004).
@@ -120,6 +121,7 @@ class ServiceTakeoffInputs:
     scale: ScaleContext
     rise_entities: list[RiseDropEntity]
     drop_entities: list[RiseDropEntity]
+    input_family: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +266,27 @@ async def _load_text_blocks(db: AsyncSession, revision_id: UUID) -> list[dict[st
 
 
 # ---------------------------------------------------------------------------
+# PDF tag-candidate filter
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_pdf_tag(text: str) -> bool:
+    """A PDF text block is a tag candidate only with real tag structure: a digit plus an
+    'mm' unit or a diameter glyph. Rejects title-block/notes prose (e.g. '5291 LONDON',
+    'Drawn: HK', '1:50') that the bare digits+word parse_tag fallback would otherwise
+    fabricate a service from. DWG tags are layer-filtered upstream and unaffected."""
+    if not re.search(r"\d", text):
+        return False
+    # 'mm' unit (case-insensitive, not part of a longer word like 'mmhg') OR a diameter glyph
+    # (clean U+00D8 or the U+FFFD replacement seen in some pipelines).
+    # Pattern: mm preceded by non-word char OR digit, followed by non-word char.
+    # Plain ASCII source (RUF002) -> use escapes.
+    return (
+        bool(re.search(r"(?i)(?<!\w)mm(?!\w)|(?<=\d)mm(?!\w)", text)) or "Ø" in text or "�" in text
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public loaders
 # ---------------------------------------------------------------------------
 
@@ -317,7 +340,7 @@ async def load_routed_entities(
             )
         return result
 
-    if input_family == _INPUT_FAMILY_PDF_VECTOR:
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
         # PDF revisions have no meaningful layers; select all routed entity types and
         # normalise layer_ref to None so identify_routed_runs groups by colour only
         # (ADR-003 / ADR-006: honest UNKNOWN groups, never legend-filter the selection).
@@ -526,13 +549,18 @@ async def load_tag_placements(
             placements.append(TagPlacement(text=text, point=pt, layer_ref=row.layer_ref))
         return placements
 
-    if input_family == _INPUT_FAMILY_PDF_VECTOR:
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
         # PDF tags live in metadata.text_blocks, not as RevisionEntity text rows.
+        # Only emit a TagPlacement when the block has real tag structure (digit + mm/diameter);
+        # prose like '5291 LONDON' or 'Drawn: HK' is rejected by _looks_like_pdf_tag to prevent
+        # parse_tag's bare digits+word fallback from fabricating services.
         blocks = await _load_text_blocks(db, revision_id)
         pdf_placements: list[TagPlacement] = []
         for block in blocks:
             text = block.get("text")
             if not isinstance(text, str) or not text.strip():
+                continue
+            if not _looks_like_pdf_tag(text):
                 continue
             bbox = block.get("bbox")
             if not isinstance(bbox, dict):
@@ -768,4 +796,5 @@ async def load_service_takeoff_inputs(
         scale=scale,
         rise_entities=rise_entities,
         drop_entities=drop_entities,
+        input_family=input_family,
     )

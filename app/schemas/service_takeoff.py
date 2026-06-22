@@ -95,3 +95,10 @@ class ServiceTakeoffResponse(BaseModel):
             "contradicted units). Clients must treat real_length_m as informational."
         ),
     )
+    length_provisional: bool = Field(
+        default=False,
+        description=(
+            "True for PDF-vector revisions: lengths may double-count double-line walls "
+            "and lack centerline separation (accuracy pending #618)."
+        ),
+    )

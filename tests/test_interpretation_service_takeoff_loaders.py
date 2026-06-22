@@ -1515,8 +1515,9 @@ class TestPdfTagPlacements:
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """metadata.text_blocks with pipe-tag text and prose:
-        both returned as TagPlacement with centroid point and layer_ref None."""
+        """metadata.text_blocks with a pipe-tag entry and a prose entry:
+        only the tag-structured block ('54 mm VAC') is returned; prose ('DRAWING NOTES')
+        is rejected by _looks_like_pdf_tag."""
         _ = (self, cleanup_projects, enqueued_job_ids)
 
         revision_id = await _ingest_with_payload(
@@ -1530,18 +1531,17 @@ class TestPdfTagPlacements:
         async with _get_session() as db:
             placements = await load_tag_placements(db, revision_id)
 
-        assert len(placements) == 2
+        assert len(placements) == 1
         texts = {p.text for p in placements}
         assert "54 mm VAC" in texts
-        assert "DRAWING NOTES" in texts
+        assert "DRAWING NOTES" not in texts
 
-        for p in placements:
-            assert isinstance(p, TagPlacement)
-            assert p.layer_ref is None
-            assert len(p.point) == 2
-            # Centroid of the "54 mm VAC" bbox: x=(100+200)/2=150, y=(200+220)/2=210
-            if p.text == "54 mm VAC":
-                assert p.point == pytest.approx((150.0, 210.0))
+        p = placements[0]
+        assert isinstance(p, TagPlacement)
+        assert p.layer_ref is None
+        assert len(p.point) == 2
+        # Centroid of the "54 mm VAC" bbox: x=(100+200)/2=150, y=(200+220)/2=210
+        assert p.point == pytest.approx((150.0, 210.0))
 
     async def test_pdf_tags_feed_fuse(
         self,
@@ -1791,3 +1791,239 @@ class TestPdfHonestEmpty:
             family = await _resolve_input_family(db, uuid.uuid4())
 
         assert family is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: _looks_like_pdf_tag (no DB required)
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikePdfTag:
+    """_looks_like_pdf_tag pass/reject table from grounding (M-540003)."""
+
+    def test_mm_unit_passes(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("54 mm VAC") is True
+
+    def test_mm_unit_no_space_passes(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("54mm VAC") is True
+
+    def test_diameter_glyph_passes(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        # U+00D8 Ø — real clean glyph
+        assert _looks_like_pdf_tag("Ø54 VAC") is True
+
+    def test_replacement_char_with_digit_passes(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        # U+FFFD replacement character seen in some PDF pipelines
+        assert _looks_like_pdf_tag("�54 VAC") is True
+
+    def test_prose_london_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        # '5291 LONDON' — grounding fabrication case
+        assert _looks_like_pdf_tag("5291 LONDON") is False
+
+    def test_prose_and_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("AND") is False
+
+    def test_prose_drawn_by_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("Drawn: HK") is False
+
+    def test_scale_ratio_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("1:50") is False
+
+    def test_empty_string_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("") is False
+
+    def test_mm_case_insensitive_passes(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        assert _looks_like_pdf_tag("54 MM VAC") is True
+
+    def test_between_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        # 'BETWEEN' — another fabrication case from grounding
+        assert _looks_like_pdf_tag("BETWEEN") is False
+
+    def test_digit_only_word_match_on_mm_boundary(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+
+        # 'mm' must be word-bounded: 'mmhg' should NOT match
+        assert _looks_like_pdf_tag("54 mmhg pressure") is False
+
+
+# ---------------------------------------------------------------------------
+# DB-backed tests: input_family field and PDF tag filter
+# ---------------------------------------------------------------------------
+
+
+# Extended text_blocks fixture including prose entries that must be rejected.
+_PDF_TEXT_BLOCKS_MIXED: list[dict[str, Any]] = [
+    {
+        "page_number": 1,
+        "layout": "Model",
+        "block_number": 0,
+        "bbox": {"x_min": 100.0, "y_min": 200.0, "x_max": 200.0, "y_max": 220.0},
+        "text": "54 mm VAC",
+    },
+    {
+        "page_number": 1,
+        "layout": "Model",
+        "block_number": 1,
+        "bbox": {"x_min": 10.0, "y_min": 10.0, "x_max": 600.0, "y_max": 30.0},
+        "text": "5291 LONDON",
+    },
+    {
+        "page_number": 1,
+        "layout": "Model",
+        "block_number": 2,
+        "bbox": {"x_min": 10.0, "y_min": 40.0, "x_max": 200.0, "y_max": 55.0},
+        "text": "Drawn: HK",
+    },
+]
+
+
+@requires_database
+class TestPdfTagFilter:
+    """load_tag_placements PDF path rejects prose; DWG path unaffected."""
+
+    async def test_pdf_prose_rejected_only_tag_structure_returned(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """text_blocks with ['54 mm VAC', '5291 LONDON', 'Drawn: HK']:
+        load_tag_placements returns only the '54 mm VAC' placement."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            metadata={"text_blocks": _PDF_TEXT_BLOCKS_MIXED},
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id)
+
+        assert len(placements) == 1, (
+            f"Expected only '54 mm VAC'; got: {[p.text for p in placements]}"
+        )
+        assert placements[0].text == "54 mm VAC"
+        assert placements[0].layer_ref is None
+
+    async def test_dwg_text_entity_tags_unaffected(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DWG path still returns text-entity tags regardless of _looks_like_pdf_tag."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "tag-dwg-001",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "HWS 100", "insertion": {"x": 100.0, "y": 100.0}},
+                ),
+                _make_entity(
+                    "tag-dwg-002",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "5291 LONDON", "insertion": {"x": 200.0, "y": 200.0}},
+                ),
+            ],
+            input_family="dwg",
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id, tag_layers=["Pipe Tags"])
+
+        # DWG path is layer-filtered, not prose-filtered — all tag-layer texts returned.
+        texts = {p.text for p in placements}
+        assert "HWS 100" in texts
+        assert "5291 LONDON" in texts
+
+
+@requires_database
+class TestInputFamilyPopulated:
+    """load_service_takeoff_inputs populates input_family on the bundle."""
+
+    async def test_pdf_vector_input_family_on_bundle(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF-vector revision -> inputs.input_family == 'pdf_vector'."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            inputs = await load_service_takeoff_inputs(db, revision_id, exclude_off_sheet=False)
+
+        assert isinstance(inputs, ServiceTakeoffInputs)
+        assert inputs.input_family == "pdf_vector"
+
+    async def test_dwg_input_family_on_bundle(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DWG revision -> inputs.input_family == 'dwg'."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 1, "rgb": "#ff0000", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "cl-001",
+                    "line",
+                    "Center Line",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+            input_family="dwg",
+        )
+
+        async with _get_session() as db:
+            inputs = await load_service_takeoff_inputs(db, revision_id, exclude_off_sheet=False)
+
+        assert isinstance(inputs, ServiceTakeoffInputs)
+        assert inputs.input_family == "dwg"
