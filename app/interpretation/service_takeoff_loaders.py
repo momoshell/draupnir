@@ -49,6 +49,17 @@ from app.interpretation.service_legend import (
 )
 
 # ---------------------------------------------------------------------------
+# PDF scale normalisation — metres per detected real-world unit (ADR-004).
+# Used only when the units block gives no conversion_factor (PDF-origin revisions).
+# ---------------------------------------------------------------------------
+
+_METRES_PER_PDF_UNIT: dict[str, float] = {
+    "millimeter": 0.001,
+    "centimeter": 0.01,
+    "meter": 1.0,
+}
+
+# ---------------------------------------------------------------------------
 # Layer defaults — ilike patterns, never hardcoded to a single value (ADR-003)
 # ---------------------------------------------------------------------------
 
@@ -474,11 +485,29 @@ async def build_scale_context(
     if not isinstance(conversion_factor, (int, float)) or isinstance(conversion_factor, bool):
         conversion_factor = None
 
+    units_confidence: str = scale_read.units_confidence
+
+    # PDF fallback: when the units block gives no factor, derive metres-per-point from
+    # pdf_scale.  ADR-004: PDF title-block detection is always "inferred", never confirmed.
+    if conversion_factor is None:
+        pdf_scale = scale_read.pdf_scale or {}
+        points_to_real = pdf_scale.get("points_to_real")
+        real_world_unit = pdf_scale.get("real_world_unit")
+        if (
+            isinstance(points_to_real, (int, float))
+            and not isinstance(points_to_real, bool)
+            and points_to_real > 0
+            and isinstance(real_world_unit, str)
+            and real_world_unit in _METRES_PER_PDF_UNIT
+        ):
+            conversion_factor = points_to_real * _METRES_PER_PDF_UNIT[real_world_unit]
+            units_confidence = "inferred"
+
     return ScaleContext(
         conversion_factor=conversion_factor,
         real_world_available=scale_read.real_world_dimensions_available,
         contradicted=scale_read.units_contradicted,
-        units_confidence=scale_read.units_confidence,
+        units_confidence=units_confidence,
     )
 
 

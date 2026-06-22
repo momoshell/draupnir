@@ -107,8 +107,9 @@ def _build_payload_with(
     *,
     entities: list[dict[str, Any]],
     units: dict[str, Any] | None = None,
+    pdf_scale: dict[str, Any] | None = None,
 ) -> IngestFinalizationPayload:
-    """Build a fake payload overriding entities and optionally units."""
+    """Build a fake payload overriding entities and optionally units/pdf_scale."""
     entity_counts = {
         "layouts": 1,
         "layers": 1,
@@ -126,6 +127,8 @@ def _build_payload_with(
     }
     if units is not None:
         canonical_json["units"] = units
+    if pdf_scale is not None:
+        canonical_json["pdf_scale"] = pdf_scale
 
     report_json: dict[str, Any] = {
         "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
@@ -184,11 +187,12 @@ async def _ingest_with_payload(
     *,
     entities: list[dict[str, Any]],
     units: dict[str, Any] | None = None,
+    pdf_scale: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """Upload a file, run ingest with the given entity list, return the revision_id."""
 
     async def _fake_run(request: IngestionRunRequest) -> IngestFinalizationPayload:
-        return _build_payload_with(request, entities=entities, units=units)
+        return _build_payload_with(request, entities=entities, units=units, pdf_scale=pdf_scale)
 
     monkeypatch.setattr(worker_module, "run_ingestion", _fake_run)
 
@@ -955,6 +959,185 @@ class TestContradictedScale:
         # RevisionScaleRead.real_world_dimensions_available (not merely cf presence),
         # so wiring is tested end-to-end.
         assert isinstance(scale.real_world_available, bool)
+
+
+_DUMMY_LINE_ENTITY = _make_entity(
+    "e-dummy",
+    "line",
+    "A-WALL",
+    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+)
+
+# pdf_scale for 1:50, millimeter: 17.638889 pts/mm -> 0.017638889 m/pt
+_PDF_SCALE_MM: dict[str, Any] = {
+    "status": "derived_from_text",
+    "scale_ratio": 50,
+    "points_to_real": 17.638889,
+    "real_world_unit": "millimeter",
+    "confidence": "high",
+}
+# Same physical scale expressed in centimeter and meter
+_PDF_SCALE_CM: dict[str, Any] = {
+    "status": "derived_from_text",
+    "scale_ratio": 50,
+    "points_to_real": 1.7638889,
+    "real_world_unit": "centimeter",
+    "confidence": "high",
+}
+_PDF_SCALE_M: dict[str, Any] = {
+    "status": "derived_from_text",
+    "scale_ratio": 50,
+    "points_to_real": 0.017638889,
+    "real_world_unit": "meter",
+    "confidence": "high",
+}
+
+
+@requires_database
+class TestBuildScaleContextPdf:
+    """build_scale_context: PDF pdf_scale fallback derives metres-per-point (ADR-004)."""
+
+    async def test_pdf_mm_scale_derives_conversion_factor(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """1:50 mm pdf_scale -> conversion_factor ~0.017638889, inferred, real_world_available."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=None,
+            pdf_scale=_PDF_SCALE_MM,
+        )
+
+        async with _get_session() as db:
+            scale = await build_scale_context(db, revision_id)
+
+        assert scale.conversion_factor == pytest.approx(0.017638889)
+        assert scale.real_world_available is True
+        assert scale.units_confidence == "inferred"
+        assert scale.contradicted is False
+
+    async def test_pdf_cm_and_m_variants_normalize_to_same_factor(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """cm and m pdf_scale variants both normalize to the same ~0.017638889 m/pt."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        rev_cm = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=None,
+            pdf_scale=_PDF_SCALE_CM,
+        )
+        rev_m = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=None,
+            pdf_scale=_PDF_SCALE_M,
+        )
+
+        async with _get_session() as db:
+            scale_cm = await build_scale_context(db, rev_cm)
+            scale_m = await build_scale_context(db, rev_m)
+
+        assert scale_cm.conversion_factor == pytest.approx(0.017638889, rel=1e-5)
+        assert scale_m.conversion_factor == pytest.approx(0.017638889, rel=1e-5)
+        assert scale_cm.units_confidence == "inferred"
+        assert scale_m.units_confidence == "inferred"
+
+    async def test_no_pdf_scale_and_no_units_returns_none(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No pdf_scale and no units -> conversion_factor None, real_world_available False."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=None,
+            pdf_scale=None,
+        )
+
+        async with _get_session() as db:
+            scale = await build_scale_context(db, revision_id)
+
+        assert scale.conversion_factor is None
+        assert scale.real_world_available is False
+        assert scale.units_confidence == "unknown"
+
+    async def test_pdf_scale_missing_real_world_unit_leaves_factor_none(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """pdf_scale with points_to_real but missing/unknown real_world_unit -> factor None."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=None,
+            pdf_scale={
+                "status": "derived_from_text",
+                "scale_ratio": 50,
+                "points_to_real": 17.638889,
+                # real_world_unit intentionally absent
+            },
+        )
+
+        async with _get_session() as db:
+            scale = await build_scale_context(db, revision_id)
+
+        assert scale.conversion_factor is None
+        # Without a usable real_world_unit the factor cannot be normalized to metres, so the
+        # availability gate stays honestly False (no available=True with a None factor).
+        assert scale.real_world_available is False
+        assert scale.units_confidence == "unknown"
+
+    async def test_units_present_wins_over_pdf_scale(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DWG-style units conversion_factor present -> pdf fallback not triggered."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_DUMMY_LINE_ENTITY],
+            units=_MM_UNITS,
+            pdf_scale=_PDF_SCALE_MM,
+        )
+
+        async with _get_session() as db:
+            scale = await build_scale_context(db, revision_id)
+
+        # Units-derived factor (0.001 m/mm) wins; PDF factor (~0.017638889) not used.
+        assert scale.conversion_factor == pytest.approx(0.001)
+        assert scale.units_confidence == "confirmed"
 
 
 @requires_database
