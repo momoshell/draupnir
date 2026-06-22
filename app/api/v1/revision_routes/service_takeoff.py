@@ -19,8 +19,11 @@ from app.db.session import get_db
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
-from app.interpretation.service_takeoff import compute_service_takeoff
-from app.interpretation.service_takeoff_loaders import load_service_takeoff_inputs
+from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
+from app.interpretation.service_takeoff_loaders import (
+    INPUT_FAMILY_PDF_VECTOR,
+    load_service_takeoff_inputs,
+)
 from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.service_takeoff import (
     ServiceTakeoffLineRead,
@@ -122,27 +125,36 @@ async def get_revision_service_takeoff(
 
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
     # dataclass boundary).
-    items = [
-        ServiceTakeoffLineRead(
-            service=line.service,
-            size_raw=line.size_raw,
-            size_kind=line.size_kind,
-            discipline=line.discipline,
-            room_id=line.room_id,
-            room_name=line.room_name,
-            room_number=line.room_number,
-            drawing_length=line.drawing_length,
-            real_length_m=line.real_length_m,
-            basis=line.basis,
-            units_confidence=line.units_confidence,
-            run_count=line.run_count,
-            identity_status=line.identity_status,
-            confidence=line.confidence,
-            riser_count=line.riser_count,
-            drop_count=line.drop_count,
+    is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
+
+    items = []
+    for line in result.lines:
+        # For PDF revisions, SERVICE_UNKNOWN lengths are not trustworthy (background
+        # linework inflates the figure). Suppress the metre/drawing-unit values while
+        # keeping run_count and other non-length fields honest. real_length_m -> None
+        # (explicit absence); drawing_length -> 0.0 because the schema field is non-nullable
+        # (Field(..., ge=0.0)) -- the paired real_length_m=None is the "suppressed" signal.
+        suppress_length = is_pdf and line.service == SERVICE_UNKNOWN
+        items.append(
+            ServiceTakeoffLineRead(
+                service=line.service,
+                size_raw=line.size_raw,
+                size_kind=line.size_kind,
+                discipline=line.discipline,
+                room_id=line.room_id,
+                room_name=line.room_name,
+                room_number=line.room_number,
+                drawing_length=0.0 if suppress_length else line.drawing_length,
+                real_length_m=None if suppress_length else line.real_length_m,
+                basis=line.basis,
+                units_confidence=line.units_confidence,
+                run_count=line.run_count,
+                identity_status=line.identity_status,
+                confidence=line.confidence,
+                riser_count=line.riser_count,
+                drop_count=line.drop_count,
+            )
         )
-        for line in result.lines
-    ]
 
     distinct_services = len({item.service for item in items})
     distinct_sizes = len({(item.service, item.size_raw) for item in items})
@@ -172,4 +184,5 @@ async def get_revision_service_takeoff(
         summary=summary,
         scale=scale_read,
         unscaled=result.unscaled,
+        length_provisional=is_pdf,
     )
