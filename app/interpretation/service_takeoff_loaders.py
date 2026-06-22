@@ -36,6 +36,7 @@ from app.interpretation.loaders import (
     load_revision_entities_by_type,
 )
 from app.interpretation.measurement import ScaleContext
+from app.interpretation.rise_drop import RiseDropEntity
 from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES, RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
 from app.interpretation.service_legend import (
@@ -66,6 +67,14 @@ _DEFAULT_CENTERLINE_LAYER_TOKENS: tuple[str, ...] = (
 # Layers bearing pipe-tag text annotations.
 _DEFAULT_TAG_LAYER_TOKENS: tuple[str, ...] = ("pipe tag", "pipetag", "tag")
 
+# Entity types that make up rise/drop symbols (ARC + HATCH).  Do NOT include line/polyline
+# here -- those are handled by ROUTED_ENTITY_TYPES for the pipe runs.
+RISE_DROP_ENTITY_TYPES: tuple[str, ...] = ("arc", "hatch")
+
+# Layer token defaults for rise/drop symbols (ilike, ADR-003).
+_DEFAULT_RISE_LAYER_TOKENS: tuple[str, ...] = ("rise", "riser")
+_DEFAULT_DROP_LAYER_TOKENS: tuple[str, ...] = ("drop",)
+
 # Radius (drawing units) within which a legend text entity is matched to a swatch.
 # Sized for a typical legend row height (~5 mm at 1:50 → ~250 drawing units / mm-unit).
 _SWATCH_MATCH_RADIUS: float = 2000.0
@@ -92,6 +101,8 @@ class ServiceTakeoffInputs:
     tag_placements: list[TagPlacement]
     geometry_by_entity_id: dict[str, dict[str, Any]]
     scale: ScaleContext
+    rise_entities: list[RiseDropEntity]
+    drop_entities: list[RiseDropEntity]
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +385,68 @@ async def load_tag_placements(
     return placements
 
 
+async def load_rise_drop_entities(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    kind: str,
+    layer_refs: list[str] | None = None,
+    exclude_off_sheet: bool = True,
+) -> list[RiseDropEntity]:
+    """Load ARC+HATCH entities from rise/drop layers as :class:`RiseDropEntity`.
+
+    When ``layer_refs`` is None, selects entities on layers matching the default
+    token set for the given ``kind`` (ilike, ADR-003).  Returns [] for degenerate
+    revisions; never raises.
+
+    ``kind`` must be ``"rise"`` or ``"drop"`` -- selects the appropriate token set.
+    """
+    from app.interpretation.rise_drop import KIND_RISE
+
+    if layer_refs is not None:
+        rows = await load_revision_entities_by_type(
+            db,
+            revision_id,
+            RISE_DROP_ENTITY_TYPES,
+            layer_refs=layer_refs,
+            exclude_off_sheet=exclude_off_sheet,
+        )
+    else:
+        from sqlalchemy import or_, select
+
+        from app.models.revision_materialization import RevisionEntity
+
+        tokens = _DEFAULT_RISE_LAYER_TOKENS if kind == KIND_RISE else _DEFAULT_DROP_LAYER_TOKENS
+
+        q = select(RevisionEntity).where(
+            RevisionEntity.drawing_revision_id == revision_id,
+            RevisionEntity.entity_type.in_(list(RISE_DROP_ENTITY_TYPES)),
+        )
+        if exclude_off_sheet:
+            q = q.where(RevisionEntity.on_sheet.isnot(False))
+        conditions = [RevisionEntity.layer_ref.ilike(f"%{token}%") for token in tokens]
+        q = q.where(or_(*conditions))
+        q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        rows = list((await db.execute(q)).scalars().all())
+
+    result: list[RiseDropEntity] = []
+    for row in rows:
+        style = row.style or {}
+        color: Mapping[str, Any] | None = style.get("color") if isinstance(style, Mapping) else None
+        raw_geom = row.geometry_json
+        geometry: dict[str, Any] | None = raw_geom if isinstance(raw_geom, dict) else None
+        result.append(
+            RiseDropEntity(
+                entity_id=str(row.id),
+                entity_type=row.entity_type,
+                layer_ref=row.layer_ref,
+                color=color,
+                geometry=geometry,
+            )
+        )
+    return result
+
+
 async def build_scale_context(
     db: AsyncSession,
     revision_id: UUID,
@@ -416,26 +489,45 @@ async def load_service_takeoff_inputs(
     layer_refs: list[str] | None = None,
     tag_layers: list[str] | None = None,
     legend_layers: list[str] | None = None,
+    rise_layers: list[str] | None = None,
+    drop_layers: list[str] | None = None,
     exclude_off_sheet: bool = True,
 ) -> ServiceTakeoffInputs:
     """Load all inputs the takeoff coordinator needs as a single atomic bundle.
 
     Composes :func:`load_routed_entities`, :func:`build_service_legend`,
-    :func:`load_tag_placements`, and :func:`build_scale_context`. All sub-loaders
-    are tolerant: an empty / degenerate revision yields empty lists and unknown scale
-    without raising.
+    :func:`load_tag_placements`, :func:`load_rise_drop_entities`, and
+    :func:`build_scale_context`. All sub-loaders are tolerant: an empty / degenerate
+    revision yields empty lists and unknown scale without raising.
+
+    ``rise_layers`` / ``drop_layers`` override the default ilike-token layer selection
+    for rise/drop entities (mirrors the ``layer_refs`` / ``tag_layers`` pattern).
     """
+    from app.interpretation.rise_drop import KIND_DROP, KIND_RISE
+
     routed_entities = await load_routed_entities(
         db, revision_id, layer_refs=layer_refs, exclude_off_sheet=exclude_off_sheet
     )
     legend = await build_service_legend(db, revision_id, legend_layers=legend_layers)
     tag_placements = await load_tag_placements(db, revision_id, tag_layers=tag_layers)
     scale = await build_scale_context(db, revision_id)
+    rise_entities = await load_rise_drop_entities(
+        db, revision_id, kind=KIND_RISE, layer_refs=rise_layers, exclude_off_sheet=exclude_off_sheet
+    )
+    drop_entities = await load_rise_drop_entities(
+        db, revision_id, kind=KIND_DROP, layer_refs=drop_layers, exclude_off_sheet=exclude_off_sheet
+    )
 
     geometry_by_entity_id: dict[str, dict[str, Any]] = {}
-    for entity in routed_entities:
-        if entity.geometry is not None:
-            geometry_by_entity_id[entity.entity_id] = dict(entity.geometry)
+    for routed_ent in routed_entities:
+        if routed_ent.geometry is not None:
+            geometry_by_entity_id[routed_ent.entity_id] = dict(routed_ent.geometry)
+    for rise_ent in rise_entities:
+        if rise_ent.geometry is not None:
+            geometry_by_entity_id[rise_ent.entity_id] = dict(rise_ent.geometry)
+    for drop_ent in drop_entities:
+        if drop_ent.geometry is not None:
+            geometry_by_entity_id[drop_ent.entity_id] = dict(drop_ent.geometry)
 
     return ServiceTakeoffInputs(
         routed_entities=routed_entities,
@@ -443,4 +535,6 @@ async def load_service_takeoff_inputs(
         tag_placements=tag_placements,
         geometry_by_entity_id=geometry_by_entity_id,
         scale=scale,
+        rise_entities=rise_entities,
+        drop_entities=drop_entities,
     )

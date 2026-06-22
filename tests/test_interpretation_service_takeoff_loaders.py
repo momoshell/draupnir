@@ -20,6 +20,7 @@ from app.ingestion.finalization import IngestFinalizationPayload, compute_adapte
 from app.ingestion.runner import IngestionRunRequest
 from app.ingestion.validation.reconciliation import build_reconciliation
 from app.interpretation.measurement import ScaleContext
+from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, RiseDropEntity
 from app.interpretation.routed_runs import RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
 from app.interpretation.service_legend import ServiceLegend
@@ -27,6 +28,7 @@ from app.interpretation.service_takeoff_loaders import (
     ServiceTakeoffInputs,
     build_scale_context,
     build_service_legend,
+    load_rise_drop_entities,
     load_routed_entities,
     load_service_takeoff_inputs,
     load_tag_placements,
@@ -953,3 +955,203 @@ class TestContradictedScale:
         # RevisionScaleRead.real_world_dimensions_available (not merely cf presence),
         # so wiring is tested end-to-end.
         assert isinstance(scale.real_world_available, bool)
+
+
+@requires_database
+class TestLoadRiseDropEntities:
+    """load_rise_drop_entities returns RiseDropEntity with color from style.
+
+    Spec tests 1-2:
+    1. Rise-token layer with ARC+HATCH -> both returned with resolved colour;
+       line/polyline on same layer NOT pulled.
+    2. Off-sheet excluded; empty revision -> [].
+    """
+
+    async def test_arc_and_hatch_on_rise_layer_returned(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ARC + HATCH on a 'Riser' layer are returned; line/polyline on same layer are NOT."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 3, "rgb": "#00ff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "arc-001",
+                    "arc",
+                    "Riser Layer",
+                    {"center": {"x": 100.0, "y": 100.0, "z": 0.0}, "radius": 50.0},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "hatch-001",
+                    "hatch",
+                    "Riser Layer",
+                    {
+                        "vertices": [
+                            {"x": 90.0, "y": 90.0, "z": 0.0},
+                            {"x": 110.0, "y": 110.0, "z": 0.0},
+                        ]
+                    },
+                    style={"color": color},
+                ),
+                # line and polyline on the same layer -- must NOT be returned.
+                _make_entity(
+                    "line-001",
+                    "line",
+                    "Riser Layer",
+                    {"start": [0.0, 0.0, 0.0], "end": [200.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "poly-001",
+                    "polyline",
+                    "Riser Layer",
+                    {"vertices": [[0.0, 0.0], [100.0, 0.0]]},
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_rise_drop_entities(
+                db,
+                revision_id,
+                kind=KIND_RISE,
+                layer_refs=["Riser Layer"],
+                exclude_off_sheet=False,
+            )
+
+        assert len(entities) == 2, (
+            f"Expected 2 entities (arc + hatch); got {len(entities)}: "
+            f"{[e.entity_type for e in entities]}"
+        )
+        entity_types = {e.entity_type for e in entities}
+        assert "arc" in entity_types
+        assert "hatch" in entity_types
+        assert "line" not in entity_types
+        assert "polyline" not in entity_types
+
+        for entity in entities:
+            assert isinstance(entity, RiseDropEntity)
+            assert entity.layer_ref == "Riser Layer"
+            assert entity.color is not None
+            assert entity.color.get("rgb") == "#00ff00"
+            assert entity.geometry is not None
+
+    async def test_off_sheet_excluded(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ARC with on_sheet=False is excluded when exclude_off_sheet=True."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 3, "rgb": "#00ff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity_with_on_sheet(
+                    "arc-off-sheet",
+                    "arc",
+                    "Riser Layer",
+                    {"center": {"x": 50.0, "y": 50.0, "z": 0.0}, "radius": 10.0},
+                    on_sheet=False,
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_rise_drop_entities(
+                db,
+                revision_id,
+                kind=KIND_RISE,
+                layer_refs=["Riser Layer"],
+                exclude_off_sheet=True,
+            )
+
+        assert entities == [], (
+            f"exclude_off_sheet=True must filter out on_sheet=False entities; got {len(entities)}"
+        )
+
+    async def test_empty_revision_returns_empty_list(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revision with no ARC/HATCH on rise-token layers -> empty list, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "wall-001",
+                    "line",
+                    "A-WALL",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_rise_drop_entities(
+                db, revision_id, kind=KIND_RISE, exclude_off_sheet=False
+            )
+
+        assert entities == []
+
+    async def test_drop_kind_uses_drop_token(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """kind=KIND_DROP selects layers matching 'drop' token, not 'rise'/'riser' tokens."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 5, "rgb": "#0000ff", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "arc-drop",
+                    "arc",
+                    "Drop Layer",
+                    {"center": {"x": 200.0, "y": 200.0, "z": 0.0}, "radius": 30.0},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "arc-riser",
+                    "arc",
+                    "Riser Layer",
+                    {"center": {"x": 300.0, "y": 300.0, "z": 0.0}, "radius": 30.0},
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            drop_entities = await load_rise_drop_entities(
+                db, revision_id, kind=KIND_DROP, exclude_off_sheet=False
+            )
+
+        # Only the 'Drop Layer' entity should come back when kind=KIND_DROP.
+        assert len(drop_entities) == 1
+        assert drop_entities[0].entity_type == "arc"
+        assert drop_entities[0].layer_ref == "Drop Layer"

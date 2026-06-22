@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.revision_lineage import _get_active_revision_manifest_or_409
 from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.db.session import get_db
+from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
 from app.interpretation.service_takeoff import compute_service_takeoff
@@ -100,13 +101,23 @@ async def get_revision_service_takeoff(
         exclude_off_sheet=exclude_off_sheet,
     )
 
-    # Step 5 -- compute takeoff (P3 coordinator).
+    # Step 5a -- cluster rise/drop symbols from loaded ARC+HATCH entities.
+    rise_symbols = cluster_rise_drop_symbols(
+        inputs.rise_entities, inputs.legend, kind=KIND_RISE
+    ).symbols
+    drop_symbols = cluster_rise_drop_symbols(
+        inputs.drop_entities, inputs.legend, kind=KIND_DROP
+    ).symbols
+
+    # Step 5b -- compute takeoff (P3 coordinator).
     result = compute_service_takeoff(
         runs=runs,
         identities=identities,
         geometry_by_entity_id=inputs.geometry_by_entity_id,
         rooms=room_result.rooms,
         scale=inputs.scale,
+        rise_symbols=rise_symbols,
+        drop_symbols=drop_symbols,
     )
 
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
@@ -127,6 +138,8 @@ async def get_revision_service_takeoff(
             run_count=line.run_count,
             identity_status=line.identity_status,
             confidence=line.confidence,
+            riser_count=line.riser_count,
+            drop_count=line.drop_count,
         )
         for line in result.lines
     ]
@@ -149,6 +162,8 @@ async def get_revision_service_takeoff(
         lines=len(items),
         unassigned_runs=result.unassigned_run_count,
         unknown_service_runs=result.unknown_service_run_count,
+        total_risers=result.total_risers,
+        total_drops=result.total_drops,
     )
 
     return ServiceTakeoffResponse(
