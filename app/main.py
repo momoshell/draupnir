@@ -47,6 +47,10 @@ _OPENAPI_TAGS = [
     {"name": "Entities", "description": "Materialized canonical entities, layers and blocks."},
     {"name": "Devices", "description": "Tagged devices and the legend-anchored device schedule."},
     {"name": "Rooms", "description": "Interpreted room polygons and containment."},
+    {
+        "name": "Service Takeoff",
+        "description": "Routed-service quantity takeoff (length per service+size, per room).",
+    },
     {"name": "Validation", "description": "Validation reports and extraction coverage."},
     {"name": "Changesets", "description": "Canonical edit changesets: create, validate, apply."},
     {"name": "Quantities", "description": "Quantity takeoffs and their items."},

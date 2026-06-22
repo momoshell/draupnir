@@ -1,0 +1,738 @@
+"""Tests for app/interpretation/service_takeoff.py (pure, fakes, no DB).
+
+M-540003-like fixture: HYDRAULIC bundle of LINE segments + a RunServiceIdentity with
+services {VAC@54, AGSS@42} + confirmed-mm ScaleContext + one containing room.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from shapely.geometry import Polygon
+
+from app.interpretation.measurement import ScaleContext
+from app.interpretation.rooms import Room
+from app.interpretation.routed_runs import RunGroup
+from app.interpretation.run_service_identity import (
+    IDENTITY_PARTIAL,
+    IDENTITY_RESOLVED,
+    IDENTITY_UNKNOWN,
+    RunServiceIdentity,
+    ServiceSize,
+)
+from app.interpretation.run_tags import BASIS_TAG_TEXT, PipeSize
+from app.interpretation.service_takeoff import (
+    ROOM_UNASSIGNED_ID,
+    SERVICE_UNKNOWN,
+    ServiceTakeoffResult,
+    compute_service_takeoff,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers / factories
+# ---------------------------------------------------------------------------
+
+_BASIS_LEGEND = "legend_colour"
+_BASIS_LEGEND_TAG = "legend_colour+tag_text"
+
+
+def _pipe_size(service: str, diameter: int) -> ServiceSize:
+    return ServiceSize(
+        service=service,
+        size=PipeSize(kind="round", diameter=diameter, width=None, height=None, raw=str(diameter)),
+        source_tag_text=f"{diameter} mm {service}",
+        basis=BASIS_TAG_TEXT,
+    )
+
+
+def _make_run(
+    *,
+    layer_ref: str | None = "Pipes",
+    colour_key: str | None = "idx150",
+    discipline: str | None = "HYDRAULIC EQUIPMENT",
+    entity_ids: tuple[str, ...] = ("e1",),
+    competing_disciplines: tuple[str, ...] = (),
+    confidence: float | None = None,
+) -> RunGroup:
+    return RunGroup(
+        layer_ref=layer_ref,
+        colour_key=colour_key,
+        colour_index=150,
+        colour_rgb=None,
+        status="resolved",
+        discipline=discipline,
+        basis=_BASIS_LEGEND,
+        source_layers=(layer_ref,) if layer_ref else (),
+        confidence=confidence,
+        competing_disciplines=competing_disciplines,
+        entity_ids=entity_ids,
+    )
+
+
+def _make_identity(
+    *,
+    layer_ref: str | None = "Pipes",
+    colour_key: str | None = "idx150",
+    discipline: str | None = "HYDRAULIC EQUIPMENT",
+    services: tuple[ServiceSize, ...] = (),
+    status: str = IDENTITY_RESOLVED,
+    entity_ids: tuple[str, ...] = ("e1",),
+    competing_disciplines: tuple[str, ...] = (),
+    confidence: float | None = None,
+) -> RunServiceIdentity:
+    return RunServiceIdentity(
+        layer_ref=layer_ref,
+        colour_key=colour_key,
+        discipline=discipline,
+        services=services,
+        status=status,
+        basis=_BASIS_LEGEND_TAG if services else _BASIS_LEGEND,
+        source_layers=(layer_ref,) if layer_ref else (),
+        confidence=confidence,
+        competing_disciplines=competing_disciplines,
+        entity_ids=entity_ids,
+    )
+
+
+def _line_geom(x1: float, y1: float, x2: float, y2: float) -> dict[str, list[float]]:
+    return {"start": [x1, y1, 0.0], "end": [x2, y2, 0.0]}
+
+
+def _arc_geom() -> dict[str, Any]:
+    """Geometry dict that looks like an arc (no start/end, no vertices)."""
+    return {"center": [0.0, 0.0], "radius": 100.0, "start_angle": 0.0, "end_angle": 90.0}
+
+
+def _square_room(
+    x: float = 0.0, y: float = 0.0, size: float = 10000.0, room_id: str = "room-1"
+) -> Room:
+    """Axis-aligned square polygon room."""
+    poly = Polygon([(x, y), (x + size, y), (x + size, y + size), (x, y + size)])
+    return Room(
+        id=room_id,
+        name="Test Room",
+        source="test",
+        polygon=poly,
+        area=size * size,
+        bounds=(x, y, x + size, y + size),
+        number="1.01",
+    )
+
+
+def _confirmed_mm_scale() -> ScaleContext:
+    """Confirmed mm-unit scale: conversion_factor=0.001, real_world_available=True."""
+    return ScaleContext(
+        conversion_factor=0.001,
+        real_world_available=True,
+        contradicted=False,
+        units_confidence="confirmed",
+    )
+
+
+def _unknown_scale() -> ScaleContext:
+    """Unknown scale: no conversion possible."""
+    return ScaleContext(
+        conversion_factor=None,
+        real_world_available=False,
+        contradicted=False,
+        units_confidence="unknown",
+    )
+
+
+# ---------------------------------------------------------------------------
+# M-540003-like: dual-service HYDRAULIC bundle, confirmed scale, one room
+# ---------------------------------------------------------------------------
+
+
+def test_m540003_dual_service_bundle_real_world() -> None:
+    """VAC@54 + AGSS@42 in one HYDRAULIC run, confirmed mm scale, inside a room.
+
+    Verifies:
+    - One ServiceTakeoffLine per service (VAC and AGSS).
+    - Each line's real_length_m == full summed drawn length * 0.001 (parallel, not halved).
+    - basis == "real_world", unscaled False.
+    - room_id, room_name, room_number populated from the containing room.
+    """
+    # Two LINE entities end-to-end: e1=(0,0)->(3000,0), e2=(3000,0)->(7000,0).
+    # Total drawn length = 3000 + 4000 = 7000 drawing units.
+    entity_ids = ("e1", "e2")
+    geometry = {
+        "e1": _line_geom(0.0, 0.0, 3000.0, 0.0),
+        "e2": _line_geom(3000.0, 0.0, 7000.0, 0.0),
+    }
+    expected_drawn = 7000.0
+    expected_real_m = 7000.0 * 0.001  # = 7.0
+
+    services = (
+        _pipe_size("VAC", 54),
+        _pipe_size("AGSS", 42),
+    )
+    run = _make_run(entity_ids=entity_ids)
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+
+    # Room covers (0,0) to (10000,10000); anchor of run is midpoint avg = (3500, 0) -- inside.
+    room = _square_room()
+
+    scale = _confirmed_mm_scale()
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[room],
+        scale=scale,
+    )
+
+    assert isinstance(result, ServiceTakeoffResult)
+    assert len(result.lines) == 2, f"Expected 2 lines, got {len(result.lines)}"
+    assert not result.unscaled
+    assert result.unassigned_run_count == 0
+    assert result.unknown_service_run_count == 0
+
+    by_service = {ln.service: ln for ln in result.lines}
+    assert set(by_service.keys()) == {"VAC", "AGSS"}
+
+    for svc in ("VAC", "AGSS"):
+        ln = by_service[svc]
+        assert ln.drawing_length == expected_drawn, (
+            f"{svc}: drawing_length {ln.drawing_length} != {expected_drawn}"
+        )
+        assert ln.real_length_m is not None
+        assert abs(ln.real_length_m - expected_real_m) < 1e-9, (
+            f"{svc}: real_length_m {ln.real_length_m} != {expected_real_m}"
+        )
+        assert ln.basis == "real_world"
+        assert ln.units_confidence == "confirmed"
+        assert ln.room_id == room.id
+        assert ln.room_name == room.name
+        assert ln.room_number == room.number
+        assert ln.identity_status == IDENTITY_RESOLVED
+
+
+# ---------------------------------------------------------------------------
+# Explicit test: L not L/2 per service in a 2-service bundle
+# ---------------------------------------------------------------------------
+
+
+def test_bundle_length_not_halved_for_two_services() -> None:
+    """Explicit assertion: 2-service bundle of length L contributes L (not L/2) to each.
+
+    A 1000-unit segment with services [SVC_A, SVC_B] must produce
+    SVC_A.drawing_length == 1000 AND SVC_B.drawing_length == 1000 (parallel runs).
+    """
+    entity_ids = ("seg1",)
+    geometry = {"seg1": _line_geom(0.0, 0.0, 1000.0, 0.0)}
+    segment_length = 1000.0
+
+    services = (_pipe_size("SVC_A", 50), _pipe_size("SVC_B", 32))
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 2
+    by_service = {ln.service: ln for ln in result.lines}
+    assert by_service["SVC_A"].drawing_length == segment_length
+    assert by_service["SVC_B"].drawing_length == segment_length
+    # Explicitly not halved:
+    assert by_service["SVC_A"].drawing_length != segment_length / 2
+    assert by_service["SVC_B"].drawing_length != segment_length / 2
+
+
+# ---------------------------------------------------------------------------
+# Unknown scale -> drawing_units_only
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_scale_yields_drawing_units_only() -> None:
+    """Unknown ScaleContext -> real_length_m None, basis drawing_units_only, unscaled True."""
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, 500.0, 0.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.real_length_m is None
+    assert ln.basis == "drawing_units_only"
+    assert result.unscaled is True
+
+
+# ---------------------------------------------------------------------------
+# Anchor outside all rooms -> ROOM_UNASSIGNED_ID
+# ---------------------------------------------------------------------------
+
+
+def test_anchor_outside_rooms_yields_unassigned() -> None:
+    """Run anchor outside all rooms -> ROOM_UNASSIGNED_ID, unassigned_run_count 1."""
+    # Room covers (0,0)..(1000,1000); entity lives at (5000,5000)..(6000,5000) -- outside.
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(5000.0, 5000.0, 6000.0, 5000.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    room = _square_room(x=0.0, y=0.0, size=1000.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[room],
+        scale=_confirmed_mm_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.room_id == ROOM_UNASSIGNED_ID
+    assert ln.room_name is None
+    assert ln.room_number is None
+    assert result.unassigned_run_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Empty services -> SERVICE_UNKNOWN bucket
+# ---------------------------------------------------------------------------
+
+
+def test_empty_services_yields_service_unknown() -> None:
+    """Run with no services -> SERVICE_UNKNOWN line, unknown_service_run_count 1."""
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, 200.0, 0.0)}
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(),
+        status=IDENTITY_PARTIAL,
+    )
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert result.unknown_service_run_count == 1
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.service == SERVICE_UNKNOWN
+    assert ln.size_raw is None
+    assert ln.drawing_length == 200.0
+
+
+# ---------------------------------------------------------------------------
+# Arc-only run -> 0 drawn length, no crash
+# ---------------------------------------------------------------------------
+
+
+def test_arc_only_run_zero_length_no_crash() -> None:
+    """Arc geometry contributes 0 drawn length (P4 gap); run is still accounted for."""
+    entity_ids = ("arc1",)
+    geometry = {"arc1": _arc_geom()}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+
+    # Should not raise.
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.drawing_length == 0.0
+    # 0 * factor = 0 metres; basis is real_world (scale valid, length just happens to be 0).
+    assert ln.real_length_m == 0.0
+    assert ln.basis == "real_world"
+
+
+# ---------------------------------------------------------------------------
+# Permutation-invariance
+# ---------------------------------------------------------------------------
+
+
+def test_permutation_invariance() -> None:
+    """Shuffling runs/identities/rooms does not change the result."""
+    # Three runs, two rooms.
+    e_ids_1 = ("e1", "e2")
+    e_ids_2 = ("e3",)
+    e_ids_3 = ("e4",)
+    geometry: dict[str, Any] = {
+        "e1": _line_geom(0.0, 0.0, 1000.0, 0.0),
+        "e2": _line_geom(1000.0, 0.0, 2000.0, 0.0),
+        "e3": _line_geom(500.0, 500.0, 800.0, 500.0),
+        "e4": _line_geom(5500.0, 5500.0, 6000.0, 5500.0),
+    }
+
+    svc_vac = (_pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    svc_ma = (_pipe_size("MA", 25),)
+
+    run1 = _make_run(layer_ref="P1", colour_key="ck1", entity_ids=e_ids_1)
+    run2 = _make_run(layer_ref="P2", colour_key="ck2", entity_ids=e_ids_2)
+    run3 = _make_run(layer_ref="P3", colour_key="ck3", entity_ids=e_ids_3)
+
+    id1 = _make_identity(layer_ref="P1", colour_key="ck1", entity_ids=e_ids_1, services=svc_vac)
+    id2 = _make_identity(layer_ref="P2", colour_key="ck2", entity_ids=e_ids_2, services=svc_ma)
+    id3 = _make_identity(
+        layer_ref="P3",
+        colour_key="ck3",
+        entity_ids=e_ids_3,
+        services=(_pipe_size("EA", 100),),
+    )
+
+    room_a = _square_room(x=0.0, y=0.0, size=3000.0, room_id="room-a")
+    room_b = _square_room(x=4000.0, y=4000.0, size=3000.0, room_id="room-b")
+
+    scale = _confirmed_mm_scale()
+
+    canonical = compute_service_takeoff(
+        runs=[run1, run2, run3],
+        identities=[id1, id2, id3],
+        geometry_by_entity_id=geometry,
+        rooms=[room_a, room_b],
+        scale=scale,
+    )
+
+    rng = random.Random(42)
+    for _ in range(8):
+        runs_shuffled = [run1, run2, run3]
+        ids_shuffled = [id1, id2, id3]
+        rooms_shuffled = [room_a, room_b]
+        rng.shuffle(runs_shuffled)
+        rng.shuffle(ids_shuffled)
+        rng.shuffle(rooms_shuffled)
+
+        result = compute_service_takeoff(
+            runs=runs_shuffled,
+            identities=ids_shuffled,
+            geometry_by_entity_id=geometry,
+            rooms=rooms_shuffled,
+            scale=scale,
+        )
+
+        assert result.lines == canonical.lines, (
+            f"Permutation produced different lines:\n{result.lines}\nvs\n{canonical.lines}"
+        )
+        assert result.unscaled == canonical.unscaled
+        assert result.unassigned_run_count == canonical.unassigned_run_count
+        assert result.unknown_service_run_count == canonical.unknown_service_run_count
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_empty_inputs_returns_empty_result() -> None:
+    """No identities -> empty result, no crash."""
+    result = compute_service_takeoff(
+        runs=[],
+        identities=[],
+        geometry_by_entity_id={},
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+    )
+    assert result.lines == ()
+    assert not result.unscaled
+    assert result.unassigned_run_count == 0
+    assert result.unknown_service_run_count == 0
+
+
+def test_identity_status_worst_across_runs() -> None:
+    """Two runs rolled up to the same bucket: worst status (UNKNOWN < PARTIAL < RESOLVED) wins."""
+    # Both runs: same service/size/room (no rooms -> ROOM_UNASSIGNED_ID).
+    e_ids_1 = ("e1",)
+    e_ids_2 = ("e2",)
+    geometry = {
+        "e1": _line_geom(0.0, 0.0, 100.0, 0.0),
+        "e2": _line_geom(0.0, 0.0, 200.0, 0.0),
+    }
+    svc = (_pipe_size("VAC", 54),)
+
+    # Use same layer_ref/colour_key so they map to the same bucket.
+    id1 = _make_identity(
+        layer_ref="P", colour_key="ck", entity_ids=e_ids_1, services=svc, status=IDENTITY_RESOLVED
+    )
+    id2 = _make_identity(
+        layer_ref="P", colour_key="ck2", entity_ids=e_ids_2, services=svc, status=IDENTITY_UNKNOWN
+    )
+    run1 = _make_run(layer_ref="P", colour_key="ck", entity_ids=e_ids_1)
+    run2 = _make_run(layer_ref="P", colour_key="ck2", entity_ids=e_ids_2)
+
+    result = compute_service_takeoff(
+        runs=[run1, run2],
+        identities=[id1, id2],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    # Both map to VAC / "54" / ROOM_UNASSIGNED_ID -> one line.
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.identity_status == IDENTITY_UNKNOWN  # worst wins
+    assert ln.run_count == 2
+    assert ln.drawing_length == 300.0
+
+
+def test_entity_ids_are_sorted_union() -> None:
+    """entity_ids on the output line is the sorted union across contributing runs."""
+    e_ids_1 = ("e3", "e1")
+    e_ids_2 = ("e2",)
+    geometry = {
+        "e1": _line_geom(0.0, 0.0, 50.0, 0.0),
+        "e2": _line_geom(0.0, 0.0, 50.0, 0.0),
+        "e3": _line_geom(0.0, 0.0, 50.0, 0.0),
+    }
+    svc = (_pipe_size("VAC", 54),)
+    id1 = _make_identity(layer_ref="P", colour_key="ck", entity_ids=e_ids_1, services=svc)
+    id2 = _make_identity(layer_ref="P", colour_key="ck2", entity_ids=e_ids_2, services=svc)
+    run1 = _make_run(layer_ref="P", colour_key="ck", entity_ids=e_ids_1)
+    run2 = _make_run(layer_ref="P", colour_key="ck2", entity_ids=e_ids_2)
+
+    result = compute_service_takeoff(
+        runs=[run1, run2],
+        identities=[id1, id2],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].entity_ids == ("e1", "e2", "e3")
+
+
+# ---------------------------------------------------------------------------
+# P0 coverage -- boundary, nesting, multi-room split, status rollup,
+# discipline determinism, unassigned_run_count per RUN
+# ---------------------------------------------------------------------------
+
+
+def test_anchor_on_room_boundary_is_inside() -> None:
+    """An anchor exactly ON a room polygon boundary is classified inside that room.
+
+    point_in_polygon is boundary-inclusive (Shapely contains_properly is NOT used;
+    the geometry helper uses the standard ``polygon.contains`` which is True on boundary).
+    """
+    # Room: (0,0) to (1000,1000). Entity: a 100-unit line whose midpoint lands exactly at
+    # x=500, y=1000 -- the top edge of the room.
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(450.0, 1000.0, 550.0, 1000.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    room = _square_room(x=0.0, y=0.0, size=1000.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[room],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.room_id == room.id, (
+        f"Boundary anchor should be inside room; got room_id={ln.room_id!r}"
+    )
+    assert result.unassigned_run_count == 0
+
+
+def test_nested_rooms_smallest_area_wins() -> None:
+    """A run anchor inside both an outer and an inner room -> inner (smaller) room wins."""
+    # Outer room: (0,0) to (5000,5000) area=25_000_000.
+    # Inner room: (1000,1000) to (3000,3000) area=4_000_000. Both contain (2000, 2000).
+    entity_ids = ("e1",)
+    # Anchor = midpoint of line = (2000, 2000) -- inside both rooms.
+    geometry = {"e1": _line_geom(1900.0, 2000.0, 2100.0, 2000.0)}
+    services = (_pipe_size("MA", 25),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+
+    outer = _square_room(x=0.0, y=0.0, size=5000.0, room_id="outer")
+    inner = _square_room(x=1000.0, y=1000.0, size=2000.0, room_id="inner")
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[outer, inner],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.room_id == "inner", f"Expected inner room; got {ln.room_id!r}"
+
+
+def test_same_service_size_different_rooms_yields_two_lines() -> None:
+    """Two runs with the same (service, size) but different room_ids -> two separate lines.
+
+    The bucket key includes room_id, so they must NOT be merged.
+    """
+    # Room A: (0,0)-(1000,1000). Room B: (5000,0)-(6000,1000).
+    # Run 1 anchor at (500, 500) -> Room A.  Run 2 anchor at (5500, 500) -> Room B.
+    geometry = {
+        "e1": _line_geom(450.0, 500.0, 550.0, 500.0),
+        "e2": _line_geom(5450.0, 500.0, 5550.0, 500.0),
+    }
+    svc = (_pipe_size("HWS", 50),)
+    id1 = _make_identity(layer_ref="P1", colour_key="ck1", entity_ids=("e1",), services=svc)
+    id2 = _make_identity(layer_ref="P2", colour_key="ck2", entity_ids=("e2",), services=svc)
+    run1 = _make_run(layer_ref="P1", colour_key="ck1", entity_ids=("e1",))
+    run2 = _make_run(layer_ref="P2", colour_key="ck2", entity_ids=("e2",))
+
+    room_a = _square_room(x=0.0, y=0.0, size=1000.0, room_id="room-a")
+    room_b = _square_room(x=5000.0, y=0.0, size=1000.0, room_id="room-b")
+
+    result = compute_service_takeoff(
+        runs=[run1, run2],
+        identities=[id1, id2],
+        geometry_by_entity_id=geometry,
+        rooms=[room_a, room_b],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 2, (
+        f"Same service in two rooms should yield 2 lines; got {len(result.lines)}"
+    )
+    room_ids = {ln.room_id for ln in result.lines}
+    assert room_ids == {"room-a", "room-b"}
+
+
+def test_worst_status_partial_beats_resolved() -> None:
+    """PARTIAL + RESOLVED in one bucket -> bucket status is PARTIAL (worse)."""
+    geometry = {
+        "e1": _line_geom(0.0, 0.0, 100.0, 0.0),
+        "e2": _line_geom(0.0, 0.0, 200.0, 0.0),
+    }
+    svc = (_pipe_size("VAC", 54),)
+    id1 = _make_identity(
+        layer_ref="P",
+        colour_key="ck1",
+        entity_ids=("e1",),
+        services=svc,
+        status=IDENTITY_PARTIAL,
+    )
+    id2 = _make_identity(
+        layer_ref="P",
+        colour_key="ck2",
+        entity_ids=("e2",),
+        services=svc,
+        status=IDENTITY_RESOLVED,
+    )
+    run1 = _make_run(layer_ref="P", colour_key="ck1", entity_ids=("e1",))
+    run2 = _make_run(layer_ref="P", colour_key="ck2", entity_ids=("e2",))
+
+    result = compute_service_takeoff(
+        runs=[run1, run2],
+        identities=[id1, id2],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].identity_status == IDENTITY_PARTIAL
+
+
+def test_discipline_determinism_under_shuffle() -> None:
+    """SERVICE_UNKNOWN bucket with two runs carrying DIFFERENT disciplines is deterministic.
+
+    The surviving discipline must be the alphabetical min() across contributors,
+    independent of input permutation order.
+    """
+    geometry = {
+        "e1": _line_geom(0.0, 0.0, 100.0, 0.0),
+        "e2": _line_geom(0.0, 0.0, 200.0, 0.0),
+    }
+    # Both have empty services -> SERVICE_UNKNOWN bucket. Different disciplines.
+    id1 = _make_identity(
+        layer_ref="P1",
+        colour_key="ck1",
+        entity_ids=("e1",),
+        services=(),
+        discipline="HYDRAULIC EQUIPMENT",
+        status=IDENTITY_PARTIAL,
+    )
+    id2 = _make_identity(
+        layer_ref="P2",
+        colour_key="ck2",
+        entity_ids=("e2",),
+        services=(),
+        discipline="MECHANICAL",
+        status=IDENTITY_PARTIAL,
+    )
+    run1 = _make_run(layer_ref="P1", colour_key="ck1", entity_ids=("e1",))
+    run2 = _make_run(layer_ref="P2", colour_key="ck2", entity_ids=("e2",))
+
+    expected_discipline = min("HYDRAULIC EQUIPMENT", "MECHANICAL")  # alphabetical
+
+    rng = random.Random(7)
+    for _ in range(10):
+        ids_shuffled = [id1, id2]
+        runs_shuffled = [run1, run2]
+        rng.shuffle(ids_shuffled)
+        rng.shuffle(runs_shuffled)
+
+        result = compute_service_takeoff(
+            runs=runs_shuffled,
+            identities=ids_shuffled,
+            geometry_by_entity_id=geometry,
+            rooms=[],
+            scale=_unknown_scale(),
+        )
+
+        assert len(result.lines) == 1
+        assert result.lines[0].discipline == expected_discipline, (
+            f"Expected {expected_discipline!r}, got {result.lines[0].discipline!r}"
+        )
+
+
+def test_unassigned_run_count_per_run_not_per_service() -> None:
+    """A dual-service bundle outside all rooms increments unassigned_run_count by 1, not 2.
+
+    unassigned_run_count tracks RUNS (identities), not individual services within a run.
+    """
+    # Single entity outside an empty rooms list; two services in the bundle.
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, 500.0, 0.0)}
+    services = (_pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    # Two service lines (bundle), but only ONE run was unassigned.
+    assert len(result.lines) == 2
+    assert result.unassigned_run_count == 1, (
+        f"Dual-service bundle outside rooms: expected unassigned_run_count=1, "
+        f"got {result.unassigned_run_count}"
+    )

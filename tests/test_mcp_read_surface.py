@@ -62,6 +62,7 @@ _EXPECTED_TOOLS = {
     "get_revision_diff",
     "get_revision_entity_source",
     "get_revision_scale",
+    "get_revision_service_takeoff",
     "get_revision_summary",
     "get_system_capabilities",
     "get_validation_report",
