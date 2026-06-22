@@ -46,7 +46,7 @@ from app.ingestion.contracts import (
     ProvenanceRecord,
 )
 from app.ingestion.registry import evaluate_availability, get_descriptor
-from app.ingestion.units_inference import extent_from_bboxes, infer_units
+from app.ingestion.units_inference import DimensionObservation, extent_from_bboxes, infer_units
 
 _DESCRIPTOR = get_descriptor(InputFamily.DWG)
 _BINARY_NAME = "dwgread"
@@ -95,6 +95,21 @@ _LWPOLYLINE_CLOSED_FLAG_BITS = 0b1 | 0x200
 _SUPPORTED_ARC_ANGLE_UNIT_TOKENS = frozenset({"deg", "degree", "degrees"})
 _SUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"ccw", "counterclockwise"})
 _UNSUPPORTED_ARC_DIRECTION_TOKENS = frozenset({"cw", "clockwise"})
+# dwgread DIMENSION record types. Linear variants (DIMENSION_LINEAR / DIMENSION_ALIGNED)
+# carry a stated_override that drives Tier-1 unit inference. Non-linear variants are
+# extracted as dimension entities but do NOT contribute Tier-1 votes (is_linear=False).
+_DIMENSION_LINEAR_TYPES = frozenset({"DIMENSION_LINEAR", "DIMENSION_ALIGNED"})
+_DIMENSION_NONLINEAR_TYPES = frozenset(
+    {
+        "DIMENSION_ANG2LN",
+        "DIMENSION_ANG3PT",
+        "DIMENSION_RADIUS",
+        "DIMENSION_DIAMETER",
+        "DIMENSION_ORDINATE",
+    }
+)
+_DIMENSION_RECORD_TYPES = _DIMENSION_LINEAR_TYPES | _DIMENSION_NONLINEAR_TYPES
+_DIMENSION_ENTITY_CONFIDENCE_SCORE = 0.72
 _NON_DRAWABLE_OBJECT_TYPES = frozenset(
     {
         "APPID",
@@ -779,6 +794,7 @@ def _build_canonical_output(
     supported_geometry_count = 0
     supported_line_count = 0
     supported_text_count = 0
+    supported_dimension_count = 0
     unsupported_drawable_count = 0
     malformed_drawable_count = 0
     unsupported_hatch_count = 0
@@ -960,6 +976,20 @@ def _build_canonical_output(
                 malformed_insert_handles.add(handle)
             continue
 
+        if record_type in _DIMENSION_RECORD_TYPES:
+            dim_entity = _build_dimension_entity(record, units=units)
+            if dim_entity is not None:
+                _record_entity(dim_entity)
+                supported_geometry_count += 1
+                supported_dimension_count += 1
+                continue
+
+            malformed_drawable_count += 1
+            handle = _record_unknown(record, reason="malformed_dimension")
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
         _record_unknown(record, reason="unsupported_drawable_record")
@@ -989,6 +1019,7 @@ def _build_canonical_output(
             "supported_geometry": supported_geometry_count,
             "supported_lines": supported_line_count,
             "supported_text": supported_text_count,
+            "supported_dimensions": supported_dimension_count,
             "unsupported_drawables": unsupported_drawable_count,
             "malformed_drawables": malformed_drawable_count,
             "unsupported_hatches": unsupported_hatch_count,
@@ -1038,6 +1069,7 @@ def _build_canonical_output(
             units.payload,
             entities,
             declared_code=_extract_insunits_code(run_result.output_payload),
+            dimension_observations=_dwg_dimension_observations_from_entities(entities),
         )
         if units.payload.get("contradiction"):
             contradiction = units.payload["contradiction"]
@@ -1276,6 +1308,7 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "supported_geometry",
         "supported_lines",
         "supported_text",
+        "supported_dimensions",
         "unsupported_drawables",
         "malformed_drawables",
         "unsupported_hatches",
@@ -1307,12 +1340,16 @@ def _apply_dwg_unit_inference(
     entities: list[JSONValue],
     *,
     declared_code: int | None,
+    dimension_observations: tuple[DimensionObservation, ...] = (),
 ) -> None:
-    """Attempt extent-based unit inference and mutate *units_payload* in-place.
+    """Attempt unit inference and mutate *units_payload* in-place.
 
     Only called on the UNCONFIRMED path (confirmed=False).  Shares the same
-    ``infer_units`` engine as the DXF adapter — prevents DXF/DWG inference drift
+    ``infer_units`` engine as the DXF adapter -- prevents DXF/DWG inference drift
     (the same lesson as #369 for the conversion table).
+
+    Tier-1 (dimension-text) runs first via dimension_observations; Tier-2
+    (extent magnitude) is the fallback.
     """
     bboxes: list[dict[str, object]] = []
     for entity in entities:
@@ -1323,7 +1360,11 @@ def _apply_dwg_unit_inference(
             bboxes.append(bbox)
 
     extent = extent_from_bboxes(bboxes)
-    result = infer_units(declared_code=declared_code, extent=extent)
+    result = infer_units(
+        declared_code=declared_code,
+        extent=extent,
+        dimension_observations=dimension_observations,
+    )
 
     if result.confidence == "inferred":
         units_payload["confidence"] = "inferred"
@@ -1331,9 +1372,8 @@ def _apply_dwg_unit_inference(
         units_payload["normalized"] = result.normalized
         units_payload["source"] = "INSUNITS"
         units_payload["basis"] = result.basis
-        if extent is not None:
-            units_payload["inference"] = {
-                "extent": {"width": extent.width, "height": extent.height},
+        if extent is not None or dimension_observations:
+            inference_block: _JSONDict = {
                 "candidates": tuple(
                     {
                         "normalized": c.normalized,
@@ -1343,7 +1383,11 @@ def _apply_dwg_unit_inference(
                     for c in result.candidates
                 ),
                 "basis": result.basis,
+                "dimension_observation_count": len(dimension_observations),
             }
+            if extent is not None:
+                inference_block["extent"] = {"width": extent.width, "height": extent.height}
+            units_payload["inference"] = inference_block
         if result.contradicts_declared:
             units_payload["contradiction"] = {
                 "declared_normalized": result.declared_normalized,
@@ -1837,6 +1881,221 @@ def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) ->
         "end": end,
         "length": quantity_length,
     }
+
+
+def _dwg_dimension_stated_override(user_text: Any) -> float | None:
+    """Parse a dwgread user_text string to a numeric stated override, or None if unusable.
+
+    '<>', '<', and '' indicate measured-only (no drafter override).
+    Non-numeric strings are also unusable. dwgwrite truncates '<>' to '<' in some
+    versions -- both are treated as measured-only.
+    """
+    if not isinstance(user_text, str):
+        return None
+    stripped = user_text.strip()
+    if stripped in ("<>", "<", ""):
+        return None
+    try:
+        return float(stripped)
+    except (ValueError, TypeError):
+        return None
+
+
+def _build_dimension_entity(
+    record: Mapping[str, Any], *, units: _UnitsResolution
+) -> _JSONDict | None:
+    """Build a canonical entity payload for a dwgread DIMENSION_* record.
+
+    Mirrors _build_line_entity in structure. bbox spans xline1_pt/xline2_pt.
+    Returns None on missing or non-finite geometry so the caller can degrade gracefully.
+    Never raises -- all field access is wrapped defensively.
+    """
+    try:
+        record_type = _extract_record_type(record) or "DIMENSION_LINEAR"
+        is_linear = record_type in _DIMENSION_LINEAR_TYPES
+
+        xline1 = _extract_point(record, prefixes=("xline1_pt", "xline1", "ext_ln1"))
+        xline2 = _extract_point(record, prefixes=("xline2_pt", "xline2", "ext_ln2"))
+        if xline1 is None or xline2 is None:
+            return None
+
+        place, _length_scale, _angle_shift = _resolve_placement(units)
+        xline1 = place(xline1)
+        xline2 = place(xline2)
+        if not _point_is_finite(xline1) or not _point_is_finite(xline2):
+            return None
+
+        raw_span = math.hypot(xline2[0] - xline1[0], xline2[1] - xline1[1])
+
+        # def_pt / text_midpt are optional audit points; extract but don't fail if absent.
+        def_pt = _extract_point(record, prefixes=("def_pt", "def_point", "defpoint"))
+        text_midpt = _extract_point(record, prefixes=("text_midpt", "text_mid_pt", "text_pt"))
+
+        user_text_raw = _first_value(record, "user_text")
+        text_override = user_text_raw if isinstance(user_text_raw, str) else None
+        stated_override = _dwg_dimension_stated_override(user_text_raw)
+
+        # DIMLFAC: not exposed on the dwgread object -- default 1.0 as specified.
+        dimlfac = 1.0
+
+        entity_id = _entity_id(record, record_type="dimension")
+        layout_name = _extract_layout_name(record)
+        layer_name = _extract_layer_name(record)
+        block_name = _extract_block_name(record)
+        source_handle = _extract_handle(record)
+
+        pt1 = _point_json(xline1)
+        pt2 = _point_json(xline2)
+        bbox = {
+            "min": {
+                "x": min(xline1[0], xline2[0]),
+                "y": min(xline1[1], xline2[1]),
+                "z": min(xline1[2], xline2[2]),
+            },
+            "max": {
+                "x": max(xline1[0], xline2[0]),
+                "y": max(xline1[1], xline2[1]),
+                "z": max(xline1[2], xline2[2]),
+            },
+        }
+
+        libredwg_native: _JSONDict = {
+            "section": "OBJECTS",
+            "record_type": record_type,
+            "handle": source_handle,
+            "kind": record_type,
+            "is_linear": is_linear,
+            "text_override": text_override,
+            "raw_span": raw_span,
+            "dimlfac": dimlfac,
+        }
+        if def_pt is not None:
+            libredwg_native["defpoint2"] = _point_json(def_pt)
+        if text_midpt is not None:
+            libredwg_native["defpoint3"] = _point_json(text_midpt)
+
+        safe_projection = _safe_record_projection(
+            record,
+            record_type=record_type,
+            geometry={"xline1_pt": pt1, "xline2_pt": pt2},
+        )
+        provenance = _entity_provenance(
+            record,
+            record_type=record_type,
+            source_handle=source_handle,
+            safe_projection=safe_projection,
+            notes=_units_notes(units),
+        )
+
+        return {
+            "entity_id": entity_id,
+            "entity_type": "dimension",
+            "entity_schema_version": _SCHEMA_VERSION,
+            **provenance,
+            "source_entity_handle": source_handle,
+            "layout_name": layout_name,
+            "layer_name": layer_name,
+            "block_name": block_name,
+            "parent_entity_id": None,
+            "drawing_revision_id": None,
+            "source_file_id": None,
+            "layout_ref": layout_name,
+            "layer_ref": layer_name,
+            "block_ref": block_name,
+            "parent_entity_ref": None,
+            "bbox": bbox,
+            "geometry": {
+                "xline1_pt": pt1,
+                "xline2_pt": pt2,
+                "bbox": bbox,
+                "units": _units_label(units),
+                "geometry_summary": {
+                    "kind": "dimension",
+                    "raw_span": raw_span,
+                    "is_linear": is_linear,
+                },
+            },
+            "properties": {
+                "source_type": record_type,
+                "source_handle": source_handle,
+                "quantity_hints": {
+                    "span": raw_span,
+                    "count": 1.0,
+                },
+                "adapter_native": {
+                    "libredwg": libredwg_native,
+                    # stated_override as a top-level key for convenience
+                    "stated_override": stated_override,
+                },
+            },
+            "provenance": provenance,
+            "confidence": {
+                "score": _DIMENSION_ENTITY_CONFIDENCE_SCORE,
+                "review_required": True,
+                "basis": f"libredwg_dimension_mapping_{_units_basis_suffix(units)}",
+            },
+            "kind": "dimension",
+            "is_linear": is_linear,
+            "raw_span": raw_span,
+            "text_override": text_override,
+        }
+    except Exception:
+        return None
+
+
+def _dwg_dimension_observations_from_entities(
+    entities: list[JSONValue],
+) -> tuple[DimensionObservation, ...]:
+    """Walk canonical entities and build DimensionObservation tuples for Tier-1 inference.
+
+    Only processes entities with entity_type=="dimension" whose adapter_native.libredwg
+    sub-block was populated by _build_dimension_entity. Non-dimension entities and
+    malformed blocks are silently skipped.
+    """
+    observations: list[DimensionObservation] = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if entity.get("entity_type") != "dimension":
+            continue
+        try:
+            props = entity.get("properties")
+            if not isinstance(props, dict):
+                continue
+            adapter_native = props.get("adapter_native")
+            if not isinstance(adapter_native, dict):
+                continue
+            libredwg_block = adapter_native.get("libredwg")
+            if not isinstance(libredwg_block, dict):
+                continue
+
+            raw_span_val = libredwg_block.get("raw_span")
+            dimlfac_val = libredwg_block.get("dimlfac")
+            is_linear_val = libredwg_block.get("is_linear")
+            text_override_val = libredwg_block.get("text_override")
+
+            if not isinstance(raw_span_val, (int, float)) or isinstance(raw_span_val, bool):
+                continue
+            if not isinstance(dimlfac_val, (int, float)) or isinstance(dimlfac_val, bool):
+                continue
+            if not isinstance(is_linear_val, bool):
+                continue
+
+            stated_override = _dwg_dimension_stated_override(
+                text_override_val if isinstance(text_override_val, str) else None
+            )
+            observations.append(
+                DimensionObservation(
+                    raw_span=float(raw_span_val),
+                    stated_override=stated_override,
+                    dimlfac=float(dimlfac_val),
+                    is_linear=bool(is_linear_val),
+                )
+            )
+        except Exception:
+            continue
+
+    return tuple(observations)
 
 
 def _build_text_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict:
