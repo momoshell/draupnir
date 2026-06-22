@@ -373,3 +373,132 @@ async def test_extract_with_process_falls_back_when_runner_cannot_spawn(monkeypa
         _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
     )
     assert result is sentinel
+
+
+# ---------------------------------------------------------------------------
+# _build_pdf_style / style block on lineish entities
+# ---------------------------------------------------------------------------
+
+
+def _make_drawing(
+    *,
+    color: object = None,
+    width: object = None,
+    dashes: object = None,
+) -> dict[str, Any]:
+    """Minimal drawing dict for style/entity tests."""
+    return {
+        "color": color,
+        "width": width,
+        "dashes": dashes,
+        "type": "s",
+        "fill": None,
+        "stroke_opacity": None,
+        "fill_opacity": None,
+        "lineCap": None,
+        "lineJoin": None,
+        "seqno": None,
+        "closePath": False,
+        "items": [],
+    }
+
+
+def test_build_pdf_style_colour_present() -> None:
+    # (0.176, 0.443, 1.0) -> 0x2d 0x71 0xff -> "2d71ff"
+    drawing = _make_drawing(color=(0.176, 0.443, 1.0), width=0.5)
+    style = pdf_adapter._build_pdf_style(drawing)
+    color = style["color"]
+    assert isinstance(color, dict)
+    assert color["rgb"] == "2d71ff"
+    assert color["index"] is None
+    assert color["by_layer"] is False
+    assert color["by_block"] is False
+
+
+def test_build_pdf_style_no_colour_rgb_is_none() -> None:
+    drawing = _make_drawing(color=None, width=0.5)
+    style = pdf_adapter._build_pdf_style(drawing)
+    color = style["color"]
+    assert isinstance(color, dict)
+    assert color["rgb"] is None
+
+
+def test_build_pdf_style_dashed_vs_solid() -> None:
+    dashed_drawing = _make_drawing(dashes="[3] 0")
+    solid_drawing_bracket = _make_drawing(dashes="[] 0")
+    solid_drawing_empty = _make_drawing(dashes="")
+    solid_drawing_none = _make_drawing(dashes=None)
+
+    dashed_style = pdf_adapter._build_pdf_style(dashed_drawing)
+    assert isinstance(dashed_style["linetype"], dict)
+    assert dashed_style["linetype"]["dashed"] is True
+
+    for drawing in (solid_drawing_bracket, solid_drawing_empty, solid_drawing_none):
+        style = pdf_adapter._build_pdf_style(drawing)
+        assert isinstance(style["linetype"], dict)
+        raw = drawing.get("dashes")
+        assert style["linetype"]["dashed"] is False, f"expected dashed=False for dashes={raw!r}"
+
+
+def _lineish_entity_for(drawing: dict[str, Any], *, polyline: bool = False) -> dict[str, JSONValue]:
+    """Build a lineish entity from a drawing dict via the real builder."""
+    if polyline:
+        points: list[tuple[float, float]] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+    else:
+        points = [(0.0, 0.0), (1.0, 1.0)]
+    entity = pdf_adapter._build_lineish_entity(
+        points=points,
+        page_number=1,
+        layout_name="page-1",
+        layer_name="pen-000000-w0.5",
+        drawing_index=0,
+        entity_index=0,
+        item_indices=(0,),
+        drawing=drawing,
+        closed=False,
+        rect_like=False,
+    )
+    assert entity is not None
+    return entity
+
+
+def test_style_on_line_entity() -> None:
+    drawing = _make_drawing(color=(0.176, 0.443, 1.0), width=0.5, dashes="[] 0")
+    entity = _lineish_entity_for(drawing, polyline=False)
+    assert entity["entity_type"] == "line"
+    style = entity["style"]
+    assert isinstance(style, dict)
+    color = style["color"]
+    assert isinstance(color, dict)
+    assert color["rgb"] == "2d71ff"
+    linetype = style["linetype"]
+    assert isinstance(linetype, dict)
+    assert linetype["dashed"] is False
+    lineweight = style["lineweight"]
+    assert isinstance(lineweight, dict)
+    # PDF stroke width is in points, not mm; mm is honestly None (width stays in properties).
+    assert lineweight["mm"] is None
+    properties = entity["properties"]
+    assert isinstance(properties, dict)
+    assert properties["stroke_width"] == 0.5
+
+
+def test_style_on_polyline_entity() -> None:
+    drawing = _make_drawing(color=(0.0, 0.0, 0.0), width=1.0, dashes="[3 1] 0")
+    entity = _lineish_entity_for(drawing, polyline=True)
+    assert entity["entity_type"] == "polyline"
+    style = entity["style"]
+    assert isinstance(style, dict)
+    color = style["color"]
+    assert isinstance(color, dict)
+    assert color["rgb"] == "000000"
+    linetype = style["linetype"]
+    assert isinstance(linetype, dict)
+    assert linetype["dashed"] is True
+    lineweight = style["lineweight"]
+    assert isinstance(lineweight, dict)
+    # PDF stroke width is in points, not mm; mm is honestly None (width stays in properties).
+    assert lineweight["mm"] is None
+    properties = entity["properties"]
+    assert isinstance(properties, dict)
+    assert properties["stroke_width"] == 1.0
