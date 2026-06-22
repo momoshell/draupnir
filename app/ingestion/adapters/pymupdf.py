@@ -887,6 +887,7 @@ def _build_lineish_entity(
         "layer": layer_name,
         "bbox": bbox,
         "properties": _entity_properties(drawing, closed=closed, rect_like=rect_like),
+        "style": _build_pdf_style(drawing),
         **provenance,
         "provenance": provenance,
         "confidence": {
@@ -1113,6 +1114,41 @@ def _entity_properties(
         "closed": closed,
         "rect_like": rect_like,
         "sequence_number": int(drawing.get("seqno") or 0),
+    }
+
+
+def _build_pdf_style(drawing: dict[str, Any]) -> dict[str, JSONValue]:
+    """Build the canonical style block for a PDF entity.
+
+    Maps PDF drawing attributes to the same shape as DWG/DXF (_resolve_entity_style),
+    so downstream consumers can select routed runs by colour the same way across all formats.
+    PDF has no ACI colour index, no ByLayer/ByBlock inheritance, and no integer lineweight enum.
+    lineweight.mm is left None: the PDF stroke width is in points, not mm, and storing a points
+    value under an mm-named slot would be a wrong-unit signal. The raw stroke width remains
+    available losslessly in ``properties.stroke_width`` for callers that need it.
+    """
+    raw_dashes = drawing.get("dashes") or ""
+    # PyMuPDF dashes: "[] 0" for solid, "[3] 0" or "[3 1] 0" for dashed.
+    # Treat as dashed only when the bracket contains at least one digit.
+    dashed = bool(re.search(r"\[\s*\d", str(raw_dashes)))
+
+    return {
+        "color": {
+            "index": None,
+            "rgb": _rgb_hex(drawing.get("color")),
+            "by_layer": False,
+            "by_block": False,
+        },
+        "linetype": {
+            "name": None,
+            "by_layer": False,
+            "dashed": dashed,
+            "scale": 1.0,
+        },
+        "lineweight": {
+            "raw": None,
+            "mm": None,
+        },
     }
 
 
