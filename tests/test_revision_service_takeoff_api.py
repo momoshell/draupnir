@@ -127,6 +127,8 @@ def _inputs_with_pipe_and_tag(scale: ScaleContext) -> ServiceTakeoffInputs:
         tag_placements=tag_placements,
         geometry_by_entity_id={entity_id: geometry},
         scale=scale,
+        rise_entities=[],
+        drop_entities=[],
     )
 
 
@@ -140,6 +142,8 @@ def _inputs_empty(scale: ScaleContext) -> ServiceTakeoffInputs:
         tag_placements=[],
         geometry_by_entity_id={},
         scale=scale,
+        rise_entities=[],
+        drop_entities=[],
     )
 
 
@@ -517,6 +521,8 @@ def _inputs_two_services_two_rooms(scale: ScaleContext) -> ServiceTakeoffInputs:
         tag_placements=tag_placements,
         geometry_by_entity_id=geometry_by_entity_id,
         scale=scale,
+        rise_entities=[],
+        drop_entities=[],
     )
 
 
@@ -630,4 +636,78 @@ async def test_service_takeoff_multi_item_summary_matches_items(
 
     assert items == sorted(items, key=_sort_key), (
         f"Items not in documented sort order: {[(i['service'], i['room_id']) for i in items]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Spec test 7: API surfaces riser_count/drop_count/total_risers/total_drops +
+# extra="forbid" still holds
+# ---------------------------------------------------------------------------
+
+
+async def test_service_takeoff_items_have_riser_and_drop_count_fields(
+    takeoff_app_confirmed_scale: FastAPI,
+) -> None:
+    """Every item in the response has riser_count and drop_count fields (>=0 ints)."""
+    response = await _get_takeoff(takeoff_app_confirmed_scale)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    assert len(items) >= 1, "Expected at least one item from the confirmed-scale fixture"
+
+    for item in items:
+        assert "riser_count" in item, f"Missing riser_count on item: {item}"
+        assert "drop_count" in item, f"Missing drop_count on item: {item}"
+        assert isinstance(item["riser_count"], int)
+        assert isinstance(item["drop_count"], int)
+        assert item["riser_count"] >= 0
+        assert item["drop_count"] >= 0
+
+
+async def test_service_takeoff_summary_has_total_risers_and_drops(
+    takeoff_app_confirmed_scale: FastAPI,
+) -> None:
+    """Summary has total_risers and total_drops fields."""
+    response = await _get_takeoff(takeoff_app_confirmed_scale)
+    assert response.status_code == 200
+    body = response.json()
+
+    summary = body["summary"]
+    assert "total_risers" in summary, f"Missing total_risers in summary: {summary}"
+    assert "total_drops" in summary, f"Missing total_drops in summary: {summary}"
+    assert isinstance(summary["total_risers"], int)
+    assert isinstance(summary["total_drops"], int)
+    assert summary["total_risers"] >= 0
+    assert summary["total_drops"] >= 0
+
+
+async def test_service_takeoff_empty_revision_total_risers_drops_zero(
+    takeoff_app_no_scale: FastAPI,
+) -> None:
+    """Empty revision -> total_risers=0, total_drops=0 in summary."""
+    response = await _get_takeoff(takeoff_app_no_scale)
+    assert response.status_code == 200
+    body = response.json()
+
+    summary = body["summary"]
+    assert summary["total_risers"] == 0
+    assert summary["total_drops"] == 0
+
+
+async def test_service_takeoff_extra_field_rejected(
+    takeoff_app_confirmed_scale: FastAPI,
+) -> None:
+    """extra='forbid' on ServiceTakeoffResponse -- response does not contain unexpected keys.
+
+    ServiceTakeoffResponse already has extra='forbid'; this test confirms the model_config
+    is still in place after adding riser/drop fields (a stray extra field would 422 the
+    Pydantic serialiser, causing a 500, not a 200).
+    """
+    response = await _get_takeoff(takeoff_app_confirmed_scale)
+    assert response.status_code == 200
+    body = response.json()
+    expected_keys = {"manifest", "items", "summary", "scale", "unscaled"}
+    assert expected_keys == set(body.keys()), (
+        f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
     )

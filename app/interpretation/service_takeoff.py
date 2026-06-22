@@ -37,6 +37,7 @@ from app.interpretation.measurement import (
     measure_length,
     path_length,
 )
+from app.interpretation.rise_drop import RiseDropSymbol
 from app.interpretation.rooms import Room
 from app.interpretation.routed_runs import RunGroup
 from app.interpretation.run_service_identity import (
@@ -88,6 +89,8 @@ class ServiceTakeoffLine:
     entity_ids: tuple[str, ...]  # sorted union (provenance)
     identity_status: str  # worst across contributing runs
     confidence: float | None  # None if any contributing run has competing_disciplines
+    riser_count: int  # count of rise symbols in this (SERVICE_UNKNOWN, room) bucket
+    drop_count: int  # count of drop symbols in this (SERVICE_UNKNOWN, room) bucket
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,8 @@ class ServiceTakeoffResult:
     unscaled: bool  # any line is drawing_units_only
     unassigned_run_count: int
     unknown_service_run_count: int
+    total_risers: int  # distinct rise symbols (len of rise_symbols input)
+    total_drops: int  # distinct drop symbols (len of drop_symbols input)
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +228,8 @@ def compute_service_takeoff(
     geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
     rooms: Sequence[Room],
     scale: ScaleContext,
+    rise_symbols: Sequence[RiseDropSymbol] = (),
+    drop_symbols: Sequence[RiseDropSymbol] = (),
 ) -> ServiceTakeoffResult:
     """Compose run identities into per-(service, size, room) length totals.
 
@@ -231,6 +238,12 @@ def compute_service_takeoff(
     the full drawn length of the run (see module docstring).  A run with no services
     is counted in the SERVICE_UNKNOWN bucket; a run whose anchor falls outside all
     rooms is counted in ROOM_UNASSIGNED_ID.  No run is ever dropped.
+
+    Rise/drop symbols (``rise_symbols`` / ``drop_symbols``) are counted per room and
+    accumulated into a dedicated SERVICE_UNKNOWN bucket for each (discipline, room)
+    pair.  Vertical length is intentionally absent (counts are scale-free).
+    ``total_risers`` / ``total_drops`` equal ``len(rise_symbols)`` /
+    ``len(drop_symbols)`` -- they count distinct physical symbols, NOT line sums.
 
     Parameters
     ----------
@@ -245,10 +258,19 @@ def compute_service_takeoff(
         Room objects with polygon geometry for spatial scoping.
     scale:
         ScaleContext driving the scale gate (ADR-004).
+    rise_symbols:
+        Clustered rise symbols from ``cluster_rise_drop_symbols``; default empty.
+    drop_symbols:
+        Clustered drop symbols from ``cluster_rise_drop_symbols``; default empty.
     """
-    if not identities:
+    if not identities and not rise_symbols and not drop_symbols:
         return ServiceTakeoffResult(
-            lines=(), unscaled=False, unassigned_run_count=0, unknown_service_run_count=0
+            lines=(),
+            unscaled=False,
+            unassigned_run_count=0,
+            unknown_service_run_count=0,
+            total_risers=len(rise_symbols),
+            total_drops=len(drop_symbols),
         )
 
     # Build a lookup: (layer_ref, colour_key) -> RunGroup for competing_disciplines.
@@ -268,6 +290,10 @@ def compute_service_takeoff(
     acc_room_name: dict[_BucketKey, str | None] = {}
     acc_room_number: dict[_BucketKey, str | None] = {}
     acc_discipline: dict[_BucketKey, str | None] = {}
+    # Rise/drop counts per SERVICE_UNKNOWN bucket -- keyed by room_id only (symbols carry
+    # no service/size, so they land in (SERVICE_UNKNOWN, None, None, room_id)).
+    acc_riser_count: dict[_BucketKey, int] = {}
+    acc_drop_count: dict[_BucketKey, int] = {}
 
     unassigned_run_count = 0
     unknown_service_run_count = 0
@@ -336,6 +362,49 @@ def compute_service_takeoff(
                     acc_discipline=acc_discipline,
                 )
 
+    # Process rise/drop symbols: map each to its containing room and accumulate counts
+    # into the SERVICE_UNKNOWN bucket for that room.  Counts are scale-free; no length
+    # is added.  Each physical symbol is counted exactly once (ADR-006).
+    def _accumulate_symbol(symbol: RiseDropSymbol, *, is_rise: bool) -> None:
+        anchor = symbol.anchor_point
+        room = _containing_room(anchor, rooms)
+        sym_room_id = room.id if room is not None else ROOM_UNASSIGNED_ID
+        sym_room_name = room.name if room is not None else None
+        sym_room_number = room.number if room is not None else None
+
+        sym_key: _BucketKey = (SERVICE_UNKNOWN, None, None, sym_room_id)
+
+        # Ensure the bucket exists (without adding drawn length or run_count).
+        if sym_key not in acc_drawing_length:
+            acc_drawing_length[sym_key] = 0.0
+            acc_run_count[sym_key] = 0
+            acc_entity_ids[sym_key] = set(symbol.entity_ids)
+            acc_identity_status[sym_key] = IDENTITY_UNKNOWN
+            acc_has_conflict[sym_key] = False
+            acc_room_name[sym_key] = sym_room_name
+            acc_room_number[sym_key] = sym_room_number
+            acc_discipline[sym_key] = symbol.discipline
+        else:
+            # Merge entity provenance and discipline (min-alphabetical).
+            acc_entity_ids[sym_key].update(symbol.entity_ids)
+            if symbol.discipline is not None:
+                current_disc = acc_discipline[sym_key]
+                acc_discipline[sym_key] = (
+                    symbol.discipline
+                    if current_disc is None
+                    else min(current_disc, symbol.discipline)
+                )
+
+        if is_rise:
+            acc_riser_count[sym_key] = acc_riser_count.get(sym_key, 0) + 1
+        else:
+            acc_drop_count[sym_key] = acc_drop_count.get(sym_key, 0) + 1
+
+    for sym in rise_symbols:
+        _accumulate_symbol(sym, is_rise=True)
+    for sym in drop_symbols:
+        _accumulate_symbol(sym, is_rise=False)
+
     # Build ServiceTakeoffLine objects from accumulators.
     lines: list[ServiceTakeoffLine] = []
     has_unscaled = False
@@ -370,6 +439,8 @@ def compute_service_takeoff(
                 entity_ids=tuple(sorted(acc_entity_ids[key])),
                 identity_status=acc_identity_status[key],
                 confidence=confidence,
+                riser_count=acc_riser_count.get(key, 0),
+                drop_count=acc_drop_count.get(key, 0),
             )
         )
 
@@ -381,6 +452,8 @@ def compute_service_takeoff(
         unscaled=has_unscaled,
         unassigned_run_count=unassigned_run_count,
         unknown_service_run_count=unknown_service_run_count,
+        total_risers=len(rise_symbols),
+        total_drops=len(drop_symbols),
     )
 
 

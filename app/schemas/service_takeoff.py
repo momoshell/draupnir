@@ -41,6 +41,8 @@ class ServiceTakeoffLineRead(BaseModel):
     confidence: float | None = Field(
         None, ge=0.0, le=1.0, description="Null in P3 (no scoring yet)"
     )
+    riser_count: int = Field(0, ge=0, description="Rise symbols in this (unknown, room) bucket")
+    drop_count: int = Field(0, ge=0, description="Drop symbols in this (unknown, room) bucket")
 
 
 class ServiceTakeoffScaleRead(BaseModel):
@@ -73,6 +75,8 @@ class ServiceTakeoffSummaryRead(BaseModel):
     unknown_service_runs: int = Field(
         ..., ge=0, description="Run groups with no resolved service identity"
     )
+    total_risers: int = Field(..., ge=0, description="Distinct rise symbols in this revision")
+    total_drops: int = Field(..., ge=0, description="Distinct drop symbols in this revision")
 
 
 class ServiceTakeoffResponse(BaseModel):

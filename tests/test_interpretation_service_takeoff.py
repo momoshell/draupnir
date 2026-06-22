@@ -12,6 +12,12 @@ from typing import Any
 from shapely.geometry import Polygon
 
 from app.interpretation.measurement import ScaleContext
+from app.interpretation.rise_drop import (
+    KIND_DROP,
+    KIND_RISE,
+    STATUS_RESOLVED,
+    RiseDropSymbol,
+)
 from app.interpretation.rooms import Room
 from app.interpretation.routed_runs import RunGroup
 from app.interpretation.run_service_identity import (
@@ -736,3 +742,183 @@ def test_unassigned_run_count_per_run_not_per_service() -> None:
         f"Dual-service bundle outside rooms: expected unassigned_run_count=1, "
         f"got {result.unassigned_run_count}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Rise/drop symbol count tests (spec tests 3-6)
+# ---------------------------------------------------------------------------
+
+
+def _make_symbol(
+    *,
+    kind: str = KIND_RISE,
+    anchor: tuple[float, float] = (500.0, 500.0),
+    discipline: str | None = "medical-gas",
+    entity_ids: tuple[str, ...] = ("arc-1",),
+    status: str = STATUS_RESOLVED,
+) -> RiseDropSymbol:
+    return RiseDropSymbol(
+        kind=kind,
+        anchor_point=anchor,
+        discipline=discipline,
+        colour_key=None,
+        entity_ids=entity_ids,
+        status=status,
+    )
+
+
+def test_rise_symbol_inside_room_counted_on_service_unknown_line() -> None:
+    """Spec test 3a: symbol anchor inside room R -> riser_count on SERVICE_UNKNOWN line for R."""
+    room = _square_room()  # (0,0) to (10000,10000)
+    sym = _make_symbol(anchor=(500.0, 500.0))  # inside
+
+    result = compute_service_takeoff(
+        runs=[],
+        identities=[],
+        geometry_by_entity_id={},
+        rooms=[room],
+        scale=_unknown_scale(),
+        rise_symbols=[sym],
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.service == SERVICE_UNKNOWN
+    assert ln.room_id == room.id
+    assert ln.riser_count == 1
+    assert ln.drop_count == 0
+    assert result.total_risers == 1
+    assert result.total_drops == 0
+
+
+def test_drop_symbol_outside_rooms_counted_on_unassigned_line() -> None:
+    """Spec test 3b: symbol anchor outside all rooms -> ROOM_UNASSIGNED_ID bucket."""
+    room = _square_room(x=0.0, y=0.0, size=100.0)  # small room
+    sym = _make_symbol(kind=KIND_DROP, anchor=(5000.0, 5000.0))  # far outside
+
+    result = compute_service_takeoff(
+        runs=[],
+        identities=[],
+        geometry_by_entity_id={},
+        rooms=[room],
+        scale=_unknown_scale(),
+        drop_symbols=[sym],
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.service == SERVICE_UNKNOWN
+    assert ln.room_id == ROOM_UNASSIGNED_ID
+    assert ln.drop_count == 1
+    assert ln.riser_count == 0
+    assert result.total_drops == 1
+
+
+def test_riser_counted_once_across_multiple_service_lines() -> None:
+    """Spec test 4: one riser in a discipline+room counted ONCE even with multiple resolved
+    service lines for that discipline+room.  The count lands on the SERVICE_UNKNOWN bucket,
+    NOT spread across VAC/AGSS lines.
+    """
+    room = _square_room()  # (0,0) to (10000,10000)
+
+    # Two service lines for VAC and AGSS in the same room.
+    identity = _make_identity(
+        entity_ids=("e1",),
+        services=(
+            _pipe_size("VAC", 54),
+            _pipe_size("AGSS", 42),
+        ),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=("e1",))
+    geometry = {"e1": _line_geom(500.0, 500.0, 1000.0, 500.0)}
+
+    sym = _make_symbol(anchor=(500.0, 500.0))  # inside the room
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[room],
+        scale=_unknown_scale(),
+        rise_symbols=[sym],
+    )
+
+    # There should be 3 lines: VAC, AGSS (from the run), + SERVICE_UNKNOWN (from the riser).
+    services = {ln.service for ln in result.lines}
+    assert SERVICE_UNKNOWN in services
+    assert "VAC" in services
+    assert "AGSS" in services
+
+    # The riser appears ONLY in the SERVICE_UNKNOWN line for room-1.
+    unknown_lines = [ln for ln in result.lines if ln.service == SERVICE_UNKNOWN]
+    assert len(unknown_lines) == 1
+    assert unknown_lines[0].riser_count == 1
+
+    # VAC and AGSS lines must have riser_count == 0.
+    for ln in result.lines:
+        if ln.service != SERVICE_UNKNOWN:
+            assert ln.riser_count == 0, (
+                f"Non-unknown service {ln.service} should have riser_count=0"
+            )
+
+    # Total is the distinct symbol count, not the sum of per-line counts.
+    assert result.total_risers == 1
+
+
+def test_total_counts_equal_distinct_symbol_counts() -> None:
+    """Spec test 5: total_risers/total_drops == len of input symbol sequences."""
+    rise_syms = [
+        _make_symbol(anchor=(100.0, 100.0), entity_ids=("a1",)),
+        _make_symbol(anchor=(200.0, 200.0), entity_ids=("a2",)),
+        _make_symbol(anchor=(300.0, 300.0), entity_ids=("a3",)),
+    ]
+    drop_syms = [
+        _make_symbol(kind=KIND_DROP, anchor=(400.0, 400.0), entity_ids=("b1",)),
+        _make_symbol(kind=KIND_DROP, anchor=(500.0, 500.0), entity_ids=("b2",)),
+    ]
+
+    result = compute_service_takeoff(
+        runs=[],
+        identities=[],
+        geometry_by_entity_id={},
+        rooms=[],
+        scale=_unknown_scale(),
+        rise_symbols=rise_syms,
+        drop_symbols=drop_syms,
+    )
+
+    assert result.total_risers == 3
+    assert result.total_drops == 2
+    # Sum of per-line counts also equals the totals (no duplication when all go to
+    # ROOM_UNASSIGNED_ID since there are no rooms).
+    total_line_risers = sum(ln.riser_count for ln in result.lines)
+    total_line_drops = sum(ln.drop_count for ln in result.lines)
+    assert total_line_risers == 3
+    assert total_line_drops == 2
+
+
+def test_no_rise_drop_args_regression() -> None:
+    """Spec test 6: compute_service_takeoff with no rise/drop args -> identical to before
+    (riser_count=0, drop_count=0 on all lines; total_risers/total_drops=0).
+    """
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, 1000.0, 0.0)}
+    identity = _make_identity(entity_ids=entity_ids, services=(_pipe_size("VAC", 54),))
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        # No rise_symbols / drop_symbols -- uses defaults.
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.riser_count == 0
+    assert ln.drop_count == 0
+    assert result.total_risers == 0
+    assert result.total_drops == 0
