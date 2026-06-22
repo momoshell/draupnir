@@ -21,8 +21,12 @@ from app.ingestion.runner import IngestionRunRequest
 from app.ingestion.validation.reconciliation import build_reconciliation
 from app.interpretation.measurement import ScaleContext
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, RiseDropEntity
-from app.interpretation.routed_runs import RoutedEntity
-from app.interpretation.run_service_identity import TagPlacement
+from app.interpretation.routed_runs import (
+    STATUS_UNKNOWN,
+    RoutedEntity,
+    identify_routed_runs,
+)
+from app.interpretation.run_service_identity import TagPlacement, fuse_run_service_identities
 from app.interpretation.service_legend import ServiceLegend
 from app.interpretation.service_takeoff_loaders import (
     ServiceTakeoffInputs,
@@ -108,8 +112,11 @@ def _build_payload_with(
     entities: list[dict[str, Any]],
     units: dict[str, Any] | None = None,
     pdf_scale: dict[str, Any] | None = None,
+    input_family: str = "dxf",
+    metadata: dict[str, Any] | None = None,
 ) -> IngestFinalizationPayload:
-    """Build a fake payload overriding entities and optionally units/pdf_scale."""
+    """Build a fake payload overriding entities and optionally units, pdf_scale, input_family,
+    and metadata."""
     entity_counts = {
         "layouts": 1,
         "layers": 1,
@@ -129,6 +136,8 @@ def _build_payload_with(
         canonical_json["units"] = units
     if pdf_scale is not None:
         canonical_json["pdf_scale"] = pdf_scale
+    if metadata is not None:
+        canonical_json["metadata"] = deepcopy(metadata)
 
     report_json: dict[str, Any] = {
         "validation_report_schema_version": _FAKE_RUNNER_VALIDATION_REPORT_SCHEMA_VERSION,
@@ -164,7 +173,7 @@ def _build_payload_with(
     result_envelope = {
         "adapter_key": _FAKE_RUNNER_ADAPTER_KEY,
         "adapter_version": _FAKE_RUNNER_ADAPTER_VERSION,
-        "input_family": "dxf",
+        "input_family": input_family,
         "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
         "canonical_json": canonical_json,
         "provenance_json": {},
@@ -175,6 +184,7 @@ def _build_payload_with(
     base = _build_fake_ingest_payload(request)
     return replace(
         base,
+        input_family=input_family,
         canonical_json=canonical_json,
         report_json=report_json,
         result_checksum_sha256=compute_adapter_result_checksum(result_envelope),
@@ -188,11 +198,20 @@ async def _ingest_with_payload(
     entities: list[dict[str, Any]],
     units: dict[str, Any] | None = None,
     pdf_scale: dict[str, Any] | None = None,
+    input_family: str = "dxf",
+    metadata: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """Upload a file, run ingest with the given entity list, return the revision_id."""
 
     async def _fake_run(request: IngestionRunRequest) -> IngestFinalizationPayload:
-        return _build_payload_with(request, entities=entities, units=units, pdf_scale=pdf_scale)
+        return _build_payload_with(
+            request,
+            entities=entities,
+            units=units,
+            pdf_scale=pdf_scale,
+            input_family=input_family,
+            metadata=metadata,
+        )
 
     monkeypatch.setattr(worker_module, "run_ingestion", _fake_run)
 
@@ -1338,3 +1357,437 @@ class TestLoadRiseDropEntities:
         assert len(drop_entities) == 1
         assert drop_entities[0].entity_type == "arc"
         assert drop_entities[0].layer_ref == "Drop Layer"
+
+
+# ---------------------------------------------------------------------------
+# PDF-vector seam tests (#626)
+# ---------------------------------------------------------------------------
+
+# Two distinct RGB colours for PDF entity fixtures (plain ASCII, no literal Ø).
+_PDF_COLOR_BLUE = {"index": None, "rgb": "#2d71ff", "by_layer": False, "by_block": False}
+_PDF_COLOR_GREY = {"index": None, "rgb": "#999999", "by_layer": False, "by_block": False}
+
+# Text blocks fixture — one pipe tag, one prose block.
+_PDF_TEXT_BLOCKS: list[dict[str, Any]] = [
+    {
+        "page_number": 1,
+        "layout": "Model",
+        "block_number": 0,
+        "bbox": {"x_min": 100.0, "y_min": 200.0, "x_max": 200.0, "y_max": 220.0},
+        "text": "54 mm VAC",
+    },
+    {
+        "page_number": 1,
+        "layout": "Model",
+        "block_number": 1,
+        "bbox": {"x_min": 10.0, "y_min": 10.0, "x_max": 300.0, "y_max": 30.0},
+        "text": "DRAWING NOTES",
+    },
+]
+
+
+def _make_pdf_entities() -> list[dict[str, Any]]:
+    """Two line entities with distinct rgb colours on pen-signature layer names."""
+    return [
+        _make_entity(
+            "pdf-line-blue",
+            "line",
+            "pen-0.25",  # meaningless pen-sig layer for PDF
+            {"start": [0.0, 0.0, 0.0], "end": [500.0, 0.0, 0.0]},
+            style={"color": _PDF_COLOR_BLUE},
+        ),
+        _make_entity(
+            "pdf-line-grey",
+            "line",
+            "pen-0.50",
+            {"start": [0.0, 100.0, 0.0], "end": [500.0, 100.0, 0.0]},
+            style={"color": _PDF_COLOR_GREY},
+        ),
+    ]
+
+
+@requires_database
+class TestPdfRoutedEntitiesSelectAll:
+    """load_routed_entities for pdf_vector: all entities returned, layer_ref normalised to None."""
+
+    async def test_pdf_select_all_layer_ref_none_colours_preserved(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF revision with two coloured lines on pen-sig layers: both returned,
+        every RoutedEntity.layer_ref is None, RGB colours preserved."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert len(entities) == 2
+        for ent in entities:
+            assert isinstance(ent, RoutedEntity)
+            assert ent.layer_ref is None, f"PDF layer_ref must be None; got {ent.layer_ref!r}"
+            assert ent.color is not None
+            assert ent.color.get("rgb") is not None
+
+        rgbs = {ent.color.get("rgb") for ent in entities if ent.color}
+        assert "#2d71ff" in rgbs
+        assert "#999999" in rgbs
+
+    async def test_pdf_colour_only_grouping_status_unknown(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF entities fed into identify_routed_runs with empty legend:
+        one group per distinct rgb, all STATUS_UNKNOWN, source_layers ()."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        result = identify_routed_runs(entities, ServiceLegend(entries=()))
+        groups = result.groups
+
+        assert len(groups) == 2, f"Expected 2 colour groups; got {len(groups)}"
+        for g in groups:
+            assert g.status == STATUS_UNKNOWN
+            assert g.source_layers == ()  # layer_ref None -> empty tuple
+            assert g.colour_rgb is not None
+
+    async def test_pdf_explicit_layer_refs_override(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit layer_refs= still takes precedence for PDF; layer_ref preserved."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(
+                db,
+                revision_id,
+                layer_refs=["pen-0.25"],
+                exclude_off_sheet=False,
+            )
+
+        assert len(entities) == 1
+        # Explicit path preserves the actual layer_ref value.
+        assert entities[0].layer_ref == "pen-0.25"
+        assert entities[0].color is not None
+        assert entities[0].color.get("rgb") == "#2d71ff"
+
+
+@requires_database
+class TestPdfTagPlacements:
+    """load_tag_placements for pdf_vector: sourced from metadata.text_blocks."""
+
+    async def test_pdf_tags_from_text_blocks(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """metadata.text_blocks with pipe-tag text and prose:
+        both returned as TagPlacement with centroid point and layer_ref None."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            metadata={"text_blocks": _PDF_TEXT_BLOCKS},
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id)
+
+        assert len(placements) == 2
+        texts = {p.text for p in placements}
+        assert "54 mm VAC" in texts
+        assert "DRAWING NOTES" in texts
+
+        for p in placements:
+            assert isinstance(p, TagPlacement)
+            assert p.layer_ref is None
+            assert len(p.point) == 2
+            # Centroid of the "54 mm VAC" bbox: x=(100+200)/2=150, y=(200+220)/2=210
+            if p.text == "54 mm VAC":
+                assert p.point == pytest.approx((150.0, 210.0))
+
+    async def test_pdf_tags_feed_fuse(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF tags from text_blocks + coloured entities fed into fuse_run_service_identities:
+        '54 mm VAC' attaches to nearest colour run; prose yields no service."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        # Blue entity near x=250 y=0; grey at x=250 y=100.
+        # Tag "54 mm VAC" centroid at (150, 210) — closer to grey run (y=100) than blue (y=0).
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            metadata={"text_blocks": _PDF_TEXT_BLOCKS},
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+            placements = await load_tag_placements(db, revision_id)
+
+        run_result = identify_routed_runs(entities, ServiceLegend(entries=()))
+        geometry_map: dict[str, Any] = {
+            ent.entity_id: ent.geometry for ent in entities if ent.geometry is not None
+        }
+        fuse_result = fuse_run_service_identities(
+            run_result.groups, geometry_map, placements, radius=5000.0
+        )
+
+        # "54 mm VAC" is parseable -> becomes a ServiceSize on the nearest run.
+        # "DRAWING NOTES" is not parseable -> silently skipped.
+        assigned_tag_texts = {
+            ss.source_tag_text for identity in fuse_result.identities for ss in identity.services
+        }
+        assert "54 mm VAC" in assigned_tag_texts, (
+            f"Expected '54 mm VAC' to appear as a service source tag; "
+            f"identities: {fuse_result.identities}"
+        )
+
+    async def test_pdf_no_text_blocks_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF revision with no metadata.text_blocks -> tag placements []."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            # No metadata kwarg -> no text_blocks.
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id)
+
+        assert placements == []
+
+    async def test_pdf_explicit_tag_layers_override(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit tag_layers= still uses entity-based path even for pdf_vector."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "tag-ent",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "HWS 50", "insertion": {"x": 10.0, "y": 10.0}},
+                ),
+            ],
+            input_family="pdf_vector",
+            metadata={"text_blocks": _PDF_TEXT_BLOCKS},
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id, tag_layers=["Pipe Tags"])
+
+        assert len(placements) == 1
+        assert placements[0].text == "HWS 50"
+        assert placements[0].layer_ref == "Pipe Tags"
+
+
+@requires_database
+class TestPdfDwgRegression:
+    """DWG/DXF paths byte-for-byte unchanged when input_family != pdf_vector."""
+
+    async def test_dwg_centerline_layer_ref_preserved(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DWG revision with centerline+pipe layers: selection uses token ilike,
+        RoutedEntity.layer_ref equals the actual row value."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 1, "rgb": "#ff0000", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "cl-001",
+                    "line",
+                    "Center Line",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "pipe-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 50.0, 0.0], "end": [1000.0, 50.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+            input_family="dwg",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        # Centerline preferred; layer_ref is the actual value (not None).
+        assert len(entities) == 1
+        assert entities[0].layer_ref == "Center Line"
+        assert entities[0].color is not None
+
+    async def test_dxf_layer_ref_preserved(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DXF revision: pipe-wall entities returned with row.layer_ref intact."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 2, "rgb": "#00ff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "p-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [500.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+            input_family="dxf",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert len(entities) == 1
+        assert entities[0].layer_ref == "Pipes"
+
+
+@requires_database
+class TestPdfHonestEmpty:
+    """Edge cases: empty/missing data never raises."""
+
+    async def test_pdf_no_routed_entities_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PDF revision with no routed entity types -> empty list."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "txt-001",
+                    "text",
+                    "pen-0.25",
+                    {"text": "NOTE", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+            ],
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert entities == []
+
+    async def test_pdf_legend_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """build_service_legend on PDF revision -> ServiceLegend with no colour entries
+        (PDFs have no legend-layer swatch entities — honest empty behaviour)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        assert len(legend.by_colour()) == 0
+
+    async def test_resolve_input_family_no_adapter_run_returns_none(
+        self,
+        cleanup_projects: None,
+    ) -> None:
+        """_resolve_input_family with unknown revision_id -> None, no raise."""
+        from app.interpretation.service_takeoff_loaders import _resolve_input_family
+
+        _ = (self, cleanup_projects)
+
+        async with _get_session() as db:
+            family = await _resolve_input_family(db, uuid.uuid4())
+
+        assert family is None
