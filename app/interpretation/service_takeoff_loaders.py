@@ -54,6 +54,15 @@ from app.interpretation.service_legend import (
 # Layers bearing routed linework: anything matching these tokens (case-insensitive).
 _DEFAULT_PIPE_LAYER_TOKENS: tuple[str, ...] = ("pipe",)
 
+# Centerline layers carry the single-line route and are preferred over double-line pipe
+# wall layers (which double-count measured length when both walls are present).
+_DEFAULT_CENTERLINE_LAYER_TOKENS: tuple[str, ...] = (
+    "center line",
+    "centre line",
+    "centerline",
+    "centreline",
+)
+
 # Layers bearing pipe-tag text annotations.
 _DEFAULT_TAG_LAYER_TOKENS: tuple[str, ...] = ("pipe tag", "pipetag", "tag")
 
@@ -176,8 +185,9 @@ async def load_routed_entities(
 ) -> list[RoutedEntity]:
     """Load line/polyline/arc entities from routed-run layers as :class:`RoutedEntity`.
 
-    When ``layer_refs`` is None, loads from all layers matching the default pipe-layer
-    token patterns (ilike). Returns an empty list for degenerate revisions; never raises.
+    When ``layer_refs`` is None, queries centerline-token layers first; falls back to
+    pipe-token layers only when no centerline entities are found. Returns an empty list
+    for degenerate revisions; never raises.
     """
     if layer_refs is not None:
         rows = await load_revision_entities_by_type(
@@ -193,21 +203,25 @@ async def load_routed_entities(
 
         from app.models.revision_materialization import RevisionEntity
 
-        query = select(RevisionEntity).where(
-            RevisionEntity.drawing_revision_id == revision_id,
-            RevisionEntity.entity_type.in_(list(ROUTED_ENTITY_TYPES)),
-        )
-        if exclude_off_sheet:
-            query = query.where(RevisionEntity.on_sheet.isnot(False))
-        layer_conditions = [
-            RevisionEntity.layer_ref.ilike(f"%{token}%") for token in _DEFAULT_PIPE_LAYER_TOKENS
-        ]
-        if len(layer_conditions) == 1:
-            query = query.where(layer_conditions[0])
-        else:
-            query = query.where(or_(*layer_conditions))
-        query = query.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
-        rows = list((await db.execute(query)).scalars().all())
+        async def _query_by_tokens(tokens: tuple[str, ...]) -> list[Any]:
+            q = select(RevisionEntity).where(
+                RevisionEntity.drawing_revision_id == revision_id,
+                RevisionEntity.entity_type.in_(list(ROUTED_ENTITY_TYPES)),
+            )
+            if exclude_off_sheet:
+                q = q.where(RevisionEntity.on_sheet.isnot(False))
+            # Token tuples are non-empty constants, so or_ always receives at least one arg.
+            conditions = [RevisionEntity.layer_ref.ilike(f"%{token}%") for token in tokens]
+            q = q.where(or_(*conditions))
+            q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+            return list((await db.execute(q)).scalars().all())
+
+        # Prefer centerline layers (single-line route) over pipe-wall layers. Pipe-outline
+        # layers may double-count measured length when both walls of a double-line pipe are
+        # present; true double-line detection is a deferred follow-up.
+        rows = await _query_by_tokens(_DEFAULT_CENTERLINE_LAYER_TOKENS)
+        if not rows:
+            rows = await _query_by_tokens(_DEFAULT_PIPE_LAYER_TOKENS)
 
     result: list[RoutedEntity] = []
     for row in rows:

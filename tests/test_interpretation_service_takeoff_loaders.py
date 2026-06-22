@@ -384,6 +384,170 @@ class TestLoadRoutedEntities:
 
 
 @requires_database
+class TestCenterlinePreference:
+    """load_routed_entities (layer_refs=None) prefers centerline layers over pipe-wall layers."""
+
+    async def test_centerline_preferred_when_present(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When both a Center Line layer and a Pipes layer exist, only Center Line entities
+        are returned — the pipe-wall double-count is avoided."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 150, "rgb": "#aaaaaa", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "centerline-001",
+                    "line",
+                    "Center Line",
+                    {"start": [0.0, 0.0, 0.0], "end": [244000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "pipe-wall-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 50.0, 0.0], "end": [244000.0, 50.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "pipe-wall-002",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, -50.0, 0.0], "end": [244000.0, -50.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        layer_refs_returned = {e.layer_ref for e in entities}
+        assert layer_refs_returned == {"Center Line"}, (
+            f"Expected only Center Line entities; got layers: {layer_refs_returned}"
+        )
+        assert len(entities) == 1
+
+    async def test_fallback_when_no_centerline_layer(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When no centerline layer exists, pipe-wall entities are returned (existing behaviour)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 3, "rgb": "#00ff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "pipe-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "pipe-002",
+                    "line",
+                    "Pipe Fittings",
+                    {"start": [1000.0, 0.0, 0.0], "end": [2000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert {e.layer_ref for e in entities} == {"Pipes", "Pipe Fittings"}
+        assert len(entities) == 2
+
+    async def test_explicit_layer_refs_overrides_centerline_preference(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit layer_refs overrides the centerline-preference logic; caller wins."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        color = {"index": 150, "rgb": "#aaaaaa", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "centerline-001",
+                    "line",
+                    "Center Line",
+                    {"start": [0.0, 0.0, 0.0], "end": [244000.0, 0.0, 0.0]},
+                    style={"color": color},
+                ),
+                _make_entity(
+                    "pipe-wall-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 50.0, 0.0], "end": [244000.0, 50.0, 0.0]},
+                    style={"color": color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(
+                db, revision_id, layer_refs=["Pipes"], exclude_off_sheet=False
+            )
+
+        layer_refs_returned = {e.layer_ref for e in entities}
+        assert layer_refs_returned == {"Pipes"}, (
+            f"Explicit layer_refs=['Pipes'] must override centerline preference; "
+            f"got layers: {layer_refs_returned}"
+        )
+        assert len(entities) == 1
+
+    async def test_no_routed_layers_returns_empty_list(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revision with no centerline or pipe layers -> empty list, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "wall-001",
+                    "line",
+                    "A-WALL",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert entities == []
+
+
+@requires_database
 class TestLoadTagPlacements:
     """load_tag_placements extracts text entities with non-None insertion points."""
 
