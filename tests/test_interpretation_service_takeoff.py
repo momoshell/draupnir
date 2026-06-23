@@ -9,6 +9,7 @@ from __future__ import annotations
 import random
 from typing import Any
 
+import pytest
 from shapely.geometry import Polygon
 
 from app.interpretation.measurement import ScaleContext
@@ -1058,3 +1059,88 @@ def test_measured_length_by_group_none_reproduces_current_results() -> None:
 
     assert result_default.lines[0].drawing_length == result_explicit_none.lines[0].drawing_length
     assert result_default.lines[0].drawing_length == 3000.0
+
+
+# ---------------------------------------------------------------------------
+# LP2 (#654): per-room centerline clipping
+# ---------------------------------------------------------------------------
+
+
+def test_lp2_clip_splits_length_across_rooms() -> None:
+    """A measured run spanning two rooms has its length distributed per room, not all-to-one.
+
+    Two adjacent 10000-du square rooms; a horizontal centerline crossing both (10000 du in each).
+    Pre-LP2 the whole 20000 du landed in the single anchor room; LP2 clips per room.
+    """
+    room_a = _square_room(x=0.0, room_id="room-a")
+    room_b = _square_room(x=10000.0, room_id="room-b")
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    polylines = (((0.0, 5000.0), (20000.0, 5000.0)),)
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 20000.0, 5000.0)},
+        rooms=[room_a, room_b],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 20000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert set(by_room) == {"room-a", "room-b"}
+    assert by_room["room-a"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert by_room["room-b"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert by_room["room-a"].real_length_m == pytest.approx(10.0, rel=1e-3)
+    assert by_room["room-b"].real_length_m == pytest.approx(10.0, rel=1e-3)
+    # run_count is NOT inflated: the run's per-room partitions land in DISTINCT buckets, so each
+    # bucket counts the run exactly once (regression guard against per-partition double-counting).
+    assert by_room["room-a"].run_count == 1
+    assert by_room["room-b"].run_count == 1
+
+
+def test_lp2_falls_back_to_anchor_without_geometry() -> None:
+    """No persisted geometry -> pre-LP2 behaviour: whole length to the single anchor room."""
+    room_a = _square_room(x=0.0, room_id="room-a")
+    room_b = _square_room(x=10000.0, room_id="room-b")
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        # Anchor (midpoint ~ (5000, 5000)) falls in room-a.
+        geometry_by_entity_id={"e1": _line_geom(1000.0, 5000.0, 9000.0, 5000.0)},
+        rooms=[room_a, room_b],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 8000.0},
+        measured_geometry_by_group=None,
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert set(by_room) == {"room-a"}
+    assert by_room["room-a"].drawing_length == pytest.approx(8000.0, rel=1e-3)
+
+
+def test_lp2_length_outside_all_rooms_is_unassigned() -> None:
+    """Centerline length that falls outside every room polygon lands in the unassigned bucket."""
+    room_a = _square_room(x=0.0, size=10000.0, room_id="room-a")
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    # First half inside room-a (5000 du), second half outside any room (5000 du).
+    polylines = (((0.0, 5000.0), (15000.0, 5000.0)),)
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 15000.0, 5000.0)},
+        rooms=[room_a],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 15000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert by_room["room-a"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert ROOM_UNASSIGNED_ID in by_room
+    assert by_room[ROOM_UNASSIGNED_ID].drawing_length == pytest.approx(5000.0, rel=1e-3)
+    # A run with any length outside all rooms is counted once as unassigned.
+    assert result.unassigned_run_count == 1

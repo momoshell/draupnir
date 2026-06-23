@@ -31,6 +31,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from shapely.geometry import LineString, MultiLineString
+
 from app.interpretation.geometry import point_in_polygon
 from app.interpretation.measurement import (
     ScaleContext,
@@ -211,6 +213,71 @@ def _containing_room(point: tuple[float, float], rooms: Sequence[Room]) -> Room 
     return min(containing, key=lambda r: (r.area if r.area is not None else 0.0, r.id))
 
 
+# Lengths are drawing units (mm or PDF points); 1e-9 safely drops only zero-length point/
+# degenerate clip results, never a legitimate room crossing at architectural scales.
+_CLIP_EPS = 1e-9
+
+
+def _partition_polylines_by_room(
+    polylines: tuple[tuple[tuple[float, float], ...], ...],
+    rooms: Sequence[Room],
+) -> list[tuple[Room | None, float]]:
+    """Distribute centerline polyline length across rooms by clipping (#654, LP2).
+
+    Each polyline segment is assigned to the SMALLEST room whose polygon contains it: rooms are
+    processed area-ascending and claimed geometry is subtracted as we go, so nested/overlapping
+    rooms never double-count. Length not inside any room falls to the unassigned bucket
+    (``room=None``). Lengths are drawing units — polylines and room polygons share the drawing
+    coordinate space; scale is applied per bucket downstream. Returns ``[]`` when there is no
+    usable line geometry (caller falls back to anchor attribution).
+    """
+    lines = [LineString(pl) for pl in polylines if len(pl) >= 2]
+    if not lines:
+        return []
+    remaining: Any = MultiLineString(lines) if len(lines) > 1 else lines[0]
+    partitions: list[tuple[Room | None, float]] = []
+    rooms_with_polygon = sorted(
+        (r for r in rooms if r.polygon is not None and r.area is not None),
+        key=lambda r: (r.area if r.area is not None else 0.0, r.id),
+    )
+    for room in rooms_with_polygon:
+        if remaining.is_empty:
+            break
+        inside = remaining.intersection(room.polygon)
+        length = float(inside.length)
+        if length > _CLIP_EPS:
+            partitions.append((room, length))
+            remaining = remaining.difference(room.polygon)
+    remainder = float(remaining.length) if not remaining.is_empty else 0.0
+    if remainder > _CLIP_EPS:
+        partitions.append((None, remainder))
+    return partitions
+
+
+def _anchor_partition(
+    identity: RunServiceIdentity,
+    rooms: Sequence[Room],
+    geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
+    measured_length_by_group: Mapping[tuple[str | None, str | None], float] | None,
+    run_key: tuple[str | None, str | None],
+) -> list[tuple[Room | None, float]]:
+    """Fallback attribution: the whole run length to its single anchor-containing room.
+
+    Used when the group has no persisted centerline geometry (passthrough / unmeasured) — the
+    pre-LP2 behaviour, preserved unchanged so non-geometry groups never regress. The drawn length
+    is the materialized scalar when present, else the naive entity-sum.
+    """
+    if measured_length_by_group is not None and run_key in measured_length_by_group:
+        drawn = measured_length_by_group[run_key]
+    else:
+        drawn = _entity_drawn_length(identity.entity_ids, geometry_by_entity_id)
+    anchor = _run_anchor(identity.entity_ids, geometry_by_entity_id)
+    room = _containing_room(anchor, rooms) if anchor is not None else None
+    # Always one partition, even when drawn==0 (e.g. arc-only runs): the run still produces a
+    # bucket entry so it is never silently dropped (pre-LP2 invariant).
+    return [(room, drawn)]
+
+
 def _worst_status(a: str, b: str) -> str:
     """Return the status with the lower rank (worse)."""
     return a if _STATUS_RANK.get(a, 0) <= _STATUS_RANK.get(b, 0) else b
@@ -231,14 +298,24 @@ def compute_service_takeoff(
     rise_symbols: Sequence[RiseDropSymbol] = (),
     drop_symbols: Sequence[RiseDropSymbol] = (),
     measured_length_by_group: Mapping[tuple[str | None, str | None], float] | None = None,
+    measured_geometry_by_group: (
+        Mapping[tuple[str | None, str | None], tuple[tuple[tuple[float, float], ...], ...]] | None
+    ) = None,
 ) -> ServiceTakeoffResult:
     """Compose run identities into per-(service, size, room) length totals.
 
     Matches each identity to its RunGroup by VALUE of (layer_ref, colour_key).
     Uses the bundle-length model: each service in a multi-service identity receives
     the full drawn length of the run (see module docstring).  A run with no services
-    is counted in the SERVICE_UNKNOWN bucket; a run whose anchor falls outside all
-    rooms is counted in ROOM_UNASSIGNED_ID.  No run is ever dropped.
+    is counted in the SERVICE_UNKNOWN bucket.  No run is ever dropped.
+
+    Room attribution (#654, LP2): when ``measured_geometry_by_group`` carries the group's
+    persisted centerline polylines, the run's length is DISTRIBUTED across rooms by clipping
+    (see :func:`_partition_polylines_by_room`) — a corridor spanning rooms is split per room,
+    and any length outside all rooms lands in ROOM_UNASSIGNED_ID.  Without geometry the run
+    falls back to the whole length in its single anchor-containing room (pre-LP2 behaviour).
+    ``unassigned_run_count`` counts runs with ANY length outside all rooms;
+    ``unknown_service_run_count`` counts service-less runs — both once per run, not per room.
 
     Rise/drop symbols (``rise_symbols`` / ``drop_symbols``) are counted per room and
     accumulated into a dedicated SERVICE_UNKNOWN bucket for each (discipline, room)
@@ -305,56 +382,47 @@ def compute_service_takeoff(
     unknown_service_run_count = 0
 
     for identity in identities:
-        # Prefer materialized skeleton length when the group has been computed;
-        # fall back to naive entity-sum when the key is absent (or mapping is None).
         run_key = (identity.layer_ref, identity.colour_key)
-        if measured_length_by_group is not None and run_key in measured_length_by_group:
-            drawn = measured_length_by_group[run_key]
-        else:
-            drawn = _entity_drawn_length(identity.entity_ids, geometry_by_entity_id)
 
-        # Compute run anchor for room scoping.
-        anchor = _run_anchor(identity.entity_ids, geometry_by_entity_id)
-        room = _containing_room(anchor, rooms) if anchor is not None else None
+        # LP2 (#654): when the group has persisted centerline geometry, distribute its measured
+        # length across rooms by clipping the polylines; otherwise fall back to the pre-LP2 rule
+        # (whole length -> the single anchor-containing room). Honest degradation, no guessing.
+        polylines = (
+            measured_geometry_by_group.get(run_key)
+            if measured_geometry_by_group is not None
+            else None
+        )
+        partitions: list[tuple[Room | None, float]] = []
+        if polylines:
+            partitions = _partition_polylines_by_room(polylines, rooms)
+        if not partitions:
+            partitions = _anchor_partition(
+                identity, rooms, geometry_by_entity_id, measured_length_by_group, run_key
+            )
 
-        if room is None:
-            room_id = ROOM_UNASSIGNED_ID
-            room_name: str | None = None
-            room_number: str | None = None
+        # Run-level diagnostic counters (counted once per run, not per room partition).
+        if not identity.services:
+            unknown_service_run_count += 1
+        if any(room is None for room, _ in partitions):
             unassigned_run_count += 1
-        else:
-            room_id = room.id
-            room_name = room.name
-            room_number = room.number
 
         # Determine competing_disciplines from the matched RunGroup.
         matched_run = runs_by_key.get(run_key)
         has_conflict = bool(matched_run and matched_run.competing_disciplines)
 
-        if not identity.services:
-            # No services -> SERVICE_UNKNOWN bucket.
-            unknown_service_run_count += 1
-            key: _BucketKey = (SERVICE_UNKNOWN, None, None, room_id)
-            _accumulate(
-                key=key,
-                drawn=drawn,
-                identity=identity,
-                has_conflict=has_conflict,
-                room_name=room_name,
-                room_number=room_number,
-                acc_drawing_length=acc_drawing_length,
-                acc_run_count=acc_run_count,
-                acc_entity_ids=acc_entity_ids,
-                acc_identity_status=acc_identity_status,
-                acc_has_conflict=acc_has_conflict,
-                acc_room_name=acc_room_name,
-                acc_room_number=acc_room_number,
-                acc_discipline=acc_discipline,
-            )
-        else:
-            # Bundle-length model: attribute FULL drawn length to EACH service.
-            for ss in identity.services:
-                key = (ss.service, ss.size.raw, ss.size.kind, room_id)
+        for room, drawn in partitions:
+            if room is None:
+                room_id = ROOM_UNASSIGNED_ID
+                room_name: str | None = None
+                room_number: str | None = None
+            else:
+                room_id = room.id
+                room_name = room.name
+                room_number = room.number
+
+            if not identity.services:
+                # No services -> SERVICE_UNKNOWN bucket.
+                key: _BucketKey = (SERVICE_UNKNOWN, None, None, room_id)
                 _accumulate(
                     key=key,
                     drawn=drawn,
@@ -371,6 +439,26 @@ def compute_service_takeoff(
                     acc_room_number=acc_room_number,
                     acc_discipline=acc_discipline,
                 )
+            else:
+                # Bundle-length model: attribute the (per-room) drawn length to EACH service.
+                for ss in identity.services:
+                    key = (ss.service, ss.size.raw, ss.size.kind, room_id)
+                    _accumulate(
+                        key=key,
+                        drawn=drawn,
+                        identity=identity,
+                        has_conflict=has_conflict,
+                        room_name=room_name,
+                        room_number=room_number,
+                        acc_drawing_length=acc_drawing_length,
+                        acc_run_count=acc_run_count,
+                        acc_entity_ids=acc_entity_ids,
+                        acc_identity_status=acc_identity_status,
+                        acc_has_conflict=acc_has_conflict,
+                        acc_room_name=acc_room_name,
+                        acc_room_number=acc_room_number,
+                        acc_discipline=acc_discipline,
+                    )
 
     # Process rise/drop symbols: map each to its containing room and accumulate counts
     # into the SERVICE_UNKNOWN bucket for that room.  Counts are scale-free; no length
