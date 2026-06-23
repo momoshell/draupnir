@@ -29,6 +29,7 @@ from app.estimating.quantities.contracts import (
 from app.exports._base import ExportArtifact
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
 from app.ingestion.finalization import IngestFinalizationPayload
+from app.jobs.centerline_materialization import materialize_centerline_lengths
 from app.jobs.db_write import _bulk_insert_model_rows
 from app.jobs.estimate_assembly import (
     _build_estimate_engine_input as _build_estimate_engine_input,
@@ -1461,6 +1462,120 @@ async def _finalize_changeset_apply_job(
                 "drawing_revision_id": str(drawing_revision_id),
                 "validation_report_id": str(validation_report_id),
                 "change_set_id": str(apply_result.change_set_id),
+            },
+            session=session,
+        )
+        await session.commit()
+
+    return True
+
+
+async def _finalize_centerline_job(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    deps: WorkerDeps,
+) -> bool:
+    """Materialize per-group centerline lengths and mark the job succeeded.
+
+    Idempotent: uses INSERT ... ON CONFLICT DO NOTHING, so running the same
+    (revision, group, version) twice produces exactly one row.  The session
+    used here is separate from the ingest transaction (lazy read-triggered).
+    """
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    async with session_maker() as session:
+        locked_source = await deps.lock_job_source(session, job_id)
+        job = locked_source.job
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            logger.info(
+                "centerline_job_completion_skipped_terminal_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if not _job_attempt_is_current(job, attempt_token=attempt_token):
+            logger.info(
+                "centerline_job_completion_skipped_stale_attempt",
+                job_id=str(job_id),
+            )
+            return False
+
+        if job.cancel_requested:
+            deps.finalize_job_cancelled(job)
+            await deps.emit_job_event(
+                job.id,
+                level="warning",
+                message="Job cancelled",
+                data_json={"status": "cancelled"},
+                session=session,
+            )
+            await session.commit()
+            logger.info("centerline_job_cancelled", job_id=str(job_id))
+            return False
+
+        if job.status != "running":
+            logger.info(
+                "centerline_job_completion_skipped_non_running_status",
+                job_id=str(job_id),
+                status=job.status,
+            )
+            return False
+
+        if (
+            locked_source.project.deleted_at is not None
+            or locked_source.source_file is None
+            or locked_source.source_file.deleted_at is not None
+        ):
+            await deps.cancel_job_for_inactive_source(
+                session,
+                job,
+                reason="source_deleted",
+                attempt_token=attempt_token,
+            )
+            logger.info("centerline_job_cancelled_inactive_source", job_id=str(job_id))
+            return False
+
+        drawing_revision_id = job.base_revision_id
+        if drawing_revision_id is None:
+            raise ValueError("Centerline job is missing base_revision_id")
+
+        manifest = await _get_revision_entity_manifest_for_revision(
+            session,
+            project_id=job.project_id,
+            source_file_id=job.file_id,
+            drawing_revision_id=drawing_revision_id,
+        )
+        if manifest is None:
+            raise RuntimeError(f"No entity manifest found for revision {drawing_revision_id}")
+
+        await materialize_centerline_lengths(
+            session,
+            job_id=job_id,
+            project_id=job.project_id,
+            source_file_id=job.file_id,
+            drawing_revision_id=drawing_revision_id,
+            adapter_run_output_id=manifest.adapter_run_output_id,
+            canonical_entity_schema_version=manifest.canonical_entity_schema_version,
+        )
+
+        job.status = "succeeded"
+        job.finished_at = _utcnow()
+        job.error_code = None
+        job.error_message = None
+        _clear_job_attempt_lease(job)
+        await deps.emit_job_event(
+            job.id,
+            level="info",
+            message="Job succeeded",
+            data_json={
+                "status": "succeeded",
+                "attempts": job.attempts,
+                "drawing_revision_id": str(drawing_revision_id),
             },
             session=session,
         )

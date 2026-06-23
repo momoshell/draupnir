@@ -14,6 +14,7 @@ type JobTypeName = Literal[
     "estimate",
     "export",
     "changeset_apply",
+    "centerline",
 ]
 
 
@@ -101,6 +102,15 @@ JOB_HANDLERS: Final[tuple[JobHandler, ...]] = (
         enqueue_publisher_name="enqueue_changeset_apply_job",
         enqueue_error_message="Failed to enqueue changeset apply job",
     ),
+    JobHandler(
+        job_type_name="centerline",
+        execute_name="_execute_centerline_job_attempt",
+        finalize_name="_finalize_centerline_job",
+        process_name="process_centerline_job",
+        run_task_name="run_centerline_job",
+        enqueue_publisher_name="enqueue_centerline_job",
+        enqueue_error_message="Failed to enqueue centerline job",
+    ),
 )
 
 _JOB_HANDLERS_BY_TYPE: Final[dict[str, JobHandler]] = {
@@ -180,6 +190,19 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             duplicate_delivery="changeset_apply_job_duplicate_delivery_skipped_running_attempt",
             max_attempts_exceeded="changeset_apply_job_max_attempts_exceeded",
             cancelled="changeset_apply_job_cancelled",
+        ),
+    ),
+    BeginOrResumeRoute(
+        process_name="process_centerline_job",
+        supported_job_types=_job_types_for_process("process_centerline_job"),
+        log_keys=BeginOrResumeLogKeys(
+            unsupported_type="centerline_job_unsupported_type_skipped",
+            terminal_status="centerline_job_skipped_terminal_status",
+            inactive_source="centerline_job_cancelled_inactive_source",
+            reclaimed_stale_running="centerline_job_reclaimed_stale_running_status",
+            duplicate_delivery="centerline_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="centerline_job_max_attempts_exceeded",
+            cancelled="centerline_job_cancelled",
         ),
     ),
 )

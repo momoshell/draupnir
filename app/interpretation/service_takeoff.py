@@ -230,6 +230,7 @@ def compute_service_takeoff(
     scale: ScaleContext,
     rise_symbols: Sequence[RiseDropSymbol] = (),
     drop_symbols: Sequence[RiseDropSymbol] = (),
+    measured_length_by_group: Mapping[tuple[str | None, str | None], float] | None = None,
 ) -> ServiceTakeoffResult:
     """Compose run identities into per-(service, size, room) length totals.
 
@@ -262,6 +263,11 @@ def compute_service_takeoff(
         Clustered rise symbols from ``cluster_rise_drop_symbols``; default empty.
     drop_symbols:
         Clustered drop symbols from ``cluster_rise_drop_symbols``; default empty.
+    measured_length_by_group:
+        Optional mapping of ``(layer_ref, colour_key) -> skeleton_length_du`` from
+        materialized centerline rows.  When a key is present, the measured length
+        overrides the naive ``_entity_drawn_length`` sum for that group.  When
+        ``None`` (default) the coordinator is byte-identical to its prior behaviour.
     """
     if not identities and not rise_symbols and not drop_symbols:
         return ServiceTakeoffResult(
@@ -299,8 +305,13 @@ def compute_service_takeoff(
     unknown_service_run_count = 0
 
     for identity in identities:
-        # Measure drawn length from this identity's entity_ids.
-        drawn = _entity_drawn_length(identity.entity_ids, geometry_by_entity_id)
+        # Prefer materialized skeleton length when the group has been computed;
+        # fall back to naive entity-sum when the key is absent (or mapping is None).
+        run_key = (identity.layer_ref, identity.colour_key)
+        if measured_length_by_group is not None and run_key in measured_length_by_group:
+            drawn = measured_length_by_group[run_key]
+        else:
+            drawn = _entity_drawn_length(identity.entity_ids, geometry_by_entity_id)
 
         # Compute run anchor for room scoping.
         anchor = _run_anchor(identity.entity_ids, geometry_by_entity_id)
@@ -317,7 +328,6 @@ def compute_service_takeoff(
             room_number = room.number
 
         # Determine competing_disciplines from the matched RunGroup.
-        run_key = (identity.layer_ref, identity.colour_key)
         matched_run = runs_by_key.get(run_key)
         has_conflict = bool(matched_run and matched_run.competing_disciplines)
 

@@ -922,3 +922,139 @@ def test_no_rise_drop_args_regression() -> None:
     assert ln.drop_count == 0
     assert result.total_risers == 0
     assert result.total_drops == 0
+
+
+# ---------------------------------------------------------------------------
+# measured_length_by_group override tests (C0 / be-639b)
+# ---------------------------------------------------------------------------
+
+
+def test_measured_length_by_group_overrides_naive_sum_for_matching_key() -> None:
+    """A matching (layer_ref, colour_key) in measured_length_by_group replaces naive sum.
+
+    The entity geometry gives 3000 drawing units; the injected measured length
+    is 9999.0.  The line's drawing_length must use the measured value.
+    """
+    entity_ids = ("m1",)
+    geometry = {"m1": _line_geom(0.0, 0.0, 3000.0, 0.0)}
+
+    run = _make_run(layer_ref="PIPE", colour_key="red", entity_ids=entity_ids)
+    identity = _make_identity(
+        layer_ref="PIPE",
+        colour_key="red",
+        entity_ids=entity_ids,
+        services=(_pipe_size("VAC", 54),),
+        status=IDENTITY_RESOLVED,
+    )
+
+    measured: dict[tuple[str | None, str | None], float] = {("PIPE", "red"): 9999.0}
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        measured_length_by_group=measured,
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].drawing_length == 9999.0, (
+        f"Expected 9999.0 (measured), got {result.lines[0].drawing_length}"
+    )
+
+
+def test_measured_length_by_group_pdf_case_none_layer_ref() -> None:
+    """PDF revisions have layer_ref=None; (None, colour_key) must match correctly."""
+    entity_ids = ("p1",)
+    geometry = {"p1": _line_geom(0.0, 0.0, 1000.0, 0.0)}
+
+    run = _make_run(layer_ref=None, colour_key="#ff0000", entity_ids=entity_ids)
+    identity = _make_identity(
+        layer_ref=None,
+        colour_key="#ff0000",
+        entity_ids=entity_ids,
+        services=(_pipe_size("VAC", 54),),
+        status=IDENTITY_RESOLVED,
+    )
+
+    measured: dict[tuple[str | None, str | None], float] = {(None, "#ff0000"): 5500.0}
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        measured_length_by_group=measured,
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].drawing_length == 5500.0, (
+        f"Expected 5500.0 (measured), got {result.lines[0].drawing_length}"
+    )
+
+
+def test_measured_length_by_group_non_matching_key_falls_back_to_naive() -> None:
+    """A key absent from measured_length_by_group uses the naive entity-sum."""
+    entity_ids = ("n1",)
+    geometry = {"n1": _line_geom(0.0, 0.0, 2000.0, 0.0)}
+
+    run = _make_run(layer_ref="PIPE", colour_key="blue", entity_ids=entity_ids)
+    identity = _make_identity(
+        layer_ref="PIPE",
+        colour_key="blue",
+        entity_ids=entity_ids,
+        services=(_pipe_size("MA", 42),),
+        status=IDENTITY_RESOLVED,
+    )
+
+    # Only a different key is in the mapping -- "blue" must fall back.
+    measured: dict[tuple[str | None, str | None], float] = {("PIPE", "red"): 9999.0}
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        measured_length_by_group=measured,
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].drawing_length == 2000.0, (
+        f"Expected 2000.0 (naive), got {result.lines[0].drawing_length}"
+    )
+
+
+def test_measured_length_by_group_none_reproduces_current_results() -> None:
+    """measured_length_by_group=None must be byte-identical to the old default.
+
+    Regression guard: the None path must match compute_service_takeoff without
+    the kwarg (which also defaults to None).
+    """
+    entity_ids = ("r1", "r2")
+    geometry = {
+        "r1": _line_geom(0.0, 0.0, 1500.0, 0.0),
+        "r2": _line_geom(1500.0, 0.0, 3000.0, 0.0),
+    }
+    run = _make_run(entity_ids=entity_ids)
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("VAC", 54),),
+        status=IDENTITY_RESOLVED,
+    )
+
+    shared_kwargs: dict[str, Any] = {
+        "runs": [run],
+        "identities": [identity],
+        "geometry_by_entity_id": geometry,
+        "rooms": [],
+        "scale": _unknown_scale(),
+    }
+
+    result_default = compute_service_takeoff(**shared_kwargs)
+    result_explicit_none = compute_service_takeoff(**shared_kwargs, measured_length_by_group=None)
+
+    assert result_default.lines[0].drawing_length == result_explicit_none.lines[0].drawing_length
+    assert result_default.lines[0].drawing_length == 3000.0

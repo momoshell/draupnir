@@ -328,6 +328,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "estimation_catalog_resolver": "db_estimation_export",
     "export_job_input_contract": "db_estimation_export",
     "quantity_takeoff_persistence": "db_estimation_export",
+    "centerline_enqueue": "db_worker",
     "append_only_lineage_tables": "db_lineage",
     "changeset_validation": "db_lineage",
     "changeset_persistence": "db_lineage",
