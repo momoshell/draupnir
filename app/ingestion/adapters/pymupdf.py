@@ -2113,6 +2113,27 @@ def _parse_scale_ratio(
     return numerator, denominator, str(block.get("text") or ""), confidence
 
 
+def _distinct_scale_ratios(
+    text_blocks: Sequence[Mapping[str, Any]],
+) -> list[tuple[int, int]]:
+    """Return the sorted set of distinct architectural scale ratios present in the text.
+
+    Uses the same candidate filter as ``_parse_scale_ratio`` (one side == 1), so the count is
+    consistent with what the single-ratio path would consider. More than one distinct ratio means
+    the sheet is genuinely multi-scale (the Revit "As indicated" case): no single sheet-wide factor
+    is correct, so the caller must not confidently pick one (#636, ADR-004).
+    """
+
+    distinct: set[tuple[int, int]] = set()
+    for block in text_blocks:
+        text = str(block.get("text") or "")
+        for match in _SCALE_RATIO_RE.finditer(text):
+            numerator, denominator = int(match.group(1)), int(match.group(2))
+            if numerator >= 1 and denominator >= 1 and (numerator == 1 or denominator == 1):
+                distinct.add((numerator, denominator))
+    return sorted(distinct)
+
+
 def _parse_real_world_unit(
     text_blocks: Sequence[Mapping[str, Any]],
 ) -> tuple[str, str] | None:
@@ -2144,6 +2165,22 @@ def _derive_pdf_scale(text_blocks: Sequence[Mapping[str, Any]]) -> dict[str, JSO
     if any(_DO_NOT_SCALE_RE.search(str(block.get("text") or "")) for block in text_blocks):
         scale["caveats"] = ("do_not_scale",)
 
+    unit_result = _parse_real_world_unit(text_blocks)
+    if unit_result is not None:
+        scale["real_world_unit"] = unit_result[0]
+        scale["real_world_unit_source"] = unit_result[1]
+
+    distinct_ratios = _distinct_scale_ratios(text_blocks)
+    if len(distinct_ratios) > 1:
+        # Genuinely multi-scale sheet (Revit "As indicated"): views are drawn at different
+        # ratios, so no single sheet-wide point->real factor is correct. Refuse to pick one —
+        # a confidently-wrong scale that mis-measures half the views is worse than an honest
+        # unknown (ADR-004, #636). Record the candidates and stay unconfirmed (no points_to_real).
+        scale["status"] = "ambiguous_multi_scale"
+        scale["scale_ratio_candidates"] = tuple(f"{n}:{d}" for n, d in distinct_ratios)
+        scale["confidence"] = "low"
+        return scale
+
     ratio = _parse_scale_ratio(text_blocks)
     if ratio is not None:
         numerator, denominator, ratio_source, confidence = ratio
@@ -2154,11 +2191,6 @@ def _derive_pdf_scale(text_blocks: Sequence[Mapping[str, Any]]) -> dict[str, JSO
         }
         scale["scale_ratio_source"] = ratio_source
         scale["confidence"] = confidence
-
-    unit_result = _parse_real_world_unit(text_blocks)
-    if unit_result is not None:
-        scale["real_world_unit"] = unit_result[0]
-        scale["real_world_unit_source"] = unit_result[1]
 
     if ratio is not None and unit_result is not None:
         numerator, denominator, _, _ = ratio
