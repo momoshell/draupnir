@@ -43,7 +43,17 @@ _PASS_STATUS_VALUES: Final[frozenset[str]] = frozenset(
     }
 )
 _PDF_SCALE_UNCONFIRMED_VALUES: Final[frozenset[str]] = frozenset(
-    {"manual_required", "pending", "placeholder", "tbd", "unconfirmed", "unknown"}
+    # "ambiguous_multi_scale" (#636): a genuinely multi-scale "As indicated" sheet where no single
+    # sheet-wide factor is correct — review_required (needs per-view handling), not invalid.
+    {
+        "ambiguous_multi_scale",
+        "manual_required",
+        "pending",
+        "placeholder",
+        "tbd",
+        "unconfirmed",
+        "unknown",
+    }
 )
 _PLACEHOLDER_ADAPTER_MODE_VALUES: Final[frozenset[str]] = frozenset(
     {"placeholder", "sparse_placeholder"}

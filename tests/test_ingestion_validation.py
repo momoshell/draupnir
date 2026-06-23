@@ -202,6 +202,34 @@ def test_build_validation_outcome_missing_pdf_scale_requires_review() -> None:
         "scale_present": False,
         "calibration_status": "missing",
     }
+
+
+def test_build_validation_outcome_ambiguous_multi_scale_requires_review() -> None:
+    """A genuinely multi-scale 'As indicated' sheet (#636) is review_required, not a hard fail.
+
+    The adapter refuses to pick one sheet-wide factor and emits status
+    ``ambiguous_multi_scale``; the validator must treat that as unconfirmed (needs per-view
+    review) rather than 'invalid metadata', since the data is legitimate — just not auto-scalable.
+    """
+    outcome = build_validation_outcome(
+        input_family=InputFamily.PDF_VECTOR,
+        canonical_json=_build_complete_canonical(
+            pdf_scale={
+                "status": "ambiguous_multi_scale",
+                "scale_ratio_candidates": ("1:50", "1:100"),
+                "confidence": "low",
+            }
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99, input_family=InputFamily.PDF_VECTOR),
+        generated_at=_GENERATED_AT,
+    )
+
+    pdf_scale_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "pdf_scale_presence_calibration_status"
+    ]
+    assert pdf_scale_check["status"] == "review_required"
+    assert pdf_scale_check["details"]["calibration_status"] == "unconfirmed"
     assert outcome.validation_status == "needs_review"
 
 

@@ -282,6 +282,61 @@ def test_derive_pdf_scale_unconfirmed_when_no_scale_text() -> None:
     assert "scale_ratio" not in scale
 
 
+def test_distinct_scale_ratios_dedupes_and_filters() -> None:
+    # Same ratio in two blocks -> one distinct entry; a non-architectural ratio (3:4) is excluded.
+    blocks = [
+        _block("Scale 1:50"),
+        _block("detail 1 : 50"),
+        _block("aspect 3:4"),
+        _block("28/03/2025 17:52:20"),
+    ]
+    assert pdf_adapter._distinct_scale_ratios(blocks) == [(1, 50)]
+
+
+def test_derive_pdf_scale_ambiguous_when_multiple_distinct_ratios() -> None:
+    """A genuinely multi-scale 'As indicated' sheet (1:50 + 1:100) must NOT pick one scale.
+
+    Per ADR-004 (#636): a confident sheet-wide factor would measure every 1:100 view at 2x the
+    true length. The detector degrades to an honest unknown instead — recording the candidates
+    but emitting no points_to_real and never flipping real_world_units true.
+    """
+    blocks = [
+        _block("Scale (@ A0):", {"x_min": 3058, "y_min": 2262, "x_max": 3285, "y_max": 2273}),
+        _block("As indicated", {"x_min": 3065, "y_min": 2272, "x_max": 3295, "y_max": 2290}),
+        _block("ALL DIMENSIONS ARE IN MILLIMETRES U.N.O."),
+        _block("GA PLAN\n1 : 50", {"x_min": 400, "y_min": 1800, "x_max": 600, "y_max": 1820}),
+        _block("DETAIL\n1 : 100", {"x_min": 1800, "y_min": 1800, "x_max": 2000, "y_max": 1820}),
+    ]
+    scale = pdf_adapter._derive_pdf_scale(blocks)
+    assert scale["status"] == "ambiguous_multi_scale"
+    assert scale["scale_ratio_candidates"] == ("1:50", "1:100")
+    assert scale["confidence"] == "low"
+    assert scale["real_world_units"] is False
+    assert "points_to_real" not in scale
+    assert "scale_ratio" not in scale
+    # The real-world unit is still recorded (it is independent of the ambiguous ratio).
+    assert scale["real_world_unit"] == "millimeter"
+
+
+def test_derive_pdf_scale_single_ratio_unaffected_by_guard() -> None:
+    """The exactly-one-ratio path is unchanged: a lone 1:50 still resolves confidently.
+
+    Covers the single-ratio 'As indicated' sheet (a 1:50 outside the title-block cell), which
+    #559 already handles and the multi-scale guard must not regress.
+    """
+    blocks = [
+        _block("Scale (@ A0):", {"x_min": 3058, "y_min": 2262, "x_max": 3285, "y_max": 2273}),
+        _block("As indicated", {"x_min": 3065, "y_min": 2272, "x_max": 3295, "y_max": 2290}),
+        _block("ALL DIMENSIONS ARE IN MILLIMETRES U.N.O."),
+        _block("GA PLAN\n1 : 50", {"x_min": 400, "y_min": 1800, "x_max": 600, "y_max": 1820}),
+    ]
+    scale = pdf_adapter._derive_pdf_scale(blocks)
+    assert scale["status"] == "derived_from_text"
+    assert scale["scale_ratio"] == {"numerator": 1, "denominator": 50, "text": "1:50"}
+    assert scale["points_to_real"] == 17.638889
+    assert scale["real_world_units"] is True
+
+
 def test_layer_source_reports_ocg_vs_pen() -> None:
     assert pdf_adapter._layer_source(["pen-000000-w0.5", "default"]) == "pen_signature"
     assert pdf_adapter._layer_source(["default-w0"]) == "pen_signature"
