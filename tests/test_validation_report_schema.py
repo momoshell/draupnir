@@ -32,6 +32,13 @@ def _coverage_block() -> dict[str, object]:
             "count": 1,
             "child_geometry_count": 4,
         },
+        "geometry_placement": {
+            "placed_from_blocks": 4,
+            "in_block_unexpanded": 0,
+            "unexpanded_blocks": 0,
+            "blocks_with_geometry": 1,
+            "ratio": 1.0,
+        },
         "review_flagged_entities": 1,
         "adapter_counts": {"line": 6, "text": 2},
     }
@@ -54,6 +61,9 @@ def test_coverage_model_validates_full_shape() -> None:
     assert coverage.layers.source == "ocg"
     assert coverage.blocks.count == 1
     assert coverage.blocks.child_geometry_count == 4
+    assert coverage.geometry_placement is not None
+    assert coverage.geometry_placement.in_block_unexpanded == 0
+    assert coverage.geometry_placement.ratio == 1.0
     assert coverage.review_flagged_entities == 1
     assert coverage.adapter_counts == {"line": 6, "text": 2}
 

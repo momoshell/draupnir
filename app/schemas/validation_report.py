@@ -61,6 +61,23 @@ class CoverageBlocks(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class CoverageGeometryPlacement(BaseModel):
+    """Spatial completeness: block-definition geometry placed into the world vs unexpanded (#542).
+
+    Distinct from entity-mapping ``mapped_ratio`` — this measures whether block geometry actually
+    reached the spatial model. ``ratio`` is 1.0 when every block carrying geometry placed at least
+    once; it drops as blocks are stranded (geometry absent from the model). Descriptive, non-gating.
+    """
+
+    placed_from_blocks: int
+    in_block_unexpanded: int
+    unexpanded_blocks: int
+    blocks_with_geometry: int
+    ratio: float
+
+    model_config = ConfigDict(extra="allow")
+
+
 class ValidationReportCoverage(BaseModel):
     """Honest extraction-coverage metrics (replacement signal for the confidence score)."""
 
@@ -69,6 +86,7 @@ class ValidationReportCoverage(BaseModel):
     unmapped_by_reason: dict[str, int] = Field(default_factory=dict)
     layers: CoverageLayers
     blocks: CoverageBlocks
+    geometry_placement: CoverageGeometryPlacement | None = None
     review_flagged_entities: int
     # Present only when the adapter records per-type entity counts in metadata.
     adapter_counts: dict[str, int] | None = None

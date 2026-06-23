@@ -157,6 +157,91 @@ def _sequence_length(value: Any) -> int:
     return 0
 
 
+_BLOCK_REF_KEYS = ("block_ref", "name", "block_handle")
+
+
+def _entity_kind(entity: Mapping[str, Any]) -> str | None:
+    """Entity type token, matching block_expansion's precedence (entity_type|kind|type)."""
+    for key in ("entity_type", "kind", "type"):
+        value = entity.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def geometry_placement(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
+    """Spatial-completeness signal: block geometry placed into the world vs left unexpanded (#542).
+
+    Post-#541 the block-expansion pass appends world-placed copies of block-instance geometry to
+    ``entities`` (tagged ``provenance_json.origin == "block_expansion"`` with the ``source_block``
+    it came from). This measures whether block-definition geometry actually reached the spatial
+    model: a block definition that carries leaf (non-INSERT) geometry but whose ref never produced
+    a placement is **unexpanded** — its geometry is absent from the model (the #542 blind spot,
+    distinct from entity-mapping ``mapped_ratio``). ``ratio`` is 1.0 when every block with geometry
+    placed at least once; it drops as blocks are stranded. Descriptive + honest, never gating.
+
+    Accounting note: ``placed_from_blocks`` counts placed entity *instances* (a block referenced N
+    times contributes N), whereas ``in_block_unexpanded`` counts a stranded block's leaf entities
+    once. The ratio is therefore instance-weighted, not type-weighted — it can understate a small
+    stranded block against many placed instances, but is monotonic (==1.0 iff nothing is stranded)
+    and never exceeds 1.0. ``unexpanded_blocks`` is the unweighted count for the blunt view.
+    """
+
+    raw_entities = canonical_json.get("entities")
+    entities = list(raw_entities) if isinstance(raw_entities, (list, tuple)) else []
+    raw_blocks = canonical_json.get("blocks")
+    blocks = list(raw_blocks) if isinstance(raw_blocks, (list, tuple)) else []
+
+    placed_from_blocks = 0
+    placed_source_refs: set[str] = set()
+    for entity in entities:
+        if not isinstance(entity, Mapping):
+            continue
+        provenance = entity.get("provenance_json")
+        if not isinstance(provenance, Mapping) or provenance.get("origin") != "block_expansion":
+            continue
+        placed_from_blocks += 1
+        detail = provenance.get("block_expansion")
+        if isinstance(detail, Mapping):
+            ref = detail.get("source_block")
+            if isinstance(ref, str) and ref:
+                placed_source_refs.add(ref)
+
+    in_block_unexpanded = 0
+    unexpanded_blocks = 0
+    blocks_with_geometry = 0
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            continue
+        children = block.get("entities")
+        if not isinstance(children, (list, tuple)):
+            continue
+        leaf_geometry = [
+            child
+            for child in children
+            if isinstance(child, Mapping) and _entity_kind(child) != "insert"
+        ]
+        if not leaf_geometry:
+            continue
+        blocks_with_geometry += 1
+        # A block is "placed" when any of its identifying refs produced a placement. The expander
+        # records ``source_block`` as the INSERT's ref, which matches one of the definition keys.
+        refs = {str(block.get(key)) for key in _BLOCK_REF_KEYS if isinstance(block.get(key), str)}
+        if not (refs & placed_source_refs):
+            in_block_unexpanded += len(leaf_geometry)
+            unexpanded_blocks += 1
+
+    denominator = placed_from_blocks + in_block_unexpanded
+    ratio = round(placed_from_blocks / denominator, 4) if denominator else 1.0
+    return {
+        "placed_from_blocks": placed_from_blocks,
+        "in_block_unexpanded": in_block_unexpanded,
+        "unexpanded_blocks": unexpanded_blocks,
+        "blocks_with_geometry": blocks_with_geometry,
+        "ratio": ratio,
+    }
+
+
 def _build_coverage(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
     """Honest extraction-coverage metrics for the validation report.
 
@@ -229,6 +314,7 @@ def _build_coverage(canonical_json: Mapping[str, Any]) -> dict[str, Any]:
             "count": len(blocks),
             "child_geometry_count": block_child_geometry,
         },
+        "geometry_placement": geometry_placement(canonical_json),
         "review_flagged_entities": review_flagged,
     }
 
