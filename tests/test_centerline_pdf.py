@@ -17,6 +17,12 @@ import sys
 
 import pytest
 
+# The producer lazy-imports cv2/skimage inside pdf_centerlines (ADR-008 read-path
+# boundary). These unit tests CALL it, so they need the ingestion extra present;
+# skip the module honestly where it is absent rather than erroring at call time.
+pytest.importorskip("cv2")
+pytest.importorskip("skimage")
+
 from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
 from app.ingestion.centerline_pdf import (
     _PDF_RASTER_PARAMS_HASH,

@@ -204,9 +204,12 @@ def _skeleton_to_polylines(
 
     Uses a greedy chain-trace: starting from the earliest unvisited skeleton
     pixel (sorted by row then col), walks to the sorted-first unvisited
-    8-neighbour at each step.  This produces a path where each consecutive
-    pair of DU points is exactly 1 or sqrt(2) pixels apart in DU space,
-    so the Euclidean segment sum equals the true skeleton arc length.
+    8-neighbour at each step.  At a junction the walk abandons the other
+    branches into separate polylines, so the polyline set is a faithful
+    GEOMETRY rendering but its Euclidean sum can under-count vs the true arc
+    length. The reported ``length_du`` is therefore measured independently on
+    the skeleton mask (``_skeleton_arc_length_px``, orth + sqrt2*diag over all
+    branches), NOT from this polyline sum.
 
     Returns a tuple of polylines (each polyline is a tuple of (x, y) DU coords).
     """

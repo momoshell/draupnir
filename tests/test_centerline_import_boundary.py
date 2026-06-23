@@ -24,6 +24,7 @@ import sys
 _CENTERLINE_CONTRACT_MODULE = "app.ingestion.centerline_contract"
 _CENTERLINE_DWG_MODULE = "app.ingestion.centerline_dwg"
 _CENTERLINE_PDF_MODULE = "app.ingestion.centerline_pdf"
+_CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -250,5 +251,43 @@ def test_centerline_pdf_does_not_import_skimage_in_isolation() -> None:
     result = _check_after_isolated_import([_CENTERLINE_PDF_MODULE], ["skimage"])
     assert result.returncode == 0, (
         f"skimage imported by centerline_pdf at module level.\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- centerline_materialization dispatch (top-level import must stay cv2-free)
+# ---------------------------------------------------------------------------
+
+
+def test_centerline_materialization_dispatch_does_not_import_cv2_in_isolation() -> None:
+    """Importing app.jobs.centerline_materialization must NOT pull cv2 into sys.modules.
+
+    The dispatch adds ``from app.ingestion.centerline_pdf import pdf_centerlines``
+    at module top, but cv2 is lazy inside pdf_centerlines (ADR-008).  This test
+    proves the lazy guard holds end-to-end: the dispatcher can reference
+    pdf_centerlines without loading cv2 at import time.
+
+    Arrange: script imports only centerline_materialization (isolated subprocess).
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_CENTERLINE_MATERIALIZATION_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by centerline_materialization at module level (ADR-008 violation).\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_centerline_materialization_dispatch_does_not_import_skimage_in_isolation() -> None:
+    """Importing app.jobs.centerline_materialization must NOT pull skimage into sys.modules.
+
+    Arrange: script imports only centerline_materialization (isolated subprocess).
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_CENTERLINE_MATERIALIZATION_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by centerline_materialization at module level (ADR-008 violation).\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
     )

@@ -32,6 +32,11 @@ _HI_M = 0.98 * _ORACLE_M  # 239.1 m
 _LO_DU = _LO_M / _M_PER_PT_AT_1_50
 _HI_DU = _HI_M / _M_PER_PT_AT_1_50
 
+# Needs the real PDF AND the ingestion extra (pymupdf + the producer's cv2/skimage).
+pytest.importorskip("fitz")
+pytest.importorskip("cv2")
+pytest.importorskip("skimage")
+
 pytestmark = pytest.mark.skipif(
     not _PDF_PATH.exists(),
     reason=f"Real PDF not present at {_PDF_PATH}",
