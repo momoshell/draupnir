@@ -21,7 +21,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
-from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION, Centerline
+from app.ingestion.centerline_contract import (
+    CURRENT_ALGO_VERSION,
+    Centerline,
+    geometry_to_json,
+)
 from app.ingestion.centerline_dwg import dwg_centerlines
 from app.ingestion.centerline_passthrough import passthrough_centerlines
 from app.ingestion.centerline_pdf import pdf_centerlines
@@ -124,7 +128,9 @@ async def materialize_centerline_lengths(
                 "producer_kind": cl.producer_kind,
                 "skeleton_length_du": cl.geometry.length_du,
                 "entity_count": cl.entity_count,
-                "geometry_json": None,
+                # Persist the centerline polylines (#653) so the cv2-free read path can clip them
+                # per-room (#654); NULL for producers that emit no geometry (passthrough).
+                "geometry_json": geometry_to_json(cl.geometry),
             }
         )
 

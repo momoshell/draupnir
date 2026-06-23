@@ -1120,3 +1120,45 @@ async def load_measured_lengths(
         present.add(key)
 
     return mapping, present
+
+
+async def load_measured_geometry(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    algo_version: str | None = None,
+) -> dict[tuple[str | None, str | None], tuple[tuple[tuple[float, float], ...], ...]]:
+    """Load persisted per-group centerline polylines for a revision at a given algo version (#653).
+
+    The read-path counterpart to the centerline producers' geometry: returns a mapping of
+    ``(layer_ref, colour_key) -> polylines`` for groups whose ``geometry_json`` was populated
+    (DWG/PDF producers; passthrough groups have none and are omitted). Version-gated like
+    :func:`load_measured_lengths`. Pure JSON decode — no cv2/skimage, safe on the read path.
+    Returns ``{}`` for degenerate / no-data / pre-geometry revisions; never raises.
+
+    Consumed by LP2 per-room clipping (#654).
+    """
+    from app.ingestion.centerline_contract import (
+        CURRENT_ALGO_VERSION,
+        polylines_from_geometry_json,
+    )
+    from app.models.revision_routed_length import RevisionRoutedLength
+
+    resolved_version = algo_version if algo_version is not None else CURRENT_ALGO_VERSION
+
+    try:
+        stmt = select(RevisionRoutedLength).where(
+            RevisionRoutedLength.drawing_revision_id == revision_id,
+            RevisionRoutedLength.algo_version == resolved_version,
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+    except Exception:
+        return {}
+
+    geometry: dict[tuple[str | None, str | None], tuple[tuple[tuple[float, float], ...], ...]] = {}
+    for row in rows:
+        polylines = polylines_from_geometry_json(row.geometry_json)
+        if polylines:
+            geometry[(row.layer_ref, row.colour_key)] = polylines
+
+    return geometry
