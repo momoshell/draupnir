@@ -136,6 +136,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "estimation_catalog_resolver": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "export_job_input_contract": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
     "quantity_takeoff_persistence": DB_ESTIMATION_EXPORT_PYTEST_ARGS,
+    "centerline_enqueue": DB_WORKER_PYTEST_ARGS,
     "append_only_lineage_tables": DB_LINEAGE_PYTEST_ARGS,
     "changeset_apply": DB_LINEAGE_PYTEST_ARGS,
     "changeset_persistence": DB_LINEAGE_PYTEST_ARGS,

@@ -34,6 +34,7 @@ from app.interpretation.service_takeoff_loaders import (
     _rgb_tuple_to_hex,
     build_scale_context,
     build_service_legend,
+    load_measured_lengths,
     load_rise_drop_entities,
     load_routed_entities,
     load_service_takeoff_inputs,
@@ -2617,3 +2618,258 @@ class TestPdfLegendReader:
         assert grey_groups[0].status == STATUS_UNKNOWN, (
             f"Grey should be STATUS_UNKNOWN (no legend entry); got {grey_groups[0].status}"
         )
+
+
+# ---------------------------------------------------------------------------
+# load_measured_lengths — version-gate and idempotent-upsert (C0 / be-639b)
+# ---------------------------------------------------------------------------
+
+
+@requires_database
+class TestLoadMeasuredLengths:
+    """load_measured_lengths version gate and idempotent upsert behaviour."""
+
+    async def test_version_gate_excludes_rows_at_different_algo_version(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rows at a different algo_version are excluded; CURRENT_ALGO_VERSION rows included."""
+        import uuid as _uuid_mod
+
+        from sqlalchemy import text
+
+        from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
+        from app.models.revision_routed_length import RevisionRoutedLength
+
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "e-load-ml-1",
+                    "line",
+                    "A-PIPE",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        # Load project + source_file_id + source_job_id via raw join (manifest knows them).
+        async with _get_session() as db:
+            result = await db.execute(
+                text(
+                    "SELECT m.project_id, m.source_file_id, m.source_job_id "
+                    "FROM revision_entity_manifests m "
+                    "WHERE m.drawing_revision_id = :rev"
+                ),
+                {"rev": revision_id},
+            )
+            row = result.fetchone()
+            assert row is not None
+            project_id, source_file_id, source_job_id = row
+
+        raster_hash = "b" * 64
+        raster_hash_other = "c" * 64
+
+        # Row at CURRENT_ALGO_VERSION.
+        row_current = RevisionRoutedLength(
+            id=_uuid_mod.uuid4(),
+            project_id=project_id,
+            source_file_id=source_file_id,
+            extraction_profile_id=None,
+            source_job_id=source_job_id,
+            drawing_revision_id=revision_id,
+            adapter_run_output_id=None,
+            canonical_entity_schema_version="1",
+            layer_ref="A-PIPE",
+            colour_key="red",
+            algo_version=CURRENT_ALGO_VERSION,
+            raster_params_hash=raster_hash,
+            producer_kind="passthrough",
+            skeleton_length_du=1234.5,
+            entity_count=1,
+            geometry_json=None,
+        )
+        # Row at a different algo_version.
+        row_other = RevisionRoutedLength(
+            id=_uuid_mod.uuid4(),
+            project_id=project_id,
+            source_file_id=source_file_id,
+            extraction_profile_id=None,
+            source_job_id=source_job_id,
+            drawing_revision_id=revision_id,
+            adapter_run_output_id=None,
+            canonical_entity_schema_version="1",
+            layer_ref="A-PIPE",
+            colour_key="blue",
+            algo_version="old-version-1",
+            raster_params_hash=raster_hash_other,
+            producer_kind="passthrough",
+            skeleton_length_du=999.0,
+            entity_count=1,
+            geometry_json=None,
+        )
+
+        async with _get_session() as db:
+            db.add(row_current)
+            db.add(row_other)
+            await db.commit()
+
+        async with _get_session() as db:
+            mapping, present = await load_measured_lengths(db, revision_id)
+
+        assert ("A-PIPE", "red") in present, "CURRENT_ALGO_VERSION row must be present"
+        assert ("A-PIPE", "blue") not in present, "old-version row must be excluded"
+        assert mapping[("A-PIPE", "red")] == pytest.approx(1234.5)
+
+    async def test_idempotent_upsert_same_group_version_hash_yields_one_row(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Persisting the same (revision, group, version, hash) twice -> exactly one row."""
+        import uuid as _uuid_mod
+
+        from sqlalchemy import func, select, text
+
+        from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
+        from app.models.revision_routed_length import RevisionRoutedLength
+
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "e-idem-1",
+                    "line",
+                    "A-PIPE",
+                    {"start": [0.0, 0.0, 0.0], "end": [500.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            result = await db.execute(
+                text(
+                    "SELECT m.project_id, m.source_file_id, m.source_job_id "
+                    "FROM revision_entity_manifests m "
+                    "WHERE m.drawing_revision_id = :rev"
+                ),
+                {"rev": revision_id},
+            )
+            row = result.fetchone()
+            assert row is not None
+            project_id, source_file_id, source_job_id = row
+
+        raster_hash = "d" * 64
+
+        def _make_row() -> RevisionRoutedLength:
+            return RevisionRoutedLength(
+                id=_uuid_mod.uuid4(),
+                project_id=project_id,
+                source_file_id=source_file_id,
+                extraction_profile_id=None,
+                source_job_id=source_job_id,
+                drawing_revision_id=revision_id,
+                adapter_run_output_id=None,
+                canonical_entity_schema_version="1",
+                layer_ref="A-PIPE",
+                colour_key="idem-key",
+                algo_version=CURRENT_ALGO_VERSION,
+                raster_params_hash=raster_hash,
+                producer_kind="passthrough",
+                skeleton_length_du=77.0,
+                entity_count=1,
+                geometry_json=None,
+            )
+
+        # Insert first time.
+        async with _get_session() as db:
+            db.add(_make_row())
+            await db.commit()
+
+        # Insert second time using ON CONFLICT DO NOTHING (the idempotent path).
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        async with _get_session() as db:
+            stmt = (
+                pg_insert(RevisionRoutedLength)
+                .values(
+                    [
+                        {
+                            "id": _uuid_mod.uuid4(),
+                            "project_id": project_id,
+                            "source_file_id": source_file_id,
+                            "extraction_profile_id": None,
+                            "source_job_id": source_job_id,
+                            "drawing_revision_id": revision_id,
+                            "adapter_run_output_id": None,
+                            "canonical_entity_schema_version": "1",
+                            "layer_ref": "A-PIPE",
+                            "colour_key": "idem-key",
+                            "algo_version": CURRENT_ALGO_VERSION,
+                            "raster_params_hash": raster_hash,
+                            "producer_kind": "passthrough",
+                            "skeleton_length_du": 77.0,
+                            "entity_count": 1,
+                            "geometry_json": None,
+                        }
+                    ]
+                )
+                .on_conflict_do_nothing(constraint="uq_revision_routed_lengths_group_version")
+            )
+            await db.execute(stmt)
+            await db.commit()
+
+        async with _get_session() as db:
+            count_result = await db.execute(
+                select(func.count()).where(
+                    RevisionRoutedLength.drawing_revision_id == revision_id,
+                    RevisionRoutedLength.colour_key == "idem-key",
+                )
+            )
+            count = count_result.scalar_one()
+
+        assert count == 1, f"Expected exactly 1 row (idempotent), got {count}"
+
+    async def test_load_measured_lengths_returns_empty_for_no_rows(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A revision with no RevisionRoutedLength rows returns ({}, set())."""
+        from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
+
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "e-empty-1",
+                    "line",
+                    "A-PIPE",
+                    {"start": [0.0, 0.0, 0.0], "end": [1.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            mapping, present = await load_measured_lengths(
+                db, revision_id, algo_version=CURRENT_ALGO_VERSION
+            )
+
+        assert mapping == {}
+        assert present == set()

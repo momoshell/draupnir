@@ -29,6 +29,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.revision_routes.scale import resolve_revision_scale
@@ -1071,3 +1072,51 @@ async def load_service_takeoff_inputs(
         drop_entities=drop_entities,
         input_family=input_family,
     )
+
+
+async def load_measured_lengths(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    algo_version: str | None = None,
+) -> tuple[dict[tuple[str | None, str | None], float], set[tuple[str | None, str | None]]]:
+    """Load materialized per-group skeleton lengths for a revision at a given algo version.
+
+    Only rows whose ``algo_version`` exactly matches the requested version are included
+    (version gate).  Returns a mapping of ``(layer_ref, colour_key) -> skeleton_length_du``
+    and the set of present group keys.  Returns ``({}, set())`` for degenerate / no-data
+    revisions; never raises.
+
+    Parameters
+    ----------
+    db:
+        Active async session.
+    revision_id:
+        Drawing revision UUID to query.
+    algo_version:
+        Algorithm version string to filter on.  When ``None``, defaults to
+        :data:`~app.ingestion.centerline_contract.CURRENT_ALGO_VERSION` at call time
+        (imported lazily to keep this module DB-seam-only with no circular deps).
+    """
+    from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
+    from app.models.revision_routed_length import RevisionRoutedLength
+
+    resolved_version = algo_version if algo_version is not None else CURRENT_ALGO_VERSION
+
+    try:
+        stmt = select(RevisionRoutedLength).where(
+            RevisionRoutedLength.drawing_revision_id == revision_id,
+            RevisionRoutedLength.algo_version == resolved_version,
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+    except Exception:
+        return {}, set()
+
+    mapping: dict[tuple[str | None, str | None], float] = {}
+    present: set[tuple[str | None, str | None]] = set()
+    for row in rows:
+        key: tuple[str | None, str | None] = (row.layer_ref, row.colour_key)
+        mapping[key] = row.skeleton_length_du
+        present.add(key)
+
+    return mapping, present
