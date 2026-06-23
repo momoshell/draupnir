@@ -155,6 +155,30 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/interpretation",
+            "get_revision_interpretation",
+            "get_revision_interpretation",
+            "RevisionInterpretationRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
+            "/revisions/{revision_id}/census",
+            "get_revision_census",
+            "get_revision_census",
+            "RevisionCensusRead",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/diff",
             "get_revision_diff",
             "get_revision_diff",

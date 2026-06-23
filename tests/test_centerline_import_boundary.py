@@ -29,6 +29,7 @@ _CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
     "app.api.v1.revision_routes.service_takeoff",
+    "app.api.v1.revision_routes.canonical",
 ]
 
 _HEAVY_CV_MODULES = ["cv2", "skimage"]

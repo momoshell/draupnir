@@ -108,6 +108,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "revision_materialization_api": DB_API_PYTEST_ARGS,
     "revision_scale_api": DB_API_PYTEST_ARGS,
     "revision_summary_api": DB_API_PYTEST_ARGS,
+    "revision_census_api": DB_API_PYTEST_ARGS,
     "revision_room_entities_api": DB_API_PYTEST_ARGS,
     "revision_diff_api": DB_API_PYTEST_ARGS,
     "revision_entity_source_api": DB_API_PYTEST_ARGS,
