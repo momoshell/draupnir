@@ -56,6 +56,39 @@ from app.interpretation.service_legend import (
 INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
 
 # ---------------------------------------------------------------------------
+# PDF legend-reader constants (ADR-003: only generic anchor text; NO colours/layers)
+# ---------------------------------------------------------------------------
+
+_ANCHOR_MAX_CHARS: int = 30
+_REGION_PAD_LEFT: float = 15.0
+_REGION_PAD_TOP: float = 5.0
+_REGION_WIDTH: float = 320.0
+_REGION_HEIGHT: float = 420.0
+_SWATCH_LINE_LEN_MIN: float = 12.0
+_SWATCH_LINE_LEN_MAX: float = 70.0
+_SWATCH_RECT_W_MIN: float = 8.0
+_SWATCH_RECT_W_MAX: float = 60.0
+_SWATCH_RECT_H_MIN: float = 3.0
+_SWATCH_RECT_H_MAX: float = 22.0
+_ROW_Y_TOL: float = 6.0
+_PAIR_X_MAX_GAP: float = 320.0
+_LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:legend|key)\b")
+_LEGEND_ANCHOR_EXCLUDE_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:key\s*plan|notes?)\b")
+
+# ---------------------------------------------------------------------------
+# PDF colour helpers (mirrors pymupdf._rgb_hex; do NOT import from there)
+# ---------------------------------------------------------------------------
+
+
+def _rgb_tuple_to_hex(rgb: tuple[float, ...]) -> str:
+    """Convert a 0..1 float RGB tuple to a 6-char lowercase hex string.
+
+    mirrors pymupdf._rgb_hex
+    """
+    return "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in rgb[:3])
+
+
+# ---------------------------------------------------------------------------
 # PDF scale normalisation — metres per detected real-world unit (ADR-004).
 # Used only when the units block gives no conversion_factor (PDF-origin revisions).
 # ---------------------------------------------------------------------------
@@ -421,13 +454,213 @@ async def load_routed_entities(
     return dwg_result
 
 
+async def _build_pdf_service_legend(db: AsyncSession, revision_id: UUID) -> ServiceLegend:
+    """Build a ServiceLegend for a pdf_vector revision from legend-region swatches.
+
+    Discovers legend regions by finding text_blocks matching the legend anchor pattern,
+    then queries RevisionEntity for line/polyline swatches inside the region bounding box.
+    Colour is read from style.color.rgb (stroke) with fallback to properties_json fill_color_rgb.
+    Swatch is paired with the nearest right-of-swatch text block on the same row.
+
+    Returns an empty ServiceLegend on any error (tolerant).
+    """
+    from sqlalchemy import select
+
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        text_blocks = await _load_text_blocks(db, revision_id)
+
+        # --- Step 1: find anchor blocks ---
+        anchors: list[dict[str, Any]] = []
+        for block in text_blocks:
+            raw_text = block.get("text")
+            if not isinstance(raw_text, str):
+                continue
+            collapsed = " ".join(raw_text.strip().split())
+            if len(collapsed) > _ANCHOR_MAX_CHARS:
+                continue
+            if not _LEGEND_ANCHOR_RE.search(collapsed):
+                continue
+            if _LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed):
+                continue
+            bbox = block.get("bbox")
+            if not isinstance(bbox, dict):
+                continue
+            anchors.append(block)
+
+        if not anchors:
+            return ServiceLegend(entries=())
+
+        # --- Step 2: build union of region windows, query swatches once ---
+        # Collect all region tuples (x_lo, y_lo, x_hi, y_hi).
+        regions: list[tuple[float, float, float, float]] = []
+        for anchor in anchors:
+            bbox = anchor["bbox"]
+            ax_min = _number(bbox.get("x_min"))
+            ay_min = _number(bbox.get("y_min"))
+            if ax_min is None or ay_min is None:
+                continue
+            x_lo = ax_min - _REGION_PAD_LEFT
+            x_hi = ax_min + _REGION_WIDTH
+            y_lo = ay_min - _REGION_PAD_TOP
+            y_hi = ay_min + _REGION_HEIGHT
+            regions.append((x_lo, y_lo, x_hi, y_hi))
+
+        if not regions:
+            return ServiceLegend(entries=())
+
+        # Query all line/polyline entities for this revision (no bbox filter in SQL — filter
+        # in Python so a single round-trip covers multiple disjoint anchor regions).
+        swatch_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity).where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.entity_type.in_(["line", "polyline"]),
+                        RevisionEntity.bbox_min_x.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 3: filter swatches by region + size gate ---
+        # Each candidate is (color_mapping, center_x, center_y).
+        candidates: list[tuple[Mapping[str, Any], float, float]] = []
+
+        for row in swatch_rows:
+            bx_min = row.bbox_min_x
+            by_min = row.bbox_min_y
+            bx_max = row.bbox_max_x
+            by_max = row.bbox_max_y
+            if bx_min is None or by_min is None or bx_max is None or by_max is None:
+                continue
+
+            w = abs(bx_max - bx_min)
+            h = abs(by_max - by_min)
+
+            # Size gate: line or rect_like polyline.
+            props = row.properties_json or {}
+            rect_like_flag: bool = (
+                bool(props.get("rect_like")) if isinstance(props, Mapping) else False
+            )
+
+            if row.entity_type == "line":
+                length = math.hypot(w, h)
+                if not (_SWATCH_LINE_LEN_MIN <= length <= _SWATCH_LINE_LEN_MAX):
+                    continue
+            elif row.entity_type == "polyline":
+                if not rect_like_flag:
+                    continue
+                if not (
+                    _SWATCH_RECT_W_MIN <= w <= _SWATCH_RECT_W_MAX
+                    and _SWATCH_RECT_H_MIN <= h <= _SWATCH_RECT_H_MAX
+                ):
+                    continue
+            else:
+                continue
+
+            # Colour precedence: resolved stroke rgb first; else fill tuple; else skip.
+            style = row.style or {}
+            color_block: Any = style.get("color") if isinstance(style, Mapping) else None
+            resolved_color: Mapping[str, Any] | None = None
+
+            if (
+                isinstance(color_block, Mapping)
+                and not color_block.get("by_layer")
+                and not color_block.get("by_block")
+            ):
+                rgb_val = color_block.get("rgb")
+                if isinstance(rgb_val, str) and rgb_val:
+                    resolved_color = {
+                        "rgb": rgb_val.lower(),
+                        "index": None,
+                        "by_layer": False,
+                        "by_block": False,
+                    }
+
+            if resolved_color is None:
+                # Fall back to fill_color_rgb from properties_json.
+                fill_raw = props.get("fill_color_rgb") if isinstance(props, Mapping) else None
+                if isinstance(fill_raw, (list, tuple)) and len(fill_raw) >= 3:
+                    try:
+                        fill_hex = _rgb_tuple_to_hex(tuple(float(c) for c in fill_raw))
+                        resolved_color = {
+                            "rgb": fill_hex,
+                            "index": None,
+                            "by_layer": False,
+                            "by_block": False,
+                        }
+                    except (TypeError, ValueError):
+                        pass
+
+            if resolved_color is None:
+                continue
+
+            cx = (bx_min + bx_max) / 2.0
+            cy = (by_min + by_max) / 2.0
+
+            # Match against regions.
+            for x_lo, y_lo, x_hi, y_hi in regions:
+                if x_lo <= bx_min and bx_max <= x_hi and y_lo <= by_min and by_max <= y_hi:
+                    candidates.append((resolved_color, cx, cy))
+                    break  # first matching region wins
+
+        if not candidates:
+            return ServiceLegend(entries=())
+
+        # --- Step 4: pair each swatch with nearest right-of-swatch text on same row ---
+        swatch_inputs: list[SwatchInput] = []
+
+        for cand_color, cand_cx, cand_cy in candidates:
+            best_text: str | None = None
+            best_gap: float = _PAIR_X_MAX_GAP + 1.0
+
+            for block in text_blocks:
+                t_bbox = block.get("bbox")
+                if not isinstance(t_bbox, dict):
+                    continue
+                t_x_min = _number(t_bbox.get("x_min"))
+                t_y_min = _number(t_bbox.get("y_min"))
+                t_x_max = _number(t_bbox.get("x_max"))
+                t_y_max = _number(t_bbox.get("y_max"))
+                if t_x_min is None or t_y_min is None or t_x_max is None or t_y_max is None:
+                    continue
+                t_center_y = (t_y_min + t_y_max) / 2.0
+                if abs(t_center_y - cand_cy) > _ROW_Y_TOL:
+                    continue
+                if t_x_min < cand_cx:
+                    continue
+                gap = t_x_min - cand_cx
+                if gap <= _PAIR_X_MAX_GAP and gap < best_gap:
+                    raw_text = block.get("text")
+                    if isinstance(raw_text, str) and raw_text.strip():
+                        best_gap = gap
+                        best_text = raw_text.strip()
+
+            if best_text is not None:
+                swatch_inputs.append(SwatchInput(color=cand_color, text=best_text))
+
+        return fuse(from_colour_swatches(swatch_inputs))
+
+    except Exception:  # tolerant: never raise
+        return ServiceLegend(entries=())
+
+
 async def build_service_legend(
     db: AsyncSession,
     revision_id: UUID,
     *,
     legend_layers: list[str] | None = None,
+    input_family: str | None = None,
 ) -> ServiceLegend:
     """Build a :class:`ServiceLegend` from legend-layer swatches and prose abbreviation rows.
+
+    For pdf_vector revisions (when ``input_family`` is ``INPUT_FAMILY_PDF_VECTOR``),
+    delegates to ``_build_pdf_service_legend`` which reads from text_blocks anchors and
+    RevisionEntity bbox-filtered swatches (no legend layers, no hardcoded colours).
 
     Source A — colour swatches: small coloured linework entities on legend layer(s),
     each paired with the nearest text entity within ``_SWATCH_MATCH_RADIUS`` drawing
@@ -438,6 +671,12 @@ async def build_service_legend(
 
     No-swatch case: returns a prose-only or empty legend, never raises.
     """
+    if input_family is None:
+        input_family = await _resolve_input_family(db, revision_id)
+
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
+        return await _build_pdf_service_legend(db, revision_id)
+
     from sqlalchemy import or_, select
 
     from app.models.revision_materialization import RevisionEntity
@@ -765,7 +1004,9 @@ async def load_service_takeoff_inputs(
         exclude_off_sheet=exclude_off_sheet,
         input_family=input_family,
     )
-    legend = await build_service_legend(db, revision_id, legend_layers=legend_layers)
+    legend = await build_service_legend(
+        db, revision_id, legend_layers=legend_layers, input_family=input_family
+    )
     tag_placements = await load_tag_placements(
         db, revision_id, tag_layers=tag_layers, input_family=input_family
     )

@@ -29,7 +29,9 @@ from app.interpretation.routed_runs import (
 from app.interpretation.run_service_identity import TagPlacement, fuse_run_service_identities
 from app.interpretation.service_legend import ServiceLegend
 from app.interpretation.service_takeoff_loaders import (
+    INPUT_FAMILY_PDF_VECTOR,
     ServiceTakeoffInputs,
+    _rgb_tuple_to_hex,
     build_scale_context,
     build_service_legend,
     load_rise_drop_entities,
@@ -78,8 +80,17 @@ def _make_entity(
     geometry_json: dict[str, Any],
     *,
     style: dict[str, Any] | None = None,
+    properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a canonical-payload entity dict that becomes a RevisionEntity row."""
+    """Build a canonical-payload entity dict that becomes a RevisionEntity row.
+
+    ``properties`` is merged into ``properties_json`` so callers can inject
+    ``rect_like`` / ``fill_color_rgb`` for PDF swatch fixtures without touching
+    the existing ``style`` path.
+    """
+    base_props: dict[str, Any] = {"layer": layer_ref}
+    if properties:
+        base_props.update(properties)
     payload: dict[str, Any] = {
         "entity_id": entity_id,
         "entity_type": entity_type,
@@ -89,7 +100,7 @@ def _make_entity(
         "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
         "confidence_json": {"score": _FAKE_RUNNER_CONFIDENCE_SCORE, "basis": "adapter"},
         "geometry_json": geometry_json,
-        "properties_json": {"layer": layer_ref},
+        "properties_json": base_props,
         "provenance_json": {
             "origin": "adapter_normalized",
             "adapter": {},
@@ -2027,3 +2038,383 @@ class TestInputFamilyPopulated:
 
         assert isinstance(inputs, ServiceTakeoffInputs)
         assert inputs.input_family == "dwg"
+
+
+# ---------------------------------------------------------------------------
+# PDF legend reader tests (#630 Phase 1)
+# ---------------------------------------------------------------------------
+
+# Anchor text block at (x=100, y=200) -> region x:[85,420], y:[195,620]
+_LEGEND_ANCHOR_BLOCK: dict[str, Any] = {
+    "page_number": 1,
+    "layout": "Model",
+    "block_number": 10,
+    "bbox": {"x_min": 100.0, "y_min": 200.0, "x_max": 190.0, "y_max": 215.0},
+    "text": "WATER LEGEND",
+}
+
+# Row 1: line swatch at y=250 (center_y=250), text at x=160 y=247..253
+_LEGEND_LINE_SWATCH_COLOR = {
+    "rgb": "00ffff",
+    "index": None,
+    "by_layer": False,
+    "by_block": False,
+}
+_LEGEND_ROW1_TEXT_BLOCK: dict[str, Any] = {
+    "page_number": 1,
+    "layout": "Model",
+    "block_number": 11,
+    "bbox": {"x_min": 160.0, "y_min": 247.0, "x_max": 300.0, "y_max": 253.0},
+    "text": "MAINS COLD WATER",
+}
+
+# Row 2: rect swatch (fill only, stroke=None) at y=270, text at x=160 y=267..273
+_LEGEND_RECT_FILL_COLOR = (0.0, 1.0, 0.0)  # => "00ff00"
+_LEGEND_ROW2_TEXT_BLOCK: dict[str, Any] = {
+    "page_number": 1,
+    "layout": "Model",
+    "block_number": 12,
+    "bbox": {"x_min": 160.0, "y_min": 267.0, "x_max": 300.0, "y_max": 273.0},
+    "text": "HOT WATER RETURN",
+}
+
+
+def _make_pdf_legend_entities() -> list[dict[str, Any]]:
+    """Two swatch entities for the PDF legend reader fixture."""
+    # Line swatch: start=[110,250], end=[150,250] -> len=40, bbox=(110,250,150,250)
+    # Inside region x:[85,420] y:[195,620] -> 85<=110 & 150<=420 & 195<=250 & 250<=620 ✓
+    # center_x=130, center_y=250
+    line_swatch = _make_entity(
+        "swatch-line-001",
+        "line",
+        "pen-0.35",
+        {"start": [110.0, 250.0, 0.0], "end": [150.0, 250.0, 0.0]},
+        style={"color": _LEGEND_LINE_SWATCH_COLOR},
+    )
+    # Rect swatch: polyline vertices forming a 30x10 rect at y=265..275
+    # bbox=(110,265,140,275), w=30, h=10; center_x=125, center_y=270
+    # fill_color_rgb=(0,1,0) => "00ff00"; stroke=None (by_layer)
+    rect_swatch = _make_entity(
+        "swatch-rect-001",
+        "polyline",
+        "pen-0.35",
+        {
+            "vertices": [
+                [110.0, 265.0],
+                [140.0, 265.0],
+                [140.0, 275.0],
+                [110.0, 275.0],
+                [110.0, 265.0],
+            ]
+        },
+        style={
+            "color": {
+                "rgb": None,
+                "index": None,
+                "by_layer": True,
+                "by_block": False,
+            }
+        },
+        properties={
+            "rect_like": True,
+            "fill_color_rgb": list(_LEGEND_RECT_FILL_COLOR),
+        },
+    )
+    return [line_swatch, rect_swatch]
+
+
+@pytest.mark.parametrize(
+    ("rgb", "expected"),
+    [
+        ((1.0, 0.0, 0.0), "ff0000"),
+        ((0.0, 1.0, 0.0), "00ff00"),
+        ((0.0, 0.0, 1.0), "0000ff"),
+        ((0.176, 0.443, 1.0), "2d71ff"),  # the medical-gas linework colour
+        ((0.0, 0.0, 0.0), "000000"),
+        ((1.0, 1.0, 1.0), "ffffff"),
+        ((1.5, -0.2, 0.5), "ff0080"),  # clipping above 1.0 and below 0.0
+        ((1.0, 0.0, 0.0, 1.0), "ff0000"),  # ignores a 4th (alpha) component
+    ],
+)
+def test_rgb_tuple_to_hex(rgb: tuple[float, ...], expected: str) -> None:
+    """The fill-tuple->hex conversion the colour-join depends on (clamped, lowercase, 6-char)."""
+    assert _rgb_tuple_to_hex(rgb) == expected
+
+
+def test_rgb_tuple_to_hex_matches_adapter_rgb_hex() -> None:
+    """Locks the colour-join invariant: fill-tuple hex == the stroke hex the adapter emits."""
+    from app.ingestion.adapters.pymupdf import _rgb_hex
+
+    for rgb in ((0.176, 0.443, 1.0), (0.0, 1.0, 1.0), (0.498, 0.0, 0.498)):
+        assert _rgb_tuple_to_hex(rgb) == _rgb_hex(rgb)
+
+
+@requires_database
+class TestPdfLegendReader:
+    """_build_pdf_service_legend: swatch detection from region + text_blocks pairing."""
+
+    async def test_pdf_legend_line_and_rect_swatches(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """pdf_vector revision with anchor + line swatch + rect swatch:
+        legend has two colour entries keyed by their hex codes."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_legend_entities(),
+            input_family="pdf_vector",
+            metadata={
+                "text_blocks": [
+                    _LEGEND_ANCHOR_BLOCK,
+                    _LEGEND_ROW1_TEXT_BLOCK,
+                    _LEGEND_ROW2_TEXT_BLOCK,
+                ]
+            },
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(
+                db, revision_id, input_family=INPUT_FAMILY_PDF_VECTOR
+            )
+
+        assert isinstance(legend, ServiceLegend)
+        by_colour = legend.by_colour()
+        assert "00ffff" in by_colour, f"Expected '00ffff' in legend; got {list(by_colour.keys())}"
+        assert "00ff00" in by_colour, f"Expected '00ff00' in legend; got {list(by_colour.keys())}"
+        assert by_colour["00ffff"].discipline == "MAINS COLD WATER"
+        assert by_colour["00ff00"].discipline == "HOT WATER RETURN"
+
+    async def test_pdf_rect_swatch_colour_from_fill_not_stroke(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rect swatch with stroke=None (by_layer) and fill tuple uses fill hex as colour key."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_make_pdf_legend_entities()[1]],  # only the rect swatch
+            input_family="pdf_vector",
+            metadata={
+                "text_blocks": [
+                    _LEGEND_ANCHOR_BLOCK,
+                    _LEGEND_ROW2_TEXT_BLOCK,
+                ]
+            },
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(
+                db, revision_id, input_family=INPUT_FAMILY_PDF_VECTOR
+            )
+
+        by_colour = legend.by_colour()
+        assert "00ff00" in by_colour, (
+            f"Fill-only rect swatch must yield '00ff00'; got {list(by_colour.keys())}"
+        )
+        assert "00ffff" not in by_colour
+
+    async def test_pdf_no_anchor_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """text_blocks with only KEY PLAN / NOTES anchors -> empty legend (exclusion RE)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_legend_entities(),
+            input_family="pdf_vector",
+            metadata={
+                "text_blocks": [
+                    {
+                        "page_number": 1,
+                        "layout": "Model",
+                        "block_number": 20,
+                        "bbox": {"x_min": 10.0, "y_min": 10.0, "x_max": 100.0, "y_max": 25.0},
+                        "text": "KEY PLAN",
+                    },
+                    {
+                        "page_number": 1,
+                        "layout": "Model",
+                        "block_number": 21,
+                        "bbox": {"x_min": 10.0, "y_min": 30.0, "x_max": 100.0, "y_max": 45.0},
+                        "text": "NOTES",
+                    },
+                    _LEGEND_ROW1_TEXT_BLOCK,
+                ]
+            },
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(
+                db, revision_id, input_family=INPUT_FAMILY_PDF_VECTOR
+            )
+
+        assert isinstance(legend, ServiceLegend)
+        assert len(legend.by_colour()) == 0
+
+    async def test_pdf_swatch_without_pairing_skipped(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In-region swatch with no same-row right text -> absent from legend, no crash."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[_make_pdf_legend_entities()[0]],  # only the line swatch
+            input_family="pdf_vector",
+            metadata={
+                "text_blocks": [
+                    _LEGEND_ANCHOR_BLOCK,
+                    # No text block on row y=250 to the right of the swatch.
+                ]
+            },
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(
+                db, revision_id, input_family=INPUT_FAMILY_PDF_VECTOR
+            )
+
+        assert isinstance(legend, ServiceLegend)
+        assert len(legend.by_colour()) == 0
+
+    async def test_dwg_legend_path_unchanged(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DXF revision with LEGEND-layer swatch+text -> same ServiceLegend as before
+        (regression: DWG path byte-for-byte unchanged by PDF branch)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        swatch_color = {"index": 4, "rgb": "#ff00ff", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "swatch-dwg-001",
+                    "line",
+                    "LEGEND",
+                    {"start": [0.0, 0.0, 0.0], "end": [100.0, 0.0, 0.0]},
+                    style={"color": swatch_color},
+                ),
+                _make_entity(
+                    "text-dwg-001",
+                    "text",
+                    "LEGEND",
+                    {"text": "GAS", "insertion": {"x": 150.0, "y": 0.0}},
+                ),
+            ],
+            input_family="dxf",
+        )
+
+        async with _get_session() as db:
+            # Explicitly pass dxf family to avoid re-resolve.
+            legend = await build_service_legend(db, revision_id, legend_layers=["LEGEND"])
+
+        by_colour = legend.by_colour()
+        assert len(by_colour) > 0
+        entry = next(iter(by_colour.values()))
+        assert entry.discipline == "GAS"
+        assert entry.colour_rgb == "#ff00ff"
+
+    async def test_pdf_colour_run_resolves_via_legend_else_unknown(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Integration: PDF legend + routed entities -> legend colour RESOLVED;
+        unmatched colour -> STATUS_UNKNOWN."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        # One routed line with colour 00ffff (matches legend), one with 999999 (unknown).
+        line_cyan = _make_entity(
+            "routed-cyan",
+            "line",
+            "pen-0.5",
+            {"start": [500.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+            style={
+                "color": {
+                    "rgb": "00ffff",
+                    "index": None,
+                    "by_layer": False,
+                    "by_block": False,
+                }
+            },
+        )
+        line_grey = _make_entity(
+            "routed-grey",
+            "line",
+            "pen-0.5",
+            {"start": [500.0, 100.0, 0.0], "end": [1000.0, 100.0, 0.0]},
+            style={
+                "color": {
+                    "rgb": "999999",
+                    "index": None,
+                    "by_layer": False,
+                    "by_block": False,
+                }
+            },
+        )
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[*_make_pdf_legend_entities(), line_cyan, line_grey],
+            input_family="pdf_vector",
+            metadata={
+                "text_blocks": [
+                    _LEGEND_ANCHOR_BLOCK,
+                    _LEGEND_ROW1_TEXT_BLOCK,
+                    _LEGEND_ROW2_TEXT_BLOCK,
+                ]
+            },
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+            legend = await build_service_legend(
+                db, revision_id, input_family=INPUT_FAMILY_PDF_VECTOR
+            )
+
+        run_result = identify_routed_runs(entities, legend)
+        groups = run_result.groups
+
+        # Find the cyan group and the grey group.
+        cyan_groups = [g for g in groups if g.colour_rgb and "00ffff" in g.colour_rgb.lower()]
+        grey_groups = [g for g in groups if g.colour_rgb and "999999" in g.colour_rgb.lower()]
+
+        assert len(cyan_groups) >= 1, f"Expected cyan group; groups: {groups}"
+        assert len(grey_groups) >= 1, f"Expected grey group; groups: {groups}"
+        assert cyan_groups[0].status != STATUS_UNKNOWN, (
+            f"Cyan should be resolved via legend; got {cyan_groups[0].status}"
+        )
+        assert grey_groups[0].status == STATUS_UNKNOWN, (
+            f"Grey should be STATUS_UNKNOWN (no legend entry); got {grey_groups[0].status}"
+        )
