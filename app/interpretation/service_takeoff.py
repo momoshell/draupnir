@@ -93,6 +93,11 @@ class ServiceTakeoffLine:
     confidence: float | None  # None if any contributing run has competing_disciplines
     riser_count: int  # count of rise symbols in this (SERVICE_UNKNOWN, room) bucket
     drop_count: int  # count of drop symbols in this (SERVICE_UNKNOWN, room) bucket
+    # True when a contributing run carried MULTIPLE services (a bundle, e.g. a shared-colour
+    # med-gas chase). Under the bundle model each service in the bundle gets the FULL corridor
+    # length, so this line's per-service length is "present in the bundle", NOT an individually
+    # resolved split (#655). Group/discipline totals and per-room metres are unaffected.
+    bundle: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +375,8 @@ def compute_service_takeoff(
     acc_identity_status: dict[_BucketKey, str] = {}
     # True if any contributing run has competing_disciplines
     acc_has_conflict: dict[_BucketKey, bool] = {}
+    # True if any contributing run carried multiple services (bundle; #655)
+    acc_is_bundle: dict[_BucketKey, bool] = {}
     acc_room_name: dict[_BucketKey, str | None] = {}
     acc_room_number: dict[_BucketKey, str | None] = {}
     acc_discipline: dict[_BucketKey, str | None] = {}
@@ -409,6 +416,8 @@ def compute_service_takeoff(
         # Determine competing_disciplines from the matched RunGroup.
         matched_run = runs_by_key.get(run_key)
         has_conflict = bool(matched_run and matched_run.competing_disciplines)
+        # A bundle: this run carries >1 service, so each gets the full corridor length (#655).
+        is_bundle = len(identity.services) > 1
 
         for room, drawn in partitions:
             if room is None:
@@ -428,6 +437,7 @@ def compute_service_takeoff(
                     drawn=drawn,
                     identity=identity,
                     has_conflict=has_conflict,
+                    is_bundle=is_bundle,
                     room_name=room_name,
                     room_number=room_number,
                     acc_drawing_length=acc_drawing_length,
@@ -435,6 +445,7 @@ def compute_service_takeoff(
                     acc_entity_ids=acc_entity_ids,
                     acc_identity_status=acc_identity_status,
                     acc_has_conflict=acc_has_conflict,
+                    acc_is_bundle=acc_is_bundle,
                     acc_room_name=acc_room_name,
                     acc_room_number=acc_room_number,
                     acc_discipline=acc_discipline,
@@ -448,6 +459,7 @@ def compute_service_takeoff(
                         drawn=drawn,
                         identity=identity,
                         has_conflict=has_conflict,
+                        is_bundle=is_bundle,
                         room_name=room_name,
                         room_number=room_number,
                         acc_drawing_length=acc_drawing_length,
@@ -455,6 +467,7 @@ def compute_service_takeoff(
                         acc_entity_ids=acc_entity_ids,
                         acc_identity_status=acc_identity_status,
                         acc_has_conflict=acc_has_conflict,
+                        acc_is_bundle=acc_is_bundle,
                         acc_room_name=acc_room_name,
                         acc_room_number=acc_room_number,
                         acc_discipline=acc_discipline,
@@ -539,6 +552,7 @@ def compute_service_takeoff(
                 confidence=confidence,
                 riser_count=acc_riser_count.get(key, 0),
                 drop_count=acc_drop_count.get(key, 0),
+                bundle=acc_is_bundle.get(key, False),
             )
         )
 
@@ -561,6 +575,7 @@ def _accumulate(
     drawn: float,
     identity: RunServiceIdentity,
     has_conflict: bool,
+    is_bundle: bool,
     room_name: str | None,
     room_number: str | None,
     acc_drawing_length: dict[_BucketKey, float],
@@ -568,6 +583,7 @@ def _accumulate(
     acc_entity_ids: dict[_BucketKey, set[str]],
     acc_identity_status: dict[_BucketKey, str],
     acc_has_conflict: dict[_BucketKey, bool],
+    acc_is_bundle: dict[_BucketKey, bool],
     acc_room_name: dict[_BucketKey, str | None],
     acc_room_number: dict[_BucketKey, str | None],
     acc_discipline: dict[_BucketKey, str | None],
@@ -579,12 +595,14 @@ def _accumulate(
         acc_entity_ids[key] = set()
         acc_identity_status[key] = identity.status
         acc_has_conflict[key] = False
+        acc_is_bundle[key] = False
         acc_room_name[key] = room_name
         acc_room_number[key] = room_number
         acc_discipline[key] = identity.discipline
 
     acc_drawing_length[key] += drawn
     acc_run_count[key] += 1
+    acc_is_bundle[key] = acc_is_bundle[key] or is_bundle
     acc_entity_ids[key].update(identity.entity_ids)
     acc_identity_status[key] = _worst_status(acc_identity_status[key], identity.status)
     acc_has_conflict[key] = acc_has_conflict[key] or has_conflict

@@ -250,6 +250,23 @@ def test_bundle_length_not_halved_for_two_services() -> None:
     # Explicitly not halved:
     assert by_service["SVC_A"].drawing_length != segment_length / 2
     assert by_service["SVC_B"].drawing_length != segment_length / 2
+    # #655: a multi-service run is flagged as a bundle (full length to each, not a split).
+    assert by_service["SVC_A"].bundle is True
+    assert by_service["SVC_B"].bundle is True
+
+
+def test_single_service_run_is_not_flagged_bundle() -> None:
+    """A single-service run is not a bundle (its length is individually resolved)."""
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 0.0, 1000.0, 0.0)},
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+    assert len(result.lines) == 1
+    assert result.lines[0].bundle is False
 
 
 # ---------------------------------------------------------------------------

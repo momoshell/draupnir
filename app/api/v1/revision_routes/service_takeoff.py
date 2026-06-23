@@ -273,6 +273,7 @@ async def get_revision_service_takeoff(
                 confidence=line.confidence,
                 riser_count=line.riser_count,
                 drop_count=line.drop_count,
+                bundle=line.bundle,
             )
         )
 

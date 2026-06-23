@@ -43,6 +43,16 @@ class ServiceTakeoffLineRead(BaseModel):
     )
     riser_count: int = Field(0, ge=0, description="Rise symbols in this (unknown, room) bucket")
     drop_count: int = Field(0, ge=0, description="Drop symbols in this (unknown, room) bucket")
+    bundle: bool = Field(
+        False,
+        description=(
+            "True when a contributing run carried multiple services (a bundle, e.g. a "
+            "shared-colour med-gas chase). Each service in the bundle is reported at the FULL "
+            "corridor length, so this line's per-service length means 'present in the bundle', "
+            "not an individually resolved split (#655). Group/discipline totals and per-room "
+            "metres are unaffected; do not sum per-service bundle lengths as distinct pipe runs."
+        ),
+    )
 
 
 class ServiceTakeoffScaleRead(BaseModel):
