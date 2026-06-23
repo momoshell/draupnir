@@ -9,6 +9,12 @@ from app.ingestion.canonical.entity_provenance import (
     EntityProvenanceError,
     validate_entity_provenance,
 )
+from app.ingestion.ref_resolution import (
+    ENTITY_LAYER_KEYS,
+    LAYER_IDENTITY_KEYS,
+    collection_identity_index,
+    first_ref,
+)
 
 from .._constants import _SOURCE_DOCUMENT_REF  # noqa: TID252
 from .._utils import (  # noqa: TID252
@@ -452,51 +458,17 @@ def _build_layer_mapping_check(
         _metadata_candidate(canonical_json, "layer_mapping"),
         _metadata_candidate(canonical_json, "layer_map"),
     )
-    used_layer_names: set[str] = set()
-    used_layer_refs: set[str] = set()
-    for entity in entities:
-        for layer_name in (entity.get("layer"), entity.get("layer_name")):
-            if isinstance(layer_name, str):
-                normalized_name = layer_name.strip()
-                if normalized_name:
-                    used_layer_names.add(normalized_name)
-        layer_ref = entity.get("layer_ref")
-        if isinstance(layer_ref, str):
-            normalized_ref = layer_ref.strip()
-            if normalized_ref:
-                used_layer_refs.add(normalized_ref)
-
-    declared_layer_names: set[str] = set()
-    declared_layer_refs: set[str] = set()
-    declared_layer_ref_fallbacks: set[str] = set()
-    for layer in _sequence_mappings(canonical_json.get("layers")):
-        layer_names: set[str] = set()
-        layer_refs: set[str] = set()
-        for layer_name in (layer.get("name"), layer.get("layer_name")):
-            if isinstance(layer_name, str):
-                normalized_name = layer_name.strip()
-                if normalized_name:
-                    layer_names.add(normalized_name)
-        for layer_ref in (layer.get("ref"), layer.get("layer_ref")):
-            if isinstance(layer_ref, str):
-                normalized_ref = layer_ref.strip()
-                if normalized_ref:
-                    layer_refs.add(normalized_ref)
-
-        declared_layer_names.update(layer_names)
-        declared_layer_refs.update(layer_refs)
-        if not layer_refs:
-            declared_layer_ref_fallbacks.update(layer_names)
-
-    used_layers = used_layer_names | used_layer_refs
-    declared_layers = declared_layer_names | declared_layer_refs
+    # Single authoritative matching rule (#539): a declared layer is identified by the SET of all
+    # its candidate refs (layer_ref/name/layer_name/ref/id); an entity's resolved layer reference
+    # (layer_ref → layer → layer_name) is "mapped" iff it is in that set — the same rule
+    # reconciliation and materialization linkage use. This matches an entity that references a
+    # layer by any of its identifiers (e.g. by name where the layer declares only a ref).
+    used_layers = {ref for entity in entities if (ref := first_ref(entity, ENTITY_LAYER_KEYS))}
+    declared_layers = collection_identity_index(
+        _sequence_mappings(canonical_json.get("layers")), LAYER_IDENTITY_KEYS
+    )
     missing_layers = (
-        sorted(
-            (used_layer_names - declared_layer_names)
-            | (used_layer_refs - (declared_layer_refs | declared_layer_ref_fallbacks))
-        )
-        if declared_layers
-        else sorted(used_layers)
+        sorted(used_layers - declared_layers) if declared_layers else sorted(used_layers)
     )
 
     if layer_mapping_hint is True:

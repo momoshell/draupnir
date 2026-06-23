@@ -58,7 +58,7 @@ def test_faithful_references_have_no_orphans() -> None:
     assert refs["dangling_parent_refs"] == []
 
 
-def test_orphan_references_are_reported_but_do_not_gate() -> None:
+def test_orphan_references_gate_as_warning() -> None:
     canonical = _faithful()
     canonical["entities"] = [
         {"entity_id": "e1", "entity_type": "insert", "layer_ref": "GHOST", "block_ref": "MISSING"},
@@ -69,21 +69,28 @@ def test_orphan_references_are_reported_but_do_not_gate() -> None:
     assert refs["orphan_layer_refs"] == ["GHOST"]
     assert refs["orphan_block_refs"] == ["MISSING"]
     assert refs["dangling_parent_refs"] == ["x"]
-    assert refs["status"] == "orphans_present"
-    # Informational only: orphans never change the verdict (see #535).
-    assert report["status"] == "match"
-    assert build_reconciliation_check(report)["status"] == "pass"
+    # #539: genuine orphans now gate as drift -> warning (valid_with_warnings, never invalid).
+    assert refs["status"] == "drift"
+    assert refs["gating"] is True
+    assert report["status"] == "drift"
+    assert "references" in report["drifted_invariants"]
+    assert build_reconciliation_check(report)["status"] == "warning"
 
 
-def test_references_match_via_shared_resolver_key_precedence() -> None:
-    # Layer declares identity under "ref"; entity points at it via "layer_ref".
+def test_references_match_via_set_membership_any_identifier() -> None:
+    # #539 core case: a layer carries BOTH "ref" and "name"; an entity may reference EITHER.
+    # Under the old single-precedence rule the layer resolved to its name ("A-WALL"), so an entity
+    # referencing it by "L" was a false orphan. Set-membership matches any declared identifier.
     canonical = _faithful()
-    canonical["layers"] = [{"ref": "L1", "name": "A-WALL"}]
+    canonical["layers"] = [{"ref": "L", "name": "A-WALL"}]
     canonical["blocks"] = []
-    canonical["entities"] = [{"entity_id": "e1", "entity_type": "line", "layer_ref": "A-WALL"}]
-    refs = _invariant(build_reconciliation(canonical), "references")
-    # "A-WALL" resolves as the layer ref (name precedes ref), so no orphan.
-    assert refs["orphan_layer_refs"] == []
+    for entity_ref in ("L", "A-WALL"):
+        canonical["entities"] = [
+            {"entity_id": "e1", "entity_type": "line", "layer_ref": entity_ref}
+        ]
+        refs = _invariant(build_reconciliation(canonical), "references")
+        assert refs["orphan_layer_refs"] == [], f"layer_ref={entity_ref!r} should not be orphan"
+        assert refs["status"] == "match"
 
 
 def test_faithful_structure_and_extents() -> None:
