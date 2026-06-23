@@ -24,6 +24,7 @@ from app.core.logging import get_logger
 from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION, Centerline
 from app.ingestion.centerline_dwg import dwg_centerlines
 from app.ingestion.centerline_passthrough import passthrough_centerlines
+from app.ingestion.centerline_pdf import pdf_centerlines
 from app.interpretation.routed_runs import RunGroup, identify_routed_runs
 from app.models.revision_routed_length import RevisionRoutedLength
 
@@ -37,14 +38,14 @@ def select_centerline_producer(input_family: str | None) -> _ProducerFn:
     """Return the appropriate centerline producer for the given ``input_family``.
 
     - ``"dwg"`` / ``"dxf"`` -> :func:`~app.ingestion.centerline_dwg.dwg_centerlines`
-    - everything else (``"pdf_vector"``, ``"pdf_raster"``, ``None``, …) ->
+    - ``"pdf_vector"`` / ``"pdf_raster"`` -> :func:`~app.ingestion.centerline_pdf.pdf_centerlines`
+    - everything else (``None``, unknown) ->
       :func:`~app.ingestion.centerline_passthrough.passthrough_centerlines`
-
-    Branching is intentionally minimal so #641 can add a ``pdf_vector`` branch
-    with a single line.
     """
     if input_family in ("dwg", "dxf"):
         return dwg_centerlines
+    if input_family in ("pdf_vector", "pdf_raster"):
+        return pdf_centerlines
     return passthrough_centerlines
 
 
