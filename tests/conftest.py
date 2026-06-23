@@ -252,6 +252,7 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "revision_layers",
     "revision_blocks",
     "revision_entities",
+    "revision_routed_lengths",
 )
 _PROJECT_TRUNCATE_CASCADE_CATALOG_TABLES: tuple[str, ...] = (
     "formula_definition_supersessions",

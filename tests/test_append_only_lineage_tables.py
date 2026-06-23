@@ -31,6 +31,7 @@ from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from app.models.estimation_catalog import EstimationRate
 from app.models.export_job_input import ExportJobInput
 from app.models.job import Job, JobStatus, JobType
+from app.models.revision_routed_length import RevisionRoutedLength
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
     APPEND_ONLY_PROTECTED_TABLES,
@@ -97,6 +98,7 @@ class _ProtectedRowIds:
     revision_layer_id: uuid.UUID
     revision_block_id: uuid.UUID
     revision_entity_id: uuid.UUID
+    revision_routed_length_id: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,7 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "revision_layers": row_ids.revision_layer_id,
         "revision_blocks": row_ids.revision_block_id,
         "revision_entities": row_ids.revision_entity_id,
+        "revision_routed_lengths": row_ids.revision_routed_length_id,
     }
     return ids_by_table[table_name]
 
@@ -473,6 +476,26 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         session.add(change_set_validation_result)
         await session.flush()
         session.add(changeset_apply_job_input)
+        await session.flush()
+        revision_routed_length = RevisionRoutedLength(
+            id=uuid.uuid4(),
+            project_id=quantity_seed.project_id,
+            source_file_id=quantity_seed.file_id,
+            extraction_profile_id=adapter_outputs[0].extraction_profile_id,
+            source_job_id=quantity_seed.ingest_job_id,
+            drawing_revision_id=drawing_revisions[0].id,
+            adapter_run_output_id=adapter_outputs[0].id,
+            canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            layer_ref="Pipes",
+            colour_key="idx:150",
+            algo_version="test",
+            raster_params_hash="e" * 64,
+            producer_kind="passthrough",
+            skeleton_length_du=1.0,
+            entity_count=1,
+            geometry_json=None,
+        )
+        session.add(revision_routed_length)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -517,6 +540,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         revision_layer_id=layers[0].id,
         revision_block_id=blocks[0].id,
         revision_entity_id=entities[0].id,
+        revision_routed_length_id=revision_routed_length.id,
     )
 
 
