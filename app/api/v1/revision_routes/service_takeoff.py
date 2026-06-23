@@ -24,6 +24,7 @@ from app.interpretation.run_service_identity import fuse_run_service_identities
 from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
 from app.interpretation.service_takeoff_loaders import (
     INPUT_FAMILY_PDF_VECTOR,
+    load_measured_geometry,
     load_measured_lengths,
     load_service_takeoff_inputs,
 )
@@ -178,8 +179,10 @@ async def get_revision_service_takeoff(
     # Step 2 -- identify routed runs (P1).
     runs = identify_routed_runs(inputs.routed_entities, inputs.legend).groups
 
-    # Step 2b -- load materialized centerline lengths (C0 lazy-materialization).
+    # Step 2b -- load materialized centerline lengths + geometry (C0 lazy-materialization).
     measured_mapping, present_keys = await load_measured_lengths(db, revision_id)
+    # LP2 (#654): persisted centerline polylines, used to distribute length per room by clipping.
+    measured_geometry = await load_measured_geometry(db, revision_id)
     required_keys: set[tuple[str | None, str | None]] = {(g.layer_ref, g.colour_key) for g in runs}
     # Fully materialized only when every required group is present (and there is at
     # least one run -- an empty revision is trivially uninteresting but still provisional).
@@ -230,6 +233,7 @@ async def get_revision_service_takeoff(
         rise_symbols=rise_symbols,
         drop_symbols=drop_symbols,
         measured_length_by_group=measured_mapping if measured_mapping else None,
+        measured_geometry_by_group=measured_geometry if measured_geometry else None,
     )
 
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
