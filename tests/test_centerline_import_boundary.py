@@ -22,6 +22,7 @@ import subprocess
 import sys
 
 _CENTERLINE_CONTRACT_MODULE = "app.ingestion.centerline_contract"
+_CENTERLINE_DWG_MODULE = "app.ingestion.centerline_dwg"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -179,4 +180,35 @@ def test_read_path_modules_do_not_import_cv2_or_skimage_after_app_bootstrap() ->
     assert result.returncode == 0, (
         "cv2 or skimage imported by read-path service modules (ADR-008 violation).\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- centerline_dwg (isolated; the DWG producer must stay pure too)
+# ---------------------------------------------------------------------------
+
+
+def test_centerline_dwg_does_not_import_cv2_in_isolation() -> None:
+    """app.ingestion.centerline_dwg must not pull cv2 when imported alone.
+
+    Arrange: script imports only centerline_dwg.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_CENTERLINE_DWG_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by centerline_dwg.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_centerline_dwg_does_not_import_skimage_in_isolation() -> None:
+    """app.ingestion.centerline_dwg must not pull skimage when imported alone.
+
+    Arrange: script imports only centerline_dwg.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_CENTERLINE_DWG_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by centerline_dwg.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )

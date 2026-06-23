@@ -14,7 +14,7 @@ from typing import Any
 # Versioning constant -- bump when the passthrough algorithm changes
 # ---------------------------------------------------------------------------
 
-CURRENT_ALGO_VERSION: str = "c0-passthrough-1"
+CURRENT_ALGO_VERSION: str = "c1-dwg-1"
 
 
 # ---------------------------------------------------------------------------

@@ -61,7 +61,7 @@ _PARALLEL_DOT_MIN: float = 0.985
 # Below 2 du the segments are likely the same line; above 80 du they are
 # structurally separate runs, not a double-line representation of one pipe.
 _PERP_OFFSET_MIN: float = 2.0
-_PERP_OFFSET_MAX_DEFAULT: float = 80.0
+_PERP_OFFSET_MAX: float = 80.0
 
 # Minimum projection-overlap fraction (overlap / min wall length) to accept a
 # pair.  0.5 means at least half of the shorter wall must shadow the longer.
@@ -79,7 +79,7 @@ _UNPAIRED_LENGTH_FACTOR: float = 0.5
 _TUNING_CONSTANTS: dict[str, float] = {
     "overlap_min": _OVERLAP_MIN,
     "parallel_dot_min": _PARALLEL_DOT_MIN,
-    "perp_offset_max": _PERP_OFFSET_MAX_DEFAULT,
+    "perp_offset_max": _PERP_OFFSET_MAX,
     "perp_offset_min": _PERP_OFFSET_MIN,
     "unpaired_length_factor": _UNPAIRED_LENGTH_FACTOR,
 }
@@ -273,7 +273,7 @@ def _derive_centerline(
             mid_jx = (s_j[0] + e_j[0]) / 2.0
             mid_jy = (s_j[1] + e_j[1]) / 2.0
             perp = abs(_perpendicular_offset(s_i[0], s_i[1], ux_i, uy_i, mid_jx, mid_jy))
-            if perp < _PERP_OFFSET_MIN or perp > _PERP_OFFSET_MAX_DEFAULT:
+            if perp < _PERP_OFFSET_MIN or perp > _PERP_OFFSET_MAX:
                 continue
 
             # 3. Projection overlap fraction.
