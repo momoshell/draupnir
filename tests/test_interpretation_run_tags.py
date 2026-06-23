@@ -177,3 +177,35 @@ def test_returns_tag_observation_type() -> None:
 def test_size_without_real_service_returns_none(text: str) -> None:
     # legend-is-ground-truth: a unit/separator token (MM/CM/M/X) is never a service.
     assert parse_tag(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "100MM ABOVE THE DESK HEIGHT.",  # note fragment -> must NOT fabricate "ABOVE"
+        "10MM AND NOT EXCEED",  # note fragment -> must NOT fabricate "AND"
+        "200 x 100 IN PLANT ROOM",  # WxH in prose -> must NOT fabricate "IN"
+        "50 mm FROM WALL",  # round+mm in prose -> must NOT fabricate "FROM"
+    ],
+)
+def test_connective_word_is_not_a_service(text: str) -> None:
+    # A real service code is never an English function word; note prose carrying a size must
+    # not fabricate a service (never-guess). See _NON_SERVICE_WORDS.
+    assert parse_tag(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "service"),
+    [
+        ("200 x 100 LV DIST", "LV"),
+        ("150 x 75 SP & LTG", "SP"),
+        ("650x350 EA", "EA"),
+        ("Ø42 mm AGSS", "AGSS"),
+        ("100 x 100 ESSENTIAL", "ESSENTIAL"),
+    ],
+)
+def test_real_services_still_parse(text: str, service: str) -> None:
+    # Guard: the connective stopwords must not reject genuine service codes.
+    result = parse_tag(text)
+    assert result is not None
+    assert result.service == service

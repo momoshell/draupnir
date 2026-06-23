@@ -299,24 +299,52 @@ async def _load_text_blocks(db: AsyncSession, revision_id: UUID) -> list[dict[st
 
 
 # ---------------------------------------------------------------------------
-# PDF tag-candidate filter
+# PDF tag-candidate extractor
 # ---------------------------------------------------------------------------
 
+# Matches any size expression that can START a pipe tag:
+#   - optional diameter glyph + digits + mm  (e.g. "Ø54 mm", "54 mm")
+#   - WxH notation                           (e.g. "200 x 100", "650x350")
+# Plain ASCII source (RUF002): use Ø escape for the Ø glyph.
+# Tag-head: an optional diameter glyph -- clean U+00D8 OR the U+FFFD replacement that
+# non-UTF-8 sources emit (mirrors run_tags) -- then a round 'NN mm' or a WxH 'NNxNN' size.
+# Matching the garbled glyph too is load-bearing: it is the segment boundary for concatenated
+# blocks like '<glyph>76 mm VAC<glyph>42 mm MA', so each tag splits out even when Ø is corrupt.
+_PDF_TAG_HEAD_RE: re.Pattern[str] = re.compile(
+    "(?:[Ø�]\\s*)?\\d{1,4}\\s*mm\\b|\\d{2,4}\\s*[xX]\\s*\\d{2,4}",
+    re.IGNORECASE,
+)
 
-def _looks_like_pdf_tag(text: str) -> bool:
-    """A PDF text block is a tag candidate only with real tag structure: a digit plus an
-    'mm' unit or a diameter glyph. Rejects title-block/notes prose (e.g. '5291 LONDON',
-    'Drawn: HK', '1:50') that the bare digits+word parse_tag fallback would otherwise
-    fabricate a service from. DWG tags are layer-filtered upstream and unaffected."""
-    if not re.search(r"\d", text):
-        return False
-    # 'mm' unit (case-insensitive, not part of a longer word like 'mmhg') OR a diameter glyph
-    # (clean U+00D8 or the U+FFFD replacement seen in some pipelines).
-    # Pattern: mm preceded by non-word char OR digit, followed by non-word char.
-    # Plain ASCII source (RUF002) -> use escapes.
-    return (
-        bool(re.search(r"(?i)(?<!\w)mm(?!\w)|(?<=\d)mm(?!\w)", text)) or "Ø" in text or "�" in text
-    )
+# Maximum characters a valid tag candidate may occupy.  Short segments from
+# densely-packed med-gas blocks (e.g. "Ø76 mm VAC") pass; an isolated size in
+# a long note sentence produces one head whose tail is far longer than this cap
+# and is therefore rejected without needing case/stopword heuristics.
+_MAX_TAG_CANDIDATE_CHARS: int = 30
+
+
+def _extract_pdf_tag_candidates(text: str) -> list[str]:
+    """Segment a PDF text block into individual tag candidates.
+
+    Uses size-expression head positions to split concatenated tags
+    (e.g. med-gas stacks like "Ø76 mm VACØ42 mm MAØ42 mm AGSS") into
+    one candidate per head, then rejects any candidate longer than
+    ``_MAX_TAG_CANDIDATE_CHARS``.  Blocks with no size head (pure prose) return [].
+
+    All candidates from one block share the block's bbox centroid; finer
+    per-tag positioning is a future refinement.
+    """
+    heads = list(_PDF_TAG_HEAD_RE.finditer(text))
+    if not heads:
+        return []
+
+    candidates: list[str] = []
+    for i, head in enumerate(heads):
+        start = head.start()
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        segment = text[start:end].strip()
+        if len(segment) <= _MAX_TAG_CANDIDATE_CHARS:
+            candidates.append(segment)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -790,16 +818,19 @@ async def load_tag_placements(
 
     if input_family == INPUT_FAMILY_PDF_VECTOR:
         # PDF tags live in metadata.text_blocks, not as RevisionEntity text rows.
-        # Only emit a TagPlacement when the block has real tag structure (digit + mm/diameter);
-        # prose like '5291 LONDON' or 'Drawn: HK' is rejected by _looks_like_pdf_tag to prevent
-        # parse_tag's bare digits+word fallback from fabricating services.
+        # Each block is segmented into individual tag candidates by _extract_pdf_tag_candidates;
+        # prose without a size head yields no candidates, and isolated sizes in long note
+        # sentences are rejected by the per-candidate length cap — no case/stopword hacks needed.
+        # All candidates from one block share the block's bbox centroid (finer per-tag
+        # positioning is a future refinement).  parse_tag remains the real gate downstream.
         blocks = await _load_text_blocks(db, revision_id)
         pdf_placements: list[TagPlacement] = []
         for block in blocks:
-            text = block.get("text")
-            if not isinstance(text, str) or not text.strip():
+            block_text = block.get("text")
+            if not isinstance(block_text, str) or not block_text.strip():
                 continue
-            if not _looks_like_pdf_tag(text):
+            candidates = _extract_pdf_tag_candidates(block_text)
+            if not candidates:
                 continue
             bbox = block.get("bbox")
             if not isinstance(bbox, dict):
@@ -811,7 +842,8 @@ async def load_tag_placements(
             if x_min is None or y_min is None or x_max is None or y_max is None:
                 continue
             point = ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
-            pdf_placements.append(TagPlacement(text=text, point=point, layer_ref=None))
+            for cand in candidates:
+                pdf_placements.append(TagPlacement(text=cand, point=point, layer_ref=None))
         return pdf_placements
 
     # DWG/DXF (or unknown family): ilike-based entity text selection, ADR-003 compliant.
