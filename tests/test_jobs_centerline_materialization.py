@@ -426,8 +426,8 @@ async def test_version_gate_divergence(
 ) -> None:
     """load_measured_lengths with a stale version string returns empty results.
 
-    A revision materialized at CURRENT_ALGO_VERSION (c2-pdf-1) must not be
-    visible when queried at the old c0-passthrough-1 version.
+    A revision materialized at CURRENT_ALGO_VERSION must not be visible when queried
+    at the old c0-passthrough-1 version.
     """
     seed = await _ingest_and_seed(
         async_client, monkeypatch, entities=_DWG_ENTITIES, input_family="dwg"
@@ -435,7 +435,7 @@ async def test_version_gate_divergence(
     await _enqueue_and_run_centerline(seed)
 
     async with _get_session() as session:
-        # Default version (c2-pdf-1) should find rows.
+        # Default (current) version should find rows.
         _mapping_current, present_current = await load_measured_lengths(
             session, seed.drawing_revision_id
         )
@@ -510,3 +510,52 @@ async def test_dwg_materialization_idempotency(
     assert len(rows_first) == len(rows_second), (
         f"Expected idempotent insert: first={len(rows_first)}, second={len(rows_second)}"
     )
+
+
+@requires_database
+async def test_dwg_materialization_persists_geometry(
+    async_client: httpx.AsyncClient,
+    cleanup_db: Any,
+    enqueued_job_ids: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DWG revision persists centerline polylines into geometry_json (#653).
+
+    The producer computes polylines; materialization now stores them (was NULL). The cv2-free
+    read loader ``load_measured_geometry`` returns them per group for LP2 per-room clipping.
+    """
+    from app.ingestion.centerline_contract import polylines_from_geometry_json
+    from app.interpretation.service_takeoff_loaders import load_measured_geometry
+
+    seed = await _ingest_and_seed(
+        async_client, monkeypatch, entities=_DWG_ENTITIES, input_family="dwg"
+    )
+    await _enqueue_and_run_centerline(seed)
+
+    async with _get_session() as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(RevisionRoutedLength).where(
+                        RevisionRoutedLength.drawing_revision_id == seed.drawing_revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        geometry = await load_measured_geometry(session, seed.drawing_revision_id)
+
+    assert rows, "Expected materialized rows"
+    # At least one group carries persisted geometry, and its polylines round-trip.
+    with_geometry = [r for r in rows if r.geometry_json is not None]
+    assert with_geometry, "Expected at least one row with populated geometry_json"
+    for row in with_geometry:
+        polylines = polylines_from_geometry_json(row.geometry_json)
+        assert polylines, "geometry_json should decode to non-empty polylines"
+        assert (row.layer_ref, row.colour_key) in geometry
+
+    # The loader only surfaces groups that have geometry.
+    assert geometry, "load_measured_geometry should return polylines for the DWG revision"
+    for polylines in geometry.values():
+        assert all(len(pl) >= 2 for pl in polylines)

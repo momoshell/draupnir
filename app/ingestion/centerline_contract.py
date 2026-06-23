@@ -12,10 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Versioning constant -- bump when the passthrough algorithm changes
+# Versioning constant -- bump when the algorithm OR the persisted output contract changes.
+# "c3-geom-1" (#653): persists centerline polylines into geometry_json (was NULL); the bump
+# invalidates pre-geometry rows so the version-gated read re-materializes them with geometry.
 # ---------------------------------------------------------------------------
 
-CURRENT_ALGO_VERSION: str = "c2-pdf-1"
+CURRENT_ALGO_VERSION: str = "c3-geom-1"
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +123,55 @@ class CenterlineGeometry:
 
     polylines: tuple[tuple[tuple[float, float], ...], ...]
     length_du: float
+
+
+# ---------------------------------------------------------------------------
+# Geometry persistence (#653) -- pure JSON (de)serialization, read-path safe
+# ---------------------------------------------------------------------------
+
+_GEOMETRY_JSON_SCHEMA_VERSION: str = "0.1"
+_COORD_PRECISION: int = 3
+
+
+def geometry_to_json(geometry: CenterlineGeometry) -> dict[str, Any] | None:
+    """Serialize centerline polylines to a JSON-safe payload, or ``None`` when there are none.
+
+    Coordinates are rounded to ``_COORD_PRECISION`` decimals (drawing units) to bound payload
+    size while staying well below any measurement-relevant precision. Returns ``None`` for empty
+    polylines (e.g. the passthrough producer) so the persisted ``geometry_json`` stays NULL there.
+    """
+    if not geometry.polylines:
+        return None
+    polylines = [
+        [[round(float(x), _COORD_PRECISION), round(float(y), _COORD_PRECISION)] for (x, y) in pl]
+        for pl in geometry.polylines
+    ]
+    return {"schema_version": _GEOMETRY_JSON_SCHEMA_VERSION, "polylines": polylines}
+
+
+def polylines_from_geometry_json(
+    payload: Any,
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Deserialize a persisted ``geometry_json`` payload back to polylines.
+
+    Defensive: returns ``()`` for absent/malformed payloads, and drops polylines with fewer than
+    two points (a clip needs segments). Pure — no cv2/skimage, safe on the read path.
+    """
+    if not isinstance(payload, Mapping):
+        return ()
+    raw = payload.get("polylines")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[tuple[tuple[float, float], ...]] = []
+    for pl in raw:
+        if not isinstance(pl, (list, tuple)):
+            continue
+        pts = tuple(
+            (float(p[0]), float(p[1])) for p in pl if isinstance(p, (list, tuple)) and len(p) >= 2
+        )
+        if len(pts) >= 2:
+            out.append(pts)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
