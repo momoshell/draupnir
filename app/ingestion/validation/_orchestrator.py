@@ -25,6 +25,7 @@ from ._utils import (
     _json_compatible,
 )
 from .checks import (
+    _build_block_expansion_check,
     _build_ifc_schema_check,
     _build_pdf_scale_check,
     _build_required_checks,
@@ -148,6 +149,12 @@ def build_validation_outcome(
     reconciliation = build_reconciliation(canonical_json)
     checks.append(build_reconciliation_check(reconciliation))
 
+    block_expansion_check, block_expansion_requires_review = _build_block_expansion_check(
+        canonical_json=canonical_json,
+        add_finding=add_finding,
+    )
+    checks.append(block_expansion_check)
+
     for index, warning in enumerate(adapter_warnings_json, start=1):
         normalized_warning = warning if isinstance(warning, Mapping) else {"value": warning}
         add_finding(
@@ -168,6 +175,7 @@ def build_validation_outcome(
         or placeholder_requires_review
         or required_checks_require_review
         or pdf_scale_requires_review
+        or block_expansion_requires_review
     )
     validation_status = _derive_validation_status(
         checks=checks,

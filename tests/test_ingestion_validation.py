@@ -24,6 +24,7 @@ from app.ingestion.finalization import (
 from app.ingestion.validation import (
     ValidationOutcome,
     _has_valid_polygon_area_geometry,
+    _utils,
     build_validation_outcome,
 )
 
@@ -40,6 +41,7 @@ _EXPECTED_CHECK_KEYS = [
     "pdf_scale_presence_calibration_status",
     "ifc_schema_support",
     "reconciliation",
+    "block_expansion_completeness",
 ]
 
 
@@ -403,10 +405,157 @@ def test_build_validation_outcome_emits_required_checks_in_deterministic_order()
     }
     assert checks[8]["details"] == {"applicable": False}
     assert checks[9]["details"] == {"applicable": False}
-    # Reconciliation rides last and a coherent canonical reconciles cleanly.
     assert checks[10]["check_key"] == "reconciliation"
     assert checks[10]["status"] == "pass"
     assert outcome.report_json["reconciliation"]["status"] == "match"
+    # Block-expansion completeness rides last; a canonical with no block geometry is not applicable.
+    assert checks[11]["check_key"] == "block_expansion_completeness"
+    assert checks[11]["details"] == {"applicable": False}
+
+
+# ---------------------------------------------------------------------------
+# #542 — block-expansion / geometry-placement completeness
+# ---------------------------------------------------------------------------
+
+
+def _placed_entity(source_block: str) -> dict[str, JSONValue]:
+    """A world-placed entity as the block-expansion pass (#541) tags it."""
+    return {
+        "kind": "line",
+        "start": {"x": 0.0, "y": 0.0},
+        "end": {"x": 1.0, "y": 0.0},
+        "provenance_json": {
+            "origin": "block_expansion",
+            "block_expansion": {"source_block": source_block, "approximate_transform": False},
+        },
+    }
+
+
+def _block_with_geometry(ref: str, leaf_count: int) -> dict[str, JSONValue]:
+    return {
+        "block_ref": ref,
+        "entities": tuple(
+            {"kind": "line", "start": {"x": 0.0, "y": 0.0}, "end": {"x": 1.0, "y": 0.0}}
+            for _ in range(leaf_count)
+        ),
+    }
+
+
+def test_geometry_placement_no_blocks_is_complete() -> None:
+    placement = _utils.geometry_placement({"entities": (), "blocks": ()})
+    assert placement["blocks_with_geometry"] == 0
+    assert placement["in_block_unexpanded"] == 0
+    assert placement["ratio"] == 1.0
+
+
+def test_geometry_placement_unexpanded_block_counts_as_missing() -> None:
+    # A block carrying 3 leaf entities that nothing placed -> all 3 unexpanded, ratio 0.
+    canonical = {"entities": (), "blocks": (_block_with_geometry("B1", 3),)}
+    placement = _utils.geometry_placement(canonical)
+    assert placement == {
+        "placed_from_blocks": 0,
+        "in_block_unexpanded": 3,
+        "unexpanded_blocks": 1,
+        "blocks_with_geometry": 1,
+        "ratio": 0.0,
+    }
+
+
+def test_geometry_placement_placed_block_is_complete() -> None:
+    # The block's geometry reached the world (an entity tagged with its source_block) -> ratio 1.
+    canonical = {
+        "entities": (_placed_entity("B1"), _placed_entity("B1")),
+        "blocks": (_block_with_geometry("B1", 2),),
+    }
+    placement = _utils.geometry_placement(canonical)
+    assert placement["in_block_unexpanded"] == 0
+    assert placement["unexpanded_blocks"] == 0
+    assert placement["placed_from_blocks"] == 2
+    assert placement["ratio"] == 1.0
+
+
+def test_geometry_placement_mixed_reports_partial_ratio() -> None:
+    # B1 placed (2 instances), B2 (4 leaf) stranded -> ratio = 2 / (2 + 4).
+    canonical = {
+        "entities": (_placed_entity("B1"), _placed_entity("B1")),
+        "blocks": (_block_with_geometry("B1", 2), _block_with_geometry("B2", 4)),
+    }
+    placement = _utils.geometry_placement(canonical)
+    assert placement["in_block_unexpanded"] == 4
+    assert placement["unexpanded_blocks"] == 1
+    assert placement["blocks_with_geometry"] == 2
+    assert placement["ratio"] == round(2 / 6, 4)
+
+
+def test_geometry_placement_nested_block_placed_via_parent_is_complete() -> None:
+    """A nested block placed via its parent is not falsely flagged unexpanded (#541 nesting).
+
+    Parent A (INSERT-only, no leaf geometry) contains an INSERT of B (leaf geometry). The expander
+    tags B's placed leaves with ``source_block="B"`` (its own ref, not A's). So B is found placed,
+    and A is skipped because it carries no leaf geometry of its own.
+    """
+    canonical = {
+        "entities": (_placed_entity("B"),),
+        "blocks": (
+            {"block_ref": "A", "entities": ({"kind": "insert", "block_ref": "B"},)},
+            _block_with_geometry("B", 1),
+        ),
+    }
+    placement = _utils.geometry_placement(canonical)
+    assert placement["blocks_with_geometry"] == 1  # only B carries leaf geometry
+    assert placement["in_block_unexpanded"] == 0
+    assert placement["unexpanded_blocks"] == 0
+    assert placement["ratio"] == 1.0
+
+
+def test_build_validation_outcome_unexpanded_blocks_require_review() -> None:
+    """Block geometry absent from the spatial model -> review_required + signal, not silently valid.
+
+    The 670003 blind spot (#542): entity-mapping coverage can read 100% while a large fraction of
+    geometry sits unplaced in block definitions. The check must surface it and reflect it in
+    validation_status.
+    """
+    canonical = _build_complete_canonical()
+    canonical["blocks"] = (_block_with_geometry("B1", 917),)
+
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.95),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    check = checks_by_key["block_expansion_completeness"]
+    assert check["status"] == "review_required"
+    assert check["details"]["geometry_placement"]["in_block_unexpanded"] == 917
+    assert outcome.validation_status == "needs_review"
+    # The descriptive signal also rides on coverage.
+    placement = outcome.report_json["coverage"]["geometry_placement"]
+    assert placement["in_block_unexpanded"] == 917
+    assert placement["ratio"] == 0.0
+
+
+def test_build_validation_outcome_fully_placed_blocks_pass() -> None:
+    """Every block with geometry was placed -> the completeness check passes (post-#541 green)."""
+    canonical = _build_complete_canonical()
+    # A single world-placed entity sourced from block B1 (the completeness check only inspects
+    # block-expansion provenance, so the rest of the entity set is irrelevant here).
+    canonical["entities"] = (_placed_entity("B1"),)
+    canonical["blocks"] = (_block_with_geometry("B1", 1),)
+
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=canonical,
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.95),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    assert checks_by_key["block_expansion_completeness"]["status"] == "pass"
+    assert outcome.report_json["coverage"]["geometry_placement"]["ratio"] == 1.0
 
 
 @pytest.mark.parametrize(
