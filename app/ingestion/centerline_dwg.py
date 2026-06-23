@@ -30,6 +30,7 @@ from app.ingestion.centerline_contract import (
     CURRENT_ALGO_VERSION,
     Centerline,
     CenterlineGeometry,
+    decompose_geometry,
     entity_group_drawn_length,
 )
 from app.interpretation.routed_runs import RunGroup
@@ -110,37 +111,12 @@ def _decompose_geometry(
     entity_ids: tuple[str, ...],
     geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
 ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
-    """Decompose member geometries into (start, end) 2-D segments.
+    """Thin local alias — delegates to the shared contract helper.
 
-    Mirrors the same geometry-type dispatch as ``entity_group_drawn_length``:
-    - line     -> one segment (start[:2], end[:2])
-    - polyline -> consecutive vertex/points[:2] pairs
-    - arc      -> skipped (arc length requires radius+span)
-    - zero-length or missing -> skipped
+    Lifted to ``app.ingestion.centerline_contract.decompose_geometry`` so that
+    the PDF raster producer can import it without depending on this module.
     """
-    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
-    for eid in entity_ids:
-        geom = geometry_by_entity_id.get(eid)
-        if geom is None:
-            continue
-        if "start" in geom and "end" in geom:
-            s = geom["start"]
-            e = geom["end"]
-            if len(s) >= 2 and len(e) >= 2:
-                p0: tuple[float, float] = (float(s[0]), float(s[1]))
-                p1: tuple[float, float] = (float(e[0]), float(e[1]))
-                if _segment_unit_and_length(*p0, *p1) is not None:
-                    segments.append((p0, p1))
-            continue
-        pts: Any = geom.get("vertices") or geom.get("points")
-        if pts:
-            coords = [(float(p[0]), float(p[1])) for p in pts if len(p) >= 2]
-            for i in range(len(coords) - 1):
-                p0 = coords[i]
-                p1 = coords[i + 1]
-                if _segment_unit_and_length(*p0, *p1) is not None:
-                    segments.append((p0, p1))
-    return segments
+    return decompose_geometry(entity_ids, geometry_by_entity_id)
 
 
 def _perpendicular_offset(

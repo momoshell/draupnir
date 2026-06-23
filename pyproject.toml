@@ -218,6 +218,16 @@ strict_optional = true
 module = ["shapely.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# cv2 ships no py.typed marker; skimage stubs are incomplete.
+module = ["cv2.*", "skimage.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# fitz (pymupdf) ships no py.typed marker.
+module = ["fitz.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
