@@ -669,6 +669,109 @@ def test_build_validation_outcome_keeps_explicit_geometry_validity_override() ->
     assert outcome.validation_status == "valid"
 
 
+def test_geometry_validity_passes_when_text_entities_mixed_with_valid_geometry() -> None:
+    # TEXT entities return None from _entity_has_valid_geometry (not applicable).
+    # A valid line should drive the check to pass; text entities are excluded from
+    # the pass/fail denominator.
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=(
+                {
+                    "kind": "line",
+                    "layer": "A-WALL",
+                    "start": {"x": 0.0, "y": 0.0},
+                    "end": {"x": 1.0, "y": 0.0},
+                },
+                {"kind": "text", "layer": "A-ANNO"},
+                {"kind": "mtext", "layer": "A-ANNO"},
+            ),
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    geometry_check = checks_by_key["geometry_validity"]
+
+    assert geometry_check["status"] == "pass"
+    assert geometry_check["details"]["validated_entity_count"] == 1
+    assert geometry_check["details"]["not_applicable_entity_count"] == 2
+
+
+def test_geometry_validity_passes_vacuously_for_text_only_drawing() -> None:
+    # A drawing with only non-geometric entities (all None) has no applicable
+    # geometry states; vacuously passes without blocking.
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=(
+                {"kind": "text", "layer": "A-ANNO"},
+                {"kind": "mtext", "layer": "A-ANNO"},
+            ),
+            layers=({"name": "A-ANNO"},),
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    geometry_check = checks_by_key["geometry_validity"]
+
+    assert geometry_check["status"] == "pass"
+    assert geometry_check["details"]["validated_entity_count"] == 0
+    assert geometry_check["details"]["not_applicable_entity_count"] == 2
+
+
+def test_geometry_validity_review_required_for_geometric_entity_missing_coords() -> None:
+    # A line entity without coordinates yields False (unconfirmed geometry);
+    # check must be review_required, not pass.
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=({"kind": "line", "layer": "A-WALL"},),
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    geometry_check = checks_by_key["geometry_validity"]
+
+    assert geometry_check["status"] == "review_required"
+    assert geometry_check["details"]["not_applicable_entity_count"] == 0
+
+
+def test_geometry_validity_fails_on_geometry_hint_false() -> None:
+    # geometry_hint=False must drive status to fail regardless of entity states.
+    outcome = build_validation_outcome(
+        input_family=InputFamily.DXF,
+        canonical_json=_build_complete_canonical(
+            entities=(
+                {
+                    "kind": "line",
+                    "layer": "A-WALL",
+                    "start": {"x": 0.0, "y": 0.0},
+                    "end": {"x": 1.0, "y": 0.0},
+                },
+            ),
+            geometry_validity="invalid",
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99),
+        generated_at=_GENERATED_AT,
+    )
+
+    checks_by_key = {check["check_key"]: check for check in outcome.report_json["checks"]}
+    geometry_check = checks_by_key["geometry_validity"]
+
+    assert geometry_check["status"] == "fail"
+    assert geometry_check["details"]["geometry_valid"] is False
+
+
 @pytest.mark.parametrize(
     ("pdf_scale", "check_status", "validation_status"),
     [
