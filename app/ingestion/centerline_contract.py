@@ -6,6 +6,7 @@ the read path where heavy vision dependencies are absent.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -14,7 +15,7 @@ from typing import Any
 # Versioning constant -- bump when the passthrough algorithm changes
 # ---------------------------------------------------------------------------
 
-CURRENT_ALGO_VERSION: str = "c1-dwg-1"
+CURRENT_ALGO_VERSION: str = "c2-pdf-1"
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,55 @@ def entity_group_drawn_length(
                 dy = coords[i + 1][1] - coords[i][1]
                 total += (dx * dx + dy * dy) ** 0.5
     return total
+
+
+# ---------------------------------------------------------------------------
+# Shared geometry decomposition helper
+# ---------------------------------------------------------------------------
+
+
+def _segment_nonzero_length(sx: float, sy: float, ex: float, ey: float) -> bool:
+    """Return True iff the segment has non-zero Euclidean length."""
+    return math.hypot(ex - sx, ey - sy) != 0.0
+
+
+def decompose_geometry(
+    entity_ids: tuple[str, ...],
+    geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Decompose member geometries into (start, end) 2-D segments.
+
+    Pure helper shared by the DWG and PDF producers.  No cv2/skimage.
+
+    Dispatches on geometry type:
+    - line     -> one segment (start[:2], end[:2])
+    - polyline -> consecutive vertex/points[:2] pairs
+    - arc      -> skipped (arc length requires radius+span)
+    - zero-length or missing -> skipped
+    """
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for eid in entity_ids:
+        geom = geometry_by_entity_id.get(eid)
+        if geom is None:
+            continue
+        if "start" in geom and "end" in geom:
+            s = geom["start"]
+            e = geom["end"]
+            if len(s) >= 2 and len(e) >= 2:
+                p0: tuple[float, float] = (float(s[0]), float(s[1]))
+                p1: tuple[float, float] = (float(e[0]), float(e[1]))
+                if _segment_nonzero_length(*p0, *p1):
+                    segments.append((p0, p1))
+            continue
+        pts: Any = geom.get("vertices") or geom.get("points")
+        if pts:
+            coords = [(float(p[0]), float(p[1])) for p in pts if len(p) >= 2]
+            for i in range(len(coords) - 1):
+                p0 = coords[i]
+                p1 = coords[i + 1]
+                if _segment_nonzero_length(*p0, *p1):
+                    segments.append((p0, p1))
+    return segments
 
 
 # ---------------------------------------------------------------------------

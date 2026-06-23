@@ -22,6 +22,7 @@ from app.api.v1.revision_routes.service_takeoff import _enqueue_centerline_mater
 from app.ingestion.centerline_contract import CURRENT_ALGO_VERSION
 from app.ingestion.centerline_dwg import dwg_centerlines
 from app.ingestion.centerline_passthrough import passthrough_centerlines
+from app.ingestion.centerline_pdf import pdf_centerlines
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
 from app.ingestion.runner import IngestionRunRequest
 from app.ingestion.validation.reconciliation import build_reconciliation
@@ -59,12 +60,12 @@ def test_select_centerline_producer_dxf_returns_dwg_centerlines() -> None:
     assert select_centerline_producer("dxf") is dwg_centerlines
 
 
-def test_select_centerline_producer_pdf_vector_returns_passthrough() -> None:
-    assert select_centerline_producer("pdf_vector") is passthrough_centerlines
+def test_select_centerline_producer_pdf_vector_returns_pdf_centerlines() -> None:
+    assert select_centerline_producer("pdf_vector") is pdf_centerlines
 
 
-def test_select_centerline_producer_pdf_raster_returns_passthrough() -> None:
-    assert select_centerline_producer("pdf_raster") is passthrough_centerlines
+def test_select_centerline_producer_pdf_raster_returns_pdf_centerlines() -> None:
+    assert select_centerline_producer("pdf_raster") is pdf_centerlines
 
 
 def test_select_centerline_producer_none_returns_passthrough() -> None:
@@ -386,7 +387,8 @@ async def test_pdf_vector_materialization_producer_kind(
     enqueued_job_ids: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Materializing a pdf_vector revision still uses passthrough producer."""
+    """Materializing a pdf_vector revision uses the pdf_raster producer."""
+    pytest.importorskip("cv2")
     seed = await _ingest_and_seed(
         async_client, monkeypatch, entities=_PDF_ENTITIES, input_family="pdf_vector"
     )
@@ -407,8 +409,11 @@ async def test_pdf_vector_materialization_producer_kind(
 
     assert rows, "Expected at least one RevisionRoutedLength row for the pdf_vector revision"
     for row in rows:
-        assert row.producer_kind == "passthrough", (
-            f"Expected producer_kind='passthrough', got {row.producer_kind!r}"
+        assert row.producer_kind == "pdf_raster", (
+            f"Expected producer_kind='pdf_raster', got {row.producer_kind!r}"
+        )
+        assert row.algo_version == CURRENT_ALGO_VERSION, (
+            f"Expected algo_version={CURRENT_ALGO_VERSION!r}, got {row.algo_version!r}"
         )
 
 
@@ -421,7 +426,7 @@ async def test_version_gate_divergence(
 ) -> None:
     """load_measured_lengths with a stale version string returns empty results.
 
-    A revision materialized at CURRENT_ALGO_VERSION (c1-dwg-1) must not be
+    A revision materialized at CURRENT_ALGO_VERSION (c2-pdf-1) must not be
     visible when queried at the old c0-passthrough-1 version.
     """
     seed = await _ingest_and_seed(
@@ -430,7 +435,7 @@ async def test_version_gate_divergence(
     await _enqueue_and_run_centerline(seed)
 
     async with _get_session() as session:
-        # Default version (c1-dwg-1) should find rows.
+        # Default version (c2-pdf-1) should find rows.
         _mapping_current, present_current = await load_measured_lengths(
             session, seed.drawing_revision_id
         )

@@ -412,6 +412,112 @@ class RevisionScaleRead(BaseModel):
     )
 
 
+class RevisionInterpretationRead(BaseModel):
+    """Interpretation summary for a revision, surfaced from the canonical payload (#562).
+
+    Pins every non-trivial reading the adapter applied — length scaling, angle
+    conversion, drawing orientation — each with its source and a ``confirmed`` flag, so
+    "is this scaled / oriented right?" is answerable rather than implicit. ``available``
+    is False (and the blocks null) when the revision's adapter produced no interpretation
+    block (e.g. a PDF/DXF adapter that does not emit it, or a changeset-origin revision
+    with no adapter run). Honest passthrough — values are reported verbatim, not re-derived.
+    """
+
+    available: bool = Field(
+        False,
+        description=(
+            "Whether the revision's adapter emitted an interpretation block. False means "
+            "no interpretation was recorded (e.g. non-DWG adapter, or no adapter run) — the "
+            "length/angle/orientation fields are null and must not be assumed."
+        ),
+    )
+    schema_version: str | None = Field(
+        None, description="Interpretation block schema version, when available"
+    )
+    length: dict[str, Any] | None = Field(
+        None,
+        description="Length interpretation: source, normalized unit, confirmed flag",
+    )
+    angle: dict[str, Any] | None = Field(
+        None,
+        description="Angle interpretation: source, stored vs canonical unit, confirmed flag",
+    )
+    orientation: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Orientation interpretation: angbase/angdir header codes, north bearing, "
+            "rotated + confirmed flags"
+        ),
+    )
+    source_input_family: str | None = Field(
+        None,
+        description=(
+            "Adapter input family the interpretation came from (e.g. dwg, dxf, pdf_vector); "
+            "null when there was no adapter run at all (changeset-origin revision)"
+        ),
+    )
+
+
+class RevisionCensusRead(BaseModel):
+    """Source census for a revision, surfaced from the canonical payload (#563).
+
+    Answers "what is on the drawing vs what we kept": the per-type ``raw_objects``
+    histogram is the reference for what the reader surfaced, ``dropped`` records how many
+    drawable records failed to map, and ``unsupported_classes`` captures reader blind spots
+    (zombie/proxy classes that never reach the object stream). Descriptive only — silent
+    loss becomes a number. ``available`` is False (counts null, collections empty) when the
+    adapter produced no census block (e.g. a non-DWG adapter, or no adapter run).
+    """
+
+    available: bool = Field(
+        False,
+        description=(
+            "Whether the revision's adapter emitted a census block. False means no census "
+            "was recorded (e.g. non-DWG adapter, or no adapter run) — counts are null and "
+            "collections empty."
+        ),
+    )
+    schema_version: str | None = Field(
+        None, description="Census block schema version, when available"
+    )
+    source: str | None = Field(None, description="Reader the census was built from (e.g. dwgread)")
+    raw_object_total: int | None = Field(
+        None, description="Total raw records the reader surfaced across all types"
+    )
+    raw_objects: dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-type raw record histogram (what is on the drawing); empty when absent",
+    )
+    drawable_candidates: int | None = Field(
+        None, description="How many raw records were drawable candidates"
+    )
+    materialized: int | None = Field(
+        None, description="How many drawable candidates were materialized (candidates - dropped)"
+    )
+    dropped: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Drop dispositions: total + per-reason counts (unsupported/malformed "
+            "drawables, hatches, inserts) + ``unsupported_types`` (a list of the record "
+            "type names that were unsupported)"
+        ),
+    )
+    unsupported_classes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Reader blind spots: classes LibreDWG could not natively resolve (zombies) or "
+            "proxies, each with dxfname/cppname/is_zombie/is_proxy; empty when absent"
+        ),
+    )
+    source_input_family: str | None = Field(
+        None,
+        description=(
+            "Adapter input family the census came from (e.g. dwg, dxf, pdf_vector); "
+            "null when there was no adapter run at all (changeset-origin revision)"
+        ),
+    )
+
+
 class RevisionMaterializationListResponseBase(BaseModel):
     """Shared metadata for revision materialization list responses."""
 

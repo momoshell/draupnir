@@ -5,6 +5,9 @@ from fastapi import APIRouter
 from app.api.v1.revision_routes.adapter_outputs import (
     adapter_outputs_router,
 )
+from app.api.v1.revision_routes.canonical import (
+    canonical_router,
+)
 from app.api.v1.revision_routes.changesets import (
     changesets_router,
 )
@@ -58,6 +61,7 @@ revisions_router = APIRouter()
 revisions_router.include_router(file_revisions_router, tags=["Revisions"])
 revisions_router.include_router(scale_router, tags=["Revisions"])
 revisions_router.include_router(summary_router, tags=["Revisions"])
+revisions_router.include_router(canonical_router, tags=["Revisions"])
 revisions_router.include_router(diff_router, tags=["Revisions"])
 revisions_router.include_router(adapter_outputs_router, tags=["Adapter Outputs"])
 revisions_router.include_router(changesets_router, tags=["Changesets"])
