@@ -1528,7 +1528,7 @@ class TestPdfTagPlacements:
     ) -> None:
         """metadata.text_blocks with a pipe-tag entry and a prose entry:
         only the tag-structured block ('54 mm VAC') is returned; prose ('DRAWING NOTES')
-        is rejected by _looks_like_pdf_tag."""
+        yields no candidates from _extract_pdf_tag_candidates (no size head)."""
         _ = (self, cleanup_projects, enqueued_job_ids)
 
         revision_id = await _ingest_with_payload(
@@ -1805,77 +1805,84 @@ class TestPdfHonestEmpty:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests: _looks_like_pdf_tag (no DB required)
+# Unit tests: _extract_pdf_tag_candidates (no DB required)
 # ---------------------------------------------------------------------------
 
 
-class TestLooksLikePdfTag:
-    """_looks_like_pdf_tag pass/reject table from grounding (M-540003)."""
+class TestExtractPdfTagCandidates:
+    """_extract_pdf_tag_candidates segments tag heads and rejects long-tail prose."""
 
-    def test_mm_unit_passes(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_concatenated_med_gas_four_candidates(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("54 mm VAC") is True
+        # Concatenated block as seen in real PDF med-gas drawings.
+        result = _extract_pdf_tag_candidates("Ø76 mm VACØ42 mm MAØ42 mm AGSSØ42 mm OXY")
+        assert result == [
+            "Ø76 mm VAC",
+            "Ø42 mm MA",
+            "Ø42 mm AGSS",
+            "Ø42 mm OXY",
+        ]
 
-    def test_mm_unit_no_space_passes(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_concatenated_med_gas_garbled_glyph(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("54mm VAC") is True
+        # Non-UTF-8 sources emit U+FFFD instead of the diameter glyph; it must still be the
+        # segment boundary so a garbled concatenated block splits per tag (mirrors run_tags).
+        g = "�"
+        result = _extract_pdf_tag_candidates(f"{g}76 mm VAC{g}42 mm MA{g}42 mm AGSS")
+        assert result == [f"{g}76 mm VAC", f"{g}42 mm MA", f"{g}42 mm AGSS"]
 
-    def test_diameter_glyph_passes(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_single_wxh_tag_returned(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        # U+00D8 Ø — real clean glyph
-        assert _looks_like_pdf_tag("Ø54 VAC") is True
+        assert _extract_pdf_tag_candidates("200 x 100 LV DIST") == ["200 x 100 LV DIST"]
 
-    def test_replacement_char_with_digit_passes(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_wxh_no_spaces_returned(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        # U+FFFD replacement character seen in some PDF pipelines
-        assert _looks_like_pdf_tag("�54 VAC") is True
+        assert _extract_pdf_tag_candidates("650x350 EA") == ["650x350 EA"]
 
-    def test_prose_london_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_note_prose_long_tail_rejected(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        # '5291 LONDON' — grounding fabrication case
-        assert _looks_like_pdf_tag("5291 LONDON") is False
+        # A single size token buried in a long prose sentence: one head, long tail -> rejected.
+        note = (
+            "WHERE PIPEWORK PASSES THROUGH A FIRE BARRIER, SPACING SHALL BE MINIMUM OF "
+            "200MM BETWEEN EACH DEVICE OR AS PER RECOMMENDATIONS."
+        )
+        assert _extract_pdf_tag_candidates(note) == []
 
-    def test_prose_and_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_no_size_no_candidates(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("AND") is False
+        assert _extract_pdf_tag_candidates("DO NOT SCALE") == []
+        assert _extract_pdf_tag_candidates("CT CONTROL PANEL") == []
 
-    def test_prose_drawn_by_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_empty_string_no_candidates(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("Drawn: HK") is False
+        assert _extract_pdf_tag_candidates("") == []
 
-    def test_scale_ratio_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_mixed_block_short_tag_then_long_prose_head(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("1:50") is False
+        # Short WxH tag (first segment <= 30 chars), then a size head buried in long prose
+        # (second segment > 30 chars) -> only the short tag is kept.
+        # Segment 1: "200x100 EA " -> "200x100 EA" (10 chars <= 30) -> kept.
+        # Segment 2: "54mm BETWEEN EACH DEVICE OR AS PER SPEC" (39 chars > 30) -> rejected.
+        result = _extract_pdf_tag_candidates("200x100 EA 54mm BETWEEN EACH DEVICE OR AS PER SPEC")
+        assert result == ["200x100 EA"]
 
-    def test_empty_string_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_short_mm_tag_single_candidate(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("") is False
+        assert _extract_pdf_tag_candidates("54 mm VAC") == ["54 mm VAC"]
 
-    def test_mm_case_insensitive_passes(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
+    def test_diameter_prefix_mm_tag(self) -> None:
+        from app.interpretation.service_takeoff_loaders import _extract_pdf_tag_candidates
 
-        assert _looks_like_pdf_tag("54 MM VAC") is True
-
-    def test_between_rejected(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
-
-        # 'BETWEEN' — another fabrication case from grounding
-        assert _looks_like_pdf_tag("BETWEEN") is False
-
-    def test_digit_only_word_match_on_mm_boundary(self) -> None:
-        from app.interpretation.service_takeoff_loaders import _looks_like_pdf_tag
-
-        # 'mm' must be word-bounded: 'mmhg' should NOT match
-        assert _looks_like_pdf_tag("54 mmhg pressure") is False
+        assert _extract_pdf_tag_candidates("Ø54 mm VAC") == ["Ø54 mm VAC"]
 
 
 # ---------------------------------------------------------------------------
@@ -1911,7 +1918,7 @@ _PDF_TEXT_BLOCKS_MIXED: list[dict[str, Any]] = [
 
 @requires_database
 class TestPdfTagFilter:
-    """load_tag_placements PDF path rejects prose; DWG path unaffected."""
+    """load_tag_placements PDF path rejects prose via extractor; DWG path unaffected."""
 
     async def test_pdf_prose_rejected_only_tag_structure_returned(
         self,
@@ -1921,7 +1928,8 @@ class TestPdfTagFilter:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """text_blocks with ['54 mm VAC', '5291 LONDON', 'Drawn: HK']:
-        load_tag_placements returns only the '54 mm VAC' placement."""
+        load_tag_placements returns only the '54 mm VAC' placement
+        ('5291 LONDON' and 'Drawn: HK' yield no candidates from the extractor)."""
         _ = (self, cleanup_projects, enqueued_job_ids)
 
         revision_id = await _ingest_with_payload(
@@ -1948,7 +1956,7 @@ class TestPdfTagFilter:
         enqueued_job_ids: list[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """DWG path still returns text-entity tags regardless of _looks_like_pdf_tag."""
+        """DWG path still returns text-entity tags regardless of the PDF extractor."""
         _ = (self, cleanup_projects, enqueued_job_ids)
 
         revision_id = await _ingest_with_payload(
@@ -1978,6 +1986,197 @@ class TestPdfTagFilter:
         texts = {p.text for p in placements}
         assert "HWS 100" in texts
         assert "5291 LONDON" in texts
+
+
+@requires_database
+class TestPdfTagExtractor:
+    """load_tag_placements PDF path: segmentation, WxH extraction, note rejection."""
+
+    async def test_concatenated_med_gas_block_segmented(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concatenated med-gas block produces one TagPlacement per segment,
+        all sharing the block centroid; a note paragraph yields none."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        med_gas_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 0,
+            "bbox": {"x_min": 100.0, "y_min": 200.0, "x_max": 300.0, "y_max": 220.0},
+            "text": "Ø76 mm VACØ42 mm MAØ42 mm AGSSØ42 mm OXY",
+        }
+        wxh_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 1,
+            "bbox": {"x_min": 400.0, "y_min": 200.0, "x_max": 550.0, "y_max": 220.0},
+            "text": "200 x 100 LV DIST",
+        }
+        note_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 2,
+            "bbox": {"x_min": 10.0, "y_min": 10.0, "x_max": 800.0, "y_max": 30.0},
+            "text": (
+                "WHERE PIPEWORK PASSES THROUGH A FIRE BARRIER, SPACING SHALL BE MINIMUM OF "
+                "200MM BETWEEN EACH DEVICE OR AS PER RECOMMENDATIONS."
+            ),
+        }
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            metadata={"text_blocks": [med_gas_block, wxh_block, note_block]},
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id)
+
+        texts = [p.text for p in placements]
+
+        # Four med-gas candidates from the concatenated block.
+        assert "Ø76 mm VAC" in texts, f"Expected Ø76 mm VAC in {texts}"
+        assert "Ø42 mm MA" in texts, f"Expected Ø42 mm MA in {texts}"
+        assert "Ø42 mm AGSS" in texts, f"Expected Ø42 mm AGSS in {texts}"
+        assert "Ø42 mm OXY" in texts, f"Expected Ø42 mm OXY in {texts}"
+
+        # WxH containment tag.
+        assert "200 x 100 LV DIST" in texts, f"Expected 200 x 100 LV DIST in {texts}"
+
+        # Note paragraph must produce no placement.
+        note_texts = [t for t in texts if "BARRIER" in t or "200MM" in t]
+        assert note_texts == [], f"Note prose must not produce placements; got {note_texts}"
+
+        # All med-gas placements share the block centroid.
+        med_gas_centroid = (200.0, 210.0)  # (100+300)/2, (200+220)/2
+        for p in placements:
+            if p.text in ("Ø76 mm VAC", "Ø42 mm MA", "Ø42 mm AGSS", "Ø42 mm OXY"):
+                assert p.point == pytest.approx(med_gas_centroid), (
+                    f"{p.text!r} centroid mismatch: {p.point}"
+                )
+                assert p.layer_ref is None
+
+    async def test_segmented_tags_feed_fuse_run_service_identities(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Segmented med-gas + WxH tags fuse onto colour runs; note yields no service."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        med_gas_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 0,
+            "bbox": {"x_min": 100.0, "y_min": 200.0, "x_max": 300.0, "y_max": 220.0},
+            "text": "Ø76 mm VACØ42 mm MAØ42 mm AGSSØ42 mm OXY",
+        }
+        wxh_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 1,
+            "bbox": {"x_min": 400.0, "y_min": 200.0, "x_max": 550.0, "y_max": 220.0},
+            "text": "200 x 100 LV DIST",
+        }
+        note_block: dict[str, Any] = {
+            "page_number": 1,
+            "layout": "Model",
+            "block_number": 2,
+            "bbox": {"x_min": 10.0, "y_min": 10.0, "x_max": 800.0, "y_max": 30.0},
+            "text": (
+                "WHERE PIPEWORK PASSES THROUGH A FIRE BARRIER, SPACING SHALL BE MINIMUM OF "
+                "200MM BETWEEN EACH DEVICE OR AS PER RECOMMENDATIONS."
+            ),
+        }
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=_make_pdf_entities(),
+            input_family="pdf_vector",
+            metadata={"text_blocks": [med_gas_block, wxh_block, note_block]},
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+            placements = await load_tag_placements(db, revision_id)
+
+        run_result = identify_routed_runs(entities, ServiceLegend(entries=()))
+        geometry_map: dict[str, Any] = {
+            ent.entity_id: ent.geometry for ent in entities if ent.geometry is not None
+        }
+        fuse_result = fuse_run_service_identities(
+            run_result.groups, geometry_map, placements, radius=5000.0
+        )
+
+        assigned_services = {
+            ss.source_tag_text for identity in fuse_result.identities for ss in identity.services
+        }
+
+        # Real services from segmented tags must be attached.
+        assert "Ø76 mm VAC" in assigned_services, (
+            f"VAC not in assigned services; got {assigned_services}"
+        )
+        assert "Ø42 mm AGSS" in assigned_services, (
+            f"AGSS not in assigned services; got {assigned_services}"
+        )
+        assert "Ø42 mm OXY" in assigned_services, (
+            f"OXY not in assigned services; got {assigned_services}"
+        )
+        assert "200 x 100 LV DIST" in assigned_services, (
+            f"LV not in assigned services; got {assigned_services}"
+        )
+
+        # No fabricated service from the note paragraph.
+        note_services = [s for s in assigned_services if "BARRIER" in s or "200MM" in s]
+        assert note_services == [], f"Note must not produce a service; got {note_services}"
+
+    async def test_dwg_tag_path_unchanged_by_extractor(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """DWG revision uses entity-based tag path; extractor is never invoked."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "tag-dwg-001",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "HWS 100", "insertion": {"x": 100.0, "y": 100.0}},
+                ),
+                _make_entity(
+                    "tag-dwg-002",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "CWS 50", "insertion": {"x": 200.0, "y": 200.0}},
+                ),
+            ],
+            input_family="dwg",
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id, tag_layers=["Pipe Tags"])
+
+        texts = {p.text for p in placements}
+        assert "HWS 100" in texts
+        assert "CWS 50" in texts
+        assert len(placements) == 2
 
 
 @requires_database

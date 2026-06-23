@@ -49,10 +49,54 @@ _ROUND_RE = re.compile(r"(\d+)\s+([A-Za-z/]+)")
 # service from a size-only tag or a stray note).
 _NON_SERVICE_TOKENS: frozenset[str] = frozenset({"MM", "CM", "M", "X"})
 
+# Common English function words (prepositions / conjunctions / articles) that can lead a
+# note fragment containing a size (e.g. "100MM ABOVE THE DESK", "10MM AND NOT EXCEED"); a real
+# service code is never a connective, so these are safe to reject and they stop note prose from
+# fabricating a service. NOT service names -- do not add technical abbreviations here.
+_NON_SERVICE_WORDS: frozenset[str] = frozenset(
+    {
+        "ABOVE",
+        "BELOW",
+        "AND",
+        "OR",
+        "IN",
+        "ON",
+        "AT",
+        "TO",
+        "FROM",
+        "WITH",
+        "THE",
+        "A",
+        "OF",
+        "AS",
+        "PER",
+        "NOT",
+        "WHERE",
+        "EACH",
+        "SHALL",
+        "BE",
+        "FOR",
+        "BY",
+        "THIS",
+        "THAT",
+        "ARE",
+        "IS",
+        "ALL",
+        "AN",
+        "INTO",
+        "ONTO",
+        "OVER",
+        "UNDER",
+    }
+)
+
 
 def _valid_service(service: str) -> bool:
-    """A service token must be non-empty and not a bare unit / dimension separator."""
-    return bool(service) and service not in _NON_SERVICE_TOKENS
+    """A service token must be non-empty, not a bare unit/dimension separator, and not a
+    common English function word (which only a note fragment would surface)."""
+    return (
+        bool(service) and service not in _NON_SERVICE_TOKENS and service not in _NON_SERVICE_WORDS
+    )
 
 
 # ---------------------------------------------------------------------------
