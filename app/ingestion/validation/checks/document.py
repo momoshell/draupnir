@@ -264,9 +264,22 @@ def _is_valid_pdf_scale(candidate: Any) -> bool:
             return False
         if _normalize_status_hint(candidate.get("confirmed"), candidate.get("calibrated")) is False:
             return False
+        # The pymupdf adapter (#559) emits a usable real-world factor as ``points_to_real`` and the
+        # ratio nested under ``scale_ratio`` (numerator/denominator/text) — NOT a flat top-level
+        # ``ratio``/``scale`` key. Recognise that shape so a genuinely scaled derived PDF is not
+        # mis-classified as invalid (#648). Older/simpler payloads still match the flat keys.
         return any(
             _is_meaningful_value(candidate.get(key))
-            for key in ("scale", "ratio", "value", "factor", "numerator", "denominator")
+            for key in (
+                "scale",
+                "ratio",
+                "value",
+                "factor",
+                "numerator",
+                "denominator",
+                "points_to_real",
+                "scale_ratio",
+            )
         )
     if isinstance(candidate, (list, tuple)):
         return bool(candidate)

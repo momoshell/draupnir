@@ -204,6 +204,40 @@ def test_build_validation_outcome_missing_pdf_scale_requires_review() -> None:
     }
 
 
+def test_build_validation_outcome_derived_pdf_scale_is_present() -> None:
+    """A genuinely scaled derived PDF (real pymupdf shape) passes the scale check (#648).
+
+    The adapter emits the usable factor as ``points_to_real`` and the ratio nested under
+    ``scale_ratio`` (numerator/denominator) — NOT a flat top-level ``ratio`` key. The check must
+    recognise this real shape as present, not mis-classify a well-scaled sheet as 'invalid'.
+    """
+    outcome = build_validation_outcome(
+        input_family=InputFamily.PDF_VECTOR,
+        canonical_json=_build_complete_canonical(
+            pdf_scale={
+                "status": "derived_from_text",
+                "coordinate_space": "pdf_page_space_unrotated",
+                "unit": "point",
+                "real_world_units": True,
+                "scale_ratio": {"numerator": 1, "denominator": 50, "text": "1:50"},
+                "scale_ratio_source": "HK\n1:50",
+                "confidence": "high",
+                "real_world_unit": "millimeter",
+                "points_to_real": 17.638889,
+            }
+        ),
+        canonical_entity_schema_version="0.1",
+        result=_build_result(score=0.99, input_family=InputFamily.PDF_VECTOR),
+        generated_at=_GENERATED_AT,
+    )
+
+    pdf_scale_check = {check["check_key"]: check for check in outcome.report_json["checks"]}[
+        "pdf_scale_presence_calibration_status"
+    ]
+    assert pdf_scale_check["status"] == "pass"
+    assert pdf_scale_check["details"]["scale_present"] is True
+
+
 def test_build_validation_outcome_ambiguous_multi_scale_requires_review() -> None:
     """A genuinely multi-scale 'As indicated' sheet (#636) is review_required, not a hard fail.
 
