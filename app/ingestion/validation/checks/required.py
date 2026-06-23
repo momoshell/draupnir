@@ -193,11 +193,12 @@ def _build_geometry_validity_check(
         )
 
     geometry_states = [_entity_has_valid_geometry(entity) for entity in entities]
-    validated_entity_count = sum(state is True for state in geometry_states)
+    applicable_states = [s for s in geometry_states if s is not None]
+    valid_count = sum(s is True for s in applicable_states)
+    not_applicable_count = len(geometry_states) - len(applicable_states)
+    all_applicable_valid = valid_count == len(applicable_states)
 
-    if geometry_hint is True or (
-        geometry_states and validated_entity_count == len(geometry_states)
-    ):
+    if geometry_hint is True or all_applicable_valid:
         return (
             _check(
                 check_key=check_key,
@@ -206,7 +207,8 @@ def _build_geometry_validity_check(
                 details={
                     "applicable": True,
                     "entity_count": len(entities),
-                    "validated_entity_count": validated_entity_count,
+                    "validated_entity_count": valid_count,
+                    "not_applicable_entity_count": not_applicable_count,
                     "geometry_valid": True,
                 },
             ),
@@ -226,7 +228,8 @@ def _build_geometry_validity_check(
         source="validator",
         details={
             "entity_count": len(entities),
-            "validated_entity_count": validated_entity_count,
+            "validated_entity_count": valid_count,
+            "not_applicable_entity_count": not_applicable_count,
         },
     )
     return (
@@ -238,7 +241,8 @@ def _build_geometry_validity_check(
             details={
                 "applicable": True,
                 "entity_count": len(entities),
-                "validated_entity_count": validated_entity_count,
+                "validated_entity_count": valid_count,
+                "not_applicable_entity_count": not_applicable_count,
                 "geometry_valid": None,
             },
         ),
