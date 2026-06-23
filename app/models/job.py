@@ -30,6 +30,7 @@ class JobType(StrEnum):
     ESTIMATE = "estimate"
     EXPORT = "export"
     CHANGESET_APPLY = "changeset_apply"
+    CENTERLINE = "centerline"
 
 
 class JobStatus(StrEnum):
@@ -53,12 +54,14 @@ _BASE_REQUIRED_JOB_TYPE_VALUES = (
     JobType.ESTIMATE.value,
     JobType.EXPORT.value,
     JobType.CHANGESET_APPLY.value,
+    JobType.CENTERLINE.value,
 )
 _EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
     JobType.QUANTITY_TAKEOFF.value,
     JobType.ESTIMATE.value,
     JobType.EXPORT.value,
     JobType.CHANGESET_APPLY.value,
+    JobType.CENTERLINE.value,
 )
 
 

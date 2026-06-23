@@ -141,6 +141,7 @@ DB_TEST_FILE_KEY_LANE_ARGS = {
     "changeset_persistence": DB_LINEAGE_PYTEST_ARGS,
     "changeset_validation": DB_LINEAGE_PYTEST_ARGS,
     "lineage_delete_restrictions": DB_LINEAGE_PYTEST_ARGS,
+    "revision_routed_length_model": DB_LINEAGE_PYTEST_ARGS,
     "db": DB_MIGRATION_PYTEST_ARGS,
     "jobs_base_revision_migration": DB_MIGRATION_PYTEST_ARGS,
     "jobs_revision_scoped_contract_migration": DB_MIGRATION_PYTEST_ARGS,

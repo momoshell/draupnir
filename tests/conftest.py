@@ -332,6 +332,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "changeset_persistence": "db_lineage",
     "changeset_apply": "db_lineage",
     "lineage_delete_restrictions": "db_lineage",
+    "revision_routed_length_model": "db_lineage",
     "db": "db_migration",
     "jobs_base_revision_migration": "db_migration",
     "jobs_revision_scoped_contract_migration": "db_migration",
