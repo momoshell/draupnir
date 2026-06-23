@@ -8,11 +8,11 @@ instances, nesting). It is deterministic and pure over ``canonical_json`` (no
 re-parsing): the adapter's declared ``entity_counts`` is the source-side reference
 and the arrays are the canonical side.
 
-Gating is intentionally narrow in v1: only a declared-vs-actual count mismatch is
-drift (a ``warning`` → ``valid_with_warnings``, never ``invalid``). Reference
-integrity (layer/block/parent resolution) is descriptive-only here — faithful
-resolution needs the same semantic resolver as layer-mapping/materialization and
-is deferred to a follow-up rather than re-implemented (and risking false drift).
+Gating (a ``warning`` → ``valid_with_warnings``, never ``invalid``): a declared-vs-actual
+count mismatch, and — since #539 — reference integrity (layer/block/parent resolution).
+Reference matching uses the single authoritative set-membership rule in ``ref_resolution``
+(shared with layer-mapping and materialization linkage), so a reference that resolves to any
+declared identifier is not a false orphan; only genuinely unresolved references drift.
 """
 
 from collections.abc import Mapping, Sequence
@@ -20,12 +20,15 @@ from typing import Any
 
 from app.ingestion.entity_geometry import compute_entity_bbox
 from app.ingestion.ref_resolution import (
+    BLOCK_IDENTITY_KEYS,
     ENTITY_BLOCK_KEYS,
     ENTITY_ID_KEYS,
     ENTITY_LAYER_KEYS,
     ENTITY_PARENT_KEYS,
-    collection_ref,
+    LAYER_IDENTITY_KEYS,
+    collection_identity_index,
     first_ref,
+    ref_set,
 )
 
 from .checks._common import _check, _pass_check
@@ -132,45 +135,50 @@ def _references(
     layers: Sequence[Mapping[str, Any]],
     blocks: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Report entity references that resolve to no declared definition (informational).
+    """Gate on entity references that resolve to no declared definition (#539).
 
-    Uses the shared ref-resolver so the orphan view matches materialization's
-    linkage semantics. Non-gating in v1: surfaced for visibility, but does not
-    change ``validation_status`` (see #535 — gating awaits a deliberate alignment
-    of the materialization / layer-mapping / reconciliation matching rules).
+    Uses the single authoritative matching rule (:func:`collection_identity_index`): a declared
+    layer/block is identified by the SET of all its candidate refs, and an entity links iff its
+    resolved ref is in that set — the same rule layer-mapping and materialization linkage use, so
+    "is this an orphan?" has one answer everywhere. Gating: a genuine orphan is ``drift`` →
+    ``warning`` (``valid_with_warnings``, never ``invalid``). The set-membership rule means an
+    entry matched by any of its identifiers (e.g. a layer ``{"ref":"L","name":"A-WALL"}`` referenced
+    as either) is not a false orphan; only references with no declared target at all drift.
     """
 
-    layer_refs = {ref for layer in layers if (ref := collection_ref(layer, "layer_ref"))}
-    block_refs = {ref for block in blocks if (ref := collection_ref(block, "block_ref"))}
-    entity_ids = {ref for entity in entities if (ref := first_ref(entity, ENTITY_ID_KEYS))}
+    layer_ref_index = collection_identity_index(layers, LAYER_IDENTITY_KEYS)
+    block_ref_index = collection_identity_index(blocks, BLOCK_IDENTITY_KEYS)
+    entity_id_index: set[str] = set()
+    for entity in entities:
+        entity_id_index |= ref_set(entity, ENTITY_ID_KEYS)
 
     orphan_layers = sorted(
         {
             ref
             for entity in entities
-            if (ref := first_ref(entity, ENTITY_LAYER_KEYS)) and ref not in layer_refs
+            if (ref := first_ref(entity, ENTITY_LAYER_KEYS)) and ref not in layer_ref_index
         }
     )
     orphan_blocks = sorted(
         {
             ref
             for entity in entities
-            if (ref := first_ref(entity, ENTITY_BLOCK_KEYS)) and ref not in block_refs
+            if (ref := first_ref(entity, ENTITY_BLOCK_KEYS)) and ref not in block_ref_index
         }
     )
     dangling_parents = sorted(
         {
             ref
             for entity in entities
-            if (ref := first_ref(entity, ENTITY_PARENT_KEYS)) and ref not in entity_ids
+            if (ref := first_ref(entity, ENTITY_PARENT_KEYS)) and ref not in entity_id_index
         }
     )
 
     has_orphans = bool(orphan_layers or orphan_blocks or dangling_parents)
     return {
         "key": "references",
-        "status": "orphans_present" if has_orphans else "match",
-        "gating": False,
+        "status": "drift" if has_orphans else "match",
+        "gating": True,
         "orphan_layer_refs": orphan_layers,
         "orphan_block_refs": orphan_blocks,
         "dangling_parent_refs": dangling_parents,

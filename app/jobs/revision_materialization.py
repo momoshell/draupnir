@@ -22,7 +22,13 @@ from app.cad.changeset import (
 from app.ingestion.canonical import EntityProvenanceError, canonicalize_entity_provenance
 from app.ingestion.entity_geometry import compute_entity_bbox
 from app.ingestion.finalization import IngestFinalizationPayload
-from app.ingestion.ref_resolution import COLLECTION_REF_FALLBACK_KEYS, string_ref
+from app.ingestion.ref_resolution import (
+    BLOCK_IDENTITY_KEYS,
+    COLLECTION_REF_FALLBACK_KEYS,
+    LAYER_IDENTITY_KEYS,
+    collection_identity,
+    string_ref,
+)
 from app.models.revision_materialization import (
     RevisionBlock,
     RevisionEntityManifest,
@@ -40,6 +46,10 @@ class _RevisionMaterializationRows:
     layers: list[dict[str, Any]]
     blocks: list[dict[str, Any]]
     entities: list[dict[str, Any]]
+
+
+# Layouts have no name-alias variants; their identity is the typed ref + the generic fallbacks.
+_LAYOUT_IDENTITY_KEYS = ("layout_ref", *COLLECTION_REF_FALLBACK_KEYS)
 
 
 def _materialized_payload_json(value: Any) -> dict[str, Any]:
@@ -303,7 +313,16 @@ def _resolve_entity_ref(
     explicit_key: str,
     legacy_key: str,
 ) -> str | None:
-    """Resolve a raw entity relationship ref from contract or legacy payloads."""
+    """Resolve a raw entity relationship ref from contract or legacy payloads.
+
+    Asymmetry note (#539): this resolves over (explicit_key, legacy_key, provenance) — it does NOT
+    include the ``*_name`` alias that validation's ``ENTITY_LAYER_KEYS`` does. This is safe only
+    because every adapter that sets an entity ``layer_name``/``block_name`` also co-emits the
+    matching ``layer_ref``/``block_ref`` (the name appears solely as descriptive provenance, never
+    as the sole top-level reference). A future adapter emitting ``layer_name`` alone would link in
+    validation but get ``layer_id=NULL`` here; extend this resolver (and the stored column) to the
+    name alias if that invariant ever breaks.
+    """
     explicit_ref = _string_ref(entity_payload_json.get(explicit_key))
     if explicit_ref is not None:
         return explicit_ref
@@ -395,6 +414,27 @@ def _resolve_entity_confidence_json(
     return {}
 
 
+def _collection_id_index(
+    rows: list[dict[str, Any]], ref_key: str, identity_keys: tuple[str, ...]
+) -> dict[str, uuid.UUID]:
+    """Map every identifier a collection row can be matched by to its row id (#539).
+
+    Single authoritative set-membership linkage rule (shared with reconciliation + layer-mapping):
+    a row is reachable by ANY of its declared identifiers (typed ref + name/alias/ref/id), not just
+    the single allocated ref — so an entity that references a layer by any of its identifiers links.
+    ``setdefault`` keeps sequence precedence when two rows share an identifier (rare; duplicate
+    names are deduplicated to distinct allocated refs upstream).
+    """
+    index: dict[str, uuid.UUID] = {}
+    for row in rows:
+        for ref in collection_identity(row["payload_json"], identity_keys):
+            index.setdefault(ref, row["id"])
+        allocated = row.get(ref_key)
+        if isinstance(allocated, str) and allocated:
+            index.setdefault(allocated, row["id"])
+    return index
+
+
 def _build_revision_materialization_rows(
     payload: IngestFinalizationPayload,
 ) -> _RevisionMaterializationRows:
@@ -459,9 +499,9 @@ def _build_revision_materialization_rows(
             }
         )
 
-    layout_ids_by_ref = {row["layout_ref"]: row["id"] for row in layouts}
-    layer_ids_by_ref = {row["layer_ref"]: row["id"] for row in layers}
-    block_ids_by_ref = {row["block_ref"]: row["id"] for row in blocks}
+    layout_ids_by_ref = _collection_id_index(layouts, "layout_ref", _LAYOUT_IDENTITY_KEYS)
+    layer_ids_by_ref = _collection_id_index(layers, "layer_ref", LAYER_IDENTITY_KEYS)
+    block_ids_by_ref = _collection_id_index(blocks, "block_ref", BLOCK_IDENTITY_KEYS)
 
     entities: list[dict[str, Any]] = []
     used_entity_ids: set[str] = set()
@@ -600,9 +640,9 @@ def _build_changeset_revision_materialization_rows(
     layers = _copy_revision_collection_rows(base_layers, ref_key="layer_ref")
     blocks = _copy_revision_collection_rows(base_blocks, ref_key="block_ref")
 
-    layout_ids_by_ref = {row["layout_ref"]: row["id"] for row in layouts}
-    layer_ids_by_ref = {row["layer_ref"]: row["id"] for row in layers}
-    block_ids_by_ref = {row["block_ref"]: row["id"] for row in blocks}
+    layout_ids_by_ref = _collection_id_index(layouts, "layout_ref", _LAYOUT_IDENTITY_KEYS)
+    layer_ids_by_ref = _collection_id_index(layers, "layer_ref", LAYER_IDENTITY_KEYS)
+    block_ids_by_ref = _collection_id_index(blocks, "block_ref", BLOCK_IDENTITY_KEYS)
 
     entities: list[dict[str, Any]] = []
     for entity in sorted(
