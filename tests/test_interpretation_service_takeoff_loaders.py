@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -582,6 +582,160 @@ class TestCenterlinePreference:
                     {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
                 )
             ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert entities == []
+
+
+@requires_database
+class TestContainerLayerRecognition:
+    """load_routed_entities recognises discipline-named containment layers (#679).
+
+    Cable tray, ladder, trunking, basket, conduit and duct layers must all be loaded
+    as routed entities when no authored Center Line layer is present.  A Pipes layer
+    continues to work (regression).  The Center Line preference must still win when
+    an authored centerline layer co-exists with a containment layer.  A layer matching
+    none of the tokens must not be loaded.
+    """
+
+    _COLOR: ClassVar[dict[str, Any]] = {
+        "index": 7,
+        "rgb": "#ffffff",
+        "by_layer": False,
+        "by_block": False,
+    }
+    _GEOM: ClassVar[dict[str, Any]] = {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]}
+
+    def _make_line(self, eid: str, layer: str) -> dict[str, Any]:
+        return _make_entity(eid, "line", layer, self._GEOM, style={"color": self._COLOR})
+
+    async def test_cable_tray_layer_loads(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A layer named 'Cable Tray' (contains 'tray') is loaded as a routed entity."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[self._make_line("tray-001", "E610G_Cable Tray")],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert len(entities) == 1
+        assert entities[0].layer_ref == "E610G_Cable Tray"
+
+    async def test_all_container_tokens_load(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ladder, trunking, basket, conduit and duct token layers are all loaded."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        token_layers = [
+            ("ldr-001", "Cable Ladder"),
+            ("trk-001", "Power Trunking"),
+            ("bsk-001", "Wire Basket"),
+            ("cnd-001", "Conduit Run"),
+            ("dct-001", "Air Duct"),
+        ]
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[self._make_line(eid, layer) for eid, layer in token_layers],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        loaded_layers = {e.layer_ref for e in entities}
+        expected = {"Cable Ladder", "Power Trunking", "Wire Basket", "Conduit Run", "Air Duct"}
+        assert loaded_layers == expected
+
+    async def test_pipes_layer_still_loads(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """'Pipes' layer continues to load — regression guard for existing pipe sheets."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[self._make_line("pipe-001", "Pipes")],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        assert len(entities) == 1
+        assert entities[0].layer_ref == "Pipes"
+
+    async def test_centerline_preference_wins_over_tray_layer(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When a Center Line layer coexists with a tray layer, only Center Line entities
+        are returned — the authored centerline preference is not affected by #679."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        cl_color = {"index": 2, "rgb": "#ffff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "cl-001",
+                    "line",
+                    "Center Line",
+                    {"start": [0.0, 0.0, 0.0], "end": [500.0, 0.0, 0.0]},
+                    style={"color": cl_color},
+                ),
+                self._make_line("tray-001", "E610G_Cable Tray"),
+            ],
+        )
+
+        async with _get_session() as db:
+            entities = await load_routed_entities(db, revision_id, exclude_off_sheet=False)
+
+        layer_refs_returned = {e.layer_ref for e in entities}
+        assert layer_refs_returned == {"Center Line"}, (
+            f"Center Line preference must win over tray layer; got: {layer_refs_returned}"
+        )
+        assert len(entities) == 1
+
+    async def test_unmatched_layer_not_loaded(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A layer matching none of the container tokens is not loaded."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[self._make_line("wall-001", "A-WALL-FIRE")],
         )
 
         async with _get_session() as db:
