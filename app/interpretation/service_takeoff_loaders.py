@@ -52,6 +52,9 @@ from app.interpretation.service_legend import (
     fuse,
 )
 from app.interpretation.service_legend import (
+    _normalize_text as _normalize_legend_text,
+)
+from app.interpretation.service_legend import (
     colour_key as _colour_key,
 )
 
@@ -146,6 +149,40 @@ _SWATCH_MATCH_RADIUS: float = 2000.0
 _NON_SWATCH_ENTITY_TYPES: frozenset[str] = frozenset(
     {"text", "mtext", "insert", "dimension", "hatch", "spline"}
 )
+
+# ---------------------------------------------------------------------------
+# DWG legend anchor-region constants (ADR-003: generic anchor text; NO hardcoded layers)
+# ---------------------------------------------------------------------------
+
+# Entity types excluded from DWG region-based swatch collection.
+# Intentionally does NOT exclude "hatch" — M-540003 swatches are HATCH entities.
+# The shared _NON_SWATCH_ENTITY_TYPES constant retains "hatch" for the layer-name path.
+_DWG_NON_SWATCH_ENTITY_TYPES: frozenset[str] = frozenset({"text", "mtext", "insert", "dimension"})
+
+# Region window built around the anchor text insertion point (drawing units).
+# Calibrated to M-540003: anchor at (-4.56, 3.31); swatch column at x≈-4.3,
+# labels at x≈-3.8, rows at y∈[1.7,2.9]. Region must exclude the keynotes
+# starting at x≥-0.66 and title-block text at x≥0.38.
+# LEFT: anchor is near the leftmost item; 1 unit left covers hatch offset.
+# RIGHT: labels end ~0.75 units right of anchor; 3.5 units keeps us well left of x≈-0.66.
+# ABOVE: anchor text sits at anchor y; 0.5 units captures any small overshoot.
+# BELOW: rows span ~1.6 units below anchor; 2.0 units covers with margin.
+_DWG_REGION_PAD_LEFT: float = 1.0  # units left of anchor x
+_DWG_REGION_PAD_RIGHT: float = 3.5  # units right of anchor x; keynotes start ~3.9u right
+_DWG_REGION_PAD_ABOVE: float = 0.5  # units above anchor y
+_DWG_REGION_PAD_BELOW: float = 2.0  # units below anchor y; rows span ≈1.6u below
+
+# Radius (drawing units) for pairing a label with the nearest in-region swatch.
+# M-540003 swatch↔label gap is ~0.5 units; rows are ~0.4 units apart.
+# 1.5 units keeps each label bound to its own row's swatch.
+_DWG_LEGEND_PAIR_RADIUS: float = 1.5
+
+# Minimum RGB channel spread (max-min across R,G,B in 0-255 space) for a DWG
+# swatch colour to be accepted as a service colour.  Achromatic colours (black,
+# white, grey, default pen) are not service identifiers.
+# M-540003 real swatches: 7ebc32→138, 00ff00→255, 9783dc→89 — all pass.
+# Black border lines (000000) → spread 0 — rejected.
+_DWG_SWATCH_MIN_CHROMA: int = 30
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +281,40 @@ def _swatch_centroid(geometry: dict[str, Any]) -> tuple[float, float] | None:
             return pt
 
     return _entity_insertion(geometry)
+
+
+def _is_chromatic_colour(
+    color: Mapping[str, Any], min_spread: int = _DWG_SWATCH_MIN_CHROMA
+) -> bool:
+    """Return True when *color* is a service-identifiable (chromatic) colour.
+
+    Achromatic colours (black 000000, white ffffff, grey) have RGB spread
+    (max_channel - min_channel) below ``min_spread`` and are rejected —
+    they indicate table borders, default pen, or background fill rather than
+    a service identity.
+
+    The rgb field may carry a leading alpha byte (e.g. "c200ff00" from the DXF
+    transparency encoding); strip it to a 6-char hex string before parsing.
+
+    Falls back to ``True`` (accept) when rgb is absent and only an index is
+    present, so index-only colours are not silently discarded.
+    """
+    rgb_raw = color.get("rgb")
+    if isinstance(rgb_raw, str) and rgb_raw:
+        rgb_str = rgb_raw.lstrip("#")
+        # Strip leading alpha byte if 8-char hex (e.g. "c200ff00" → "00ff00").
+        if len(rgb_str) == 8:
+            rgb_str = rgb_str[2:]
+        if len(rgb_str) == 6:
+            try:
+                r = int(rgb_str[0:2], 16)
+                g = int(rgb_str[2:4], 16)
+                b = int(rgb_str[4:6], 16)
+                return max(r, g, b) - min(r, g, b) >= min_spread
+            except ValueError:
+                pass
+    # No parseable rgb — accept if index present, reject if neither.
+    return color.get("index") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +760,146 @@ async def _build_pdf_service_legend(db: AsyncSession, revision_id: UUID) -> Serv
         return ServiceLegend(entries=())
 
 
+async def _build_dwg_legend_from_anchor(
+    db: AsyncSession,
+    revision_id: UUID,
+) -> tuple[list[SwatchInput], bool]:
+    """Discover DWG legend swatches via text anchor + spatial region.
+
+    Returns (swatch_inputs, anchor_found).  ``anchor_found=True`` means at least one
+    anchor was detected; the caller should skip the layer-name fallback in this case.
+    Never raises — returns ([], False) on any error.
+
+    Algorithm:
+    1. Query ALL text/mtext entities (any layer) for the revision.
+    2. Normalise each text with ``_normalize_legend_text`` and match against
+       ``_LEGEND_ANCHOR_RE`` / ``_LEGEND_ANCHOR_EXCLUDE_RE`` + length cap.
+    3. Build an axis-aligned bounding box around each anchor's insertion point.
+    4. Query ALL entities (any type) for the revision; collect swatch candidates
+       (not in ``_DWG_NON_SWATCH_ENTITY_TYPES``, resolved colour, centroid in region)
+       and label candidates (text/mtext insertion in region, raw text non-empty).
+    5. Pair each label with its nearest swatch via ``_nearest_swatch``.
+    """
+    try:
+        from sqlalchemy import select
+
+        from app.models.revision_materialization import RevisionEntity
+
+        # --- Step 1: load all text entities (any layer) ---
+        text_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.entity_type.in_(["text", "mtext"]),
+                    )
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 2: identify anchor entities ---
+        regions: list[tuple[float, float, float, float]] = []  # (x_lo, y_lo, x_hi, y_hi)
+
+        for row in text_rows:
+            geometry = row.geometry_json or {}
+            raw_text = geometry.get("text")
+            if not isinstance(raw_text, str):
+                continue
+            collapsed = _normalize_legend_text(raw_text)
+            if len(collapsed) > _ANCHOR_MAX_CHARS:
+                continue
+            if not _LEGEND_ANCHOR_RE.search(collapsed):
+                continue
+            if _LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed):
+                continue
+            pt = _entity_insertion(geometry)
+            if pt is None:
+                continue
+            ax, ay = pt
+            regions.append(
+                (
+                    ax - _DWG_REGION_PAD_LEFT,
+                    ay - _DWG_REGION_PAD_BELOW,
+                    ax + _DWG_REGION_PAD_RIGHT,
+                    ay + _DWG_REGION_PAD_ABOVE,
+                )
+            )
+
+        if not regions:
+            return [], False
+
+        # --- Step 3: load all entities for this revision (one round-trip) ---
+        all_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        def _in_any_region(x: float, y: float) -> bool:
+            for x_lo, y_lo, x_hi, y_hi in regions:
+                if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+                    return True
+            return False
+
+        # --- Step 4: collect swatch candidates and label text entries ---
+        swatch_candidates: list[tuple[tuple[float, float], Mapping[str, Any]]] = []
+        text_entries: list[tuple[str, tuple[float, float]]] = []
+
+        for row in all_rows:
+            row_geom: dict[str, Any] = row.geometry_json or {}
+
+            if row.entity_type in ("text", "mtext"):
+                raw_text = row_geom.get("text")
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    continue
+                pt = _entity_insertion(row_geom)
+                if pt is not None and _in_any_region(pt[0], pt[1]):
+                    text_entries.append((raw_text.strip(), pt))
+
+            elif row.entity_type not in _DWG_NON_SWATCH_ENTITY_TYPES:
+                # Swatch candidate: must carry a resolved colour (not by_layer/by_block,
+                # rgb or index non-None) AND have a usable centroid that falls in region.
+                style = row.style or {}
+                color_val: Any = style.get("color") if isinstance(style, Mapping) else None
+                if not isinstance(color_val, Mapping):
+                    continue
+                if color_val.get("by_layer") or color_val.get("by_block"):
+                    continue
+                if color_val.get("rgb") is None and color_val.get("index") is None:
+                    continue
+                # Reject achromatic colours (black border lines, default pen, grey).
+                # Service swatches are chromatic; greyscale is structural linework.
+                if not _is_chromatic_colour(color_val):
+                    continue
+                centroid = _swatch_centroid(row_geom)
+                if centroid is None:
+                    continue
+                if _in_any_region(centroid[0], centroid[1]):
+                    swatch_candidates.append((centroid, color_val))
+
+        # --- Step 5: pair each label with nearest in-region swatch ---
+        swatch_inputs: list[SwatchInput] = []
+        for text, text_pt in text_entries:
+            color = _nearest_swatch(text_pt, swatch_candidates, _DWG_LEGEND_PAIR_RADIUS)
+            if color is not None:
+                swatch_inputs.append(SwatchInput(color=color, text=text))
+
+        return swatch_inputs, True
+
+    except Exception:  # tolerant: never raise
+        return [], False
+
+
 async def build_service_legend(
     db: AsyncSession,
     revision_id: UUID,
@@ -702,12 +913,15 @@ async def build_service_legend(
     delegates to ``_build_pdf_service_legend`` which reads from text_blocks anchors and
     RevisionEntity bbox-filtered swatches (no legend layers, no hardcoded colours).
 
-    Source A — colour swatches: small coloured linework entities on legend layer(s),
-    each paired with the nearest text entity within ``_SWATCH_MATCH_RADIUS`` drawing
-    units (radius-bounded nearest-neighbour, mirrors ``label_rooms._nearest_name``).
+    For DWG/DXF revisions the swatch-discovery precedence is:
+    1. Explicit ``legend_layers`` override → layer-IN query (existing passing tests preserved).
+    2. Anchor region (no explicit layers): find text matching _LEGEND_ANCHOR_RE on any layer;
+       build a spatial region around each anchor; collect HATCH+line+polyline swatches and
+       label text that fall inside the region; pair label→nearest swatch.
+    3. Layer-name fallback (no explicit layers AND no anchor found): ILIKE %LEGEND%/%KEY%.
 
-    Source B — prose abbreviation rows: ``DENOTES``/``=`` rows from the same legend
-    layers (via ``load_legend_text_candidates``).
+    Source B — prose abbreviation rows: ``DENOTES``/``=`` rows via ``load_legend_text_candidates``
+    (still uses legend-layer filtering; out of scope for anchor-region discovery).
 
     No-swatch case: returns a prose-only or empty legend, never raises.
     """
@@ -721,57 +935,104 @@ async def build_service_legend(
 
     from app.models.revision_materialization import RevisionEntity
 
-    legend_query = select(RevisionEntity).where(
-        RevisionEntity.drawing_revision_id == revision_id,
-    )
-    if legend_layers:
-        legend_query = legend_query.where(RevisionEntity.layer_ref.in_(list(legend_layers)))
-    else:
-        legend_query = legend_query.where(
-            or_(
-                RevisionEntity.layer_ref.ilike("%LEGEND%"),
-                RevisionEntity.layer_ref.ilike("%KEY%"),
-            )
-        )
-
-    legend_rows = list((await db.execute(legend_query)).scalars().all())
-
-    # Separate text candidates from potential swatch entities.
-    text_entries: list[tuple[str, tuple[float, float]]] = []  # (text, point)
-    swatch_candidates: list[tuple[tuple[float, float], Mapping[str, Any]]] = []  # (centroid, color)
-
-    for row in legend_rows:
-        geometry = row.geometry_json or {}
-        if row.entity_type in ("text", "mtext"):
-            text = geometry.get("text")
-            if not isinstance(text, str) or not text.strip():
-                continue
-            pt = _entity_insertion(geometry)
-            if pt is not None:
-                text_entries.append((text.strip(), pt))
-        elif row.entity_type not in _NON_SWATCH_ENTITY_TYPES:
-            # Candidate swatch: must carry a resolved colour.
-            style = row.style or {}
-            color: Any = style.get("color") if isinstance(style, Mapping) else None
-            if not isinstance(color, Mapping):
-                continue
-            # Skip by_layer / by_block unresolved colours.
-            if color.get("by_layer") or color.get("by_block"):
-                continue
-            if color.get("rgb") is None and color.get("index") is None:
-                continue
-            centroid = _swatch_centroid(geometry)
-            if centroid is not None:
-                swatch_candidates.append((centroid, color))
-
-    # Pair each text entry with its nearest swatch.
     swatch_inputs: list[SwatchInput] = []
-    for text, text_pt in text_entries:
-        color = _nearest_swatch(text_pt, swatch_candidates, _SWATCH_MATCH_RADIUS)
-        if color is not None:
-            swatch_inputs.append(SwatchInput(color=color, text=text))
+
+    if legend_layers:
+        # --- Path 1: explicit legend_layers override (highest precedence) ---
+        legend_query = (
+            select(RevisionEntity)
+            .where(
+                RevisionEntity.drawing_revision_id == revision_id,
+                RevisionEntity.layer_ref.in_(list(legend_layers)),
+            )
+            .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        )
+        legend_rows = list((await db.execute(legend_query)).scalars().all())
+
+        text_entries_layer: list[tuple[str, tuple[float, float]]] = []
+        swatch_candidates_layer: list[tuple[tuple[float, float], Mapping[str, Any]]] = []
+
+        for row in legend_rows:
+            geometry = row.geometry_json or {}
+            if row.entity_type in ("text", "mtext"):
+                text = geometry.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                pt = _entity_insertion(geometry)
+                if pt is not None:
+                    text_entries_layer.append((text.strip(), pt))
+            elif row.entity_type not in _NON_SWATCH_ENTITY_TYPES:
+                style = row.style or {}
+                color: Any = style.get("color") if isinstance(style, Mapping) else None
+                if not isinstance(color, Mapping):
+                    continue
+                if color.get("by_layer") or color.get("by_block"):
+                    continue
+                if color.get("rgb") is None and color.get("index") is None:
+                    continue
+                centroid = _swatch_centroid(geometry)
+                if centroid is not None:
+                    swatch_candidates_layer.append((centroid, color))
+
+        for text, text_pt in text_entries_layer:
+            clr = _nearest_swatch(text_pt, swatch_candidates_layer, _SWATCH_MATCH_RADIUS)
+            if clr is not None:
+                swatch_inputs.append(SwatchInput(color=clr, text=text))
+
+    else:
+        # --- Path 2: anchor-region discovery (no explicit layers) ---
+        anchor_swatch_inputs, anchor_found = await _build_dwg_legend_from_anchor(db, revision_id)
+
+        if anchor_found:
+            swatch_inputs = anchor_swatch_inputs
+        else:
+            # --- Path 3: layer-name fallback ---
+            legend_query_fallback = (
+                select(RevisionEntity)
+                .where(
+                    RevisionEntity.drawing_revision_id == revision_id,
+                    or_(
+                        RevisionEntity.layer_ref.ilike("%LEGEND%"),
+                        RevisionEntity.layer_ref.ilike("%KEY%"),
+                    ),
+                )
+                .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+            )
+            fallback_rows = list((await db.execute(legend_query_fallback)).scalars().all())
+
+            text_entries_fallback: list[tuple[str, tuple[float, float]]] = []
+            swatch_candidates_fallback: list[tuple[tuple[float, float], Mapping[str, Any]]] = []
+
+            for row in fallback_rows:
+                geometry = row.geometry_json or {}
+                if row.entity_type in ("text", "mtext"):
+                    text = geometry.get("text")
+                    if not isinstance(text, str) or not text.strip():
+                        continue
+                    pt = _entity_insertion(geometry)
+                    if pt is not None:
+                        text_entries_fallback.append((text.strip(), pt))
+                elif row.entity_type not in _NON_SWATCH_ENTITY_TYPES:
+                    style = row.style or {}
+                    color_fb: Any = style.get("color") if isinstance(style, Mapping) else None
+                    if not isinstance(color_fb, Mapping):
+                        continue
+                    if color_fb.get("by_layer") or color_fb.get("by_block"):
+                        continue
+                    if color_fb.get("rgb") is None and color_fb.get("index") is None:
+                        continue
+                    centroid = _swatch_centroid(geometry)
+                    if centroid is not None:
+                        swatch_candidates_fallback.append((centroid, color_fb))
+
+            for text, text_pt in text_entries_fallback:
+                clr = _nearest_swatch(text_pt, swatch_candidates_fallback, _SWATCH_MATCH_RADIUS)
+                if clr is not None:
+                    swatch_inputs.append(SwatchInput(color=clr, text=text))
 
     # Source B — prose abbreviation rows via shared loader.
+    # Note: load_legend_text_candidates still uses legend-layer filtering (anchor-region
+    # discovery for prose is out of scope here).
     prose_texts = await load_legend_text_candidates(db, revision_id, legend_layers=legend_layers)
     prose_inputs = [ProseInput(text=t) for t in prose_texts]
 

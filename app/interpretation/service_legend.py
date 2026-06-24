@@ -47,8 +47,11 @@ _PROSE_EQUALS_RE = re.compile(
     r"^([A-Z][A-Z0-9]{0,3}(?:-[A-Z0-9]{1,3})?)\s*=\s*(.+)$",
 )
 
-# Strip leading \L underline directive that some DXF/DWG text fields emit.
-_UNDERLINE_DIRECTIVE_RE = re.compile(r"^\\L", re.IGNORECASE)
+# Strip leading \L / trailing \l underline directives and %%u/%%U toggle pairs that
+# some DXF/DWG text fields emit (e.g. "\LLEGEND\l", "%%uLEGEND%%u", "%%ULEGEND%%U").
+_UNDERLINE_DIRECTIVE_RE = re.compile(r"^\\[Ll]")
+_UNDERLINE_TRAILING_RE = re.compile(r"\\[Ll]$")
+_UNDERLINE_PERCENT_TOGGLE_RE = re.compile(r"%%[uU]")
 
 # ---------------------------------------------------------------------------
 # Input dataclasses
@@ -146,12 +149,20 @@ def colour_key(color: Mapping[str, object] | None) -> str | None:
 
 
 def _strip_underline(text: str) -> str:
-    """Strip a leading \\L underline directive from DXF/DWG text."""
-    return _UNDERLINE_DIRECTIVE_RE.sub("", text)
+    """Strip DXF/DWG underline formatting codes from text.
+
+    Handles:
+    - Leading ``\\L`` / ``\\l`` (underline-on directives)
+    - Trailing ``\\l`` / ``\\L`` (underline-off directives)
+    - ``%%u`` / ``%%U`` toggle pairs (alternate underline encoding)
+    """
+    return _UNDERLINE_PERCENT_TOGGLE_RE.sub(
+        "", _UNDERLINE_TRAILING_RE.sub("", _UNDERLINE_DIRECTIVE_RE.sub("", text))
+    )
 
 
 def _normalize_text(raw: str) -> str:
-    """Strip underline directive and collapse internal whitespace."""
+    """Strip underline directives and collapse internal whitespace."""
     return " ".join(_strip_underline(raw).split())
 
 

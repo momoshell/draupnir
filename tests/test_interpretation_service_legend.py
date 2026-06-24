@@ -23,10 +23,15 @@ from app.interpretation.service_legend import (
     ServiceEntry,
     ServiceLegend,
     SwatchInput,
+    _normalize_text,
     colour_key,
     from_abbreviation_prose,
     from_colour_swatches,
     fuse,
+)
+from app.interpretation.service_takeoff_loaders import (
+    _LEGEND_ANCHOR_EXCLUDE_RE,
+    _LEGEND_ANCHOR_RE,
 )
 
 # ---------------------------------------------------------------------------
@@ -581,3 +586,65 @@ def test_prose_parametrize(text: str, expected_abbr: str, expected_desc: str) ->
     assert e.description == expected_desc
     assert e.colour_key is None
     assert e.discipline is None
+
+
+# ---------------------------------------------------------------------------
+# _normalize_text — DWG underline formatting stripping (be-671)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_text_leading_backslash_l_uppercase_code() -> None:
+    r"""_normalize_text strips \LLEGEND -> 'LEGEND'."""
+    assert _normalize_text(r"\LLEGEND") == "LEGEND"
+
+
+def test_normalize_text_leading_and_trailing_backslash_l() -> None:
+    r"""_normalize_text strips \LLEGEND\l (leading + trailing underline toggle)."""
+    assert _normalize_text(r"\LLEGEND\l") == "LEGEND"
+
+
+def test_normalize_text_percent_u_toggles() -> None:
+    r"""_normalize_text strips %%uLEGEND%%u (alternate underline encoding)."""
+    assert _normalize_text("%%uLEGEND%%u") == "LEGEND"
+
+
+def test_normalize_text_percent_u_uppercase_toggles() -> None:
+    r"""_normalize_text strips %%ULEGEND%%U (uppercase variant)."""
+    assert _normalize_text("%%ULEGEND%%U") == "LEGEND"
+
+
+def test_normalize_text_plain_text_unchanged() -> None:
+    """Plain text without directives is returned as-is (modulo whitespace)."""
+    assert _normalize_text("LEGEND") == "LEGEND"
+    assert _normalize_text("  LEGEND  ") == "LEGEND"
+
+
+# ---------------------------------------------------------------------------
+# Anchor regex: normalized text matching (be-671)
+# ---------------------------------------------------------------------------
+
+
+def test_anchor_re_matches_normalized_legend() -> None:
+    """'LEGEND' (normalized from \\LLEGEND) matches _LEGEND_ANCHOR_RE."""
+    assert _LEGEND_ANCHOR_RE.search(_normalize_text(r"\LLEGEND")) is not None
+
+
+def test_anchor_re_matches_key() -> None:
+    """'KEY' matches _LEGEND_ANCHOR_RE."""
+    assert _LEGEND_ANCHOR_RE.search("KEY") is not None
+
+
+def test_anchor_exclude_re_rejects_key_plan() -> None:
+    """'KEY PLAN' is excluded by _LEGEND_ANCHOR_EXCLUDE_RE."""
+    assert _LEGEND_ANCHOR_EXCLUDE_RE.search("KEY PLAN") is not None
+
+
+def test_anchor_exclude_re_rejects_notes() -> None:
+    """'NOTES' is excluded by _LEGEND_ANCHOR_EXCLUDE_RE."""
+    assert _LEGEND_ANCHOR_EXCLUDE_RE.search("NOTES") is not None
+
+
+def test_anchor_re_does_not_match_random_text() -> None:
+    """Arbitrary non-legend text does not match the anchor pattern."""
+    assert _LEGEND_ANCHOR_RE.search("HYDRAULIC EQUIPMENT") is None
+    assert _LEGEND_ANCHOR_RE.search("SCALE 1:50") is None
