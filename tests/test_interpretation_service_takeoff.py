@@ -19,7 +19,7 @@ from app.interpretation.rise_drop import (
     STATUS_RESOLVED,
     RiseDropSymbol,
 )
-from app.interpretation.rooms import Room
+from app.interpretation.rooms import Room, room_from_label
 from app.interpretation.routed_runs import RunGroup
 from app.interpretation.run_service_identity import (
     IDENTITY_PARTIAL,
@@ -33,6 +33,7 @@ from app.interpretation.service_takeoff import (
     ROOM_UNASSIGNED_ID,
     SERVICE_UNKNOWN,
     ServiceTakeoffResult,
+    _nearest_label_room,
     compute_service_takeoff,
 )
 
@@ -1190,3 +1191,266 @@ def test_lp2_length_outside_all_rooms_is_unassigned() -> None:
     assert by_room[ROOM_UNASSIGNED_ID].drawing_length == pytest.approx(5000.0, rel=1e-3)
     # A run with any length outside all rooms is counted once as unassigned.
     assert result.unassigned_run_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Label-proximity fallback tests (#662)
+# ---------------------------------------------------------------------------
+
+
+def _label_room(
+    x: float,
+    y: float,
+    room_id: str = "label-room-1",
+    name: str = "PH Plantroom",
+    number: str = "0.9.01",
+) -> Room:
+    return room_from_label(
+        room_id, source="test", location=(x, y), name=name, number=number, confidence=0.7
+    )
+
+
+def test_anchor_label_room_in_range_attributed() -> None:
+    """Run anchor outside polygon rooms but within 8m of a label room -> attributed to that room.
+
+    mm fixture: radius = 8.0 / 0.001 = 8000 du. Label room 1000 du away -> within range.
+    """
+    entity_ids = ("e1",)
+    # Anchor midpoint = (5500, 5000) -- outside the polygon room (0,0)-(1000,1000).
+    geometry = {"e1": _line_geom(5000.0, 5000.0, 6000.0, 5000.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    poly_room = _square_room(x=0.0, y=0.0, size=1000.0)
+    # Label room 1000 du from anchor (5500 + 1000 = 6500, same y).
+    label = _label_room(6500.0, 5000.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[poly_room, label],
+        scale=_confirmed_mm_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.room_id == "label-room-1"
+    assert ln.room_name == "PH Plantroom"
+    assert ln.room_number == "0.9.01"
+    assert result.unassigned_run_count == 0
+
+
+def test_anchor_label_room_out_of_range_unassigned() -> None:
+    """Label room 20000 du away (>> 8000 du radius) -> run stays unassigned."""
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(5000.0, 5000.0, 6000.0, 5000.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    poly_room = _square_room(x=0.0, y=0.0, size=1000.0)
+    # Label room 20000 du away -- beyond 8000 du radius.
+    label = _label_room(25500.0, 5000.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[poly_room, label],
+        scale=_confirmed_mm_scale(),
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].room_id == ROOM_UNASSIGNED_ID
+    assert result.unassigned_run_count == 1
+
+
+def test_polygon_containment_precedence_over_label() -> None:
+    """Anchor inside a polygon room AND within range of a label room -> polygon room wins."""
+    entity_ids = ("e1",)
+    # Anchor midpoint = (500, 500) -- inside poly_room (0,0)-(10000,10000).
+    geometry = {"e1": _line_geom(0.0, 500.0, 1000.0, 500.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    poly_room = _square_room(x=0.0, y=0.0, size=10000.0, room_id="poly-room-1")
+    # Label room very close (100 du away) -- should NOT override polygon containment.
+    label = _label_room(600.0, 500.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[poly_room, label],
+        scale=_confirmed_mm_scale(),
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].room_id == "poly-room-1"
+    assert result.unassigned_run_count == 0
+
+
+def test_lp2_remainder_attributed_to_nearest_label_room() -> None:
+    """LP2: centerline remainder outside polygon rooms -> attributed to nearby label room.
+
+    Polyline: (0,5000) to (15000,5000). Room-a covers (0,0)-(10000,10000) -> 10000 du inside.
+    Remainder: (10000,5000)-(15000,5000) = 5000 du outside. Label room near (12500, 5000).
+    With mm scale, radius = 8000 du. 12500 - 12500 = 0 du to label room -> within range.
+    """
+    room_a = _square_room(x=0.0, size=10000.0, room_id="room-a")
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    polylines = (((0.0, 5000.0), (15000.0, 5000.0)),)
+    # representative_point of (10000,5000)-(15000,5000) is near x=12500, y=5000.
+    label = _label_room(12500.0, 5000.0)
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 15000.0, 5000.0)},
+        rooms=[room_a, label],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 15000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert "room-a" in by_room
+    assert by_room["room-a"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert "label-room-1" in by_room
+    assert by_room["label-room-1"].drawing_length == pytest.approx(5000.0, rel=1e-3)
+    assert ROOM_UNASSIGNED_ID not in by_room
+    assert result.unassigned_run_count == 0
+
+
+def test_lp2_remainder_label_room_out_of_range_unassigned() -> None:
+    """LP2: label room far from the remainder -> remainder stays unassigned."""
+    room_a = _square_room(x=0.0, size=10000.0, room_id="room-a")
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    polylines = (((0.0, 5000.0), (15000.0, 5000.0)),)
+    # Label room far from the remainder's representative_point (~12500, 5000).
+    label = _label_room(100000.0, 5000.0)
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 15000.0, 5000.0)},
+        rooms=[room_a, label],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 15000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert "room-a" in by_room
+    assert ROOM_UNASSIGNED_ID in by_room
+    assert by_room[ROOM_UNASSIGNED_ID].drawing_length == pytest.approx(5000.0, rel=1e-3)
+    assert result.unassigned_run_count == 1
+
+
+def test_label_fallback_skipped_without_scale_factor() -> None:
+    """Unknown scale -> conversion_factor is None -> label_radius is None -> fallback skipped."""
+    entity_ids = ("e1",)
+    # Anchor at (5500, 5000) -- outside poly_room (0,0)-(1000,1000).
+    geometry = {"e1": _line_geom(5000.0, 5000.0, 6000.0, 5000.0)}
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services)
+    run = _make_run(entity_ids=entity_ids)
+    poly_room = _square_room(x=0.0, y=0.0, size=1000.0)
+    # Label room right next to the anchor (1 du away) -- would be in range if scale were known.
+    label = _label_room(5501.0, 5000.0)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[poly_room, label],
+        scale=_unknown_scale(),  # conversion_factor=None
+    )
+
+    assert len(result.lines) == 1
+    assert result.lines[0].room_id == ROOM_UNASSIGNED_ID
+    assert result.unassigned_run_count == 1
+
+
+def test_lp2_remainder_distributed_across_two_label_rooms() -> None:
+    """LP2 per-segment: a line with no polygon rooms splits between two label rooms by segment.
+
+    Horizontal line (0,5000)-(20000,5000), no polygon rooms.
+    Label room A near (3000,5000), label room B near (17000,5000).
+    With mm scale, radius = 8000 du (= 8.0 / 0.001).
+
+    The single segment midpoint is (10000,5000) — equidistant from both labels (7000 du each).
+    To force a clear split we use a two-segment polyline: (0,5000)-(10000,5000)-(20000,5000)
+    so segment 1 midpoint=(5000,5000) nearest A (2000 du), segment 2 midpoint=(15000,5000)
+    nearest B (2000 du). Each segment is 10000 du -> each label room gets ~10000 du.
+    """
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    # Two-segment polyline that straddles both label rooms.
+    polylines = (((0.0, 5000.0), (10000.0, 5000.0), (20000.0, 5000.0)),)
+    label_a = _label_room(3000.0, 5000.0, room_id="label-a", name="Room A", number="1.01")
+    label_b = _label_room(17000.0, 5000.0, room_id="label-b", name="Room B", number="1.02")
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 20000.0, 5000.0)},
+        rooms=[label_a, label_b],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 20000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    # Both label rooms must receive length.
+    assert "label-a" in by_room, f"label-a missing; got rooms: {set(by_room)}"
+    assert "label-b" in by_room, f"label-b missing; got rooms: {set(by_room)}"
+    assert ROOM_UNASSIGNED_ID not in by_room
+    # Each segment is 10000 du, so each label room gets approx 10000 du.
+    assert by_room["label-a"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert by_room["label-b"].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert result.unassigned_run_count == 0
+
+
+def test_lp2_per_segment_segments_out_of_range_unassigned() -> None:
+    """LP2 per-segment: segments far from all label rooms land unassigned.
+
+    A line entirely 50000 du from the only label room (radius 8000 du) -> all unassigned.
+    """
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    polylines = (((0.0, 5000.0), (10000.0, 5000.0)),)
+    # Label room 50000 du away -- well beyond 8000 du radius.
+    label = _label_room(60000.0, 5000.0, room_id="far-label")
+
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 5000.0, 10000.0, 5000.0)},
+        rooms=[label],
+        scale=_confirmed_mm_scale(),
+        measured_length_by_group={("Pipes", "idx150"): 10000.0},
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+    )
+
+    by_room = {ln.room_id: ln for ln in result.lines}
+    assert ROOM_UNASSIGNED_ID in by_room, f"Expected unassigned; got rooms: {set(by_room)}"
+    assert "far-label" not in by_room
+    assert by_room[ROOM_UNASSIGNED_ID].drawing_length == pytest.approx(10000.0, rel=1e-3)
+    assert result.unassigned_run_count == 1
+
+
+def test_nearest_label_room_deterministic_tie_break() -> None:
+    """_nearest_label_room: two equidistant label rooms -> lower room.id wins regardless of
+    order (permutation-invariant tie-break)."""
+    # Both rooms at equal distance (500 du) from origin.
+    room_a = _label_room(500.0, 0.0, room_id="aaa-room")
+    room_b = _label_room(-500.0, 0.0, room_id="zzz-room")
+    point = (0.0, 0.0)
+    radius = 1000.0
+
+    result_forward = _nearest_label_room(point, [room_a, room_b], radius=radius)
+    result_reversed = _nearest_label_room(point, [room_b, room_a], radius=radius)
+
+    assert result_forward is not None
+    assert result_reversed is not None
+    assert result_forward.id == "aaa-room"
+    assert result_reversed.id == "aaa-room"

@@ -27,7 +27,8 @@ Pure module -- NO DB, ORM, FastAPI, or SQLAlchemy imports.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,7 +42,7 @@ from app.interpretation.measurement import (
     path_length,
 )
 from app.interpretation.rise_drop import RiseDropSymbol
-from app.interpretation.rooms import Room
+from app.interpretation.rooms import Room, _nearest_anchor_distance
 from app.interpretation.routed_runs import RunGroup
 from app.interpretation.run_service_identity import (
     IDENTITY_PARTIAL,
@@ -217,14 +218,61 @@ def _containing_room(point: tuple[float, float], rooms: Sequence[Room]) -> Room 
     return min(containing, key=lambda r: (r.area if r.area is not None else 0.0, r.id))
 
 
+def _nearest_label_room(
+    point: tuple[float, float],
+    rooms: Sequence[Room],
+    *,
+    radius: float,
+) -> Room | None:
+    """Nearest label-only room (no polygon) whose anchor is within ``radius`` of ``point`` (#662).
+
+    Fallback for run length that no polygon room contains. ``radius`` is in the coordinator's
+    drawing-coordinate space (caller converts from metres via the scale factor). Distance is the
+    distance to the room's NEAREST anchor (merged U-shaped rooms cover several placements, #581).
+    Deterministic: ties broken by ``(distance, room.id)`` so the result is permutation-invariant.
+    Returns None when there are no label rooms or none within ``radius`` (honest unassigned).
+    """
+    label_rooms = [r for r in rooms if r.polygon is None and r.location is not None]
+    if not label_rooms:
+        return None
+    nearest = min(label_rooms, key=lambda r: (_nearest_anchor_distance(point, r), r.id))
+    if _nearest_anchor_distance(point, nearest) <= radius:
+        return nearest
+    return None
+
+
 # Lengths are drawing units (mm or PDF points); 1e-9 safely drops only zero-length point/
 # degenerate clip results, never a legitimate room crossing at architectural scales.
 _CLIP_EPS = 1e-9
+
+# Real-world cap (metres) for attributing otherwise-unassigned run length to the nearest
+# label-only room (#662). Mirrors the device->label-room precedent
+# (room_pipeline.DEFAULT_DEVICE_LABEL_ROOM_RADIUS=8.0, #555): a plant space spans several
+# metres; beyond this a run is left unassigned rather than guessed (ADR-004). Converted to
+# drawing units per call via scale.conversion_factor — the coordinator works in drawing space.
+_LABEL_ROOM_RADIUS_M: float = 8.0
+
+
+def _iter_line_segments(
+    geom: Any,
+) -> Iterator[tuple[tuple[float, float], tuple[float, float]]]:
+    """Yield consecutive 2-point segments from a shapely LineString or MultiLineString.
+
+    Handles both geometry types uniformly so callers don't need to branch on
+    ``geom_type``. Each yielded pair is ((x0, y0), (x1, y1)) — the two endpoints
+    of one straight segment of the original polyline.
+    """
+    lines = geom.geoms if geom.geom_type == "MultiLineString" else [geom]
+    for line in lines:
+        coords = list(line.coords)
+        for i in range(len(coords) - 1):
+            yield (coords[i][0], coords[i][1]), (coords[i + 1][0], coords[i + 1][1])
 
 
 def _partition_polylines_by_room(
     polylines: tuple[tuple[tuple[float, float], ...], ...],
     rooms: Sequence[Room],
+    label_radius: float | None = None,
 ) -> list[tuple[Room | None, float]]:
     """Distribute centerline polyline length across rooms by clipping (#654, LP2).
 
@@ -254,7 +302,36 @@ def _partition_polylines_by_room(
             remaining = remaining.difference(room.polygon)
     remainder = float(remaining.length) if not remaining.is_empty else 0.0
     if remainder > _CLIP_EPS:
-        partitions.append((None, remainder))
+        if label_radius is None:
+            # No scale factor available — cannot compute a meaningful radius; leave whole
+            # remainder unassigned (ADR-004: honest degradation, no guessing).
+            partitions.append((None, remainder))
+        else:
+            # Per-segment distribution: walk each straight segment of the remainder,
+            # find its nearest label room by midpoint, and accumulate length per room.
+            # Segments with no label room in range contribute to an unassigned bucket.
+            label_buckets: dict[str, float] = {}  # room.id -> length
+            label_room_by_id: dict[str, Room] = {}  # room.id -> Room object
+            unassigned_length = 0.0
+            for (x0, y0), (x1, y1) in _iter_line_segments(remaining):
+                seg_len = math.hypot(x1 - x0, y1 - y0)
+                if seg_len <= _CLIP_EPS:
+                    continue
+                midpoint = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+                seg_room = _nearest_label_room(midpoint, rooms, radius=label_radius)
+                if seg_room is None:
+                    unassigned_length += seg_len
+                else:
+                    label_buckets[seg_room.id] = label_buckets.get(seg_room.id, 0.0) + seg_len
+                    label_room_by_id[seg_room.id] = seg_room
+            # Emit label-room partitions sorted by room.id (determinism; coordinator is
+            # permutation-invariant so ordering here is only for stable output).
+            for rid in sorted(label_buckets):
+                length = label_buckets[rid]
+                if length > _CLIP_EPS:
+                    partitions.append((label_room_by_id[rid], length))
+            if unassigned_length > _CLIP_EPS:
+                partitions.append((None, unassigned_length))
     return partitions
 
 
@@ -264,6 +341,7 @@ def _anchor_partition(
     geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
     measured_length_by_group: Mapping[tuple[str | None, str | None], float] | None,
     run_key: tuple[str | None, str | None],
+    label_radius: float | None = None,
 ) -> list[tuple[Room | None, float]]:
     """Fallback attribution: the whole run length to its single anchor-containing room.
 
@@ -276,7 +354,11 @@ def _anchor_partition(
     else:
         drawn = _entity_drawn_length(identity.entity_ids, geometry_by_entity_id)
     anchor = _run_anchor(identity.entity_ids, geometry_by_entity_id)
-    room = _containing_room(anchor, rooms) if anchor is not None else None
+    room: Room | None = None
+    if anchor is not None:
+        room = _containing_room(anchor, rooms)
+        if room is None and label_radius is not None:
+            room = _nearest_label_room(anchor, rooms, radius=label_radius)
     # Always one partition, even when drawn==0 (e.g. arc-only runs): the run still produces a
     # bucket entry so it is never silently dropped (pre-LP2 invariant).
     return [(room, drawn)]
@@ -365,6 +447,12 @@ def compute_service_takeoff(
         (rg.layer_ref, rg.colour_key): rg for rg in runs
     }
 
+    # #662: convert the metre radius into the coordinator's drawing-coordinate space so the
+    # label-proximity fallback uses the same units as room polygons. None when scale gives no
+    # usable factor -> fallback skipped (length stays unassigned, ADR-004).
+    cf = scale.conversion_factor
+    label_radius = _LABEL_ROOM_RADIUS_M / cf if cf is not None and cf > 0 else None
+
     # Accumulators keyed by (service, size_raw, size_kind, room_id).
     # Each bucket stores a mutable working state before conversion to ServiceTakeoffLine.
     # Type alias kept at module scope via _BucketKey below.
@@ -400,10 +488,15 @@ def compute_service_takeoff(
         )
         partitions: list[tuple[Room | None, float]] = []
         if polylines:
-            partitions = _partition_polylines_by_room(polylines, rooms)
+            partitions = _partition_polylines_by_room(polylines, rooms, label_radius=label_radius)
         if not partitions:
             partitions = _anchor_partition(
-                identity, rooms, geometry_by_entity_id, measured_length_by_group, run_key
+                identity,
+                rooms,
+                geometry_by_entity_id,
+                measured_length_by_group,
+                run_key,
+                label_radius=label_radius,
             )
 
         # Run-level diagnostic counters (counted once per run, not per room partition).
