@@ -744,6 +744,366 @@ class TestBuildServiceLegend:
         colour_entries = legend.by_colour()
         assert len(colour_entries) == 0
 
+    async def test_anchor_region_hatch_swatch_on_non_legend_layer(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Anchor + nearby HATCH swatch on a NON-legend layer + label → colour entry (Gap A+B)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        # Geometry mirrors M-540003 legend (scaled to anchor at 0,0):
+        # Anchor at (0, 0). Swatch hatch centroid at (0.25, -0.5) — within PAD_RIGHT=3.5
+        # and PAD_BELOW=2.0. Label at (0.75, -0.5) — 0.5 units right of swatch centroid
+        # (within pair radius 1.5). Black border line at swatch location — must be rejected.
+        green_color = {"index": 3, "rgb": "00ff00", "by_layer": False, "by_block": False}
+        black_color = {"index": 0, "rgb": "000000", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Anchor: "LEGEND" on a non-legend layer.
+                _make_entity(
+                    "anchor-001",
+                    "text",
+                    "Z010T",
+                    {"text": "LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Green HATCH swatch in legend column — chromatic, accepted.
+                _make_entity(
+                    "hatch-001",
+                    "hatch",
+                    "A060G5",
+                    {
+                        "vertices": [
+                            [0.0, -0.75],
+                            [0.5, -0.75],
+                            [0.5, -0.25],
+                            [0.0, -0.25],
+                        ]
+                    },
+                    style={"color": green_color},
+                ),
+                # Black border line at same location — achromatic, must be rejected.
+                _make_entity(
+                    "border-001",
+                    "line",
+                    "Z000",
+                    {"start": [0.0, -0.25, 0.0], "end": [0.5, -0.25, 0.0]},
+                    style={"color": black_color},
+                ),
+                # Label: text 0.5 units right of swatch centroid, within pair radius 1.5.
+                _make_entity(
+                    "label-001",
+                    "text",
+                    "Z010T",
+                    {"text": "MECHANICAL EQUIPMENT", "insertion": {"x": 0.75, "y": -0.5}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        colour_entries = legend.by_colour()
+        # Black border must NOT appear.
+        assert "000000" not in colour_entries, "Achromatic border must be rejected"
+        # Green swatch must be paired with "MECHANICAL EQUIPMENT".
+        entry = colour_entries.get("00ff00")
+        assert entry is not None, f"Expected 00ff00 in {list(colour_entries.keys())}"
+        assert entry.discipline == "MECHANICAL EQUIPMENT"
+
+    async def test_three_chromatic_swatches_black_borders_notes_excluded(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """3 chromatic HATCH swatches + adjacent labels; black borders and notes cluster excluded.
+
+        Mirrors M-540003 real-data geometry (scaled so anchor is at 0,0):
+        - olive/green/purple hatches in column at x≈0.25, y∈[-1.6,-0.4]
+        - labels 0.5u right of each swatch on same row
+        - 39 black border lines collocated with swatches → must not appear
+        - notes text cluster at x≈4.0 (outside PAD_RIGHT=3.5) → excluded
+        Expected: exactly 3 colour→discipline entries, no greyscale entry.
+        """
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        olive_color = {"index": 65, "rgb": "7ebc32", "by_layer": False, "by_block": False}
+        green_color = {"index": 3, "rgb": "00ff00", "by_layer": False, "by_block": False}
+        purple_color = {"index": 193, "rgb": "9783dc", "by_layer": False, "by_block": False}
+        black_color = {"index": 0, "rgb": "000000", "by_layer": False, "by_block": False}
+
+        def _hatch(eid: str, cx: float, cy: float, color: dict) -> dict:  # type: ignore[type-arg]
+            """Build a square hatch centred at (cx, cy), 0.4 units wide."""
+            return _make_entity(
+                eid,
+                "hatch",
+                "A060G5",
+                {
+                    "vertices": [
+                        [cx - 0.2, cy - 0.2],
+                        [cx + 0.2, cy - 0.2],
+                        [cx + 0.2, cy + 0.2],
+                        [cx - 0.2, cy + 0.2],
+                    ]
+                },
+                style={"color": color},
+            )
+
+        def _border(eid: str, cx: float, cy: float) -> dict:  # type: ignore[type-arg]
+            """Black border line at swatch location — must be rejected as achromatic."""
+            return _make_entity(
+                eid,
+                "line",
+                "Z000",
+                {"start": [cx - 0.2, cy, 0.0], "end": [cx + 0.2, cy, 0.0]},
+                style={"color": black_color},
+            )
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Anchor at (0, 0).
+                _make_entity(
+                    "anchor-m",
+                    "text",
+                    "Z010T",
+                    {"text": "LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Row 1 (y=-0.4): olive swatch + label.
+                _hatch("h-olive", 0.25, -0.4, olive_color),
+                _border("b-olive", 0.25, -0.4),
+                _make_entity(
+                    "lbl-olive",
+                    "text",
+                    "Z010T",
+                    {"text": "GAS", "insertion": {"x": 0.75, "y": -0.4}},
+                ),
+                # Row 2 (y=-1.0): green swatch + label.
+                _hatch("h-green", 0.25, -1.0, green_color),
+                _border("b-green", 0.25, -1.0),
+                _make_entity(
+                    "lbl-green",
+                    "text",
+                    "Z010T",
+                    {"text": "MECHANICAL EQUIPMENT", "insertion": {"x": 0.75, "y": -1.0}},
+                ),
+                # Row 3 (y=-1.6): purple swatch + label.
+                _hatch("h-purple", 0.25, -1.6, purple_color),
+                _border("b-purple", 0.25, -1.6),
+                _make_entity(
+                    "lbl-purple",
+                    "text",
+                    "Z010T",
+                    {"text": "HYDRAULIC EQUIPMENT", "insertion": {"x": 0.75, "y": -1.6}},
+                ),
+                # Notes cluster at x=4.0 — outside PAD_RIGHT=3.5, must be excluded.
+                _make_entity(
+                    "note-001",
+                    "text",
+                    "Z010T",
+                    {"text": "NOTES", "insertion": {"x": 4.0, "y": -0.5}},
+                ),
+                _make_entity(
+                    "note-002",
+                    "text",
+                    "Z010T",
+                    {"text": "SEE DRAWING NOTES", "insertion": {"x": 4.0, "y": -1.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        colour_entries = legend.by_colour()
+        # Exactly 3 chromatic entries — no greyscale blob.
+        assert "000000" not in colour_entries, "Black border must not appear in legend"
+        assert len(colour_entries) == 3, (
+            f"Expected 3 colour entries, got {len(colour_entries)}: {list(colour_entries.keys())}"
+        )
+        assert colour_entries["7ebc32"].discipline == "GAS"
+        assert colour_entries["00ff00"].discipline == "MECHANICAL EQUIPMENT"
+        assert colour_entries["9783dc"].discipline == "HYDRAULIC EQUIPMENT"
+
+    async def test_explicit_legend_layers_still_works(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit legend_layers override still produces colour entries (existing path)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        swatch_color = {"index": 5, "rgb": "#0000ff", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "swatch-002",
+                    "line",
+                    "LEGEND",
+                    {"start": [0.0, 0.0, 0.0], "end": [100.0, 0.0, 0.0]},
+                    style={"color": swatch_color},
+                ),
+                _make_entity(
+                    "text-002",
+                    "text",
+                    "LEGEND",
+                    {"text": "HYDRAULICS", "insertion": {"x": 150.0, "y": 0.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id, legend_layers=["LEGEND"])
+
+        colour_entries = legend.by_colour()
+        assert len(colour_entries) >= 1
+        entry = next(iter(colour_entries.values()))
+        assert entry.discipline == "HYDRAULICS"
+
+    async def test_no_anchor_no_legend_layer_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No anchor and no LEGEND/KEY layer -> empty colour legend, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "pipe-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [1000.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        assert len(legend.by_colour()) == 0
+
+    async def test_anchor_but_no_in_region_swatch_yields_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Anchor found but no in-region swatch -> empty colour legend (prose may still exist)."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Anchor at (0, 0).
+                _make_entity(
+                    "anchor-002",
+                    "text",
+                    "Z010T",
+                    {"text": "LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Swatch far outside region (x=50, well beyond _DWG_REGION_PAD_RIGHT=3.5).
+                _make_entity(
+                    "swatch-far",
+                    "line",
+                    "SomeLayer",
+                    {"start": [50.0, 0.0, 0.0], "end": [60.0, 0.0, 0.0]},
+                    style={"color": {"index": 7, "rgb": "ffff00", "by_layer": False}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        assert len(legend.by_colour()) == 0
+
+    async def test_region_excludes_far_routed_entity(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A coloured routed entity at x≈40 is excluded; legend swatch near anchor is included."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        # Anchor at (0, 0); legend swatch hatch at (1, -1); label at (2, -1).
+        # Routed pipe entity at x=40 (far outside region) — must NOT appear in legend.
+        legend_color = {"index": 10, "rgb": "ff0000", "by_layer": False, "by_block": False}
+        pipe_color = {"index": 20, "rgb": "0000ff", "by_layer": False, "by_block": False}
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "anchor-003",
+                    "text",
+                    "Z010T",
+                    {"text": "LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Legend swatch (hatch) near anchor — should be included.
+                _make_entity(
+                    "hatch-leg",
+                    "hatch",
+                    "A060G5",
+                    {"vertices": [[0.5, -1.5], [1.5, -1.5], [1.5, -0.5], [0.5, -0.5]]},
+                    style={"color": legend_color},
+                ),
+                # Label for legend swatch.
+                _make_entity(
+                    "label-leg",
+                    "text",
+                    "Z010T",
+                    {"text": "HYDRAULIC EQUIPMENT", "insertion": {"x": 2.0, "y": -1.0}},
+                ),
+                # Routed entity far from legend — should NOT appear in legend.
+                _make_entity(
+                    "pipe-far",
+                    "line",
+                    "Pipes",
+                    {"start": [40.0, 0.0, 0.0], "end": [50.0, 0.0, 0.0]},
+                    style={"color": pipe_color},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        colour_entries = legend.by_colour()
+        # The far-away pipe colour must NOT appear in the legend.
+        assert "0000ff" not in colour_entries, (
+            "Far-away routed entity colour must not appear in legend"
+        )
+        # The legend swatch colour MUST appear.
+        assert "ff0000" in colour_entries, (
+            f"Legend colour missing; got {list(colour_entries.keys())}"
+        )
+        assert colour_entries["ff0000"].discipline == "HYDRAULIC EQUIPMENT"
+
 
 @requires_database
 class TestLoadServiceTakeoffInputs:
