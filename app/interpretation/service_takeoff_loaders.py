@@ -137,7 +137,10 @@ _DEFAULT_CONTAINER_LAYER_TOKENS: tuple[str, ...] = (
     "trunking",  # trunking / wireway
     "basket",  # wire basket / cable basket
     "conduit",  # conduit runs
-    "duct",  # ductwork / air duct
+    "duct",  # ductwork / air duct. NOTE: %duct% is the one token with English-substring
+    # collisions ("product", "conduct", "viaduct") — could match a stray annotation/schedule
+    # layer. Low risk in practice (service layers dominate), but if a false-positive surfaces,
+    # tighten to a word-boundary / token-aware match rather than widening the ilike.
 )
 
 # Centerline layers carry the single-line route and are preferred over double-line pipe
