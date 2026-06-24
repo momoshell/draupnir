@@ -1083,6 +1083,35 @@ def test_measured_length_by_group_none_reproduces_current_results() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_dict_coord_geometry_lengths_and_anchors() -> None:
+    """Real materialized geometry uses dict coords {"x","y"}; length + room anchor must work.
+
+    Regression for the KeyError on real M-540003 DWG (synthetic tests used list coords, masking
+    it). A line entity with dict-shaped start/end is measured and anchored into its room.
+    """
+    room = _square_room(x=0.0, room_id="room-a")  # 10000 x 10000 du square at origin
+    identity = _make_identity(services=(_pipe_size("VAC", 54),), entity_ids=("e1",))
+    # dict coords, no measured_geometry -> exercises _entity_drawn_length + _run_anchor fallback
+    geom = {
+        "e1": {
+            "start": {"x": 1000.0, "y": 5000.0, "z": 0.0},
+            "end": {"x": 4000.0, "y": 5000.0, "z": 0.0},
+        }
+    }
+    result = compute_service_takeoff(
+        runs=[_make_run()],
+        identities=[identity],
+        geometry_by_entity_id=geom,
+        rooms=[room],
+        scale=_confirmed_mm_scale(),
+    )
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.room_id == "room-a"  # anchored into the room (dict-coord anchor worked)
+    assert ln.drawing_length == pytest.approx(3000.0)  # |4000-1000| du (dict-coord length worked)
+    assert ln.real_length_m == pytest.approx(3.0)  # x 0.001
+
+
 def test_lp2_clip_splits_length_across_rooms() -> None:
     """A measured run spanning two rooms has its length distributed per room, not all-to-one.
 

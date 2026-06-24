@@ -25,6 +25,36 @@ CURRENT_ALGO_VERSION: str = "c3-geom-1"
 # ---------------------------------------------------------------------------
 
 
+def _xy(point: Any) -> tuple[float, float] | None:
+    """Extract an (x, y) pair from a coordinate in either real shape.
+
+    Materialized canonical geometry uses **dict** coords (``{"x":.., "y":.., "z":..}``); some
+    fixtures/legacy payloads use **list/tuple** coords (``[x, y, z]``). Returns ``None`` for
+    anything unusable. Pure — no cv2/numpy; safe on the read path.
+    """
+    if isinstance(point, Mapping):
+        x, y = point.get("x"), point.get("y")
+    elif isinstance(point, (list, tuple)) and len(point) >= 2:
+        x, y = point[0], point[1]
+    else:
+        return None
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        return (float(x), float(y))
+    return None
+
+
+def _xy_list(pts: Any) -> list[tuple[float, float]]:
+    """Extract a list of (x, y) pairs from a vertices/points sequence (dict or list coords)."""
+    if not isinstance(pts, (list, tuple)):
+        return []
+    out: list[tuple[float, float]] = []
+    for p in pts:
+        xy = _xy(p)
+        if xy is not None:
+            out.append(xy)
+    return out
+
+
 def entity_group_drawn_length(
     entity_ids: tuple[str, ...],
     geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
@@ -46,20 +76,14 @@ def entity_group_drawn_length(
         if geom is None:
             continue
         if "start" in geom and "end" in geom:
-            s = geom["start"]
-            e = geom["end"]
-            if len(s) >= 2 and len(e) >= 2:
-                dx = e[0] - s[0]
-                dy = e[1] - s[1]
-                total += (dx * dx + dy * dy) ** 0.5
+            s = _xy(geom["start"])
+            e = _xy(geom["end"])
+            if s is not None and e is not None:
+                total += math.hypot(e[0] - s[0], e[1] - s[1])
             continue
-        pts: Any = geom.get("vertices") or geom.get("points")
-        if pts:
-            coords = [(p[0], p[1]) for p in pts if len(p) >= 2]
-            for i in range(len(coords) - 1):
-                dx = coords[i + 1][0] - coords[i][0]
-                dy = coords[i + 1][1] - coords[i][1]
-                total += (dx * dx + dy * dy) ** 0.5
+        coords = _xy_list(geom.get("vertices") or geom.get("points"))
+        for i in range(len(coords) - 1):
+            total += math.hypot(coords[i + 1][0] - coords[i][0], coords[i + 1][1] - coords[i][1])
     return total
 
 
@@ -93,22 +117,17 @@ def decompose_geometry(
         if geom is None:
             continue
         if "start" in geom and "end" in geom:
-            s = geom["start"]
-            e = geom["end"]
-            if len(s) >= 2 and len(e) >= 2:
-                p0: tuple[float, float] = (float(s[0]), float(s[1]))
-                p1: tuple[float, float] = (float(e[0]), float(e[1]))
-                if _segment_nonzero_length(*p0, *p1):
-                    segments.append((p0, p1))
+            s = _xy(geom["start"])
+            e = _xy(geom["end"])
+            if s is not None and e is not None and _segment_nonzero_length(*s, *e):
+                segments.append((s, e))
             continue
-        pts: Any = geom.get("vertices") or geom.get("points")
-        if pts:
-            coords = [(float(p[0]), float(p[1])) for p in pts if len(p) >= 2]
-            for i in range(len(coords) - 1):
-                p0 = coords[i]
-                p1 = coords[i + 1]
-                if _segment_nonzero_length(*p0, *p1):
-                    segments.append((p0, p1))
+        coords = _xy_list(geom.get("vertices") or geom.get("points"))
+        for i in range(len(coords) - 1):
+            p0 = coords[i]
+            p1 = coords[i + 1]
+            if _segment_nonzero_length(*p0, *p1):
+                segments.append((p0, p1))
     return segments
 
 

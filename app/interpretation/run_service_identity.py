@@ -41,6 +41,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from app.ingestion.centerline_contract import _xy, _xy_list
 from app.interpretation.routed_runs import RunGroup
 from app.interpretation.run_tags import BASIS_TAG_TEXT, PipeSize, TagObservation, parse_tag
 
@@ -129,20 +130,19 @@ def _representative_point(geometry: Mapping[str, Any]) -> tuple[float, float] | 
 
     Coordinates beyond index 1 (z-axis etc.) are ignored.
     """
-    # Line: {"start": [x, y, ...], "end": [x, y, ...]}
+    # Line: start/end coords may be dicts ({"x","y","z"}) on real data or lists ([x,y,z]).
     if "start" in geometry and "end" in geometry:
-        s = geometry["start"]
-        e = geometry["end"]
-        if len(s) >= 2 and len(e) >= 2:
+        s = _xy(geometry["start"])
+        e = _xy(geometry["end"])
+        if s is not None and e is not None:
             return ((s[0] + e[0]) / 2.0, (s[1] + e[1]) / 2.0)
 
-    # Polyline: {"vertices": [[x, y], ...]} or {"points": [[x, y], ...]}
-    pts: Any = geometry.get("vertices") or geometry.get("points")
-    if pts and len(pts) >= 1:
-        xs = [p[0] for p in pts if len(p) >= 2]
-        ys = [p[1] for p in pts if len(p) >= 2]
-        if xs:
-            return (sum(xs) / len(xs), sum(ys) / len(ys))
+    # Polyline: {"vertices": [...]} or {"points": [...]} (dict or list coords).
+    coords = _xy_list(geometry.get("vertices") or geometry.get("points"))
+    if coords:
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     return None
 

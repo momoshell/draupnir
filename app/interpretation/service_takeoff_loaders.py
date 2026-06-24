@@ -33,6 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.revision_routes.scale import resolve_revision_scale
+from app.ingestion.centerline_contract import _xy
 from app.interpretation.loaders import (
     load_legend_text_candidates,
     load_revision_entities_by_type,
@@ -215,15 +216,17 @@ def _swatch_centroid(geometry: dict[str, Any]) -> tuple[float, float] | None:
     - fallback: insertion point
     """
     if "start" in geometry and "end" in geometry:
-        s, e = geometry["start"], geometry["end"]
-        if len(s) >= 2 and len(e) >= 2:
+        s = _xy(geometry["start"])
+        e = _xy(geometry["end"])
+        if s is not None and e is not None:
             return ((s[0] + e[0]) / 2.0, (s[1] + e[1]) / 2.0)
 
     pts: Any = geometry.get("vertices") or geometry.get("points")
-    if pts and len(pts) >= 1:
-        xs = [p[0] for p in pts if len(p) >= 2]
-        ys = [p[1] for p in pts if len(p) >= 2]
-        if xs:
+    if isinstance(pts, (list, tuple)) and pts:
+        coords = [c for p in pts if (c := _xy(p)) is not None]
+        if coords:
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
             return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     center = geometry.get("center")
