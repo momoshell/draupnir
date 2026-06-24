@@ -18,14 +18,18 @@ from app.api.v1.revision_lineage import _get_active_revision_manifest_or_409
 from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.core.logging import get_logger
 from app.db.session import get_db, get_session_maker
+from app.ingestion.centerline_contract import _xy
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
+from app.interpretation.service_fill_takeoff import compute_fill_attributed_lengths
 from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
 from app.interpretation.service_takeoff_loaders import (
+    _DEFAULT_CENTERLINE_LAYER_TOKENS,
     INPUT_FAMILY_PDF_VECTOR,
     load_measured_geometry,
     load_measured_lengths,
+    load_service_fill_bands,
     load_service_takeoff_inputs,
 )
 from app.jobs.worker import enqueue_centerline_job as _enqueue_centerline_job_direct
@@ -34,6 +38,8 @@ from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_i
 from app.models.job import Job, JobType
 from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.service_takeoff import (
+    ServiceFillAttributionRead,
+    ServiceFillColourRead,
     ServiceTakeoffLineRead,
     ServiceTakeoffResponse,
     ServiceTakeoffScaleRead,
@@ -236,9 +242,52 @@ async def get_revision_service_takeoff(
         measured_geometry_by_group=measured_geometry if measured_geometry else None,
     )
 
+    # Step 5c -- fill-colour attribution (DWG only; compute-on-read, Phase 1 / #663).
+    # Only meaningful for DWG revisions that have Center Line entities. For PDF revisions
+    # the HATCH fill bands are absent so attribution is honest-absent (None).
+    fill_attribution: ServiceFillAttributionRead | None = None
+    is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
+    if not is_pdf:
+        # Filter routed_entities to centerline-token layers, line entity type only.
+        cl_tokens_lower = tuple(t.lower() for t in _DEFAULT_CENTERLINE_LAYER_TOKENS)
+        centerline_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        for ent in inputs.routed_entities:
+            if ent.entity_type != "line":
+                continue
+            lr = (ent.layer_ref or "").lower()
+            if not any(tok in lr for tok in cl_tokens_lower):
+                continue
+            geom = ent.geometry
+            if not isinstance(geom, dict):
+                continue
+            s = _xy(geom.get("start"))
+            e = _xy(geom.get("end"))
+            if s is not None and e is not None:
+                centerline_segments.append((s, e))
+
+        if centerline_segments:
+            fill_bands = await load_service_fill_bands(db, revision_id)
+            raw_fill = compute_fill_attributed_lengths(
+                centerline_segments=centerline_segments,
+                fill_bands=fill_bands,
+            )
+            fill_attribution = ServiceFillAttributionRead(
+                per_colour=[
+                    ServiceFillColourRead(
+                        colour_key=fc.colour_key,
+                        colour_index=fc.colour_index,
+                        colour_rgb=fc.colour_rgb,
+                        length_m=fc.length_m,
+                    )
+                    for fc in raw_fill.per_colour
+                ],
+                shared_length_m=raw_fill.shared_length_m,
+                total_length_m=raw_fill.total_length_m,
+                centerline_segment_count=raw_fill.centerline_segment_count,
+            )
+
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
     # dataclass boundary).
-    is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
     # length_provisional reflects length TRUSTWORTHINESS by format: PDF is provisional
     # (double-line wall inflation), DWG is not (accurate via the Center Line layer, #616).
     # It is intentionally NOT tied to centerline materialization in C0: the passthrough
@@ -304,6 +353,7 @@ async def get_revision_service_takeoff(
         items=items,
         summary=summary,
         scale=scale_read,
+        fill_attribution=fill_attribution,
         unscaled=result.unscaled,
         length_provisional=length_provisional,
     )

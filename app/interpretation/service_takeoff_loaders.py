@@ -42,6 +42,7 @@ from app.interpretation.measurement import ScaleContext
 from app.interpretation.rise_drop import RiseDropEntity
 from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES, RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
+from app.interpretation.service_fill_takeoff import FillBand
 from app.interpretation.service_legend import (
     ProseInput,
     ServiceLegend,
@@ -49,6 +50,9 @@ from app.interpretation.service_legend import (
     from_abbreviation_prose,
     from_colour_swatches,
     fuse,
+)
+from app.interpretation.service_legend import (
+    colour_key as _colour_key,
 )
 
 # ---------------------------------------------------------------------------
@@ -127,6 +131,10 @@ RISE_DROP_ENTITY_TYPES: tuple[str, ...] = ("arc", "hatch")
 # Layer token defaults for rise/drop symbols (ilike, ADR-003).
 _DEFAULT_RISE_LAYER_TOKENS: tuple[str, ...] = ("rise", "riser")
 _DEFAULT_DROP_LAYER_TOKENS: tuple[str, ...] = ("drop",)
+
+# Combined token set for fill-band (HATCH) queries: all three service-layer families.
+# Referenced as the default in load_service_fill_bands so the set cannot silently drift.
+_SERVICE_FILL_LAYER_TOKENS: tuple[str, ...] = ("pipe", "rise", "drop")
 
 # Radius (drawing units) within which a legend text entity is matched to a swatch.
 # Sized for a typical legend row height (~5 mm at 1:50 → ~250 drawing units / mm-unit).
@@ -943,6 +951,84 @@ async def load_rise_drop_entities(
                 layer_ref=row.layer_ref,
                 color=color,
                 geometry=geometry,
+            )
+        )
+    return result
+
+
+async def load_service_fill_bands(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    layer_tokens: tuple[str, ...] = _SERVICE_FILL_LAYER_TOKENS,
+    exclude_off_sheet: bool = True,
+    input_family: str | None = None,
+) -> list[FillBand]:
+    """Load HATCH entities from pipe/rise/drop token layers as :class:`FillBand` objects.
+
+    Mirrors the token-layer query pattern of :func:`load_rise_drop_entities`.  Only
+    ``hatch`` entity types are selected; non-service colours (colour_key is None) are
+    silently skipped.
+
+    ``input_family`` is accepted for interface symmetry but not used in Phase 1 (the
+    query is DWG-specific; PDF revisions have no HATCH fill bands on pipe/rise/drop layers).
+
+    Returns ``[]`` for degenerate revisions; never raises.
+    """
+    del input_family  # Phase 2/3 extension point; unused in Phase 1
+
+    from sqlalchemy import or_, select
+
+    from app.ingestion.centerline_contract import _xy_list
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        q = select(RevisionEntity).where(
+            RevisionEntity.drawing_revision_id == revision_id,
+            RevisionEntity.entity_type == "hatch",
+        )
+        if exclude_off_sheet:
+            q = q.where(RevisionEntity.on_sheet.isnot(False))
+        conditions = [RevisionEntity.layer_ref.ilike(f"%{token}%") for token in layer_tokens]
+        q = q.where(or_(*conditions))
+        q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        rows = list((await db.execute(q)).scalars().all())
+    except Exception:
+        return []
+
+    result: list[FillBand] = []
+    for row in rows:
+        style = row.style or {}
+        color: Mapping[str, Any] | None = style.get("color") if isinstance(style, Mapping) else None
+        ck = _colour_key(color)
+        if ck is None:
+            continue
+
+        colour_index: int | None = color.get("index") if color is not None else None
+        colour_rgb: str | None = color.get("rgb") if color is not None else None
+
+        raw_geom = row.geometry_json
+        geometry: dict[str, Any] | None = raw_geom if isinstance(raw_geom, dict) else None
+        if geometry is None:
+            continue
+
+        # Prefer first boundary loop; fall back to vertices field.
+        boundary_loops = geometry.get("boundary_loops")
+        if isinstance(boundary_loops, (list, tuple)) and boundary_loops:
+            pts_raw = boundary_loops[0]
+        else:
+            pts_raw = geometry.get("vertices")
+
+        ring_pts = _xy_list(pts_raw)
+        if len(ring_pts) < 3:
+            continue
+
+        result.append(
+            FillBand(
+                colour_key=ck,
+                colour_index=colour_index,
+                colour_rgb=colour_rgb,
+                ring=tuple(ring_pts),
             )
         )
     return result

@@ -89,6 +89,33 @@ class ServiceTakeoffSummaryRead(BaseModel):
     total_drops: int = Field(..., ge=0, description="Distinct drop symbols in this revision")
 
 
+class ServiceFillColourRead(BaseModel):
+    """Attributed length for a single fill colour key (Phase 1 — opaque colour key only)."""
+
+    colour_key: str = Field(..., description="Opaque per-drawing colour key (rgb hex or idx:<n>)")
+    colour_index: int | None = Field(None, description="DWG ACI colour index, if present")
+    colour_rgb: str | None = Field(None, description="RGB hex string, if present")
+    length_m: float = Field(..., ge=0.0, description="Total attributed length in metres")
+
+
+class ServiceFillAttributionRead(BaseModel):
+    """Fill-colour attribution result for one drawing revision (compute-on-read, Phase 1)."""
+
+    per_colour: list[ServiceFillColourRead] = Field(
+        default_factory=list,
+        description="Per-colour attributed lengths, sorted by colour_key",
+    )
+    shared_length_m: float = Field(
+        ..., ge=0.0, description="Length not clearly attributable to a single colour (manifold)"
+    )
+    total_length_m: float = Field(
+        ..., ge=0.0, description="Total centerline length in metres (Σ per_colour + shared)"
+    )
+    centerline_segment_count: int = Field(
+        ..., ge=0, description="Number of centerline line segments processed"
+    )
+
+
 class ServiceTakeoffResponse(BaseModel):
     """Routed-service takeoff for one drawing revision (compute-on-read)."""
 
@@ -98,6 +125,13 @@ class ServiceTakeoffResponse(BaseModel):
     items: list[ServiceTakeoffLineRead] = Field(default_factory=list)
     summary: ServiceTakeoffSummaryRead
     scale: ServiceTakeoffScaleRead
+    fill_attribution: ServiceFillAttributionRead | None = Field(
+        default=None,
+        description=(
+            "Per-fill-colour attributed centerline lengths (DWG only; null for PDF or "
+            "when no centerline segments are present). Phase 1 — colour key is opaque."
+        ),
+    )
     unscaled: bool = Field(
         ...,
         description=(

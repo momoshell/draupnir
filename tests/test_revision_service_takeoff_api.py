@@ -305,7 +305,15 @@ async def test_service_takeoff_response_has_required_top_level_keys(
     assert response.status_code == 200
     body = response.json()
     # extra='forbid' on ServiceTakeoffResponse -- assert all expected keys are present.
-    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
+    expected_keys = {
+        "manifest",
+        "items",
+        "summary",
+        "scale",
+        "fill_attribution",
+        "unscaled",
+        "length_provisional",
+    }
     assert expected_keys == set(body.keys())
 
 
@@ -707,7 +715,15 @@ async def test_service_takeoff_extra_field_rejected(
     response = await _get_takeoff(takeoff_app_confirmed_scale)
     assert response.status_code == 200
     body = response.json()
-    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
+    expected_keys = {
+        "manifest",
+        "items",
+        "summary",
+        "scale",
+        "fill_attribution",
+        "unscaled",
+        "length_provisional",
+    }
     assert expected_keys == set(body.keys()), (
         f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
     )
@@ -980,7 +996,15 @@ async def test_extra_forbid_still_holds_with_length_provisional(
     response = await _get_takeoff(takeoff_app_pdf)
     assert response.status_code == 200
     body = response.json()
-    expected_keys = {"manifest", "items", "summary", "scale", "unscaled", "length_provisional"}
+    expected_keys = {
+        "manifest",
+        "items",
+        "summary",
+        "scale",
+        "fill_attribution",
+        "unscaled",
+        "length_provisional",
+    }
     assert expected_keys == set(body.keys()), (
         f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
     )
