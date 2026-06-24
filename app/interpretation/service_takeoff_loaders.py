@@ -971,15 +971,25 @@ async def build_scale_context(
         )
 
     units = scale_read.units or {}
-    conversion_factor: float | None = units.get("conversion_factor")
-    if not isinstance(conversion_factor, (int, float)) or isinstance(conversion_factor, bool):
-        conversion_factor = None
+    units_factor = units.get("conversion_factor")
+    has_units_factor = isinstance(units_factor, (int, float)) and not isinstance(units_factor, bool)
 
     units_confidence: str = scale_read.units_confidence
+    conversion_factor: float | None
 
-    # PDF fallback: when the units block gives no factor, derive metres-per-point from
-    # pdf_scale.  ADR-004: PDF title-block detection is always "inferred", never confirmed.
-    if conversion_factor is None:
+    if has_units_factor:
+        # Vector (DWG/DXF): the adapter has ALREADY scaled the stored geometry to the
+        # conversion_target (metres) by this very factor — start/end/vertices are in metres
+        # (libredwg `_scale_point`, ezdxf `_scaled_point_payload`). The units-block
+        # ``conversion_factor`` is metadata describing the transform that was applied, NOT a
+        # factor to re-apply. So the takeoff measures the already-metre drawing_length with a
+        # factor of 1.0; re-applying ``conversion_factor`` double-converted (1000x under on a
+        # mm drawing) — #661 Bug B.
+        conversion_factor = 1.0
+    else:
+        # PDF: geometry is in page points (NOT pre-scaled); derive metres-per-point from
+        # pdf_scale. ADR-004: PDF title-block detection is always "inferred", never confirmed.
+        conversion_factor = None
         pdf_scale = scale_read.pdf_scale or {}
         points_to_real = pdf_scale.get("points_to_real")
         real_world_unit = pdf_scale.get("real_world_unit")

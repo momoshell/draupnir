@@ -281,7 +281,9 @@ class TestBuildScaleContext:
             scale = await build_scale_context(db, revision_id)
 
         assert scale.real_world_available is True
-        assert scale.conversion_factor == pytest.approx(0.001)
+        # Vector geometry is already scaled to metres by the adapter; the takeoff factor is 1.0,
+        # NOT the units-block conversion_factor (which must not be re-applied) — #661 Bug B.
+        assert scale.conversion_factor == pytest.approx(1.0)
         assert scale.units_confidence == "confirmed"
         assert scale.contradicted is False
 
@@ -801,9 +803,10 @@ class TestLoadServiceTakeoffInputs:
         pipe_entity = inputs.routed_entities[0]
         assert pipe_entity.entity_id in inputs.geometry_by_entity_id
 
-        # Scale reflects the mm units.
+        # Scale reflects the mm units; geometry is pre-scaled to metres so the takeoff factor
+        # is 1.0 (the units conversion_factor was already applied by the adapter) — #661 Bug B.
         assert inputs.scale.real_world_available is True
-        assert inputs.scale.conversion_factor == pytest.approx(0.001)
+        assert inputs.scale.conversion_factor == pytest.approx(1.0)
 
     async def test_empty_degenerate_revision_no_raise(
         self,
@@ -982,8 +985,9 @@ class TestContradictedScale:
         async with _get_session() as db:
             scale = await build_scale_context(db, revision_id)
 
-        # With mm units and no contradiction: cf=0.001, real_world_available=True.
-        assert scale.conversion_factor == pytest.approx(0.001)
+        # With mm units (pre-scaled geometry) and no contradiction: takeoff factor=1.0,
+        # real_world_available=True (#661 Bug B — conversion_factor not re-applied).
+        assert scale.conversion_factor == pytest.approx(1.0)
         assert scale.real_world_available is True
 
         # The ScaleContext.real_world_available is driven by
@@ -1166,8 +1170,9 @@ class TestBuildScaleContextPdf:
         async with _get_session() as db:
             scale = await build_scale_context(db, revision_id)
 
-        # Units-derived factor (0.001 m/mm) wins; PDF factor (~0.017638889) not used.
-        assert scale.conversion_factor == pytest.approx(0.001)
+        # Units path wins over the PDF fallback (PDF factor ~0.017638889 not used). Geometry is
+        # pre-scaled to metres, so the takeoff factor is 1.0, not 0.001 (#661 Bug B).
+        assert scale.conversion_factor == pytest.approx(1.0)
         assert scale.units_confidence == "confirmed"
 
 
