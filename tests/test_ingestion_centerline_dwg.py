@@ -252,6 +252,86 @@ def test_rungs_excluded_dict_coords() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test: conservation invariant (no rail silently zeroed)
+# ---------------------------------------------------------------------------
+
+
+def test_conservation_coincident_midpoints() -> None:
+    """Every rail contributes either a midline or the 0.5x unpaired residual.
+
+    Regression for the de-dup bug: if a de-dup guard marks rails as matched but
+    skips emitting their midline, the rails contribute zero to total_length (not
+    even the 0.5x residual).  This test asserts the conservation invariant holds
+    even when two distinct rail-pairs produce midlines that coincide within 1 mm.
+
+    Fixture:
+        Pair 1 rails at y=0 / y=0.4 m,  x=[0, 3.0]  -> midline at y=0.20, length=3.0 m
+        Pair 2 rails at y=10 / y=10.4 m, x=[0, 3.0]  -> midline at y=10.20, length=3.0 m
+        Pair 3 rails at y=0 / y=0.4 m,  x=[20, 23.0] -> midline at y=0.20, length=3.0 m
+                (same y-band as pair 1 but no x-overlap -> distinct physical run)
+
+    All three pairs are valid and distinct; pair 1 and pair 3 produce midlines
+    with the SAME y-coordinate (0.20 m) and the same length (3.0 m) but at
+    different x positions — a de-dup by endpoint would drop pair 3.
+
+    Conservation assertion:
+        total_length == 3 * 3.0 == 9.0 m  (all three pairs fully emitted)
+        polylines == 3
+    """
+    geom = {
+        # Pair 1
+        "p1_a": _line_geom_list(0.0, 0.0, 3.0, 0.0),
+        "p1_b": _line_geom_list(3.0, 0.4, 0.0, 0.4),
+        # Pair 2
+        "p2_a": _line_geom_list(0.0, 10.0, 3.0, 10.0),
+        "p2_b": _line_geom_list(3.0, 10.4, 0.0, 10.4),
+        # Pair 3 — same y-band as pair 1, different x range (no overlap with pair 1)
+        "p3_a": _line_geom_list(20.0, 0.0, 23.0, 0.0),
+        "p3_b": _line_geom_list(23.0, 0.4, 20.0, 0.4),
+    }
+    entity_ids: tuple[str, ...] = ("p1_a", "p1_b", "p2_a", "p2_b", "p3_a", "p3_b")
+    group = _make_group(entity_ids, layer_ref="E-TRAY Cable Tray")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    # All 3 pairs must be emitted; no rail silently zeroed.
+    assert len(cl.geometry.polylines) == 3, (
+        f"Expected 3 midline polylines (conservation), got {len(cl.geometry.polylines)}"
+    )
+    assert math.isclose(cl.geometry.length_du, 9.0, rel_tol=1e-9), (
+        f"Expected total 9.0 m (3 x 3.0 m), got {cl.geometry.length_du}"
+    )
+
+
+def test_conservation_unpaired_not_silenced() -> None:
+    """Unpaired rails always reach the 0.5x residual — never silently zero.
+
+    Three rails: pairs (A,B) match; C is unpaired.
+    total = midline(A,B) + 0.5 * len(C).
+    """
+    geom = {
+        "ra": _line_geom_list(0.0, 0.0, 4.0, 0.0),
+        "rb": _line_geom_list(4.0, 0.3, 0.0, 0.3),
+        "rc": _line_geom_list(10.0, 5.0, 14.0, 5.0),  # lone rail, no partner
+    }
+    entity_ids: tuple[str, ...] = ("ra", "rb", "rc")
+    group = _make_group(entity_ids, layer_ref="E-TRAY Cable Tray")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    # 1 midline (ra+rb) + 1 unpaired polyline (rc)
+    assert len(cl.geometry.polylines) == 2, (
+        f"Expected 2 polylines (1 midline + 1 unpaired), got {len(cl.geometry.polylines)}"
+    )
+    expected = 4.0 + 4.0 * _UNPAIRED_LENGTH_FACTOR  # midline=4.0 + 0.5*4.0=2.0
+    assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9), (
+        f"Expected {expected} m, got {cl.geometry.length_du}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test: width-agnostic pairing
 # ---------------------------------------------------------------------------
 

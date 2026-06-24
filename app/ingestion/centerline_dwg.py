@@ -239,8 +239,11 @@ def _derive_centerline(
     4. **Midline** via _midline_polyline; accumulate into total_length.
     5. **Unpaired rails** (expected residual at junctions) -> 0.5 x drawn length.
        Rungs contribute neither length nor polylines.
-    6. **De-dup**: skip a midline whose both endpoints match an already-emitted
-       one within 1 mm (cheap set-lookup).
+    Conservation invariant: every rail ends up in exactly one of (a) an emitted
+    midline or (b) the 0.5x unpaired residual.  De-dup is intentionally absent:
+    pairing is mutual+greedy so each rail has at most one partner — a given
+    midline cannot be emitted twice.  Two distinct physical runs whose midpoints
+    coincide are both kept (double-counting is their honest measurement).
 
     Returns (polylines, total_length_du).
     """
@@ -306,13 +309,13 @@ def _derive_centerline(
             candidates.append((perp, i, j))
 
     # Greedy match: sort by (perp_offset, i, j) asc; accept if both unmatched.
+    # Conservation: every accepted pair emits a midline; every rail that never
+    # enters `matched` falls to the 0.5x unpaired residual below.  No rail is
+    # silently zeroed.  De-dup is intentionally absent (see docstring).
     candidates.sort()
     matched: set[int] = set()
     polylines: list[tuple[tuple[float, float], ...]] = []
     total_length = 0.0
-    # De-dup: track emitted endpoint pairs by rounding to 1 mm.
-    _emitted: set[tuple[tuple[float, float], tuple[float, float]]] = set()
-    _dedup_prec = 3  # mm precision (round to 3 dp in metres)
 
     for _perp, i, j in candidates:
         if i in matched or j in matched:
@@ -325,15 +328,6 @@ def _derive_centerline(
         ux_i, uy_i = all_units[i]
 
         mid_polyline, mid_length = _midline_polyline(s_i, e_i, s_j, e_j, ux_i, uy_i)
-
-        # De-dup: skip if both endpoints already emitted (trivially cheap).
-        pt0 = (round(mid_polyline[0][0], _dedup_prec), round(mid_polyline[0][1], _dedup_prec))
-        pt1 = (round(mid_polyline[-1][0], _dedup_prec), round(mid_polyline[-1][1], _dedup_prec))
-        key = (pt0, pt1) if pt0 <= pt1 else (pt1, pt0)
-        if key in _emitted:
-            continue
-        _emitted.add(key)
-
         polylines.append(mid_polyline)
         total_length += mid_length
 
