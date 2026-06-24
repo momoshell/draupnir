@@ -85,9 +85,10 @@ _PAIR_X_MAX_GAP: float = 320.0
 _LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:legend|key)\b")
 _LEGEND_ANCHOR_EXCLUDE_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:key\s*plan|notes?)\b")
 
-# Stack-header pattern: "FROM TOP TO BOTTOM", "FROM LEFT TO RIGHT", etc. (ADR-003: any layer).
+# Stack-header pattern: "FROM TOP TO BOTTOM", "TOP TO BOTTOM TA:", etc.
+# FROM is optional — drawings sometimes omit it (ADR-003: any layer).
 _STACK_HEADER_RE: re.Pattern[str] = re.compile(
-    r"FROM\s+(TOP\s+TO\s+BOTTOM|BOTTOM\s+TO\s+TOP|LEFT\s+TO\s+RIGHT|RIGHT\s+TO\s+LEFT)",
+    r"(?:FROM\s+)?(TOP\s+TO\s+BOTTOM|BOTTOM\s+TO\s+TOP|LEFT\s+TO\s+RIGHT|RIGHT\s+TO\s+LEFT)",
     re.IGNORECASE,
 )
 

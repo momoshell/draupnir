@@ -566,3 +566,71 @@ def test_assignments_sorted_by_colour_key() -> None:
     )
     keys = [a.colour_key for a in result.assignments]
     assert keys == sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# Split-service topology: same service in non-adjacent runs
+# ---------------------------------------------------------------------------
+
+
+def test_split_service_sizes_aligned_by_run_position() -> None:
+    """Stack fingerprint [(VAC,2),(AGSS,1),(VAC,2)] — VAC appears in two non-adjacent
+    runs separated by AGSS.  Size attachment must use the position-aligned colour_rle
+    (run i -> colour_rle[i].colour_key), NOT a service-name lookup, so each distinct
+    VAC colour gets sizes from its OWN spatial run.
+
+    Topology:
+        Top run (VAC x2): c_vac1 at y=4..6  sizes "50 mm", "42 mm"
+        Mid run (AGSS x1): c_agss at y=2..4  size "25 mm"
+        Bot run (VAC x2): c_vac2 at y=0..2  sizes "76 mm", "63 mm"
+    """
+    tags = [
+        # Top VAC run (y=6,5)
+        TagStackText(text="50 mm VAC", point=(0.0, 6.0)),
+        TagStackText(text="42 mm VAC", point=(0.0, 5.0)),
+        # Mid AGSS run (y=4)
+        TagStackText(text="25 mm AGSS", point=(0.0, 4.0)),
+        # Bot VAC run (y=3,2)
+        TagStackText(text="76 mm VAC", point=(0.0, 3.0)),
+        TagStackText(text="63 mm VAC", point=(0.0, 2.0)),
+    ]
+    headers = [StackHeader(text="TOP TO BOTTOM", point=(0.0, 6.5))]
+
+    # Bands: four x-positions for stability.
+    n = 4
+    bands: dict[str, list[BundleColourBand]] = {
+        "c_vac1": [_vband("c_vac1", 10.0 + i * 0.5, 10.4 + i * 0.5, 5.0, 6.0) for i in range(n)]
+        + [_vband("c_vac1", 10.0 + i * 0.5, 10.4 + i * 0.5, 4.0, 5.0) for i in range(n)],
+        "c_agss": [_vband("c_agss", 10.0 + i * 0.5, 10.4 + i * 0.5, 2.0, 4.0) for i in range(n)],
+        "c_vac2": [_vband("c_vac2", 10.0 + i * 0.5, 10.4 + i * 0.5, 1.0, 2.0) for i in range(n)]
+        + [_vband("c_vac2", 10.0 + i * 0.5, 10.4 + i * 0.5, 0.0, 1.0) for i in range(n)],
+    }
+
+    result = assign_services_by_tag_stack(tags=tags, headers=headers, bundle_bands_by_colour=bands)
+    assert result.matched_stack_count == 1, f"Got: {result}"
+    by_colour = {a.colour_key: a for a in result.assignments}
+
+    # Both VAC runs must be assigned to VAC.
+    assert by_colour["c_vac1"].service == "VAC"
+    assert by_colour["c_vac2"].service == "VAC"
+    assert by_colour["c_agss"].service == "AGSS"
+
+    # Each VAC colour must have sizes from its OWN run (not mixed or from the other run).
+    assert len(by_colour["c_vac1"].sizes) == 2
+    assert len(by_colour["c_vac2"].sizes) == 2
+    # The two runs have DIFFERENT sizes — verify they are not equal (proving alignment).
+    assert by_colour["c_vac1"].sizes != by_colour["c_vac2"].sizes
+    assert len(by_colour["c_agss"].sizes) == 1
+
+
+# ---------------------------------------------------------------------------
+# _normalize_header: header without "FROM" prefix is recognised
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_header_without_from_prefix() -> None:
+    """'TOP TO BOTTOM TA:' has no FROM — must still match (Fix 3: FROM is optional)."""
+    assert _normalize_header("TOP TO BOTTOM TA:") == "TOP TO BOTTOM"
+    assert _normalize_header("BOTTOM TO TOP") == "BOTTOM TO TOP"
+    assert _normalize_header("LEFT TO RIGHT reference") == "LEFT TO RIGHT"
+    assert _normalize_header("RIGHT TO LEFT") == "RIGHT TO LEFT"

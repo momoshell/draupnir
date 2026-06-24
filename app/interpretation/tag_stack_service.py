@@ -528,7 +528,7 @@ def _match_stack_to_bands(
     bundle_gap_tol: float,
     dedup_tol: float,
     min_stable: int,
-) -> _Mapping | None:
+) -> tuple[_Mapping, tuple[tuple[str, int], ...]] | None:
     """Find a stable, consistent colour->service mapping for one ParsedStack.
 
     Sweeps scan lines through all bands. At each candidate position the scan line
@@ -539,9 +539,12 @@ def _match_stack_to_bands(
     sequence matches the stack's count sequence. Stability requires the SAME bundle
     segment (same mapping) to match across >=min_stable adjacent scan positions.
 
-    Returns a _Mapping (sorted tuple) on success, or None to abstain.
+    Returns ``(mapping, colour_rle)`` on success — the colour_rle is the position-
+    aligned colour run-length sequence whose run i corresponds to fingerprint run i.
+    Callers use this to attach sizes by run index, NOT by re-deriving via service
+    name (which breaks when the same service appears in non-adjacent runs).
 
-    Abstain when:
+    Returns None to abstain when:
     - No (position, segment) hit found (case 6).
     - No mapping is stable across >=min_stable adjacent scan positions (case 7).
     - Multiple distinct stable mappings found (non-unique geometry, case 3).
@@ -560,9 +563,10 @@ def _match_stack_to_bands(
     if not candidates:
         return None
 
-    # Accumulate per-mapping hit positions so we can check stability per mapping.
-    # mapping -> list of scan positions where that mapping matched a bundle segment.
+    # Accumulate per-mapping hit positions AND one representative colour_rle.
+    # mapping -> (list of scan positions, first colour_rle that produced that mapping)
     mapping_positions: dict[_Mapping, list[float]] = {}
+    mapping_colour_rle: dict[_Mapping, tuple[tuple[str, int], ...]] = {}
 
     for pos in candidates:
         segments = _scan_line_colour_rle(
@@ -576,6 +580,8 @@ def _match_stack_to_bands(
             if mapping is None:
                 continue
             mapping_positions.setdefault(mapping, []).append(pos)
+            if mapping not in mapping_colour_rle:
+                mapping_colour_rle[mapping] = colour_rle
 
     if not mapping_positions:
         return None  # abstain: no (position, segment) hit (case 6)
@@ -593,7 +599,8 @@ def _match_stack_to_bands(
     if len(stable_mappings) > 1:
         return None  # abstain: non-unique stable mapping (case 3)
 
-    return stable_mappings[0]
+    winner = stable_mappings[0]
+    return winner, mapping_colour_rle[winner]
 
 
 def _is_stable(
@@ -700,11 +707,15 @@ def assign_services_by_tag_stack(
         )
 
     # ------------------------------------------------------------------ #
-    # Step 3 & 4: scan-line match each stack                               #
+    # Steps 3-6: match each stack (ONCE per stack), check consistency,     #
+    # attach sizes by position-aligned run index.                          #
     # ------------------------------------------------------------------ #
-    # colour_key -> service mapping candidates from successful stack matches.
-    # We require ALL successful stacks to agree on the mapping; conflict -> abstain.
-    stack_mappings: list[_Mapping] = []
+    # Per stack: call _match_stack_to_bands ONCE and keep (mapping, colour_rle).
+    # Two-pass approach avoids re-invoking the scan-line sweep for size attachment
+    # and correctly handles repeated services in non-adjacent runs (fix 1+2).
+
+    # stack_results: (ParsedStack, mapping, aligned_colour_rle) for each match.
+    stack_results: list[tuple[ParsedStack, _Mapping, tuple[tuple[str, int], ...]]] = []
 
     for ps in parsed_stacks:
         fp = ps.fingerprint
@@ -713,7 +724,7 @@ def assign_services_by_tag_stack(
             abstain_triggered = True
             continue
 
-        mapping = _match_stack_to_bands(
+        result_pair = _match_stack_to_bands(
             ps,
             all_bands,
             level_merge_tol=level_merge_tol_m,
@@ -721,12 +732,13 @@ def assign_services_by_tag_stack(
             dedup_tol=SCAN_DEDUP_TOL_M,
             min_stable=MIN_STABLE_MATCH_COUNT,
         )
-        if mapping is None:
+        if result_pair is None:
             abstain_triggered = True  # cases 2, 6, 7
             continue
-        stack_mappings.append(mapping)
+        mapping, colour_rle = result_pair
+        stack_results.append((ps, mapping, colour_rle))
 
-    if not stack_mappings:
+    if not stack_results:
         return TagStackServiceResult(
             assignments=(),
             unmatched_colour_keys=all_colours_sorted,
@@ -735,16 +747,13 @@ def assign_services_by_tag_stack(
         )
 
     # ------------------------------------------------------------------ #
-    # Step 5: require all stacks to agree (case 4: one bundle / >=2 stacks
-    # with conflicting mappings -> abstain)                                #
+    # Consistency check: all matched stacks must agree on colour->service. #
+    # Conflict (same colour_key -> different services) -> abstain (case 4)  #
     # ------------------------------------------------------------------ #
-    # If multiple stacks produced mappings, all must be consistent.
-    # (Same colour->service pairs; different stacks may assign different colours
-    #  so we check for contradictions: same colour_key mapped to different services.)
     merged_mapping: dict[str, str] = {}
     conflict = False
-    for m in stack_mappings:
-        for ck, svc in m:
+    for _ps, mapping, _rle in stack_results:
+        for ck, svc in mapping:
             if ck in merged_mapping and merged_mapping[ck] != svc:
                 conflict = True
                 break
@@ -762,57 +771,27 @@ def assign_services_by_tag_stack(
         )
 
     # ------------------------------------------------------------------ #
-    # Step 6: build assignments from merged mapping                        #
+    # Build assignments: sizes attached by position-aligned run index.     #
+    # For run i in the fingerprint, colour_rle[i].colour_key is the match; #
+    # stack.entries[offset:offset+count] are the corresponding sizes.      #
+    # This correctly handles repeated services in non-adjacent runs.       #
     # ------------------------------------------------------------------ #
-    # For each successfully matched stack, collect per-colour-run sizes.
-    # We use the FIRST stack that contributed a given colour_key's mapping.
     colour_sizes: dict[str, tuple[str, ...]] = {}
     colour_kind: dict[str, str | None] = {}
-    matched_count = 0
+    matched_count = len(stack_results)
 
-    for ps in parsed_stacks:
+    for ps, _mapping, colour_rle in stack_results:
         fp = ps.fingerprint
-        if _is_degenerate_fingerprint(fp):
-            continue
-        # Re-derive the mapping to associate entries with colour keys.
-        # We need the actual colour_rle that matched this stack.
-        mapping = _match_stack_to_bands(
-            ps,
-            all_bands,
-            level_merge_tol=level_merge_tol_m,
-            bundle_gap_tol=BUNDLE_GAP_TOL_M,
-            dedup_tol=SCAN_DEDUP_TOL_M,
-            min_stable=MIN_STABLE_MATCH_COUNT,
-        )
-        if mapping is None:
-            continue
-        matched_count += 1
-        # Build colour->run-entries for this stack.
-        # mapping: ((colour_key, service), ...) sorted; we need (service, count) order
-        # from fp to slice entries correctly.
-        # Reconstruct aligned colour_rle from mapping + fp.
-        svc_to_colours: dict[str, list[str]] = {}
-        for ck, svc in mapping:
-            svc_to_colours.setdefault(svc, []).append(ck)
-
         entry_idx = 0
-        for svc, run_count in fp:
-            # Which colour_key did this run match to?
-            colours_for_svc = svc_to_colours.get(svc, [])
-            # Find the specific colour for this run by matching run position.
-            # Since mapping is many->one possible, we iterate fp in order and
-            # consume matching entries.
+        for run_idx, (_svc, run_count) in enumerate(fp):
+            colour_key = colour_rle[run_idx][0]  # position-aligned: run i -> colour i
             run_entries = ps.entries[entry_idx : entry_idx + run_count]
             entry_idx += run_count
-            # Find a colour_key in merged_mapping that maps to svc and hasn't been
-            # sized yet (in order of the sorted mapping).
-            for ck in sorted(colours_for_svc):
-                if ck not in colour_sizes:
-                    sizes = tuple(size.raw for _, size in run_entries)
-                    kinds = {size.kind for _, size in run_entries}
-                    colour_sizes[ck] = sizes
-                    colour_kind[ck] = next(iter(kinds)) if len(kinds) == 1 else None
-                    break
+            if colour_key not in colour_sizes:
+                sizes = tuple(size.raw for _, size in run_entries)
+                kinds = {size.kind for _, size in run_entries}
+                colour_sizes[colour_key] = sizes
+                colour_kind[colour_key] = next(iter(kinds)) if len(kinds) == 1 else None
 
     assignments: list[ColourServiceAssignment] = []
     for ck in sorted(merged_mapping):
