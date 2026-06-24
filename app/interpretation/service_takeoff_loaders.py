@@ -120,8 +120,28 @@ _METRES_PER_PDF_UNIT: dict[str, float] = {
 # Layer defaults — ilike patterns, never hardcoded to a single value (ADR-003)
 # ---------------------------------------------------------------------------
 
-# Layers bearing routed linework: anything matching these tokens (case-insensitive).
-_DEFAULT_PIPE_LAYER_TOKENS: tuple[str, ...] = ("pipe",)
+# Layers bearing routed linework for all routed-container disciplines (case-insensitive ilike).
+# Each token covers a distinct containment type so that sheets without an authored Center Line
+# layer (e.g. cable-tray, conduit, duct sheets) still yield routed entities via the fallback.
+# Entities loaded via this fallback route to the DERIVED (rail-pair) centerline producer (#681),
+# whereas authored Center Line layers use the preferred direct query above.
+# ADR-003: generic discipline vocabulary — never a firm-specific layer name (e.g. E610G_Cable Tray).
+#
+# Known edge case (follow-on): a sheet with BOTH an authored Center Line layer AND separate
+# containment layers (e.g. tray rails) will return only the Center Line entities — the
+# containment layers are silently ignored. Resolving this requires multi-family merging.
+_DEFAULT_CONTAINER_LAYER_TOKENS: tuple[str, ...] = (
+    "pipe",  # piped services (M-540003 etc.) — preserved for regression
+    "tray",  # cable tray (e.g. "Cable Tray", "E610G_Cable Tray")
+    "ladder",  # cable ladder
+    "trunking",  # trunking / wireway
+    "basket",  # wire basket / cable basket
+    "conduit",  # conduit runs
+    "duct",  # ductwork / air duct. NOTE: %duct% is the one token with English-substring
+    # collisions ("product", "conduct", "viaduct") — could match a stray annotation/schedule
+    # layer. Low risk in practice (service layers dominate), but if a false-positive surfaces,
+    # tighten to a word-boundary / token-aware match rather than widening the ilike.
+)
 
 # Centerline layers carry the single-line route and are preferred over double-line pipe
 # wall layers (which double-count measured length when both walls are present).
@@ -546,12 +566,14 @@ async def load_routed_entities(
         q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
         return list((await db.execute(q)).scalars().all())
 
-    # Prefer centerline layers (single-line route) over pipe-wall layers. Pipe-outline
+    # Prefer centerline layers (single-line route) over pipe/container-wall layers. Pipe-outline
     # layers may double-count measured length when both walls of a double-line pipe are
     # present; true double-line detection is a deferred follow-up.
+    # Container-discipline layers (tray, duct, conduit …) reach here only when no authored
+    # Center Line layer exists; their entities are handed to _derive_centerline (#681).
     dwg_rows = await _query_by_tokens(_DEFAULT_CENTERLINE_LAYER_TOKENS)
     if not dwg_rows:
-        dwg_rows = await _query_by_tokens(_DEFAULT_PIPE_LAYER_TOKENS)
+        dwg_rows = await _query_by_tokens(_DEFAULT_CONTAINER_LAYER_TOKENS)
 
     dwg_result: list[RoutedEntity] = []
     for row in dwg_rows:
