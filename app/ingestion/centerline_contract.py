@@ -15,9 +15,12 @@ from typing import Any
 # Versioning constant -- bump when the algorithm OR the persisted output contract changes.
 # "c3-geom-1" (#653): persists centerline polylines into geometry_json (was NULL); the bump
 # invalidates pre-geometry rows so the version-gated read re-materializes them with geometry.
+# "c4-rail-1" (#681): derived path rewritten to width-agnostic rail-pair synthesis at
+# metre-scale; rung filter separates long rails from short perpendicular crossbars; pairing
+# bounds are now metre-scale (not drawing-unit-tuned) so metre-scale geometry pairs correctly.
 # ---------------------------------------------------------------------------
 
-CURRENT_ALGO_VERSION: str = "c3-geom-1"
+CURRENT_ALGO_VERSION: str = "c4-rail-1"
 
 
 # ---------------------------------------------------------------------------

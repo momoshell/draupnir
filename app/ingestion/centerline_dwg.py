@@ -9,9 +9,12 @@ Two paths per group:
   (case-insensitive substring).  Length = sum of member drawn lengths.
   ``producer_kind="dwg_authored"``.
 
-* **Derived** — greedy parallel-segment pairing finds double-line wall pairs;
-  the midline of each pair is the inferred centerline.  Unpaired segments
-  contribute 0.5 x their drawn length (honest fallback).
+* **Derived** — width-agnostic rail-pair synthesis (#681).  Separates short
+  perpendicular rungs from long boundary rails, then pairs the two boundary
+  rails of any width by finding the nearest parallel, overlapping counterpart
+  within a generous metre-scale offset cap.  The midline of each pair is the
+  inferred centerline.  Unpaired rails contribute 0.5 x their drawn length
+  (honest fallback).  Rungs contribute neither length nor polylines.
   ``producer_kind="dwg_derived"``.
 
 No DB, ORM, FastAPI, or SQLAlchemy imports.  Safe to use anywhere in the
@@ -58,18 +61,34 @@ _DEFAULT_CENTERLINE_LAYER_TOKENS: tuple[str, ...] = (
 # cos(10 deg) ~ 0.985 — rejects walls that are genuinely non-parallel.
 _PARALLEL_DOT_MIN: float = 0.985
 
-# Acceptable perpendicular offset range (drawing units) for a wall pair.
-# Below 2 du the segments are likely the same line; above 80 du they are
-# structurally separate runs, not a double-line representation of one pipe.
-_PERP_OFFSET_MIN: float = 2.0
-_PERP_OFFSET_MAX: float = 80.0
+# Rung filter: segments shorter than this (metres) are treated as perpendicular
+# crossbars (rungs) and excluded from pairing.  A rung spans the containment
+# WIDTH; rails run the LENGTH.  0.7 m sits above the widest containment width on
+# the evidence sheet (E-610003: 650 mm max) and below real rail-segment lengths —
+# the derived length is stable across [0.7, 0.9] m (plateau on E-610003 real
+# data), confirming 0.7 m is where rung-leakage stops.
+# SINGLE-BUILDING CALIBRATION: a containment type wider than ~0.7 m would have
+# rungs that escape this filter.  The principled follow-on is orientation-based
+# rung detection (rung perpendicular to local run direction) or an adaptive
+# bimodal length split — flagged as a follow-on (#681), not built here.
+_RUNG_MAX_LEN_M: float = 0.7  # above widest tray rung (650 mm); plateau [0.7, 0.9] m
 
-# Minimum projection-overlap fraction (overlap / min wall length) to accept a
-# pair.  0.5 means at least half of the shorter wall must shadow the longer.
+# Acceptable perpendicular offset range (metres) for a boundary-rail pair.
+# Below _PERP_OFFSET_MIN_M the segments are likely co-linear (same rail);
+# above _PERP_OFFSET_MAX_M they are structurally separate runs, not a
+# double-line representation of one service.  The upper bound is a generous
+# sanity cap — NOT tuned to a particular pipe/tray width — so the algorithm
+# is width-agnostic across all cable-tray, duct, and pipe scales.
+_PERP_OFFSET_MIN_M: float = 0.01  # ~1 cm — rejects same-line co-incident rails
+_PERP_OFFSET_MAX_M: float = 2.0  # ~2 m  — generous sanity cap; structurally separate beyond this
+
+# Minimum projection-overlap fraction (overlap / min rail length) to accept a
+# pair.  0.5 means at least half of the shorter rail must shadow the longer.
 _OVERLAP_MIN: float = 0.5
 
-# Unpaired segments count at this fraction of their drawn length.  Honest
-# fallback: we know the segment is a wall, but we cannot confirm it is paired.
+# Unpaired rails count at this fraction of their drawn length.  Honest
+# fallback: we know the segment is a boundary rail, but we cannot confirm it
+# is paired (expected residual at junctions).
 _UNPAIRED_LENGTH_FACTOR: float = 0.5
 
 # ---------------------------------------------------------------------------
@@ -80,8 +99,9 @@ _UNPAIRED_LENGTH_FACTOR: float = 0.5
 _TUNING_CONSTANTS: dict[str, float] = {
     "overlap_min": _OVERLAP_MIN,
     "parallel_dot_min": _PARALLEL_DOT_MIN,
-    "perp_offset_max": _PERP_OFFSET_MAX,
-    "perp_offset_min": _PERP_OFFSET_MIN,
+    "perp_offset_max_m": _PERP_OFFSET_MAX_M,
+    "perp_offset_min_m": _PERP_OFFSET_MIN_M,
+    "rung_max_len_m": _RUNG_MAX_LEN_M,
     "unpaired_length_factor": _UNPAIRED_LENGTH_FACTOR,
 }
 
@@ -201,7 +221,29 @@ def _derive_centerline(
     entity_ids: tuple[str, ...],
     geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
 ) -> tuple[tuple[tuple[tuple[float, float], ...], ...], float]:
-    """Run the greedy double-line pairing algorithm for one group.
+    """Width-agnostic rail-pair synthesis for one group (#681).
+
+    Algorithm
+    ---------
+    1. Decompose member geometries into (start, end) segments (metres).
+    2. **Rung filter**: discard segments shorter than _RUNG_MAX_LEN_M.  These
+       are perpendicular crossbars connecting the two boundary rails; they
+       carry no run-length information.  The parallel test (step 3) is the
+       real correctness guard — rungs that slip past the length filter fail
+       _PARALLEL_DOT_MIN because they are perpendicular to the run direction.
+    3. **Pair rails** greedily (longest first, deterministic tie-break):
+       - parallel   : |û_i · û_j| >= _PARALLEL_DOT_MIN
+       - offset     : _PERP_OFFSET_MIN_M < perp < _PERP_OFFSET_MAX_M (metres)
+       - overlap    : projection_overlap / min_length >= _OVERLAP_MIN
+       - nearest    : pick the smallest valid offset; each rail ≤ 1 partner.
+    4. **Midline** via _midline_polyline; accumulate into total_length.
+    5. **Unpaired rails** (expected residual at junctions) -> 0.5 x drawn length.
+       Rungs contribute neither length nor polylines.
+    Conservation invariant: every rail ends up in exactly one of (a) an emitted
+    midline or (b) the 0.5x unpaired residual.  De-dup is intentionally absent:
+    pairing is mutual+greedy so each rail has at most one partner — a given
+    midline cannot be emitted twice.  Two distinct physical runs whose midpoints
+    coincide are both kept (double-counting is their honest measurement).
 
     Returns (polylines, total_length_du).
     """
@@ -209,35 +251,42 @@ def _derive_centerline(
     if not raw_segments:
         return (), 0.0
 
-    n = len(raw_segments)
+    # Pre-compute unit vectors and lengths; collect rail indices (non-rungs).
+    all_units: list[tuple[float, float]] = []
+    all_lengths: list[float] = []
+    rail_indices: list[int] = []  # indices into raw_segments that are rails
 
-    # Pre-compute unit vectors and lengths for all segments.
-    units: list[tuple[float, float]] = []
-    lengths: list[float] = []
-    for s, e in raw_segments:
+    for idx, (s, e) in enumerate(raw_segments):
         result = _segment_unit_and_length(s[0], s[1], e[0], e[1])
         if result is None:
-            # Already filtered by _decompose_geometry, but be defensive.
-            units.append((1.0, 0.0))
-            lengths.append(0.0)
+            # Zero-length — already filtered by _decompose_geometry; defensive.
+            all_units.append((1.0, 0.0))
+            all_lengths.append(0.0)
         else:
             u, ln = result
-            units.append(u)
-            lengths.append(ln)
+            all_units.append(u)
+            all_lengths.append(ln)
+            if ln > _RUNG_MAX_LEN_M:
+                rail_indices.append(idx)
 
-    # Build candidate pairs (i < j) that pass all three geometric filters.
+    if not rail_indices:
+        return (), 0.0
+
+    # Sort rails longest-first for deterministic greedy ordering.
+    rail_indices.sort(key=lambda idx: -all_lengths[idx])
+    n_rails = len(rail_indices)
+
+    # Build candidate pairs (ri < rj in sorted order) passing all three filters.
     candidates: list[tuple[float, int, int]] = []
-    for i in range(n):
-        if lengths[i] == 0.0:
-            continue
-        ux_i, uy_i = units[i]
-        len_i = lengths[i]
-        s_i, e_i = raw_segments[i]
-        for j in range(i + 1, n):
-            if lengths[j] == 0.0:
-                continue
-            ux_j, uy_j = units[j]
-            len_j = lengths[j]
+    for ri in range(n_rails):
+        i = rail_indices[ri]
+        ux_i, uy_i = all_units[i]
+        len_i = all_lengths[i]
+        s_i, _ = raw_segments[i]
+        for rj in range(ri + 1, n_rails):
+            j = rail_indices[rj]
+            ux_j, uy_j = all_units[j]
+            len_j = all_lengths[j]
             s_j, e_j = raw_segments[j]
 
             # 1. Parallelism: |cos(angle)| >= threshold (handles antiparallel).
@@ -245,11 +294,11 @@ def _derive_centerline(
             if dot < _PARALLEL_DOT_MIN:
                 continue
 
-            # 2. Perpendicular offset of j's midpoint to i's infinite line.
+            # 2. Perpendicular offset of j's midpoint to i's infinite line (metres).
             mid_jx = (s_j[0] + e_j[0]) / 2.0
             mid_jy = (s_j[1] + e_j[1]) / 2.0
             perp = abs(_perpendicular_offset(s_i[0], s_i[1], ux_i, uy_i, mid_jx, mid_jy))
-            if perp < _PERP_OFFSET_MIN or perp > _PERP_OFFSET_MAX:
+            if perp < _PERP_OFFSET_MIN_M or perp > _PERP_OFFSET_MAX_M:
                 continue
 
             # 3. Projection overlap fraction.
@@ -260,6 +309,9 @@ def _derive_centerline(
             candidates.append((perp, i, j))
 
     # Greedy match: sort by (perp_offset, i, j) asc; accept if both unmatched.
+    # Conservation: every accepted pair emits a midline; every rail that never
+    # enters `matched` falls to the 0.5x unpaired residual below.  No rail is
+    # silently zeroed.  De-dup is intentionally absent (see docstring).
     candidates.sort()
     matched: set[int] = set()
     polylines: list[tuple[tuple[float, float], ...]] = []
@@ -273,18 +325,20 @@ def _derive_centerline(
 
         s_i, e_i = raw_segments[i]
         s_j, e_j = raw_segments[j]
-        ux_i, uy_i = units[i]
+        ux_i, uy_i = all_units[i]
 
         mid_polyline, mid_length = _midline_polyline(s_i, e_i, s_j, e_j, ux_i, uy_i)
         polylines.append(mid_polyline)
         total_length += mid_length
 
-    # Unpaired segments: 0.5 x their drawn length.
-    for k in range(n):
-        if k not in matched and lengths[k] > 0.0:
+    # Unpaired rails: 0.5 x their drawn length (honest fallback for junction residuals).
+    # Rungs (excluded from rail_indices) contribute nothing.
+    rail_set = set(rail_indices)
+    for k in rail_set:
+        if k not in matched and all_lengths[k] > 0.0:
             s_k, e_k = raw_segments[k]
             polylines.append((s_k, e_k))
-            total_length += lengths[k] * _UNPAIRED_LENGTH_FACTOR
+            total_length += all_lengths[k] * _UNPAIRED_LENGTH_FACTOR
 
     return tuple(polylines), total_length
 
