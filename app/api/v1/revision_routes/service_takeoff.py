@@ -23,16 +23,19 @@ from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop
 from app.interpretation.routed_connectivity import refine_shared_by_connectivity
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
-from app.interpretation.service_fill_takeoff import compute_fill_attributed_lengths
 from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
 from app.interpretation.service_takeoff_loaders import (
     _DEFAULT_CENTERLINE_LAYER_TOKENS,
     INPUT_FAMILY_PDF_VECTOR,
+    load_bundle_bands_by_colour,
     load_measured_geometry,
     load_measured_lengths,
     load_service_fill_bands,
     load_service_takeoff_inputs,
+    load_stack_headers,
+    load_tag_stack_texts,
 )
+from app.interpretation.tag_stack_service import assign_services_by_tag_stack
 from app.jobs.worker import enqueue_centerline_job as _enqueue_centerline_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
 from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
@@ -41,6 +44,8 @@ from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.service_takeoff import (
     ServiceFillAttributionRead,
     ServiceFillColourRead,
+    ServiceTagAttributionRead,
+    ServiceTagColourRead,
     ServiceTakeoffLineRead,
     ServiceTakeoffResponse,
     ServiceTakeoffScaleRead,
@@ -268,10 +273,9 @@ async def get_revision_service_takeoff(
 
         if centerline_segments:
             fill_bands = await load_service_fill_bands(db, revision_id)
-            raw_fill = compute_fill_attributed_lengths(
-                centerline_segments=centerline_segments,
-                fill_bands=fill_bands,
-            )
+            # BUG FIX: removed the dead first compute_fill_attributed_lengths call that
+            # was immediately overwritten; refine_shared_by_connectivity internally
+            # recomputes verdicts via _segment_verdicts and is the authoritative result.
             raw_fill = refine_shared_by_connectivity(
                 centerline_segments=centerline_segments,
                 fill_bands=fill_bands,
@@ -290,6 +294,55 @@ async def get_revision_service_takeoff(
                 total_length_m=raw_fill.total_length_m,
                 centerline_segment_count=raw_fill.centerline_segment_count,
             )
+
+    # Step 5d -- tag-stack service attribution (DWG only; Phase 3 / #674).
+    # PDF revisions lack HATCH fill bands so the matcher has no bundle geometry; honest-absent.
+    # Tag service OVERRIDES legend discipline for routed colours (additive only — lengths
+    # are never touched). Discipline from RunServiceIdentity is attached as context.
+    tag_service_attribution: ServiceTagAttributionRead | None = None
+    if not is_pdf:
+        tag_texts = await load_tag_stack_texts(
+            db,
+            revision_id,
+            input_family=inputs.input_family,
+        )
+        stack_headers = await load_stack_headers(
+            db,
+            revision_id,
+            input_family=inputs.input_family,
+        )
+        bundle_bands = await load_bundle_bands_by_colour(
+            db,
+            revision_id,
+            exclude_off_sheet=exclude_off_sheet,
+            input_family=inputs.input_family,
+        )
+        tag_stack_result = assign_services_by_tag_stack(
+            tags=tag_texts,
+            headers=stack_headers,
+            bundle_bands_by_colour=bundle_bands,
+        )
+        # Build a colour_key → discipline lookup from Step 3 identities for context.
+        _discipline_by_colour: dict[str, str | None] = {
+            ident.colour_key: ident.discipline
+            for ident in identities
+            if ident.colour_key is not None
+        }
+        tag_service_attribution = ServiceTagAttributionRead(
+            per_colour=[
+                ServiceTagColourRead(
+                    colour_key=a.colour_key,
+                    service=a.service,
+                    sizes=list(a.sizes),
+                    size_kind=a.size_kind,
+                    discipline=_discipline_by_colour.get(a.colour_key),
+                )
+                for a in tag_stack_result.assignments
+            ],
+            unmatched_colour_keys=list(tag_stack_result.unmatched_colour_keys),
+            matched_stack_count=tag_stack_result.matched_stack_count,
+            ambiguous=tag_stack_result.ambiguous,
+        )
 
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
     # dataclass boundary).
@@ -359,6 +412,7 @@ async def get_revision_service_takeoff(
         summary=summary,
         scale=scale_read,
         fill_attribution=fill_attribution,
+        tag_service_attribution=tag_service_attribution,
         unscaled=result.unscaled,
         length_provisional=length_provisional,
     )

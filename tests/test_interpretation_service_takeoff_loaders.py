@@ -34,12 +34,16 @@ from app.interpretation.service_takeoff_loaders import (
     _rgb_tuple_to_hex,
     build_scale_context,
     build_service_legend,
+    load_bundle_bands_by_colour,
     load_measured_lengths,
     load_rise_drop_entities,
     load_routed_entities,
     load_service_takeoff_inputs,
+    load_stack_headers,
     load_tag_placements,
+    load_tag_stack_texts,
 )
+from app.interpretation.tag_stack_service import BundleColourBand, StackHeader, TagStackText
 from app.jobs.worker import process_ingest_job
 from tests.conftest import requires_database
 from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
@@ -3238,3 +3242,340 @@ class TestLoadMeasuredLengths:
 
         assert mapping == {}
         assert present == set()
+
+
+# ---------------------------------------------------------------------------
+# Tests for the tag-stack / header / bundle loaders (#674 Phase 3 be-674b)
+# ---------------------------------------------------------------------------
+
+
+@requires_database
+class TestLoadTagStackTexts:
+    """load_tag_stack_texts maps TagPlacement -> TagStackText (text + point)."""
+
+    async def test_pipe_tag_entities_become_tag_stack_texts(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Text entities on a Pipe Tags layer are returned as TagStackText with point."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "tag-stack-001",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "54 mm VAC", "insertion": {"x": 10.0, "y": 20.0}},
+                ),
+                _make_entity(
+                    "tag-stack-002",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "42 mm MA", "insertion": {"x": 10.5, "y": 15.0}},
+                ),
+                _make_entity(
+                    "non-tag-001",
+                    "text",
+                    "A-ANNO",
+                    {"text": "Room 01", "insertion": {"x": 50.0, "y": 50.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            texts = await load_tag_stack_texts(db, revision_id, tag_layers=["Pipe Tags"])
+
+        assert len(texts) == 2
+        for t in texts:
+            assert isinstance(t, TagStackText)
+            assert len(t.point) == 2
+        raw_texts = {t.text for t in texts}
+        assert "54 mm VAC" in raw_texts
+        assert "42 mm MA" in raw_texts
+
+    async def test_no_tag_entities_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revision with no Pipe Tag entities -> empty list, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "pipe-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [1.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            texts = await load_tag_stack_texts(db, revision_id, tag_layers=["Pipe Tags"])
+
+        assert texts == []
+
+
+@requires_database
+class TestLoadStackHeaders:
+    """load_stack_headers finds FROM ... TO ... orientation text on any layer."""
+
+    async def test_header_text_on_any_layer_is_returned(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 'FROM TOP TO BOTTOM' text on a generic layer is returned as StackHeader."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "header-001",
+                    "text",
+                    "Z010T",
+                    {"text": "FROM TOP TO BOTTOM", "insertion": {"x": 5.0, "y": 25.0}},
+                ),
+                _make_entity(
+                    "non-header-001",
+                    "text",
+                    "Z010T",
+                    {"text": "DRAWING NOTES", "insertion": {"x": 100.0, "y": 100.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            headers = await load_stack_headers(db, revision_id)
+
+        assert len(headers) == 1
+        h = headers[0]
+        assert isinstance(h, StackHeader)
+        assert "TOP TO BOTTOM" in h.text.upper()
+        assert h.point == (5.0, 25.0)
+
+    async def test_all_four_orientations_are_matched(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """All four FROM ... TO ... orientation variants are matched."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "h-ttb",
+                    "text",
+                    "Z010T",
+                    {"text": "FROM TOP TO BOTTOM", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                _make_entity(
+                    "h-btt",
+                    "text",
+                    "Z010T",
+                    {"text": "FROM BOTTOM TO TOP", "insertion": {"x": 1.0, "y": 0.0}},
+                ),
+                _make_entity(
+                    "h-ltr",
+                    "text",
+                    "Z010T",
+                    {"text": "FROM LEFT TO RIGHT", "insertion": {"x": 2.0, "y": 0.0}},
+                ),
+                _make_entity(
+                    "h-rtl",
+                    "text",
+                    "Z010T",
+                    {"text": "FROM RIGHT TO LEFT", "insertion": {"x": 3.0, "y": 0.0}},
+                ),
+                _make_entity(
+                    "non-header",
+                    "text",
+                    "Z010T",
+                    {"text": "SOME OTHER TEXT", "insertion": {"x": 4.0, "y": 0.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            headers = await load_stack_headers(db, revision_id)
+
+        assert len(headers) == 4
+        direction_texts = {h.text for h in headers}
+        for expected in ("TOP TO BOTTOM", "BOTTOM TO TOP", "LEFT TO RIGHT", "RIGHT TO LEFT"):
+            assert any(expected in t for t in direction_texts), (
+                f"Expected '{expected}' in a header text; got {direction_texts}"
+            )
+
+    async def test_no_header_entities_returns_empty(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revision with no orientation-header text -> empty list, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "pipe-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [1.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            headers = await load_stack_headers(db, revision_id)
+
+        assert headers == []
+
+
+@requires_database
+class TestLoadBundleBandsByColour:
+    """load_bundle_bands_by_colour groups FillBand output by colour_key."""
+
+    async def test_hatch_bands_grouped_by_colour_key(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """HATCH entities on Pipes layer are grouped into per-colour BundleColourBand lists."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        green_color = {"index": 3, "rgb": "00ff00", "by_layer": False, "by_block": False}
+        blue_color = {"index": 5, "rgb": "0000ff", "by_layer": False, "by_block": False}
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Two green hatches → one colour_key bucket with 2 entries.
+                _make_entity(
+                    "hatch-green-1",
+                    "hatch",
+                    "Pipes",
+                    {
+                        "vertices": [
+                            [0.0, 0.0],
+                            [1.0, 0.0],
+                            [1.0, 0.5],
+                            [0.0, 0.5],
+                        ]
+                    },
+                    style={"color": green_color},
+                ),
+                _make_entity(
+                    "hatch-green-2",
+                    "hatch",
+                    "Pipes",
+                    {
+                        "vertices": [
+                            [0.0, 0.5],
+                            [1.0, 0.5],
+                            [1.0, 1.0],
+                            [0.0, 1.0],
+                        ]
+                    },
+                    style={"color": green_color},
+                ),
+                # One blue hatch → separate colour_key bucket with 1 entry.
+                _make_entity(
+                    "hatch-blue-1",
+                    "hatch",
+                    "Pipes",
+                    {
+                        "vertices": [
+                            [2.0, 0.0],
+                            [3.0, 0.0],
+                            [3.0, 1.0],
+                            [2.0, 1.0],
+                        ]
+                    },
+                    style={"color": blue_color},
+                ),
+                # Non-hatch entity should be ignored.
+                _make_entity(
+                    "line-001",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [5.0, 0.0, 0.0]},
+                    style={"color": green_color},
+                ),
+            ],
+            units=_MM_UNITS,
+        )
+
+        async with _get_session() as db:
+            bands_by_colour = await load_bundle_bands_by_colour(
+                db, revision_id, exclude_off_sheet=False
+            )
+
+        assert "00ff00" in bands_by_colour, f"Expected '00ff00' key; got {list(bands_by_colour)}"
+        assert "0000ff" in bands_by_colour, f"Expected '0000ff' key; got {list(bands_by_colour)}"
+        assert len(bands_by_colour["00ff00"]) == 2
+        assert len(bands_by_colour["0000ff"]) == 1
+
+        for band in bands_by_colour["00ff00"]:
+            assert isinstance(band, BundleColourBand)
+            assert band.colour_key == "00ff00"
+            assert len(band.ring) >= 3
+
+        for band in bands_by_colour["0000ff"]:
+            assert isinstance(band, BundleColourBand)
+            assert band.colour_key == "0000ff"
+
+    async def test_no_hatch_entities_returns_empty_dict(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Revision with no HATCH entities on pipe/rise/drop layers -> empty dict, no raise."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "line-only",
+                    "line",
+                    "Pipes",
+                    {"start": [0.0, 0.0, 0.0], "end": [1.0, 0.0, 0.0]},
+                )
+            ],
+        )
+
+        async with _get_session() as db:
+            bands_by_colour = await load_bundle_bands_by_colour(db, revision_id)
+
+        assert bands_by_colour == {}

@@ -116,6 +116,45 @@ class ServiceFillAttributionRead(BaseModel):
     )
 
 
+class ServiceTagColourRead(BaseModel):
+    """Tag-stack service+size assignment for one fill colour (Phase 3 / #674)."""
+
+    colour_key: str = Field(..., description="Opaque per-drawing colour key (rgb hex or idx:<n>)")
+    service: str = Field(..., description="Service abbreviation derived from tag-stack match")
+    sizes: list[str] = Field(
+        default_factory=list,
+        description="Pipe size raw strings for this colour's stack run, in stack order",
+    )
+    size_kind: str | None = Field(None, description="'round' | 'rect' | None when mixed")
+    discipline: str | None = Field(
+        None,
+        description=(
+            "Legend discipline for this colour (context only — tag service is primary). "
+            "Null when the colour has no legend entry."
+        ),
+    )
+
+
+class ServiceTagAttributionRead(BaseModel):
+    """Tag-stack service attribution result for one drawing revision (DWG only, #674)."""
+
+    per_colour: list[ServiceTagColourRead] = Field(
+        default_factory=list,
+        description="Confident tag-stack matches, sorted by colour_key",
+    )
+    unmatched_colour_keys: list[str] = Field(
+        default_factory=list,
+        description="Colour keys present in bundle bands but not confidently matched",
+    )
+    matched_stack_count: int = Field(
+        0, ge=0, description="Number of tag stacks successfully matched to bundle colours"
+    )
+    ambiguous: bool = Field(
+        False,
+        description="True when at least one abstain case was triggered during matching",
+    )
+
+
 class ServiceTakeoffResponse(BaseModel):
     """Routed-service takeoff for one drawing revision (compute-on-read)."""
 
@@ -130,6 +169,14 @@ class ServiceTakeoffResponse(BaseModel):
         description=(
             "Per-fill-colour attributed centerline lengths (DWG only; null for PDF or "
             "when no centerline segments are present). Phase 1 — colour key is opaque."
+        ),
+    )
+    tag_service_attribution: ServiceTagAttributionRead | None = Field(
+        default=None,
+        description=(
+            "Tag-stack service+size assignments per fill colour (DWG only; null for PDF or "
+            "when no tag stacks are present). Tag-derived service OVERRIDES legend discipline "
+            "for routed colours. Phase 3 / #674."
         ),
     )
     unscaled: bool = Field(
