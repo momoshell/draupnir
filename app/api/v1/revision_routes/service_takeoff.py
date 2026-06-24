@@ -20,6 +20,7 @@ from app.core.logging import get_logger
 from app.db.session import get_db, get_session_maker
 from app.ingestion.centerline_contract import _xy
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
+from app.interpretation.routed_connectivity import refine_shared_by_connectivity
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
 from app.interpretation.service_fill_takeoff import compute_fill_attributed_lengths
@@ -268,6 +269,10 @@ async def get_revision_service_takeoff(
         if centerline_segments:
             fill_bands = await load_service_fill_bands(db, revision_id)
             raw_fill = compute_fill_attributed_lengths(
+                centerline_segments=centerline_segments,
+                fill_bands=fill_bands,
+            )
+            raw_fill = refine_shared_by_connectivity(
                 centerline_segments=centerline_segments,
                 fill_bands=fill_bands,
             )
