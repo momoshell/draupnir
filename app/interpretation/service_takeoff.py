@@ -33,6 +33,7 @@ from typing import Any
 
 from shapely.geometry import LineString, MultiLineString
 
+from app.ingestion.centerline_contract import _xy, _xy_list
 from app.interpretation.geometry import point_in_polygon
 from app.interpretation.measurement import (
     ScaleContext,
@@ -126,17 +127,16 @@ def _representative_point(geometry: Mapping[str, Any]) -> tuple[float, float] | 
     - other    -> None (entity is skipped; arcs contribute 0 -- see module docstring)
     """
     if "start" in geometry and "end" in geometry:
-        s = geometry["start"]
-        e = geometry["end"]
-        if len(s) >= 2 and len(e) >= 2:
+        s = _xy(geometry["start"])
+        e = _xy(geometry["end"])
+        if s is not None and e is not None:
             return ((s[0] + e[0]) / 2.0, (s[1] + e[1]) / 2.0)
 
-    pts: Any = geometry.get("vertices") or geometry.get("points")
-    if pts and len(pts) >= 1:
-        xs = [p[0] for p in pts if len(p) >= 2]
-        ys = [p[1] for p in pts if len(p) >= 2]
-        if xs:
-            return (sum(xs) / len(xs), sum(ys) / len(ys))
+    coords = _xy_list(geometry.get("vertices") or geometry.get("points"))
+    if coords:
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     return None
 
@@ -183,16 +183,15 @@ def _entity_drawn_length(
             continue
 
         if "start" in geom and "end" in geom:
-            s = geom["start"]
-            e = geom["end"]
-            if len(s) >= 2 and len(e) >= 2:
-                total += path_length([(s[0], s[1]), (e[0], e[1])])
+            s = _xy(geom["start"])
+            e = _xy(geom["end"])
+            if s is not None and e is not None:
+                total += path_length([s, e])
             continue
 
-        pts: Any = geom.get("vertices") or geom.get("points")
-        if pts:
-            points = [(p[0], p[1]) for p in pts if len(p) >= 2]
-            total += path_length(points)
+        coords = _xy_list(geom.get("vertices") or geom.get("points"))
+        if coords:
+            total += path_length(coords)
             continue
 
         # arc or unrecognised -- contributes 0; see module docstring
