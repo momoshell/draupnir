@@ -144,6 +144,94 @@ def _build_colour_unions(
 
 
 # ---------------------------------------------------------------------------
+# Internal per-segment classifier
+# ---------------------------------------------------------------------------
+
+
+def _segment_verdicts(
+    *,
+    centerline_segments: Sequence[tuple[tuple[float, float], tuple[float, float]]],
+    fill_bands: Sequence[FillBand],
+    overlap_ratio_min: float,
+    nearest_max_m: float,
+    nearest_margin_m: float,
+    band_buffer_m: float,
+) -> list[tuple[float, str | None]]:
+    """One (seg_length_m, colour_key | None) per NON-degenerate segment, input order.
+
+    None == shared. Exactly the current overlap->nearest->single-colour->shared logic.
+    Zero-length segments skipped (excluded from output and total), matching current behaviour.
+    """
+    colour_unions = _build_colour_unions(fill_bands, band_buffer_m)
+    colour_keys = sorted(colour_unions)  # deterministic order
+
+    verdicts: list[tuple[float, str | None]] = []
+
+    for start, end in centerline_segments:
+        seg = LineString([start, end])
+        seg_len = seg.length
+
+        if seg_len == 0.0:
+            # Zero-length degenerate segment — skip; excluded from output entirely.
+            continue
+
+        if not colour_keys:
+            # No fill bands at all — shared.
+            verdicts.append((seg_len, None))
+            continue
+
+        # --- Overlap phase ---
+        overlap_lengths: dict[str, float] = {}
+        for ck in colour_keys:
+            try:
+                inter = seg.intersection(colour_unions[ck])
+                ol = inter.length if not inter.is_empty else 0.0
+            except Exception:
+                ol = 0.0
+            overlap_lengths[ck] = ol
+
+        best_ck = max(colour_keys, key=lambda k: overlap_lengths[k])
+        best_overlap = overlap_lengths[best_ck]
+
+        if best_overlap >= overlap_ratio_min * seg_len:
+            verdicts.append((seg_len, best_ck))
+            continue
+
+        # --- Nearest-band fallback ---
+        distances: dict[str, float] = {}
+        for ck in colour_keys:
+            try:
+                d = seg.distance(colour_unions[ck])
+            except Exception:
+                d = math.inf
+            distances[ck] = d
+
+        sorted_by_dist = sorted(colour_keys, key=lambda k: distances[k])
+        nearest_ck = sorted_by_dist[0]
+        nearest_dist = distances[nearest_ck]
+
+        if (
+            nearest_dist < nearest_max_m
+            and len(sorted_by_dist) >= 2
+            and (distances[sorted_by_dist[1]] - nearest_dist) >= nearest_margin_m
+        ):
+            verdicts.append((seg_len, nearest_ck))
+            continue
+
+        # Single-colour fallback: when only one colour exists there is no competing service,
+        # so the ambiguity-margin check is intentionally waived — attribution to the sole
+        # colour is unambiguous by definition.
+        if nearest_dist < nearest_max_m and len(sorted_by_dist) == 1:
+            verdicts.append((seg_len, nearest_ck))
+            continue
+
+        # --- Shared/manifold ---
+        verdicts.append((seg_len, None))
+
+    return verdicts
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -180,80 +268,27 @@ def compute_fill_attributed_lengths(
             centerline_segment_count=0,
         )
 
-    # --- Step 1: build per-colour union geometries ---
-    colour_unions = _build_colour_unions(fill_bands, band_buffer_m)
-    colour_keys = sorted(colour_unions)  # deterministic order
+    # --- Per-segment classification via shared helper ---
+    verdicts = _segment_verdicts(
+        centerline_segments=centerline_segments,
+        fill_bands=fill_bands,
+        overlap_ratio_min=overlap_ratio_min,
+        nearest_max_m=nearest_max_m,
+        nearest_margin_m=nearest_margin_m,
+        band_buffer_m=band_buffer_m,
+    )
 
-    # --- Step 2-4: attribute each segment ---
+    # --- Tally verdicts ---
     length_by_colour: dict[str, float] = {}
     shared_length: float = 0.0
     total_length: float = 0.0
 
-    for start, end in centerline_segments:
-        seg = LineString([start, end])
-        seg_len = seg.length
-
-        if seg_len == 0.0:
-            # Zero-length degenerate segment — skip attribution and exclude from total
-            # so the invariant Σ(per_colour)+shared==total_length holds structurally,
-            # not just numerically (degenerate segments contribute nothing to either side).
-            continue
-
-        # Accumulate total only for non-degenerate segments (same segments that get attributed).
+    for seg_len, colour_key in verdicts:
         total_length += seg_len
-
-        if not colour_keys:
-            # No fill bands at all — everything goes to shared
+        if colour_key is None:
             shared_length += seg_len
-            continue
-
-        # --- Overlap phase ---
-        overlap_lengths: dict[str, float] = {}
-        for ck in colour_keys:
-            try:
-                inter = seg.intersection(colour_unions[ck])
-                ol = inter.length if not inter.is_empty else 0.0
-            except Exception:
-                ol = 0.0
-            overlap_lengths[ck] = ol
-
-        best_ck = max(colour_keys, key=lambda k: overlap_lengths[k])
-        best_overlap = overlap_lengths[best_ck]
-
-        if best_overlap >= overlap_ratio_min * seg_len:
-            length_by_colour[best_ck] = length_by_colour.get(best_ck, 0.0) + seg_len
-            continue
-
-        # --- Nearest-band fallback ---
-        distances: dict[str, float] = {}
-        for ck in colour_keys:
-            try:
-                d = seg.distance(colour_unions[ck])
-            except Exception:
-                d = math.inf
-            distances[ck] = d
-
-        sorted_by_dist = sorted(colour_keys, key=lambda k: distances[k])
-        nearest_ck = sorted_by_dist[0]
-        nearest_dist = distances[nearest_ck]
-
-        if (
-            nearest_dist < nearest_max_m
-            and len(sorted_by_dist) >= 2
-            and (distances[sorted_by_dist[1]] - nearest_dist) >= nearest_margin_m
-        ):
-            length_by_colour[nearest_ck] = length_by_colour.get(nearest_ck, 0.0) + seg_len
-            continue
-
-        # Single-colour fallback: when only one colour exists there is no competing service,
-        # so the ambiguity-margin check is intentionally waived — attribution to the sole
-        # colour is unambiguous by definition.
-        if nearest_dist < nearest_max_m and len(sorted_by_dist) == 1:
-            length_by_colour[nearest_ck] = length_by_colour.get(nearest_ck, 0.0) + seg_len
-            continue
-
-        # --- Shared/manifold ---
-        shared_length += seg_len
+        else:
+            length_by_colour[colour_key] = length_by_colour.get(colour_key, 0.0) + seg_len
 
     # --- Gather metadata (colour_index, colour_rgb) for each attributed colour_key ---
     # Prefer the first band we encounter for each key (bands are per-drawing, arbitrary order).
