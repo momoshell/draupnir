@@ -311,6 +311,7 @@ async def test_service_takeoff_response_has_required_top_level_keys(
         "summary",
         "scale",
         "fill_attribution",
+        "tag_service_attribution",
         "unscaled",
         "length_provisional",
     }
@@ -721,6 +722,7 @@ async def test_service_takeoff_extra_field_rejected(
         "summary",
         "scale",
         "fill_attribution",
+        "tag_service_attribution",
         "unscaled",
         "length_provisional",
     }
@@ -1002,9 +1004,75 @@ async def test_extra_forbid_still_holds_with_length_provisional(
         "summary",
         "scale",
         "fill_attribution",
+        "tag_service_attribution",
         "unscaled",
         "length_provisional",
     }
     assert expected_keys == set(body.keys()), (
         f"Unexpected top-level keys: {set(body.keys()) - expected_keys}"
     )
+
+
+# ---------------------------------------------------------------------------
+# tag_service_attribution field tests (#674 Phase 3)
+# ---------------------------------------------------------------------------
+
+
+async def test_tag_service_attribution_present_in_dwg_response(
+    takeoff_app_confirmed_scale: FastAPI,
+) -> None:
+    """DWG revision: tag_service_attribution is present in the response (may be null
+    when no tag stacks are found, but the field itself must exist)."""
+    response = await _get_takeoff(takeoff_app_confirmed_scale)
+    assert response.status_code == 200
+    body = response.json()
+    assert "tag_service_attribution" in body
+
+
+async def test_tag_service_attribution_null_for_pdf(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """PDF-vector revision: tag_service_attribution must be null (honest-absent)."""
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["tag_service_attribution"] is None
+
+
+async def test_tag_service_attribution_shape_when_present(
+    takeoff_app_confirmed_scale: FastAPI,
+) -> None:
+    """When tag_service_attribution is not null it must have the correct schema shape."""
+    response = await _get_takeoff(takeoff_app_confirmed_scale)
+    assert response.status_code == 200
+    body = response.json()
+    tsa = body["tag_service_attribution"]
+    if tsa is None:
+        # No bundle bands in the monkeypatched fixture — degenerate but valid.
+        return
+    assert isinstance(tsa["per_colour"], list)
+    assert isinstance(tsa["unmatched_colour_keys"], list)
+    assert isinstance(tsa["matched_stack_count"], int)
+    assert tsa["matched_stack_count"] >= 0
+    assert isinstance(tsa["ambiguous"], bool)
+    for entry in tsa["per_colour"]:
+        assert isinstance(entry["colour_key"], str)
+        assert isinstance(entry["service"], str)
+        assert isinstance(entry["sizes"], list)
+
+
+async def test_tag_service_attribution_degenerate_dwg_returns_empty_per_colour(
+    takeoff_app_dwg_unknown: FastAPI,
+) -> None:
+    """DWG revision with no bundle bands: tag_service_attribution.per_colour=[] and
+    unmatched_colour_keys=[] (no bands → no colours to classify), matched_stack_count=0.
+    """
+    response = await _get_takeoff(takeoff_app_dwg_unknown)
+    assert response.status_code == 200
+    body = response.json()
+    tsa = body["tag_service_attribution"]
+    # The monkeypatched DWG fixture has no HATCH bands so assign_services_by_tag_stack
+    # returns the empty result.
+    assert tsa is not None
+    assert tsa["per_colour"] == []
+    assert tsa["matched_stack_count"] == 0

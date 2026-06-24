@@ -57,6 +57,7 @@ from app.interpretation.service_legend import (
 from app.interpretation.service_legend import (
     colour_key as _colour_key,
 )
+from app.interpretation.tag_stack_service import BundleColourBand, StackHeader, TagStackText
 
 # ---------------------------------------------------------------------------
 # Input-family constant (ADR-003: branch on family, never on hardcoded colours/layers)
@@ -83,6 +84,12 @@ _ROW_Y_TOL: float = 6.0
 _PAIR_X_MAX_GAP: float = 320.0
 _LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:legend|key)\b")
 _LEGEND_ANCHOR_EXCLUDE_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:key\s*plan|notes?)\b")
+
+# Stack-header pattern: "FROM TOP TO BOTTOM", "FROM LEFT TO RIGHT", etc. (ADR-003: any layer).
+_STACK_HEADER_RE: re.Pattern[str] = re.compile(
+    r"FROM\s+(TOP\s+TO\s+BOTTOM|BOTTOM\s+TO\s+TOP|LEFT\s+TO\s+RIGHT|RIGHT\s+TO\s+LEFT)",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # PDF colour helpers (mirrors pymupdf._rgb_hex; do NOT import from there)
@@ -1292,6 +1299,110 @@ async def load_service_fill_bands(
                 ring=tuple(ring_pts),
             )
         )
+    return result
+
+
+async def load_tag_stack_texts(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    tag_layers: list[str] | None = None,
+    input_family: str | None = None,
+) -> list[TagStackText]:
+    """Load Pipe-Tag text entities as :class:`TagStackText` objects.
+
+    Maps :func:`load_tag_placements` output (TagPlacement) to the simpler
+    TagStackText(text, point) shape expected by ``assign_services_by_tag_stack``.
+    Raw text is passed through; parse_tag is applied downstream.
+
+    Returns [] for empty/degenerate revisions; never raises.
+    """
+    try:
+        placements = await load_tag_placements(
+            db, revision_id, tag_layers=tag_layers, input_family=input_family
+        )
+        return [TagStackText(text=p.text, point=p.point) for p in placements]
+    except Exception:
+        return []
+
+
+async def load_stack_headers(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    input_family: str | None = None,
+) -> list[StackHeader]:
+    """Load stack orientation header text entities as :class:`StackHeader` objects.
+
+    Queries ALL text/mtext entities on ANY layer (ADR-003: Z010T is generic; do not
+    layer-filter). Normalises each text via ``_normalize_legend_text`` (strips \\\\L, %%u
+    formatting), then matches case-insensitively against the FROM ... TO ... pattern.
+
+    Returns [] when none match; never raises.
+    """
+    del input_family  # accepted for symmetry; headers are layer-agnostic in all families
+
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        q = (
+            select(RevisionEntity)
+            .where(
+                RevisionEntity.drawing_revision_id == revision_id,
+                RevisionEntity.entity_type.in_(["text", "mtext"]),
+            )
+            .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        )
+        rows = list((await db.execute(q)).scalars().all())
+    except Exception:
+        return []
+
+    result: list[StackHeader] = []
+    for row in rows:
+        geometry = row.geometry_json or {}
+        raw_text = geometry.get("text")
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            continue
+        normalized = _normalize_legend_text(raw_text)
+        if not _STACK_HEADER_RE.search(normalized):
+            continue
+        pt = _entity_insertion(geometry)
+        if pt is None:
+            continue
+        result.append(StackHeader(text=normalized, point=pt))
+    return result
+
+
+async def load_bundle_bands_by_colour(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    exclude_off_sheet: bool = True,
+    input_family: str | None = None,
+) -> dict[str, list[BundleColourBand]]:
+    """Load HATCH fill bands grouped by colour_key as :class:`BundleColourBand` lists.
+
+    Regroups :func:`load_service_fill_bands` output (list[FillBand]) by colour_key.
+    No new hatch query is issued. Bands with None colour_key are already skipped by
+    load_service_fill_bands.
+
+    Returns {} for degenerate/empty revisions; never raises.
+    """
+    try:
+        bands = await load_service_fill_bands(
+            db,
+            revision_id,
+            exclude_off_sheet=exclude_off_sheet,
+            input_family=input_family,
+        )
+    except Exception:
+        return {}
+
+    result: dict[str, list[BundleColourBand]] = {}
+    for band in bands:
+        ck = band.colour_key
+        bucket = result.setdefault(ck, [])
+        bucket.append(BundleColourBand(colour_key=ck, ring=band.ring))
     return result
 
 
