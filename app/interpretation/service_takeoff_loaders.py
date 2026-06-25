@@ -32,7 +32,6 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.revision_routes.scale import resolve_revision_scale
 from app.ingestion.centerline_contract import _xy
 from app.interpretation.loaders import (
     load_legend_text_candidates,
@@ -379,6 +378,11 @@ async def _resolve_input_family(db: AsyncSession, revision_id: UUID) -> str | No
     Swallows HTTPException (revision invisible / no adapter run) — callers treat None
     as "unknown origin" and apply DWG/DXF default paths unchanged.
     """
+    # Lazy import: resolve_revision_scale lives in the API layer, and a module-level
+    # import here creates an interpretation->api->interpretation cycle that crashes the
+    # celery worker (CENTERLINE job) when this module is imported before app.api (#705).
+    from app.api.v1.revision_routes.scale import resolve_revision_scale
+
     try:
         return (await resolve_revision_scale(revision_id, db)).source_input_family
     except HTTPException:
@@ -1471,6 +1475,9 @@ async def build_scale_context(
     ``ScaleContext``. Returns an unknown/unavailable ``ScaleContext`` when the revision
     has no adapter run or does not exist (honest, never raises).
     """
+    # Lazy import to avoid the interpretation->api import cycle (see #705).
+    from app.api.v1.revision_routes.scale import resolve_revision_scale
+
     try:
         scale_read = await resolve_revision_scale(revision_id, db)
     except HTTPException:

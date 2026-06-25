@@ -72,9 +72,11 @@ def _check_after_app_import(
 ) -> subprocess.CompletedProcess[str]:
     """Bootstrap via app.main (which initialises the full module graph), then check.
 
-    service_takeoff_loaders imports from app.api (for the scale resolver), creating a
-    circular import when imported directly in isolation. Bootstrapping via app.main first
-    primes the module cache so the circular dependency is resolved correctly.
+    Bootstrapping via app.main first primes the full module cache. (Historically this
+    also dodged an interpretation->api circular import in service_takeoff_loaders; that
+    cycle was removed in #705 — see test_read_path_modules_import_in_isolation_no_cycle —
+    so isolation import now works too, but the app-bootstrap variant remains a valid
+    after-startup check.)
     """
     extra_lines = "\n".join(f"import {m}" for m in extra_modules)
     check = "any(k.startswith(m + '.') for k in sys.modules)"
@@ -145,10 +147,6 @@ def test_centerline_contract_does_not_import_shapely_in_isolation() -> None:
 def test_read_path_modules_do_not_import_cv2_after_app_bootstrap() -> None:
     """The read-path service modules must not pull cv2 after normal app startup.
 
-    The check bootstraps app.main first to avoid the circular import that arises
-    when service_takeoff_loaders is imported in isolation (it imports the scale
-    resolver from app.api which re-imports service_takeoff, a known circular dep).
-
     Arrange: script imports app.main then the read-path modules.
     Act:     run in fresh subprocess.
     Assert:  exit 0.
@@ -184,6 +182,59 @@ def test_read_path_modules_do_not_import_cv2_or_skimage_after_app_bootstrap() ->
     result = _check_after_app_import(_READ_PATH_MODULES, _HEAVY_CV_MODULES)
     assert result.returncode == 0, (
         "cv2 or skimage imported by read-path service modules (ADR-008 violation).\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- interpretation->api import cycle (#705): the CENTERLINE job imports
+# service_takeoff_loaders fresh in the celery worker (before app.api). A
+# module-level api import there crashed the worker. These guard that the
+# read-path loader + the centerline materialization job import in ISOLATION.
+# ---------------------------------------------------------------------------
+
+
+def test_read_path_modules_import_in_isolation_no_cycle() -> None:
+    """service_takeoff_loaders must import standalone (no app.main bootstrap) (#705).
+
+    The celery worker imports this module fresh when the lazy CENTERLINE job runs;
+    a module-level ``from app.api...`` import created an interpretation->api->
+    interpretation cycle that raised ImportError in the worker. Guard isolation import.
+
+    Arrange: script imports only the loader (+ the route that closes the cycle).
+    Act:     run in fresh subprocess (NO app.main bootstrap).
+    Assert:  exit 0 (no circular ImportError).
+    """
+    script = (
+        "import app.interpretation.service_takeoff_loaders\n"
+        "import app.api.v1.revision_routes.service_takeoff\n"
+        "print('ok')\n"
+    )
+    result = _run_script(script)
+    assert result.returncode == 0, (
+        "interpretation->api import cycle regressed (#705).\n"
+        f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_centerline_materialization_imports_loader_in_isolation_no_cycle() -> None:
+    """The CENTERLINE job's materialization path must import in isolation (#705).
+
+    Mirrors the worker: import app.jobs.centerline_materialization (which lazy-imports
+    load_service_takeoff_inputs) with NO prior app.api import, then import the loader.
+
+    Arrange: script imports centerline_materialization then the loader, isolated.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    script = (
+        "import app.jobs.centerline_materialization\n"
+        "from app.interpretation.service_takeoff_loaders import load_service_takeoff_inputs\n"
+        "print('ok')\n"
+    )
+    result = _run_script(script)
+    assert result.returncode == 0, (
+        "CENTERLINE job loader import cycle regressed (#705).\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
     )
 
