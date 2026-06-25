@@ -197,8 +197,8 @@ def test_connective_word_is_not_a_service(text: str) -> None:
 @pytest.mark.parametrize(
     ("text", "service"),
     [
-        ("200 x 100 LV DIST", "LV"),
-        ("150 x 75 SP & LTG", "SP"),
+        ("200 x 100 LV DIST", "LV DIST"),
+        ("150 x 75 SP & LTG", "SP & LTG"),
         ("650x350 EA", "EA"),
         ("Ø42 mm AGSS", "AGSS"),
         ("100 x 100 ESSENTIAL", "ESSENTIAL"),
@@ -209,3 +209,79 @@ def test_real_services_still_parse(text: str, service: str) -> None:
     result = parse_tag(text)
     assert result is not None
     assert result.service == service
+
+
+# ---------------------------------------------------------------------------
+# Multi-word rect service labels (#680)
+# ---------------------------------------------------------------------------
+
+
+def test_rect_lv_dist() -> None:
+    result = parse_tag("300 x 125 LV DIST")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 300
+    assert result.size.height == 125
+    assert result.service == "LV DIST"
+
+
+def test_rect_fa_dectn_alm() -> None:
+    result = parse_tag("150 x 105 FA DECTN ALM")
+    assert result is not None
+    assert result.service == "FA DECTN ALM"
+    assert result.size.width == 150
+    assert result.size.height == 105
+
+
+def test_rect_data_and_comms() -> None:
+    result = parse_tag("200 x 100 DATA & COMMS")
+    assert result is not None
+    assert result.service == "DATA & COMMS"
+
+
+def test_rect_sp_single() -> None:
+    result = parse_tag("150 x 75 SP")
+    assert result is not None
+    assert result.service == "SP"
+
+
+def test_rect_da_single_regression() -> None:
+    result = parse_tag("700x300 DA")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 700
+    assert result.size.height == 300
+    assert result.service == "DA"
+
+
+def test_rect_prose_stop_at_from() -> None:
+    # Locational note: TYPE is extracted only up to the first function word (FROM).
+    result = parse_tag("650x350 LV DIST FROM PIT TO HL")
+    assert result is not None
+    assert result.service == "LV DIST"
+
+
+def test_rect_prose_rejection_above() -> None:
+    # First token after WxH is a function word — not a real tag.
+    result = parse_tag("200 x 100 ABOVE THE DESK")
+    assert result is None
+
+
+def test_round_vac_regression() -> None:
+    result = parse_tag("Ø54 mm VAC")
+    assert result is not None
+    assert result.size.kind == "round"
+    assert result.size.diameter == 54
+    assert result.service == "VAC"
+
+
+def test_round_sa_regression() -> None:
+    result = parse_tag("Ø150 SA")
+    assert result is not None
+    assert result.size.kind == "round"
+    assert result.size.diameter == 150
+    assert result.service == "SA"
+
+
+def test_round_mm_bare_returns_none() -> None:
+    assert parse_tag("42 mm") is None
