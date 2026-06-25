@@ -23,6 +23,12 @@ from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop
 from app.interpretation.routed_connectivity import refine_shared_by_connectivity
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
+from app.interpretation.run_tags import parse_tag
+from app.interpretation.segment_label_takeoff import (
+    SegmentLabel,
+    SegmentLabelResult,
+    compute_segment_label_lengths,
+)
 from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
 from app.interpretation.service_takeoff_loaders import (
     _DEFAULT_CENTERLINE_LAYER_TOKENS,
@@ -44,6 +50,9 @@ from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.service_takeoff import (
     ServiceFillAttributionRead,
     ServiceFillColourRead,
+    ServiceSegmentLabelAttributionRead,
+    ServiceSegmentServiceRead,
+    ServiceSegmentSizeRead,
     ServiceTagAttributionRead,
     ServiceTagColourRead,
     ServiceTakeoffLineRead,
@@ -347,6 +356,57 @@ async def get_revision_service_takeoff(
             ambiguous=tag_stack_result.ambiguous,
         )
 
+    # Step 5e -- per-segment nearest-label type attribution (DWG only; #687).
+    # Consumes the ALREADY-LOADED measured_geometry (flattened across all groups) and the
+    # ALREADY-LOADED tag_placements. parse_tag filters non-tag prose so no pre-filter needed.
+    # Honest-absent (None) when measured_geometry is empty — the CENTERLINE job is already
+    # lazily enqueued above for unmaterialized revisions.
+    segment_label_attribution: ServiceSegmentLabelAttributionRead | None = None
+    if not is_pdf and measured_geometry:
+        # Flatten all groups' polylines into one list.
+        flat_polylines: list[tuple[tuple[float, float], ...]] = []
+        for polylines in measured_geometry.values():
+            flat_polylines.extend(polylines)
+
+        # Build SegmentLabel list from parsed tag_placements (parse_tag is the content gate).
+        seg_labels: list[SegmentLabel] = []
+        for placement in inputs.tag_placements:
+            obs = parse_tag(placement.text)
+            if obs is None:
+                continue
+            seg_labels.append(
+                SegmentLabel(
+                    point=placement.point,
+                    service=obs.service,
+                    size_raw=obs.size.raw,
+                    size_kind=obs.size.kind,
+                )
+            )
+
+        raw_seg: SegmentLabelResult = compute_segment_label_lengths(
+            centerline_polylines=flat_polylines,
+            labels=seg_labels,
+            nearest_max_m=_DEFAULT_TAG_RADIUS,
+        )
+        segment_label_attribution = ServiceSegmentLabelAttributionRead(
+            per_service=[
+                ServiceSegmentServiceRead(service=s.service, length_m=s.length_m)
+                for s in raw_seg.per_service
+            ],
+            per_size=[
+                ServiceSegmentSizeRead(
+                    service=s.service,
+                    size_raw=s.size_raw,
+                    size_kind=s.size_kind,
+                    length_m=s.length_m,
+                )
+                for s in raw_seg.per_size
+            ],
+            unknown_length_m=raw_seg.unknown_length_m,
+            total_length_m=raw_seg.total_length_m,
+            segment_count=raw_seg.segment_count,
+        )
+
     # Step 6 -- adapt result to response (explicit kwargs, no from_attributes across frozen
     # dataclass boundary).
     # length_provisional reflects length TRUSTWORTHINESS by format: PDF is provisional
@@ -416,6 +476,7 @@ async def get_revision_service_takeoff(
         scale=scale_read,
         fill_attribution=fill_attribution,
         tag_service_attribution=tag_service_attribution,
+        segment_label_attribution=segment_label_attribution,
         unscaled=result.unscaled,
         length_provisional=length_provisional,
     )
