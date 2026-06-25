@@ -96,6 +96,9 @@ class CableEstimateParams:
     spare_basis: str
 
     def __post_init__(self) -> None:
+        # spare_fraction is a dimensionless fraction (0.10 = 10%). Lower-bounded at 0;
+        # intentionally NOT upper-bounded — a project may carry >100% for safety/waste
+        # allowances, so callers can pass e.g. 1.5 deliberately.
         if self.spare_fraction < 0:
             raise ValueError(f"spare_fraction must be >= 0, got {self.spare_fraction!r}")
 
@@ -104,7 +107,12 @@ class CableEstimateParams:
     # ------------------------------------------------------------------
 
     def drop_for(self, category: str) -> DropParam | None:
-        """Return the :class:`DropParam` for *category*, or ``None`` if absent."""
+        """Return the :class:`DropParam` for *category*, or ``None`` if absent.
+
+        Linear scan — fine for the handful of categories here. If a consumer
+        (#696) calls this in a hot per-device loop, build a category→DropParam
+        dict once rather than scanning per call.
+        """
         for drop in self.vertical_drops:
             if drop.category == category:
                 return drop
@@ -154,10 +162,8 @@ class CableEstimateParams:
 
         sorted_drops = tuple(sorted(drop_map.values(), key=lambda d: d.category))
 
+        # Negative-value validation is enforced once in __post_init__ on construction below.
         new_spare = spare_fraction if spare_fraction is not None else self.spare_fraction
-        if new_spare < 0:
-            raise ValueError(f"spare_fraction must be >= 0, got {new_spare!r}")
-
         new_spare_source = SOURCE_USER_OVERRIDE if spare_fraction is not None else self.spare_source
         new_spare_basis = "user override" if spare_fraction is not None else self.spare_basis
 
