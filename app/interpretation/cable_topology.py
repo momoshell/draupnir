@@ -165,33 +165,37 @@ def _associate_terminal(
 ) -> TerminalAssociation | None:
     """Return the best TerminalAssociation for a terminal node at (px, py).
 
-    Returns None if devices is empty (caller wraps into no-match result).
-    Precedence: contained (distance_m=0.0) > nearest within terminal_assoc_m.
-    Tie-break: lowest device_entity_id lexicographically (deterministic).
+    Returns None when no device is usable (caller wraps into no-match result).
+
+    Precedence: contained (point inside bbox, distance_m=0.0) > nearest within
+    terminal_assoc_m.
+
+    **Tie-break is permutation-independent (two-pass):**
+    - Contained: collect all containers, pick lowest entity_id.
+    - Nearest: (a) find the global minimum distance; (b) collect all devices
+      whose distance is within _EQ_EPSILON of that minimum; (c) pick lowest
+      entity_id among them.  This is equivalent to sorting by (distance, entity_id)
+      but guarantees the epsilon window is anchored on the true global minimum, not
+      on whichever device happened to be processed first.
     """
-    best_contained: DeviceFootprint | None = None
-    best_near: DeviceFootprint | None = None
-    best_near_dist: float = math.inf
+    # Pass 1: partition candidates into contained vs. near.
+    containers: list[DeviceFootprint] = []
+    near_candidates: list[tuple[float, DeviceFootprint]] = []  # (distance, device)
 
     for device in devices:
         effective_bbox = _device_bbox(device)
         if effective_bbox is None:
             continue
         if _contains(effective_bbox, px, py):
-            # Multiple containers: keep lexicographically lowest entity_id.
-            if best_contained is None or device.entity_id < best_contained.entity_id:
-                best_contained = device
+            containers.append(device)
         else:
             dist = _point_to_bbox_distance(px, py, effective_bbox)
-            if dist < best_near_dist - _EQ_EPSILON:
-                best_near_dist = dist
-                best_near = device
-            elif abs(dist - best_near_dist) <= _EQ_EPSILON:
-                # Tie-break: lowest entity_id.
-                if best_near is None or device.entity_id < best_near.entity_id:
-                    best_near = device
+            if dist <= terminal_assoc_m:
+                near_candidates.append((dist, device))
 
-    if best_contained is not None:
+    # Contained wins over nearest; among containers pick lowest entity_id.
+    if containers:
+        best_contained = min(containers, key=lambda d: d.entity_id)
         return TerminalAssociation(
             node_id=(0, 0),  # placeholder; caller fills node_id
             device_entity_id=best_contained.entity_id,
@@ -200,16 +204,22 @@ def _associate_terminal(
             contained=True,
         )
 
-    if best_near is not None and best_near_dist <= terminal_assoc_m:
-        return TerminalAssociation(
-            node_id=(0, 0),  # placeholder; caller fills node_id
-            device_entity_id=best_near.entity_id,
-            device_block_ref=best_near.block_ref,
-            distance_m=best_near_dist,
-            contained=False,
-        )
+    if not near_candidates:
+        return None
 
-    return None
+    # Pass 2: find global minimum distance, then collect all devices within
+    # _EQ_EPSILON of it, then pick lowest entity_id (permutation-independent).
+    min_dist = min(d for d, _ in near_candidates)
+    tied = [dev for d, dev in near_candidates if abs(d - min_dist) <= _EQ_EPSILON]
+    best_near = min(tied, key=lambda dev: dev.entity_id)
+
+    return TerminalAssociation(
+        node_id=(0, 0),  # placeholder; caller fills node_id
+        device_entity_id=best_near.entity_id,
+        device_block_ref=best_near.block_ref,
+        distance_m=min_dist,
+        contained=False,
+    )
 
 
 # ---------------------------------------------------------------------------

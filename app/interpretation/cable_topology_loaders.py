@@ -70,7 +70,13 @@ def _is_annotation_block(block_ref: str | None) -> bool:
 
 
 def _is_non_device_block(block_ref: str | None) -> bool:
-    """Return True if the block should be excluded from the device footprint list."""
+    """Return True if the block should be excluded from the device footprint list.
+
+    v1 known limitation: substring patterns such as "Grid", "Door", "Window", "Column"
+    can false-positive on real device block_refs (e.g. "MV_Grid_Transformer",
+    "Outdoor_Lighting").  This will be replaced by full ``classify_instance_kind``/
+    ``KIND_DEVICE`` once a legend is wired — see device_identity.py ADR-002.
+    """
     return _is_architecture_block(block_ref) or _is_annotation_block(block_ref)
 
 
@@ -260,11 +266,9 @@ async def load_spline_inputs(
             if xy is not None:
                 parsed.append(xy)
 
-        # Builder will mark <2 as dropped; we pass through 1-vertex splines so
-        # the conservation invariant is maintained by the builder counter.
-        if not parsed:
-            continue
-
+        # Always emit — even zero-parseable-vertex rows — so the builder's `dropped`
+        # counter accounts for every DB row and the conservation invariant
+        # (spline_count == edge_count + dropped) holds across the full DB row set.
         closed: bool = bool(geometry.get("closed", False))
         results.append(
             SplineInput(

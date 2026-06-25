@@ -218,6 +218,27 @@ def test_conservation_every_spline_accounted() -> None:
     )
 
 
+def test_conservation_zero_vertex_row_surfaces_in_dropped() -> None:
+    """A SplineInput with empty vertices (as emitted by the fixed loader for
+    zero-parseable-vertex DB rows) must appear in dropped, not be silently lost.
+
+    This confirms Fix 1: load_spline_inputs no longer skips un-parseable rows;
+    it emits SplineInput(vertices=()) so the builder's conservation invariant
+    (spline_count == edge_count + dropped) holds against the full DB row count.
+    """
+    # Simulate what the fixed loader emits for a row with un-parseable vertices.
+    splines = [
+        _spline("good1", (0.0, 0.0), (1.0, 0.0)),
+        SplineInput("malformed_db_row", vertices=(), closed=False),  # loader output for bad row
+    ]
+    graph = build_cable_graph(splines=splines, devices=[])
+
+    assert graph.spline_count == 2
+    assert graph.edge_count == 1, f"only good1 should produce an edge, got {graph.edge_count}"
+    assert graph.dropped == 1, f"malformed row should be in dropped, got {graph.dropped}"
+    assert graph.edge_count + graph.dropped == graph.spline_count
+
+
 # ---------------------------------------------------------------------------
 # (6) Terminal with no device within radius → device_entity_id None
 # ---------------------------------------------------------------------------
@@ -318,6 +339,45 @@ def test_terminal_nearest_device_by_bbox_distance() -> None:
 
     # Far terminal has no match.
     assert None in by_assoc, "far terminal should have no association"
+
+
+def test_tie_break_equidistant_devices_permutation_independent() -> None:
+    """Three devices where two are equidistant from one terminal — always picks
+    lowest entity_id regardless of input permutation (Fix 2 verification).
+
+    Arrange:
+      - Spline s1: (0,0) → (5,0).  Terminal at (5,0).
+      - Device "zzz_lum": bbox at x=[6, 7], distance from (5,0) = 1.0 m.
+      - Device "aaa_lum": bbox at x=[6, 7] (same shape, different y-band so
+        same clamped distance = 1.0 m exactly).
+      - Device "mmm_lum": distance = 2.0 m (distinct, should lose).
+    Expected winner: "aaa_lum" (lowest lex among the tied pair).
+    Tested across 6 permutations to confirm order-independence.
+    """
+    import itertools
+
+    splines = [_spline("s1", (0.0, 0.0), (5.0, 0.0))]
+
+    # Both "aaa_lum" and "zzz_lum" are exactly 1.0 m from terminal (5,0).
+    # "mmm_lum" is 2.0 m away.
+    equidistant_a = _device("aaa_lum", "Lum_A", bbox=(6.0, -0.5, 7.0, 0.5))
+    equidistant_z = _device("zzz_lum", "Lum_Z", bbox=(6.0, -0.5, 7.0, 0.5))
+    far = _device("mmm_lum", "Lum_M", bbox=(7.0, -0.5, 8.0, 0.5))
+
+    base_devices = [equidistant_a, equidistant_z, far]
+
+    winner_ids: set[str] = set()
+    for perm in itertools.permutations(base_devices):
+        graph = build_cable_graph(splines=splines, devices=list(perm), terminal_assoc_m=2.5)
+        # Terminal at (5,0) — find the associated terminal.
+        assoc = {t.device_entity_id for t in graph.terminals if t.device_entity_id is not None}
+        winner_ids.update(assoc)
+
+    # Only "aaa_lum" should ever win (lowest entity_id of the tied pair).
+    # "zzz_lum" must never win; "mmm_lum" is farther so it must never win either.
+    assert winner_ids == {"aaa_lum"}, (
+        f"expected only 'aaa_lum' across all permutations, got {winner_ids}"
+    )
 
 
 # ---------------------------------------------------------------------------
