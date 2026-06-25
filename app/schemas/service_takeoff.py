@@ -155,6 +155,47 @@ class ServiceTagAttributionRead(BaseModel):
     )
 
 
+class ServiceSegmentServiceRead(BaseModel):
+    """Attributed centerline length for a single service (nearest-label, #687)."""
+
+    service: str = Field(..., description="Service abbreviation from the parsed tag")
+    length_m: float = Field(..., ge=0.0, description="Total attributed length in metres")
+
+
+class ServiceSegmentSizeRead(BaseModel):
+    """Attributed centerline length for a single (service, size) bucket (nearest-label, #687)."""
+
+    service: str = Field(..., description="Service abbreviation from the parsed tag")
+    size_raw: str | None = Field(None, description="Raw size string from tag (e.g. '54', '54x42')")
+    size_kind: str | None = Field(None, description="'round' | 'rect' | None")
+    length_m: float = Field(..., ge=0.0, description="Total attributed length in metres")
+
+
+class ServiceSegmentLabelAttributionRead(BaseModel):
+    """Per-segment nearest-label attribution result for one drawing revision (#687).
+
+    Each synthesized centerline segment is attributed to its nearest parsed size-label
+    within ``nearest_max_m`` metres. Segments beyond the radius land in ``unknown_length_m``.
+    INVARIANT: Σ(per_service lengths) + unknown_length_m == total_length_m within ±0.1 m.
+    """
+
+    per_service: list[ServiceSegmentServiceRead] = Field(
+        default_factory=list,
+        description="Per-service attributed lengths, sorted by service",
+    )
+    per_size: list[ServiceSegmentSizeRead] = Field(
+        default_factory=list,
+        description="Per-(service, size) attributed lengths, sorted by (service, size_raw)",
+    )
+    unknown_length_m: float = Field(
+        ..., ge=0.0, description="Length not attributed to any label (beyond nearest_max_m)"
+    )
+    total_length_m: float = Field(
+        ..., ge=0.0, description="Total segment length in metres (Σ per_service + unknown)"
+    )
+    segment_count: int = Field(..., ge=0, description="Number of centerline segments processed")
+
+
 class ServiceTakeoffResponse(BaseModel):
     """Routed-service takeoff for one drawing revision (compute-on-read)."""
 
@@ -177,6 +218,14 @@ class ServiceTakeoffResponse(BaseModel):
             "Tag-stack service+size assignments per fill colour (DWG only; null for PDF or "
             "when no tag stacks are present). Tag-derived service OVERRIDES legend discipline "
             "for routed colours. Phase 3 / #674."
+        ),
+    )
+    segment_label_attribution: ServiceSegmentLabelAttributionRead | None = Field(
+        default=None,
+        description=(
+            "Per-segment nearest-label type attribution (DWG only; null for PDF or when no "
+            "materialized geometry is present). Each centerline segment is attributed to its "
+            "nearest parsed size-label within the tag radius. #687."
         ),
     )
     unscaled: bool = Field(

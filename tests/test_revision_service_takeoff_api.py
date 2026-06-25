@@ -312,6 +312,7 @@ async def test_service_takeoff_response_has_required_top_level_keys(
         "scale",
         "fill_attribution",
         "tag_service_attribution",
+        "segment_label_attribution",
         "unscaled",
         "length_provisional",
     }
@@ -723,6 +724,7 @@ async def test_service_takeoff_extra_field_rejected(
         "scale",
         "fill_attribution",
         "tag_service_attribution",
+        "segment_label_attribution",
         "unscaled",
         "length_provisional",
     }
@@ -1005,6 +1007,7 @@ async def test_extra_forbid_still_holds_with_length_provisional(
         "scale",
         "fill_attribution",
         "tag_service_attribution",
+        "segment_label_attribution",
         "unscaled",
         "length_provisional",
     }
