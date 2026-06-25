@@ -395,3 +395,31 @@ def test_callout_tag_at_3_85m_fuses_at_5m_default() -> None:
     # Junk tag at 16 m stays unassigned
     assert len(result.unassigned_tags) == 1
     assert result.unassigned_tags[0].service == "VAC"
+
+
+# ---------------------------------------------------------------------------
+# Default radius lock: behavioural pin on _DEFAULT_RADIUS == 5.0
+# ---------------------------------------------------------------------------
+
+
+def test_default_radius_locks_at_5m() -> None:
+    """Calls fuse_run_service_identities without explicit radius to lock _DEFAULT_RADIUS=5.0.
+
+    A callout tag at 3.85 m (M-540003 OXY class) must fuse; a junk tag at 16 m must not.
+    If _DEFAULT_RADIUS drifts below 3.85 or above some future junk-inclusion threshold,
+    this test will fail before the real-data gate catches it.
+    """
+    run = _make_run(entity_ids=("pipe1",))
+    geometry = {"pipe1": _line_geom(0.0, 0.0, 10.0, 0.0)}
+
+    tag_callout = TagPlacement(text="42 mm OXY", point=(5.0, 3.85))  # 3.85 m from segment
+    tag_junk = TagPlacement(text="54 mm VAC", point=(5.0, 16.0))  # 16 m from segment
+
+    # No radius= kwarg — exercises the module default directly.
+    result = fuse_run_service_identities([run], geometry, [tag_callout, tag_junk])
+
+    identity = result.identities[0]
+    assert identity.status == IDENTITY_RESOLVED
+    assert any(ss.service == "OXY" for ss in identity.services)
+    assert len(result.unassigned_tags) == 1
+    assert result.unassigned_tags[0].service == "VAC"

@@ -258,7 +258,7 @@ def fuse_run_service_identities(
         (proximity-only, not layer-scoped -- see module docstring).
     radius:
         Maximum distance in metres from a tag to a run's nearest segment for association.
-        Default ``3.0`` m (#661 — adapters pre-scale geometry to metres).
+        Default ``5.0`` m (#661 — adapters pre-scale geometry to metres).
 
     Returns
     -------

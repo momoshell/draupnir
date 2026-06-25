@@ -1349,7 +1349,11 @@ async def load_tag_stack_texts(
     """
     try:
         placements = await load_tag_placements(
-            db, revision_id, tag_layers=tag_layers, input_family=input_family
+            db,
+            revision_id,
+            tag_layers=tag_layers,
+            input_family=input_family,
+            broaden_tag_layers=False,  # #674 path: preserve token-scoped behaviour
         )
         return [TagStackText(text=p.text, point=p.point) for p in placements]
     except Exception:
