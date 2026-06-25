@@ -339,7 +339,11 @@ class TestCrossCircuitDevice:
     """
 
     def _build(self) -> CableEstimateResult:
-        # D_BIG: bbox spans from x=-1 to x=12, covering both circuit terminals.
+        # D_BIG: bbox spans from x=-1 to x=12, covering terminals of BOTH circuits,
+        # so partition_circuits places it in both circuits' device_entity_ids.
+        # D_LB: at (11,0) — contained inside D_BIG's bbox, loses the entity_id
+        # tie-break ("D_BIG" < "D_LB"), so (11,0) terminal associates to D_BIG;
+        # D_LB ends up in no circuit → unattributed bucket.
         d_big = _device_wide("D_BIG", "Whitecroft LED Panel", (-1.0, -1.0, 12.0, 1.0))
         d_lb = _device("D_LB", "Downlight 10W", (11.0, 0.0))
         splines = [
@@ -356,17 +360,23 @@ class TestCrossCircuitDevice:
 
     def test_d_big_attributed_to_lower_circuit_only(self) -> None:
         result = self._build()
-        # The circuit with the lower circuit_id gets D_BIG; the other does not.
-        circuit_a = result.circuits[0]  # lower circuit_id
-        circuit_b = result.circuits[1]
-        # D_BIG's drop (2.0) must appear in exactly one circuit.
-        drops = [c.device_drop_m for c in (circuit_a, circuit_b)]
-        # Circuit A has D_BIG + possibly D_LB if terminal falls in its bbox too;
-        # but D_LB is at (11,0) which is outside D_BIG's range by layout.
-        # Total across both circuits must equal total_device_drop_m.
-        assert sum(drops) + result.unattributed_device_drop_m == pytest.approx(
-            result.total_device_drop_m
+        assert len(result.circuits) == 2
+        circuit_a = result.circuits[0]  # lower circuit_id (contains SA1)
+        circuit_b = result.circuits[1]  # higher circuit_id (contains SB1)
+
+        # D_BIG must be attributed to circuit_a (lowest circuit_id that lists it).
+        # circuit_a carries D_BIG's luminaire drop (2.0); circuit_b carries nothing
+        # for it — if first-claim attribution regressed, circuit_b would have 2.0 too.
+        assert circuit_a.device_drop_m == pytest.approx(2.0), (
+            "circuit_a should carry D_BIG's 2.0 m drop"
         )
+        assert circuit_b.device_drop_m == pytest.approx(0.0), (
+            "circuit_b must NOT double-count D_BIG; it was already claimed by circuit_a"
+        )
+
+        # D_LB is unattributed (lost the terminal tie-break to D_BIG).
+        assert result.unattributed_device_count == 1
+        assert result.unattributed_device_drop_m == pytest.approx(2.0)
 
     def test_conservation_invariant(self) -> None:
         result = self._build()

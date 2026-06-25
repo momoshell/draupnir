@@ -100,7 +100,9 @@ _SOCKET_PATTERNS: tuple[str, ...] = (
     "Power Point",
 )
 
-# Category evaluation order: distribution board MUST come first.
+# Category evaluation order: DISTRIBUTION_BOARD MUST come before SWITCH.
+# "Switchboard" (a distribution-board pattern) contains the substring "Switch",
+# so evaluating SWITCH first would misclassify switchboard blocks.
 _CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     (CATEGORY_DISTRIBUTION_BOARD, _DISTRIBUTION_PATTERNS),
     (CATEGORY_LUMINAIRE, _LUMINAIRE_PATTERNS),
@@ -139,6 +141,10 @@ def _polyline_length(vertices: tuple[tuple[float, float], ...]) -> float:
 
     Acceptable for the schematic/provisional in-plan term.  Returns 0.0 for
     fewer than 2 vertices.
+
+    Assumes finite vertex coordinates — the upstream loader (cable_topology_loaders)
+    guarantees all vertices are finite before constructing SplineInput; NaN/Inf
+    would propagate silently into the total if that guarantee were violated.
     """
     if len(vertices) < 2:
         return 0.0
@@ -375,7 +381,12 @@ def estimate_cable_in_plan(
     # -----------------------------------------------------------------------
     circuit_drop_sum = sum(c.device_drop_m for c in circuit_estimates)
     conservation_total = circuit_drop_sum + unattributed_device_drop_m
-    if abs(conservation_total - total_device_drop_m) > 1e-9:
+    # rel_tol=1e-9 catches true double-counts (they differ by whole drop values).
+    # abs_tol=1e-6 absorbs float rounding from different summation orders: Step 1
+    # sums all devices in one pass; Step 2 sums per-circuit then across circuits.
+    # Non-representable drops like 1.2 m accumulate ~2.5e-9 error per 10k devices,
+    # which would exceed a pure 1e-9 threshold and cause spurious failures at scale.
+    if not math.isclose(conservation_total, total_device_drop_m, rel_tol=1e-9, abs_tol=1e-6):
         raise RuntimeError(
             f"device-drop conservation violated: "
             f"circuit_sum={circuit_drop_sum!r} + "
