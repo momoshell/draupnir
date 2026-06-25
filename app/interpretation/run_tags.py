@@ -183,16 +183,21 @@ def _parse_tag_inner(text: str) -> TagObservation | None:
         # Build multi-word TYPE as the maximal leading run of service-like tokens,
         # stopping at the first function word/unit so note prose doesn't over-capture.
         type_tokens: list[str] = []
+        prev_was_token = False
         for tok in tail.split():
             t = tok.upper()
             if t == "&":
-                # Allow "&" as an in-phrase connector only, never leading
-                if type_tokens:
+                if prev_was_token:
                     type_tokens.append("&")
-                continue
+                    prev_was_token = False  # a following & (or end) won't be kept
+                    continue
+                break  # leading or doubled & -> stop the run
             if t in _NON_SERVICE_WORDS or t in _NON_SERVICE_TOKENS:
-                break  # stop at prose / units
+                break
             type_tokens.append(t)
+            prev_was_token = True
+        while type_tokens and type_tokens[-1] == "&":  # strip dangling trailing &
+            type_tokens.pop()
         if not type_tokens:
             return None  # first token was prose / unit — not a real tag
         service = " ".join(type_tokens)

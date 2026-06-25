@@ -285,3 +285,28 @@ def test_round_sa_regression() -> None:
 
 def test_round_mm_bare_returns_none() -> None:
     assert parse_tag("42 mm") is None
+
+
+# ---------------------------------------------------------------------------
+# Adversarial & connector edge cases (#680 code-review bugs)
+# ---------------------------------------------------------------------------
+
+
+def test_rect_trailing_ampersand_stripped() -> None:
+    # "LV &" → dangling & stripped → service is "LV", not "LV &"
+    result = parse_tag("300 x 125 LV &")
+    assert result is not None
+    assert result.service == "LV"
+
+
+def test_rect_leading_ampersand_returns_none() -> None:
+    # "& COMMS" — no valid leading service token before & → reject
+    result = parse_tag("300 x 125 & COMMS")
+    assert result is None
+
+
+def test_rect_double_ampersand_stops_run() -> None:
+    # "SP & & COMMS" — second & is a leading & after the first consumed it → stop at second &
+    result = parse_tag("300 x 125 SP & & COMMS")
+    assert result is not None
+    assert result.service == "SP"
