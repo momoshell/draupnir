@@ -109,6 +109,7 @@ def test_operation_id_inventory_is_pinned() -> None:
         "get_project_file",
         "get_rate",
         "get_revision_adapter_output",
+        "get_revision_cable_estimate",
         "get_revision_census",
         "get_revision_changeset",
         "get_revision_entity",

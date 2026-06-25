@@ -51,6 +51,10 @@ _OPENAPI_TAGS = [
         "name": "Service Takeoff",
         "description": "Routed-service quantity takeoff (length per service+size, per room).",
     },
+    {
+        "name": "Cable Estimate",
+        "description": "Estimated cable per circuit (home-run + in-plan + drops x (1+spare)).",
+    },
     {"name": "Validation", "description": "Validation reports and extraction coverage."},
     {"name": "Changesets", "description": "Canonical edit changesets: create, validate, apply."},
     {"name": "Quantities", "description": "Quantity takeoffs and their items."},

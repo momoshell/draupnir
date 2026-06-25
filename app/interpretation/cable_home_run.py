@@ -61,11 +61,14 @@ class HomeRunResult:
 # ---------------------------------------------------------------------------
 
 # Fixed status key order for suppressed_counts determinism.
+# "no_containment_sheet" is the synthetic status used when no containment revision is supplied
+# (the caller chose not to provide tray geometry — honest absence, not a routing failure).
 _STATUS_ORDER: tuple[str, ...] = (
     "no_anchor",
     "unreachable_tray",
     "disconnected_tray",
     "bad_registration",
+    "no_containment_sheet",
 )
 
 # Multiplier on entry_max_m beyond which a reported d_panel/d_area distance is suppressed
@@ -479,6 +482,56 @@ def compute_home_runs(
         per_circuit=per_circuit,
         total_home_run_m=total_home_run_m,
         ok_count=ok_count,
+        suppressed_counts=suppressed_counts,
+        circuit_count=circuit_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# No-containment factory (#698b)
+# ---------------------------------------------------------------------------
+
+
+def no_containment_home_run_result(circuit_ids: Sequence[int]) -> HomeRunResult:
+    """Build a :class:`HomeRunResult` for the case where no containment revision is supplied.
+
+    Every circuit receives status ``"no_containment_sheet"`` with all metric terms set to None.
+    The aggregate totals are honest: ``total_home_run_m=0.0``, ``ok_count=0``.
+
+    This is NOT a routing failure — the caller explicitly chose not to provide a containment
+    revision. The status propagates through the assembler as a None home-run term, which is
+    treated identically to any other non-"ok" suppression (home_run_m=None → 0.0 in base_total).
+
+    Parameters
+    ----------
+    circuit_ids:
+        Ordered sequence of circuit IDs from the lighting partition.
+
+    Returns
+    -------
+    HomeRunResult
+        Sorted by circuit_id; conservation invariant holds.
+    """
+    ids = sorted(circuit_ids)
+    per_circuit = tuple(
+        CircuitHomeRun(
+            circuit_id=cid,
+            status="no_containment_sheet",
+            home_run_m=None,
+            d_panel_m=None,
+            along_tray_m=None,
+            d_area_m=None,
+            lower_bound_m=None,
+        )
+        for cid in ids
+    )
+    circuit_count = len(ids)
+    suppressed_counts: dict[str, int] = dict.fromkeys(_STATUS_ORDER, 0)
+    suppressed_counts["no_containment_sheet"] = circuit_count
+    return HomeRunResult(
+        per_circuit=per_circuit,
+        total_home_run_m=0.0,
+        ok_count=0,
         suppressed_counts=suppressed_counts,
         circuit_count=circuit_count,
     )

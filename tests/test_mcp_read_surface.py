@@ -59,6 +59,7 @@ _EXPECTED_TOOLS = {
     "validate_revision_changeset",
     # reads (generated)
     "get_revision_adapter_output",
+    "get_revision_cable_estimate",
     "get_revision_census",
     "get_revision_diff",
     "get_revision_entity_source",
