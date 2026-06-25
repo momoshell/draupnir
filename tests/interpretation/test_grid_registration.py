@@ -17,6 +17,11 @@ from app.interpretation.grid_registration import (
     GridTransform,
     estimate_grid_transform,
 )
+from app.interpretation.grid_registration_loaders import (
+    _insertion_point,
+    _nearest_text_label,
+    _text_position,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -321,3 +326,129 @@ def test_large_residual_failed() -> None:
     result = estimate_grid_transform(src, tgt, residual_fail_m=3.0)
 
     assert result.quality == "failed"
+
+
+# ---------------------------------------------------------------------------
+# (11) Loader pure helpers — no DB required
+# ---------------------------------------------------------------------------
+
+
+class TestInsertionPoint:
+    """_insertion_point: parse INSERT geometry_json without a DB."""
+
+    def test_canonical_transform_shape(self) -> None:
+        """Standard materialized shape: geometry_json["transform"]["insertion_point"]."""
+        geom = {"transform": {"insertion_point": {"x": 10.5, "y": 20.3}}}
+        pt = _insertion_point(geom)
+        assert pt == (10.5, 20.3)
+
+    def test_top_level_insertion_key(self) -> None:
+        """Legacy shape: top-level 'insertion' dict key (no transform)."""
+        geom = {"insertion": {"x": 5.0, "y": 7.0}}
+        pt = _insertion_point(geom)
+        assert pt == (5.0, 7.0)
+
+    def test_insertion_key_present_but_invalid_falls_to_none(self) -> None:
+        """'insertion' key present but holds an invalid value (not a usable coord).
+
+        With explicit key-presence check (not bool-or), this returns None rather than
+        silently trying the 'insert' fallback with a corrupt value.
+        """
+        geom = {"insertion": "not-a-coord", "insert": {"x": 1.0, "y": 2.0}}
+        # 'insertion' is present so it is tried; _xy("not-a-coord") → None.
+        # The 'insert' fallback is NOT used because 'insertion' is explicitly present.
+        pt = _insertion_point(geom)
+        assert pt is None
+
+    def test_insert_fallback_when_insertion_absent(self) -> None:
+        """'insert' key is used when 'insertion' is not present at all."""
+        geom = {"insert": {"x": 3.0, "y": 4.0}}
+        pt = _insertion_point(geom)
+        assert pt == (3.0, 4.0)
+
+    def test_none_on_missing_geometry(self) -> None:
+        assert _insertion_point(None) is None
+        assert _insertion_point({}) is None
+        assert _insertion_point("bad") is None
+
+    def test_transform_preferred_over_top_level(self) -> None:
+        """transform.insertion_point takes priority over top-level keys."""
+        geom = {
+            "transform": {"insertion_point": {"x": 99.0, "y": 88.0}},
+            "insertion": {"x": 1.0, "y": 2.0},
+        }
+        pt = _insertion_point(geom)
+        assert pt == (99.0, 88.0)
+
+
+class TestTextPosition:
+    """_text_position: parse text/mtext geometry_json without a DB."""
+
+    def test_insertion_key(self) -> None:
+        geom = {"insertion": {"x": 12.0, "y": 34.0}}
+        pt = _text_position(geom)
+        assert pt == (12.0, 34.0)
+
+    def test_insert_fallback(self) -> None:
+        geom = {"insert": {"x": 5.5, "y": 6.6}}
+        pt = _text_position(geom)
+        assert pt == (5.5, 6.6)
+
+    def test_insertion_present_but_invalid_does_not_fall_through(self) -> None:
+        """Explicit key-presence: 'insertion' held but invalid → None, not 'insert' fallback."""
+        geom = {"insertion": [], "insert": {"x": 1.0, "y": 2.0}}
+        pt = _text_position(geom)
+        assert pt is None
+
+    def test_none_on_missing(self) -> None:
+        assert _text_position(None) is None
+        assert _text_position({}) is None
+
+
+class TestNearestTextLabel:
+    """_nearest_text_label: pure spatial proximity logic, no DB."""
+
+    def test_returns_closest_within_radius(self) -> None:
+        candidates = [
+            ((0.0, 0.0), "A"),
+            ((0.3, 0.0), "B"),  # closer to bubble at (0.2, 0)
+            ((2.0, 0.0), "C"),
+        ]
+        result = _nearest_text_label((0.2, 0.0), candidates, radius_m=0.5)
+        assert result == "B"
+
+    def test_returns_none_when_nothing_within_radius(self) -> None:
+        candidates = [((5.0, 0.0), "A"), ((10.0, 0.0), "B")]
+        result = _nearest_text_label((0.0, 0.0), candidates, radius_m=0.5)
+        assert result is None
+
+    def test_returns_none_on_empty_candidates(self) -> None:
+        result = _nearest_text_label((0.0, 0.0), [], radius_m=0.5)
+        assert result is None
+
+    def test_exact_radius_boundary_included(self) -> None:
+        """A point at exactly radius_m is within the cut (≤ not <)."""
+        candidates = [((0.5, 0.0), "X")]
+        assert _nearest_text_label((0.0, 0.0), candidates, radius_m=0.5) == "X"
+
+    def test_just_outside_radius_excluded(self) -> None:
+        candidates = [((0.51, 0.0), "X")]
+        assert _nearest_text_label((0.0, 0.0), candidates, radius_m=0.5) is None
+
+    def test_deterministic_on_ties(self) -> None:
+        """When two candidates are equidistant, the first encountered wins (linear scan).
+
+        This is the documented tie-break behavior: the loop keeps the first minimum found
+        (strict <, not <=), so input order determines the winner.  Tests verify consistency.
+        """
+        candidates = [
+            ((0.3, 0.0), "FIRST"),
+            ((-0.3, 0.0), "SECOND"),  # same distance
+        ]
+        # Both are 0.3 m away; "FIRST" appears first in the list → wins.
+        result = _nearest_text_label((0.0, 0.0), candidates, radius_m=0.5)
+        assert result == "FIRST"
+
+        # Reversed order → "SECOND" wins.
+        result2 = _nearest_text_label((0.0, 0.0), list(reversed(candidates)), radius_m=0.5)
+        assert result2 == "SECOND"

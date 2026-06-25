@@ -20,7 +20,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ingestion.centerline_contract import _xy
-from app.interpretation.grid_registration import GridFiducial, _normalize_label
+from app.interpretation.grid_registration import GridFiducial, normalize_label
 from app.models.revision_materialization import RevisionEntity
 
 # Default configurable-default layer tokens (ADR-003).
@@ -31,7 +31,9 @@ def _insertion_point(geometry_json: Any) -> tuple[float, float] | None:
     """Extract the (x, y) insertion point from an INSERT entity's geometry_json.
 
     Supports the materialized canonical shape: geometry_json["transform"]["insertion_point"]
-    as a dict with x/y keys.  Falls back to a top-level "insertion" key for legacy payloads.
+    as a dict with x/y keys.  Falls back to a top-level "insertion" key, then "insert", for
+    legacy payloads.  Keys are checked by presence to avoid the bool-or footgun where a
+    present-but-empty/invalid value silently falls through to the next key.
     """
     if not isinstance(geometry_json, Mapping):
         return None
@@ -40,7 +42,10 @@ def _insertion_point(geometry_json: Any) -> tuple[float, float] | None:
         pt = _xy(transform.get("insertion_point"))
         if pt is not None:
             return pt
-    return _xy(geometry_json.get("insertion") or geometry_json.get("insert"))
+    raw = (
+        geometry_json["insertion"] if "insertion" in geometry_json else geometry_json.get("insert")
+    )
+    return _xy(raw)
 
 
 def _text_content(geometry_json: Any) -> str | None:
@@ -52,10 +57,17 @@ def _text_content(geometry_json: Any) -> str | None:
 
 
 def _text_position(geometry_json: Any) -> tuple[float, float] | None:
-    """Extract the position of a text/mtext entity (insertion key)."""
+    """Extract the position of a text/mtext entity (insertion key, then insert fallback).
+
+    Uses explicit key presence to avoid the bool-or footgun where a present-but-invalid
+    "insertion" value would silently fall through to "insert".
+    """
     if not isinstance(geometry_json, Mapping):
         return None
-    return _xy(geometry_json.get("insertion") or geometry_json.get("insert"))
+    raw = (
+        geometry_json["insertion"] if "insertion" in geometry_json else geometry_json.get("insert")
+    )
+    return _xy(raw)
 
 
 def _nearest_text_label(
@@ -131,7 +143,7 @@ async def load_grid_fiducials(
         content = _text_content(row.geometry_json)
         if pos is None or content is None:
             continue
-        text_candidates.append((pos, _normalize_label(content)))
+        text_candidates.append((pos, normalize_label(content)))
 
     # --- Resolve each bubble to a labelled fiducial ---
     fiducials: list[GridFiducial] = []

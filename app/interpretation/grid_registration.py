@@ -3,9 +3,10 @@
 Pure (stdlib + math only) — no DB/ORM/FastAPI/numpy/cv2/shapely imports.
 
 A structural grid layer (e.g. Z030G) carries INSERT entities whose nearest text labels are
-identical fiducials on every sheet of the same floor.  Matching those labels yields a set of
-point-pair correspondences from which a translation (and, as quality-gate data, rotation + scale)
-can be estimated robustly.
+identical fiducials on every sheet of the same floor.  R-1 measured grid labels at ~0.15 m from
+their bubble's insertion point; the loader matches within a 0.5 m radius for margin.  Matching
+those labels yields point-pair correspondences from which a translation (and, as quality-gate
+data, rotation + scale) can be estimated robustly.
 
 ADR-003: layer name tokens are CONFIGURABLE DEFAULTS, never hardcoded literals.  The default token
 "z030g" and secondary "grid" live in the loader; this module is token-agnostic.
@@ -59,7 +60,7 @@ class GridTransform:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_label(raw: str) -> str:
+def normalize_label(raw: str) -> str:
     """Strip whitespace and upper-case so "b", "B ", " B" all map to "B"."""
     return raw.strip().upper()
 
@@ -167,7 +168,7 @@ def estimate_grid_transform(
     def _index(fiducials: Sequence[GridFiducial]) -> dict[str, tuple[float, float] | None]:
         idx: dict[str, tuple[float, float] | None] = {}
         for f in fiducials:
-            lbl = _normalize_label(f.label)
+            lbl = normalize_label(f.label)
             if lbl in idx:
                 idx[lbl] = None  # mark ambiguous
             else:
@@ -223,9 +224,12 @@ def estimate_grid_transform(
     rot_ok = abs(rotation_rad) <= rot_tol_rad
     scale_ok = abs(scale - 1.0) <= scale_tol
 
-    if n < 2 or median_residual > residual_fail_m:
+    if median_residual > residual_fail_m:
         quality: Literal["good", "degraded", "failed"] = "failed"
     elif n >= 3 and median_residual <= residual_warn_m and rot_ok and scale_ok:
+        # Require ≥3 pairs for "good": with only 2 pairs the median residual is always 0 by
+        # construction (translation is fitted to those exact two points), so residual is not
+        # a meaningful quality signal — a perfect 2-match is "degraded" by design.
         quality = "good"
     else:
         quality = "degraded"
