@@ -8,20 +8,21 @@ from a nearby tag), PARTIAL (discipline only, no tag within radius), or UNKNOWN 
 **Association is proximity-only, NOT layer-equality.**  Pipe tags live on a different
 layer (e.g. "Pipe Tags") from routed-run linework (e.g. "Pipes"); the layer-scoping
 used by ``rooms.assign_devices_to_label_rooms`` therefore does NOT apply here.  We use
-straight nearest-anchor distance against each run's centroid anchor.
+minimum point-to-segment distance from each tag to the run's member geometry.
 
-**Anchor computation** (per run): centroid of the representative points of the run's
-member entities, derived from ``geometry_by_entity_id``.  Representative point per
-entity:
+**Minimum-segment distance** (per run): for each member entity the minimum distance from
+the tag point to the entity's geometry segments is computed; the run distance is the
+minimum across all members.  Per entity:
 
-- line     -> midpoint of start/end
-- polyline -> centroid of all vertex points (``vertices`` or ``points`` key)
-- arc/other -> not used (skipped); a run whose members yield no usable geometry has no
-  anchor and cannot be a tag target.
+- line     -> point-to-segment distance over [start, end]
+- polyline -> min over consecutive vertex segments (``vertices`` or ``points`` key);
+              single-vertex polylines fall back to point distance
+- arc/other -> representative_point fallback if available (arc approximation documented
+               on the helper); a run whose members yield no usable geometry has distance
+               None and cannot be a tag target.
 
-The centroid choice is deliberate: it is the least-biased single-point summary of a
-run's spatial extent without requiring full geometry traversal, and is invariant under
-member-input permutation.
+The minimum-segment metric is strictly superior to centroid distance for L-shaped or
+long runs where the centroid may lie far from any labelled leg.
 
 **Equidistant ambiguity**: when a tag is equidistant (within floating-point epsilon) to
 two or more runs, it is added to ``ambiguous_tags`` AND deterministically attached to
@@ -58,8 +59,11 @@ BASIS_LEGEND_AND_TAG: str = "legend_colour+tag_text"
 # CAD coordinate magnitudes up to ~1e6 units).
 _EQ_EPSILON: float = 1e-9
 
-# Default search radius (drawing units -- typically mm in metric MEP drawings).
-_DEFAULT_RADIUS: float = 2000.0
+# Default search radius in metres (#661 — adapters pre-scale geometry to metres).
+# Calibrated across M-540003 (pipe callout tag at 3.85 m) + E-610003 (labels ≤2.2 m);
+# plateau-stable 5-7 m; junk >=16 m. Single-building-calibrated -- scale-relative radius
+# is the follow-on.
+_DEFAULT_RADIUS: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Input / output dataclasses
@@ -147,31 +151,81 @@ def _representative_point(geometry: Mapping[str, Any]) -> tuple[float, float] | 
     return None
 
 
-def _run_anchor(
-    run: RunGroup, geometry_by_entity_id: Mapping[str, Mapping[str, Any]]
-) -> tuple[float, float] | None:
-    """Centroid of representative points across a run's member entities.
+def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    Returns ``None`` when no member has usable geometry (honest -- the run cannot be a
-    tag target).
+
+def _point_to_segment_dist(
+    p: tuple[float, float], a: tuple[float, float], b: tuple[float, float]
+) -> float:
+    """Minimum distance from point ``p`` to segment [``a``, ``b``]."""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0.0:
+        # Degenerate segment (a == b): distance to the point.
+        return _dist(p, a)
+    # Project p onto the line through a,b; clamp t to [0,1] for the segment.
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    proj = (ax + t * dx, ay + t * dy)
+    return _dist(p, proj)
+
+
+def _run_min_distance(
+    tag_point: tuple[float, float],
+    run: RunGroup,
+    geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
+) -> float | None:
+    """Minimum point-to-segment distance from ``tag_point`` to any member of ``run``.
+
+    Per-entity rules:
+    - line:     point-to-segment over [start, end].
+    - polyline: min over consecutive vertex pairs (``vertices`` or ``points``);
+                single-vertex polyline falls back to point distance.
+    - arc/other: representative_point fallback (arc approximation — uses midpoint of
+                 arc chord; exact arc distance is a future refinement).
+
+    Returns ``None`` when no member yields usable geometry (run cannot be a tag target).
     """
-    xs: list[float] = []
-    ys: list[float] = []
+    best: float | None = None
+
+    def _update(d: float) -> None:
+        nonlocal best
+        if best is None or d < best:
+            best = d
+
     for eid in run.entity_ids:
         geom = geometry_by_entity_id.get(eid)
         if geom is None:
             continue
+
+        # Line: point-to-segment over [start, end].
+        if "start" in geom and "end" in geom:
+            s = _xy(geom["start"])
+            e = _xy(geom["end"])
+            if s is not None and e is not None:
+                _update(_point_to_segment_dist(tag_point, s, e))
+                continue
+
+        # Polyline: min over consecutive vertex segments.
+        raw_pts = geom.get("vertices") or geom.get("points")
+        coords = _xy_list(raw_pts)
+        if coords:
+            if len(coords) == 1:
+                _update(_dist(tag_point, coords[0]))
+            else:
+                for i in range(len(coords) - 1):
+                    _update(_point_to_segment_dist(tag_point, coords[i], coords[i + 1]))
+            continue
+
+        # Arc/other: representative_point fallback (chord approximation).
         pt = _representative_point(geom)
         if pt is not None:
-            xs.append(pt[0])
-            ys.append(pt[1])
-    if not xs:
-        return None
-    return (sum(xs) / len(xs), sum(ys) / len(ys))
+            _update(_dist(tag_point, pt))
 
-
-def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    return best
 
 
 def _sort_key(run: RunGroup) -> tuple[str, str]:
@@ -198,13 +252,13 @@ def fuse_run_service_identities(
         P1 :class:`~app.interpretation.routed_runs.RunGroup` objects (any order; output
         is deterministic regardless).
     geometry_by_entity_id:
-        Mapping from entity_id to its geometry dict -- used only to compute run anchors.
+        Mapping from entity_id to its geometry dict -- used to compute run-segment distances.
     tags:
         Placed pipe-tag texts in world coordinates.  Tags on ANY layer are considered
         (proximity-only, not layer-scoped -- see module docstring).
     radius:
-        Maximum distance (drawing units) from a tag to a run anchor for association.
-        Default ``2000.0`` (2 m in mm-unit MEP drawings).
+        Maximum distance in metres from a tag to a run's nearest segment for association.
+        Default ``5.0`` m (#661 — adapters pre-scale geometry to metres).
 
     Returns
     -------
@@ -218,11 +272,6 @@ def fuse_run_service_identities(
 
     # Sort runs for deterministic output and equidistant tie-breaking.
     sorted_runs = sorted(runs, key=_sort_key)
-
-    # Precompute anchors -- None means no usable geometry.
-    anchors: list[tuple[float, float] | None] = [
-        _run_anchor(run, geometry_by_entity_id) for run in sorted_runs
-    ]
 
     # services_by_run_idx: index into sorted_runs -> list[ServiceSize]
     services_by_run_idx: list[list[ServiceSize]] = [[] for _ in sorted_runs]
@@ -239,12 +288,12 @@ def fuse_run_service_identities(
             # Non-parseable: skip entirely (do NOT add to unassigned -- it carries no info).
             continue
 
-        # Find distances to all anchored runs.
+        # Find minimum point-to-segment distances to all runs.
         dists: list[tuple[float, int]] = []  # (distance, run_index)
-        for idx, anchor in enumerate(anchors):
-            if anchor is None:
+        for idx, run in enumerate(sorted_runs):
+            d = _run_min_distance(tag.point, run, geometry_by_entity_id)
+            if d is None:
                 continue
-            d = _dist(tag.point, anchor)
             if d <= radius:
                 dists.append((d, idx))
 

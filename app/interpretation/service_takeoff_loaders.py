@@ -1077,6 +1077,7 @@ async def load_tag_placements(
     *,
     tag_layers: list[str] | None = None,
     input_family: str | None = None,
+    broaden_tag_layers: bool = True,
 ) -> list[TagPlacement]:
     """Load pipe-tag text entities as :class:`TagPlacement` objects.
 
@@ -1086,9 +1087,11 @@ async def load_tag_placements(
     point; ``layer_ref`` is None. Raw text is passed through without pre-parsing
     (the coordinator calls parse_tag which self-filters non-tag prose).
 
-    For DWG/DXF revisions (when ``tag_layers`` is None), selects text entities on layers
-    containing default tag-layer tokens (ilike, ADR-003). ``point`` is the entity's
-    insertion point; ``text`` is geometry_json['text'].
+    For DWG/DXF revisions (when ``tag_layers`` is None and ``broaden_tag_layers`` is
+    True, the default), selects ALL text entities for the revision regardless of layer
+    (ADR-003: content filtering via parse_tag downstream, not layer-scoping).  When
+    ``broaden_tag_layers`` is False, falls back to the legacy ilike filter over
+    ``_DEFAULT_TAG_LAYER_TOKENS`` (reachable for tests / explicit opt-out).
 
     Returns [] for empty/degenerate revisions; never raises.
     """
@@ -1149,7 +1152,10 @@ async def load_tag_placements(
                 pdf_placements.append(TagPlacement(text=cand, point=point, layer_ref=None))
         return pdf_placements
 
-    # DWG/DXF (or unknown family): ilike-based entity text selection, ADR-003 compliant.
+    # DWG/DXF (or unknown family): entity text selection, ADR-003 compliant.
+    # When broaden_tag_layers is True (default): select ALL text entities — layer-scoping
+    # is deferred to parse_tag (content gate) + spatial radius (proximity gate).
+    # When broaden_tag_layers is False: legacy ilike filter over _DEFAULT_TAG_LAYER_TOKENS.
     from sqlalchemy import or_, select
 
     from app.models.revision_materialization import RevisionEntity
@@ -1158,11 +1164,12 @@ async def load_tag_placements(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
     )
-    # _DEFAULT_TAG_LAYER_TOKENS is a non-empty constant, so or_ always receives >= 1 arg.
-    conditions = [
-        RevisionEntity.layer_ref.ilike(f"%{token}%") for token in _DEFAULT_TAG_LAYER_TOKENS
-    ]
-    query = query.where(or_(*conditions))
+    if not broaden_tag_layers:
+        # _DEFAULT_TAG_LAYER_TOKENS is a non-empty constant, so or_ always receives >= 1 arg.
+        conditions = [
+            RevisionEntity.layer_ref.ilike(f"%{token}%") for token in _DEFAULT_TAG_LAYER_TOKENS
+        ]
+        query = query.where(or_(*conditions))
 
     rows = list((await db.execute(query)).scalars().all())
 
@@ -1342,7 +1349,11 @@ async def load_tag_stack_texts(
     """
     try:
         placements = await load_tag_placements(
-            db, revision_id, tag_layers=tag_layers, input_family=input_family
+            db,
+            revision_id,
+            tag_layers=tag_layers,
+            input_family=input_family,
+            broaden_tag_layers=False,  # #674 path: preserve token-scoped behaviour
         )
         return [TagStackText(text=p.text, point=p.point) for p in placements]
     except Exception:
@@ -1535,7 +1546,11 @@ async def load_service_takeoff_inputs(
         db, revision_id, legend_layers=legend_layers, input_family=input_family
     )
     tag_placements = await load_tag_placements(
-        db, revision_id, tag_layers=tag_layers, input_family=input_family
+        db,
+        revision_id,
+        tag_layers=tag_layers,
+        input_family=input_family,
+        broaden_tag_layers=True,
     )
     scale = await build_scale_context(db, revision_id)
     rise_entities = await load_rise_drop_entities(

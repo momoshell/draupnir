@@ -141,8 +141,11 @@ async def _enqueue_centerline_materialization(
         logger.warning("centerline_enqueue_failed", revision_id=str(revision_id), exc_info=True)
 
 
-# Default tag-association radius (drawing units -- typically mm in metric MEP drawings).
-_DEFAULT_TAG_RADIUS: float = 2000.0
+# Default tag-association radius in metres (#661 — adapters pre-scale geometry to metres).
+# Calibrated across M-540003 (pipe callout tag at 3.85 m) + E-610003 (labels ≤2.2 m);
+# plateau-stable 5-7 m; junk >=16 m. Single-building-calibrated -- scale-relative radius
+# is the follow-on.
+_DEFAULT_TAG_RADIUS: float = 5.0
 
 
 @service_takeoff_router.get(
@@ -173,7 +176,7 @@ async def get_revision_service_takeoff(
 
     ``scope`` mirrors the rooms endpoint: ``sheet`` (default) restricts routed linework and
     room geometry to the printed sheet; ``modelspace`` interprets the full modelspace.
-    ``radius`` is the tag-to-run association radius in drawing units.
+    ``radius`` is the tag-to-run association radius in metres.
     """
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
     exclude_off_sheet = scope == "sheet"

@@ -825,6 +825,94 @@ class TestLoadTagPlacements:
 
 
 @requires_database
+class TestLoadTagPlacementsBroaden:
+    """load_tag_placements broadened (broaden_tag_layers=True/False) behaviour."""
+
+    async def test_broaden_picks_up_tag_on_non_pipe_tag_layer(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With broaden=True (default), a parseable tag on layer 'E600T_Gen' is returned.
+
+        The loader does NOT layer-scope DWG text — content filtering is deferred to parse_tag
+        downstream (ADR-003).  Title-block junk on a far layer is returned by the loader but
+        rejected by the spatial radius gate in fuse_run_service_identities.
+        """
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Parseable tag on a non-pipe-tag layer ("E600T_Gen").
+                _make_entity(
+                    "tag-non-standard",
+                    "text",
+                    "E600T_Gen",
+                    {"text": "42 mm VAC", "insertion": {"x": 1.0, "y": 1.0}},
+                ),
+                # Title-block-style text on a far layer — returned by loader but spatially gated.
+                _make_entity(
+                    "title-block-001",
+                    "text",
+                    "A-TITLE",
+                    {"text": "PROJECT NAME", "insertion": {"x": 999.0, "y": 999.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id)
+
+        texts = {p.text for p in placements}
+        # Broadened loader returns the parseable tag regardless of layer.
+        assert "42 mm VAC" in texts
+        # Title-block text is also returned (spatial gate rejects it later).
+        assert "PROJECT NAME" in texts
+
+    async def test_broaden_false_still_token_scopes(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """broaden=False: only text on _DEFAULT_TAG_LAYER_TOKENS layers is returned."""
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # On a matching layer ("Pipe Tags" contains "tag").
+                _make_entity(
+                    "tag-matching",
+                    "text",
+                    "Pipe Tags",
+                    {"text": "54 mm HWS", "insertion": {"x": 1.0, "y": 1.0}},
+                ),
+                # On a non-matching layer — excluded when broaden=False.
+                _make_entity(
+                    "tag-non-standard",
+                    "text",
+                    "E600T_Gen",
+                    {"text": "42 mm VAC", "insertion": {"x": 2.0, "y": 2.0}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            placements = await load_tag_placements(db, revision_id, broaden_tag_layers=False)
+
+        texts = {p.text for p in placements}
+        assert "54 mm HWS" in texts
+        assert "42 mm VAC" not in texts
+
+
+@requires_database
 class TestBuildServiceLegend:
     """build_service_legend pairs swatches with text and emits ServiceLegend."""
 

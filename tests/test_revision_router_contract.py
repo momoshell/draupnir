@@ -553,7 +553,7 @@ def test_revision_router_routes_match_baseline_contract() -> None:
                 ("query", "scope", False, "sheet", None, None, None),
                 ("query", "snap_tolerance", False, 0.0, 0.0, None, None),
                 ("query", "min_area", False, 0.0, 0.0, None, None),
-                ("query", "radius", False, 2000.0, None, None, None),
+                ("query", "radius", False, 5.0, None, None, None),
                 ("dependency", "db", None, None, None, None, "get_db"),
             ),
         ),
