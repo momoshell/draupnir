@@ -1140,6 +1140,67 @@ class TestBuildServiceLegend:
         colour_entries = legend.by_colour()
         assert "ff00ff" not in colour_entries, "Chromatic spline must not be a swatch"
 
+    async def test_anchor_title_excluded_even_when_closest_to_swatch(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The legend title/anchor must not leak as a discipline (#673 anchor-label-exclude).
+
+        Adversarial geometry: the anchor "CONTAINMENTS LEGEND" sits CLOSER to the swatch
+        than the real label "LV DIST". A distance-only pairing would pick the title; the
+        anchor-text exclusion must win so the discipline is "LV DIST".
+        """
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        blue_color = {"index": 5, "rgb": "0000ff", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                # Anchor title at (0, 0).
+                _make_entity(
+                    "anchor-001",
+                    "text",
+                    "Z010T",
+                    {"text": "CONTAINMENTS LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Blue swatch close to the anchor (dist ~0.39) ...
+                _make_entity(
+                    "hatch-001",
+                    "hatch",
+                    "E610G_Cable Tray",
+                    {
+                        "vertices": [
+                            [0.1, -0.45],
+                            [0.4, -0.45],
+                            [0.4, -0.15],
+                            [0.1, -0.15],
+                        ]
+                    },
+                    style={"color": blue_color},
+                ),
+                # ... and the real label FARTHER from the swatch (dist ~0.65).
+                _make_entity(
+                    "label-001",
+                    "text",
+                    "Z010T",
+                    {"text": "LV DIST", "insertion": {"x": 0.9, "y": -0.3}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        colour_entries = legend.by_colour()
+        entry = colour_entries.get("0000ff")
+        assert entry is not None, f"Expected 0000ff in {list(colour_entries.keys())}"
+        assert entry.discipline == "LV DIST", "Anchor title must not leak as discipline"
+
     async def test_three_chromatic_swatches_black_borders_notes_excluded(
         self,
         async_client: httpx.AsyncClient,
