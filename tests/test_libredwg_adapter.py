@@ -124,6 +124,7 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("malformed_inserts", 0)
     merged_counts.setdefault("skipped_non_drawable", 0)
     merged_counts.setdefault("supported_dimensions", 0)
+    merged_counts.setdefault("supported_splines", 0)
     return merged_counts
 
 
@@ -3907,12 +3908,13 @@ async def test_libredwg_adapter_emits_source_census(
     assert census["source"] == "dwgread"
     assert census["raw_object_total"] == 3
     assert census["raw_objects"] == {"LINE": 1, "SPLINE": 1, "VIEWPORT": 1}
-    # SPLINE is a drawable candidate we don't map; VIEWPORT is a skipped non-drawable.
+    # SPLINE (malformed, no ctrl_pts) is a drawable candidate; VIEWPORT is a skipped non-drawable.
     assert census["drawable_candidates"] == 2
     assert census["materialized"] == 1
     assert census["dropped"]["total"] == 1
-    assert census["dropped"]["unsupported_drawables"] == 1
-    assert census["dropped"]["unsupported_types"] == ("SPLINE",)
+    # The SPLINE has no ctrl_pts → malformed (not unsupported); unsupported_drawables stays 0.
+    assert census["dropped"]["unsupported_drawables"] == 0
+    assert census["dropped"].get("unsupported_types", ()) == ()
     # the zombie class is a reader blind spot, surfaced as a warning + census entry
     assert [c["dxfname"] for c in census["unsupported_classes"]] == ["ACAD_PROXY_ENTITY"]
     assert census["unsupported_classes"][0]["is_zombie"] is True
@@ -5420,3 +5422,240 @@ async def test_libredwg_adapter_dimension_inf_coord_degrades(
     assert len(dim_entities) == 0
     warning_codes = [w.code for w in result.warnings]
     assert "libredwg.malformed_drawable_record" in warning_codes
+
+
+# ---------------------------------------------------------------------------
+# SPLINE capture tests (#677)
+# ---------------------------------------------------------------------------
+
+
+def _make_spline_record(
+    *,
+    handle: str = "SP1",
+    layer: str = "Wires",
+    ctrl_pts: list[dict[str, float]] | None = None,
+    degree: int = 3,
+    periodic: bool = False,
+    closed_b: bool = False,
+) -> dict[str, Any]:
+    """Build a minimal synthetic SPLINE dwgread JSON record."""
+    if ctrl_pts is None:
+        ctrl_pts = [
+            {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            {"x": 1000.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            {"x": 1000.0, "y": 1000.0, "z": 0.0, "w": 1.0},
+        ]
+    return {
+        "type": "SPLINE",
+        "handle": handle,
+        "layer": layer,
+        "ctrl_pts": ctrl_pts,
+        "degree": degree,
+        "periodic": periodic,
+        "closed_b": closed_b,
+    }
+
+
+def test_spline_not_in_routed_entity_types() -> None:
+    """Guard: 'spline' must never enter the length-takeoff pipeline."""
+    from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES
+
+    assert "spline" not in ROUTED_ENTITY_TYPES
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_captures_clamped_degree3_spline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clamped degree-3 SPLINE → entity_type='spline', correct vertices (metres), no length hint."""
+    ctrl_pts = [
+        {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 500.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 500.0, "y": 500.0, "z": 0.0, "w": 1.0},
+        {"x": 1000.0, "y": 500.0, "z": 0.0, "w": 1.0},
+    ]
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _make_spline_record(handle="SP3", layer="Wires", ctrl_pts=ctrl_pts, degree=3)
+            ]
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = spline_entities[0]
+
+    assert sp["entity_type"] == "spline"
+    assert sp["layer_ref"] == "Wires"
+    assert sp["layer_name"] == "Wires"
+
+    # vertices and points must be identical tuples
+    assert sp["geometry"]["vertices"] == sp["geometry"]["points"]
+
+    verts = sp["geometry"]["vertices"]
+    assert len(verts) >= 2
+
+    # Endpoints must equal scaled first/last ctrl_pt
+    assert verts[0] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert verts[-1] == {"x": 1000.0, "y": 500.0, "z": 0.0}
+
+    # No length hint
+    qty = sp["properties"]["quantity_hints"]
+    assert "length" not in qty
+    assert "perimeter" not in qty
+    assert qty["count"] == 1.0
+
+    # source_type
+    assert sp["properties"]["source_type"] == "SPLINE"
+
+    # geometry_summary
+    gs = sp["geometry"]["geometry_summary"]
+    assert gs["kind"] == "spline"
+    assert gs["approximation"] == "control_polygon"
+    assert gs["source_degree"] == 3
+    assert gs["closed"] is False
+    assert gs["endpoints_on_curve"] is True
+    assert gs["vertex_count"] == len(verts)
+
+    assert not _contains_non_finite_numbers(sp)
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_captures_clamped_degree2_spline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clamped degree-2 SPLINE → identical contract, source_degree=2."""
+    ctrl_pts = [
+        {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 2000.0, "y": 1000.0, "z": 0.0, "w": 1.0},
+        {"x": 4000.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    ]
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _make_spline_record(handle="SP2", layer="Pipes", ctrl_pts=ctrl_pts, degree=2)
+            ]
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = spline_entities[0]
+
+    assert sp["entity_type"] == "spline"
+    assert sp["layer_ref"] == "Pipes"
+    assert sp["geometry"]["vertices"] == sp["geometry"]["points"]
+
+    verts = sp["geometry"]["vertices"]
+    assert len(verts) >= 2
+    assert verts[0] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert verts[-1] == {"x": 4000.0, "y": 0.0, "z": 0.0}
+
+    gs = sp["geometry"]["geometry_summary"]
+    assert gs["source_degree"] == 2
+    assert gs["endpoints_on_curve"] is True
+    assert "length" not in sp["properties"]["quantity_hints"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_captures_periodic_spline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Periodic/closed SPLINE → closed=True, endpoints_on_curve=False, ≥2 verts."""
+    ctrl_pts = [
+        {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 1000.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 1000.0, "y": 1000.0, "z": 0.0, "w": 1.0},
+        {"x": 0.0, "y": 1000.0, "z": 0.0, "w": 1.0},
+    ]
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _make_spline_record(
+                    handle="SPP", layer="Wires", ctrl_pts=ctrl_pts, periodic=True, closed_b=False
+                )
+            ]
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = spline_entities[0]
+
+    gs = sp["geometry"]["geometry_summary"]
+    assert gs["closed"] is True
+    assert gs["endpoints_on_curve"] is False
+    assert len(sp["geometry"]["vertices"]) >= 2
+    assert "length" not in sp["properties"]["quantity_hints"]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_rejects_spline_with_fewer_than_2_ctrl_pts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPLINE with <2 ctrl_pts → malformed_drawable (not unsupported_drawable_record)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "SPLINE",
+                    "handle": "SPBad",
+                    "layer": "Wires",
+                    "ctrl_pts": [{"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}],
+                    "degree": 3,
+                }
+            ]
+        },
+    )
+    entities = cast(list[dict[str, Any]], result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 0
+
+    # Must appear as malformed, not unsupported
+    unknown_entities = [e for e in entities if e.get("entity_type") == "unknown"]
+    assert len(unknown_entities) == 1
+    assert unknown_entities[0]["geometry"]["reason"] == "malformed_spline_geometry"
+
+    diagnostic = cast(Mapping[str, Any], result.canonical["metadata"])
+    counts = cast(Mapping[str, int], diagnostic["entity_counts"])
+    assert counts["malformed_drawables"] >= 1
+    assert counts.get("supported_splines", 0) == 0
+    # The SPLINE must NOT be counted as unsupported_drawable
+    assert counts["unsupported_drawables"] == 0
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_spline_entity_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """entity_counts.supported_splines tracks captured splines; unsupported_drawables stays zero."""
+    ctrl_pts = [
+        {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        {"x": 1000.0, "y": 500.0, "z": 0.0, "w": 1.0},
+        {"x": 2000.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    ]
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                _make_spline_record(handle="S1", ctrl_pts=ctrl_pts),
+                _make_spline_record(handle="S2", ctrl_pts=ctrl_pts),
+                {
+                    "type": "LINE",
+                    "handle": "L1",
+                    "layer": "Wires",
+                    "start": {"x": 0, "y": 0, "z": 0},
+                    "end": {"x": 1, "y": 0, "z": 0},
+                },
+            ]
+        },
+    )
+    counts = cast(Mapping[str, int], result.canonical["metadata"]["entity_counts"])
+    assert counts["supported_splines"] == 2
+    assert counts["unsupported_drawables"] == 0
+    assert counts["supported_geometry"] >= 3

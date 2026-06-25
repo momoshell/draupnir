@@ -1935,3 +1935,345 @@ async def test_ezdxf_dimlfac_override_resolver(
     props = _mapping(dim_entities[0]["properties"])
     dim_block = _mapping(_mapping(_mapping(props["adapter_native"])["ezdxf"])["dimension"])
     assert dim_block["dimlfac"] == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# SPLINE capture tests (#677, be-677b)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSplineEntity:
+    """Minimal fake ezdxf Spline entity for unit-level SPLINE tests."""
+
+    # Class-level flag constants matching ezdxf.entities.Spline
+    CLOSED: int = 1
+    PERIODIC: int = 2
+
+    def __init__(
+        self,
+        *,
+        handle: str,
+        layer: str,
+        layout_name: str,
+        control_points: list[tuple[float, float, float]],
+        fit_points: list[tuple[float, float, float]] | None = None,
+        degree: int = 3,
+        closed: bool = False,
+        periodic: bool = False,
+    ) -> None:
+        self._layout = types.SimpleNamespace(name=layout_name)
+        self._control_points = control_points
+        self._fit_points = fit_points or []
+        flags = 0
+        if closed:
+            flags |= self.CLOSED
+        if periodic:
+            flags |= self.PERIODIC
+        self.closed = closed or periodic
+        self.dxf = types.SimpleNamespace(
+            handle=handle,
+            layer=layer,
+            linetype="Continuous",
+            degree=degree,
+            flags=flags,
+        )
+
+    def dxftype(self) -> str:
+        return "SPLINE"
+
+    def get_layout(self) -> Any:
+        return self._layout
+
+    @property
+    def control_points(self) -> list[tuple[float, float, float]]:
+        return self._control_points
+
+    @property
+    def fit_points(self) -> list[tuple[float, float, float]]:
+        return self._fit_points
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_captures_clamped_degree3_spline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clamped degree-3 SPLINE → entity_type='spline', correct scaled vertices, no length hint."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "spline-clamped.dxf"
+    document = cast(Any, ezdxf).new(units=6)  # 6=metres
+    msp = document.modelspace()
+    ctrl_pts = [(0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (0.5, 0.5, 0.0), (1.0, 0.5, 0.0)]
+    spline = msp.add_spline(dxfattribs={"degree": 3})
+    spline.control_points = ctrl_pts
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    assert result.confidence is not None
+    assert result.warnings == ()
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = _mapping(spline_entities[0])
+
+    _assert_common_entity_contract(sp, entity_type="spline", layout_ref="Model", layer_ref="0")
+
+    # vertices and points must be identical
+    assert sp["vertices"] == sp["points"]
+    geometry = _mapping(sp["geometry"])
+    assert geometry["vertices"] == geometry["points"]
+    assert geometry["closed"] is False
+
+    verts = _mapping_tuple(geometry["vertices"])
+    assert len(verts) >= 2
+    # Endpoints == scaled first/last control point (metres, units=6 so no scaling needed)
+    assert verts[0] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert verts[-1] == {"x": 1.0, "y": 0.5, "z": 0.0}
+
+    # geometry_summary
+    gs = _mapping(geometry["geometry_summary"])
+    assert gs["kind"] == "spline"
+    assert gs["approximation"] == "control_polygon"
+    assert gs["source_degree"] == 3
+    assert gs["closed"] is False
+    assert gs["endpoints_on_curve"] is True
+    assert gs["vertex_count"] == len(verts)
+
+    # properties
+    props = _mapping(sp["properties"])
+    assert props["source_type"] == "SPLINE"
+    qty = _mapping(props["quantity_hints"])
+    assert "length" not in qty
+    assert "perimeter" not in qty
+    assert qty["count"] == 1.0
+
+    _assert_no_nonfinite_numbers(sp)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_captures_periodic_closed_spline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Periodic/closed SPLINE → closed=True, endpoints_on_curve=False, no length hint."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "spline-periodic.dxf"
+    document = cast(Any, ezdxf).new(units=6)
+    msp = document.modelspace()
+    # PERIODIC flag = 2, CLOSED flag = 1 → flags=3
+    spline = msp.add_spline(dxfattribs={"degree": 3, "flags": 3})
+    spline.control_points = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    ]
+    document.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=2)),
+    )
+
+    assert result.warnings == ()
+    entities = _mapping_tuple(result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = _mapping(spline_entities[0])
+
+    geometry = _mapping(sp["geometry"])
+    gs = _mapping(geometry["geometry_summary"])
+    assert gs["closed"] is True
+    assert gs["endpoints_on_curve"] is False
+
+    qty = _mapping(_mapping(sp["properties"])["quantity_hints"])
+    assert "length" not in qty
+    assert "perimeter" not in qty
+    assert qty["count"] == 1.0
+
+    assert len(_mapping_tuple(geometry["vertices"])) >= 2
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_spline_uses_fit_points_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When control_points is empty but fit_points present, fall back to fit_points."""
+    adapter = _load_ezdxf_adapter()
+    fake_spline = _FakeSplineEntity(
+        handle="SF1",
+        layer="0",
+        layout_name="Model",
+        control_points=[],
+        fit_points=[(0.0, 0.0, 0.0), (2.0, 3.0, 0.0), (4.0, 0.0, 0.0)],
+        degree=3,
+    )
+    document = _FakeDocument(entities=(fake_spline,))
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: document)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="spline-fit.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.warnings == ()
+    entities = _mapping_tuple(result.canonical["entities"])
+    spline_entities = [e for e in entities if e.get("entity_type") == "spline"]
+    assert len(spline_entities) == 1
+    sp = _mapping(spline_entities[0])
+    verts = _mapping_tuple(_mapping(sp["geometry"])["vertices"])
+    assert len(verts) == 3
+    assert verts[0] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert verts[-1] == {"x": 4.0, "y": 0.0, "z": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_spline_malformed_no_points_retained_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPLINE with no control_points and no fit_points → unknown entity + malformed_coordinates."""
+    adapter = _load_ezdxf_adapter()
+    fake_spline = _FakeSplineEntity(
+        handle="SBad",
+        layer="0",
+        layout_name="Model",
+        control_points=[],
+        fit_points=[],
+        degree=3,
+    )
+    document = _FakeDocument(entities=(fake_spline,))
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: document)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="spline-empty.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert [w.code for w in result.warnings] == ["malformed_coordinates"]
+    entities = _mapping_tuple(result.canonical["entities"])
+    assert entities[0]["entity_type"] == "unknown"
+
+    diagnostics_details = {d.code: d.details for d in result.diagnostics}
+    entity_diag = _mapping(diagnostics_details["dxf_entities_extracted"])
+    assert cast(int, entity_diag["unsupported_entity_count"]) >= 1
+    assert cast(int, entity_diag["supported_entity_count"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_spline_supported_count_increments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Captured SPLINE increments supported_entity_count (not unsupported)."""
+    adapter = _load_ezdxf_adapter()
+    fake_spline = _FakeSplineEntity(
+        handle="SOK",
+        layer="Wires",
+        layout_name="Model",
+        control_points=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 1.0, 0.0)],
+        degree=3,
+    )
+    document = _FakeDocument(entities=(fake_spline,))
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: document)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="spline-ok.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.warnings == ()
+    diagnostics_details = {d.code: d.details for d in result.diagnostics}
+    entity_diag = _mapping(diagnostics_details["dxf_entities_extracted"])
+    assert cast(int, entity_diag["supported_entity_count"]) == 1
+    assert cast(int, entity_diag["unsupported_entity_count"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_spline_symmetry_with_libredwg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-adapter symmetry: same logical clamped degree-3 spline → same canonical shape (#369).
+
+    The ezdxf adapter reads the SPLINE from DXF; the libredwg builder is called directly with
+    a synthetic dwgread-style record at metre-unit scale. Both must agree on: entity_type,
+    source_type, geometry_summary.kind, approximation, endpoints_on_curve, vertex_count, and
+    scaled endpoints.
+    """
+    from app.ingestion.adapters import libredwg as libredwg_module
+
+    # Shared control polygon in metres (unit=6 DXF → no scaling; libredwg scale=1.0)
+    ctrl_m = [(0.0, 0.0, 0.0), (0.5, 0.5, 0.0), (1.0, 0.5, 0.0), (1.5, 0.0, 0.0)]
+
+    # --- ezdxf side ---
+    adapter = _load_ezdxf_adapter()
+    fake_spline = _FakeSplineEntity(
+        handle="SYM",
+        layer="Wires",
+        layout_name="Model",
+        control_points=list(ctrl_m),
+        degree=3,
+    )
+    document = _FakeDocument(entities=(fake_spline,), units=6)
+    monkeypatch.setattr(adapter, "_read_document", lambda _path: document)
+
+    ezdxf_result = await adapter.ingest(
+        build_contract_source(file_path=_FIXTURE_PATH, original_name="symmetry-spline.dxf"),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+    ezdxf_entities = _mapping_tuple(ezdxf_result.canonical["entities"])
+    ezdxf_splines = [e for e in ezdxf_entities if e.get("entity_type") == "spline"]
+    assert len(ezdxf_splines) == 1
+    ez_sp = _mapping(ezdxf_splines[0])
+
+    # --- libredwg side: call _build_spline_entity directly with metre-unit resolution ---
+    # dwgread JSON record uses mm-stored coords for metric, but we pass scale=1.0 (metres)
+    # to match the ezdxf side which is already in metres.
+    libredwg_record = {
+        "type": "SPLINE",
+        "handle": "SYM",
+        "layer": "Wires",
+        "ctrl_pts": [{"x": pt[0], "y": pt[1], "z": pt[2], "w": 1.0} for pt in ctrl_m],
+        "degree": 3,
+        "periodic": False,
+        "closed_b": False,
+    }
+    units_resolution = libredwg_module._UnitsResolution(
+        payload={
+            "normalized": "meter",
+            "source": "INSUNITS",
+            "source_value": 6,
+            "conversion_target": "meter",
+            "conversion_factor": 1.0,
+        },
+        scale=1.0,
+        confirmed=True,
+    )
+    lb_entity = libredwg_module._build_spline_entity(libredwg_record, units=units_resolution)
+    assert lb_entity is not None
+
+    # --- Compare canonical fields ---
+    assert ez_sp["entity_type"] == lb_entity["entity_type"] == "spline"
+    assert (
+        _mapping(ez_sp["properties"])["source_type"]
+        == _mapping(lb_entity["properties"])["source_type"]
+        == "SPLINE"
+    )
+
+    ez_gs = _mapping(_mapping(ez_sp["geometry"])["geometry_summary"])
+    lb_gs = _mapping(_mapping(lb_entity["geometry"])["geometry_summary"])
+    assert ez_gs["kind"] == lb_gs["kind"] == "spline"
+    assert ez_gs["approximation"] == lb_gs["approximation"] == "control_polygon"
+    assert ez_gs["endpoints_on_curve"] == lb_gs["endpoints_on_curve"] is True
+    assert ez_gs["vertex_count"] == lb_gs["vertex_count"]
+    assert int(cast(int, ez_gs["source_degree"])) == int(cast(int, lb_gs["source_degree"])) == 3
+
+    ez_verts = _mapping_tuple(_mapping(ez_sp["geometry"])["vertices"])
+    lb_verts = _mapping_tuple(_mapping(lb_entity["geometry"])["vertices"])
+    assert len(ez_verts) == len(lb_verts)
+    # Endpoints must match
+    assert ez_verts[0] == lb_verts[0]
+    assert ez_verts[-1] == lb_verts[-1]

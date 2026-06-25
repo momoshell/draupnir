@@ -185,7 +185,12 @@ _NON_SWATCH_ENTITY_TYPES: frozenset[str] = frozenset(
 # Entity types excluded from DWG region-based swatch collection.
 # Intentionally does NOT exclude "hatch" — M-540003 swatches are HATCH entities.
 # The shared _NON_SWATCH_ENTITY_TYPES constant retains "hatch" for the layer-name path.
-_DWG_NON_SWATCH_ENTITY_TYPES: frozenset[str] = frozenset({"text", "mtext", "insert", "dimension"})
+# Excludes "spline" (#677): captured splines are routed/connection topology, never
+# swatches; a chromatic spline whose centroid lands in a legend region would otherwise
+# be misread as a colour swatch.
+_DWG_NON_SWATCH_ENTITY_TYPES: frozenset[str] = frozenset(
+    {"text", "mtext", "insert", "dimension", "spline"}
+)
 
 # Region window built around the anchor text insertion point (drawing units).
 # Calibrated to M-540003: anchor at (-4.56, 3.31); swatch column at x≈-4.3,
