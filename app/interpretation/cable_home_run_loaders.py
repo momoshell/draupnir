@@ -41,6 +41,7 @@ async def load_and_compute_home_runs(
     *,
     lighting_revision_id: UUID,
     containment_revision_id: UUID,
+    exclude_off_sheet: bool = True,
     rot_tol_rad: float = 0.02,
 ) -> tuple[HomeRunResult, dict[str, object]]:
     """Load two revisions, co-register them, and compute circuit home-run lengths.
@@ -53,6 +54,11 @@ async def load_and_compute_home_runs(
         UUID of the lighting (primary) drawing revision — defines the routing frame.
     containment_revision_id:
         UUID of the containment (cable-tray) drawing revision — supplies tray geometry.
+    exclude_off_sheet:
+        Passed to ``load_spline_inputs`` for the lighting revision. Must match the
+        value used by the route's in-plan loaders so the circuit partition is identical
+        and circuit_ids align correctly in the assembly join. Defaults to ``True``
+        (sheet scope) — callers must pass ``False`` for modelspace scope.
     rot_tol_rad:
         Maximum tolerated rotation between revisions (radians). Exceeding this marks
         ``registration_failed=True`` so all circuits receive status "bad_registration".
@@ -107,8 +113,14 @@ async def load_and_compute_home_runs(
         )
 
     # --- Step 1: lighting side ---
-    splines = await load_spline_inputs(db, lighting_revision_id)
-    device_footprints = await load_device_footprints(db, lighting_revision_id)
+    # exclude_off_sheet must match what the route's in-plan path used, so the circuit
+    # partition (and therefore circuit_ids) is identical for both paths in the assembly join.
+    splines = await load_spline_inputs(
+        db, lighting_revision_id, exclude_off_sheet=exclude_off_sheet
+    )
+    device_footprints = await load_device_footprints(
+        db, lighting_revision_id, exclude_off_sheet=False
+    )
 
     graph = build_cable_graph(splines=splines, devices=device_footprints)
     circuits = partition_circuits(graph)

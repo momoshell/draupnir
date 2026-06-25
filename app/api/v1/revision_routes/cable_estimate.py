@@ -101,6 +101,7 @@ async def get_revision_cable_estimate(
                 db,
                 lighting_revision_id=revision_id,
                 containment_revision_id=containment_revision_id,
+                exclude_off_sheet=exclude_off_sheet,
             )
         except ValueError as exc:
             # Coordinator raises ValueError when revisions belong to different projects.

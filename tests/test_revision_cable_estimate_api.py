@@ -328,3 +328,81 @@ async def test_cable_estimate_reliability_keys_present(
     assert "in_plan_length_m" in rel
     assert "home_run_m" in rel
     assert "combined" in rel
+
+
+# ---------------------------------------------------------------------------
+# Additional tests from code review (scope=modelspace, empty revision)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cable_estimate_app_empty(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """App with loaders patched to return NO splines and NO devices (empty revision)."""
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest(revision_id)
+
+    async def _fake_splines(
+        db: Any, revision_id: uuid.UUID, *, exclude_off_sheet: bool = True
+    ) -> list[SplineInput]:
+        return []
+
+    async def _fake_devices(
+        db: Any, revision_id: uuid.UUID, *, exclude_off_sheet: bool = False
+    ) -> list[DeviceFootprint]:
+        return []
+
+    monkeypatch.setattr(
+        cable_estimate_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(cable_estimate_route, "load_spline_inputs", _fake_splines)
+    monkeypatch.setattr(cable_estimate_route, "load_device_footprints", _fake_devices)
+
+    yield app
+    app.dependency_overrides.clear()
+
+
+async def test_cable_estimate_scope_modelspace_accepted(
+    cable_estimate_app: FastAPI,
+) -> None:
+    """scope=modelspace is a valid value and returns 200 on the no-containment path."""
+    response = await _get_estimate(cable_estimate_app, "?scope=modelspace")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["quantity_kind"] == "estimated"
+
+
+async def test_cable_estimate_scope_bogus_returns_422(
+    cable_estimate_app: FastAPI,
+) -> None:
+    """scope=bogus is not a valid Literal value → FastAPI rejects with 422."""
+    response = await _get_estimate(cable_estimate_app, "?scope=bogus")
+    assert response.status_code == 422
+
+
+async def test_cable_estimate_empty_revision_200_honest_zeros(
+    cable_estimate_app_empty: FastAPI,
+) -> None:
+    """A revision with no splines/devices yields 200 with an honest empty estimate.
+
+    grand_base_m=0, per_circuit=[], all aggregate totals=0. Never 500.
+    """
+    response = await _get_estimate(cable_estimate_app_empty)
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["per_circuit"] == []
+    assert body["grand_base_m"] == pytest.approx(0.0)
+    assert body["grand_with_spare_m"] == pytest.approx(0.0)
+    assert body["total_device_drop_m"] == pytest.approx(0.0)
+    assert body["total_in_plan_length_m"] == pytest.approx(0.0)
+    assert body["total_home_run_m"] == pytest.approx(0.0)
+    assert body["unattributed_device_drop_m"] == pytest.approx(0.0)
+    assert body["quantity_kind"] == "estimated"
+    # No circuits → no_containment_sheet count is 0.
+    assert body["home_run_suppressed_counts"]["no_containment_sheet"] == 0

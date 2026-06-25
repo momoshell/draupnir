@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 class CircuitCableEstimateRead(BaseModel):
     """Combined cable estimate for a single circuit."""
 
+    model_config = ConfigDict(extra="forbid")
+
     circuit_id: int = Field(..., description="Circuit identifier")
     device_drop_m: float = Field(
         ..., ge=0.0, description="Per-device vertical drop total (reliable)"
