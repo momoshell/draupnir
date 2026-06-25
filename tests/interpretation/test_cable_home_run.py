@@ -155,7 +155,8 @@ def test_simple_tray_ok() -> None:
     assert cr.home_run_m == pytest.approx(cr.d_panel_m + cr.along_tray_m + cr.d_area_m, abs=1e-9)
     # Total matches the single ok circuit.
     assert result.total_home_run_m == pytest.approx(cr.home_run_m, abs=1e-9)
-    assert result.lower_bound_m is None if hasattr(result, "lower_bound_m") else True
+    # lower_bound_m is on CircuitHomeRun only; None when status is "ok".
+    assert cr.lower_bound_m is None
 
 
 # ---------------------------------------------------------------------------
@@ -470,3 +471,43 @@ def test_home_run_decomposition() -> None:
         if cr.status == "ok":
             expected = cr.d_panel_m + cr.along_tray_m + cr.d_area_m  # type: ignore[operator]
             assert cr.home_run_m == pytest.approx(expected, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# (12) Non-finite vertices in tray polylines → graceful skip, no crash
+# ---------------------------------------------------------------------------
+
+
+def test_nan_inf_vertices_in_tray() -> None:
+    """A tray polyline containing NaN/inf vertices is silently dropped; good segments survive."""
+    import math as _math
+
+    # One good polyline, one with a NaN vertex, one with an inf vertex.
+    nan = _math.nan
+    inf = _math.inf
+    tray_good = [(0.0, 0.0), (10.0, 0.0)]
+    tray_with_nan = [(0.0, 0.0), (nan, 5.0), (10.0, 5.0)]
+    tray_with_inf = [(0.0, 0.0), (inf, 0.0), (10.0, 0.0)]
+
+    panel = _device("panel-1", _PANEL_BLOCK_REF, bbox=(-0.1, -0.1, 0.1, 0.1))
+    served = _device("served-1", "Luminaire", bbox=(9.9, -0.1, 10.1, 0.1))
+
+    splines = [_spline("sp-1", (0.0, 0.0), (10.0, 0.0))]
+    devices = [panel, served]
+
+    circuits = _make_circuits(splines, devices)
+    device_map = {d.entity_id: d for d in devices}
+
+    # Should not raise — bad polylines are skipped, good one is used.
+    result = compute_home_runs(
+        circuits=circuits,
+        device_footprints_by_id=device_map,
+        tray_polylines=[tray_good, tray_with_nan, tray_with_inf],
+    )
+
+    # Good tray is still present → at least one circuit routes ok.
+    assert result.ok_count >= 1
+    for cr in result.per_circuit:
+        if cr.status == "ok":
+            assert cr.home_run_m is not None
+            assert _math.isfinite(cr.home_run_m)

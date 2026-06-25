@@ -144,11 +144,12 @@ async def load_and_compute_home_runs(
     transform = estimate_grid_transform(containment_fiducials, lighting_fiducials)
 
     # --- Step 4: fail-closed quality gates ---
-    # "failed" quality or excessive rotation → registration_failed=True.
-    # The rotation tolerance in estimate_grid_transform uses rot_tol_rad for its
-    # quality classification; we apply our own gate here as an explicit check so the
-    # coordinator's rot_tol_rad parameter is honoured independently of the pure fn's default.
-    registration_failed = (transform.quality == "failed") or (
+    # v1 routes only on a GOOD registration; degraded/failed → all circuits bad_registration.
+    # "degraded" already covers: <3 fiducials, scale mismatch, or residual in warn band.
+    # GridTransform.apply() is translation-only — it ignores scale — so a degraded scale
+    # mismatch would silently mis-place every tray vertex and produce confidently-wrong
+    # home_run_m values. Explicit rotation check is kept for belt-and-suspenders clarity.
+    registration_failed = (transform.quality != "good") or (
         abs(transform.rotation_rad) > rot_tol_rad
     )
 

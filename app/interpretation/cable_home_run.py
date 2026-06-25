@@ -68,6 +68,11 @@ _STATUS_ORDER: tuple[str, ...] = (
     "bad_registration",
 )
 
+# Multiplier on entry_max_m beyond which a reported d_panel/d_area distance is suppressed
+# (None) in an "unreachable_tray" result — avoids surfacing absurd noise distances from
+# near-empty or corrupt geometry to callers.
+_UNREACHABLE_REPORT_MULTIPLIER: float = 10.0
+
 
 def _snap_node(coord: tuple[float, float], tol: float) -> tuple[int, int]:
     """Map a world coordinate to a grid cell index for node identity."""
@@ -103,7 +108,9 @@ def _build_tray_graph(
             adjacency[nid] = []
 
     for polyline in tray_polylines:
-        pts = list(polyline)
+        # Drop non-finite vertices before processing — NaN/inf coordinates make
+        # round() raise in _snap_node and propagate NaN through hypot.
+        pts = [p for p in polyline if math.isfinite(p[0]) and math.isfinite(p[1])]
         if len(pts) < 2:
             continue
         for i in range(len(pts) - 1):
@@ -265,6 +272,12 @@ def compute_home_runs(
     All geometry is assumed to be in metres (conversion_factor=1.0 on ingestion).
     A full per-revision units re-resolution is out of scope for v1 — callers must
     ensure both revisions share the same metre scale.
+
+    **Node-snap approximation (v1):** panel and area entry points attach to the
+    NEAREST tray NODE (polyline vertex), not the nearest point on a segment
+    interior. This is an acceptable v1 approximation but can inflate d_panel/d_area
+    and occasionally over-trip ``unreachable_tray`` when tray segments are long with
+    sparse vertices. Segment-projection snap is a planned follow-up.
     """
     circuit_count = circuits.circuit_count
 
@@ -377,9 +390,13 @@ def compute_home_runs(
                     circuit_id=cid,
                     status="unreachable_tray",
                     home_run_m=None,
-                    d_panel_m=d_panel if d_panel <= entry_max_m * 10 else None,
+                    d_panel_m=(
+                        d_panel if d_panel <= entry_max_m * _UNREACHABLE_REPORT_MULTIPLIER else None
+                    ),
                     along_tray_m=None,
-                    d_area_m=d_area if d_area <= entry_max_m * 10 else None,
+                    d_area_m=(
+                        d_area if d_area <= entry_max_m * _UNREACHABLE_REPORT_MULTIPLIER else None
+                    ),
                     lower_bound_m=None,
                 )
             )
