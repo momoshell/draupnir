@@ -265,6 +265,24 @@ def _entity_insertion(geometry: dict[str, Any]) -> tuple[float, float] | None:
     return _point_xy(geometry.get("insertion") or geometry.get("insert"))
 
 
+def _is_legend_anchor_text(raw_text: object) -> bool:
+    """True if ``raw_text`` is a legend *title* (anchor), not a discipline label.
+
+    Same predicate Step 2 uses to discover anchors (length cap + ``_LEGEND_ANCHOR_RE``
+    minus ``_LEGEND_ANCHOR_EXCLUDE_RE``). Used in Step 4 to keep the anchor's own text
+    ("LEGEND", "CONTAINMENTS LEGEND", …) out of the discipline-label candidates so it
+    cannot win the swatch pairing and leak in as a service name (#673 anchor-label-exclude).
+    """
+    if not isinstance(raw_text, str):
+        return False
+    collapsed = _normalize_legend_text(raw_text)
+    if len(collapsed) > _ANCHOR_MAX_CHARS:
+        return False
+    if not _LEGEND_ANCHOR_RE.search(collapsed):
+        return False
+    return not _LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed)
+
+
 def _nearest_swatch(
     text_pt: tuple[float, float],
     swatches: list[tuple[tuple[float, float], Mapping[str, Any]]],
@@ -842,14 +860,7 @@ async def _build_dwg_legend_from_anchor(
         for row in text_rows:
             geometry = row.geometry_json or {}
             raw_text = geometry.get("text")
-            if not isinstance(raw_text, str):
-                continue
-            collapsed = _normalize_legend_text(raw_text)
-            if len(collapsed) > _ANCHOR_MAX_CHARS:
-                continue
-            if not _LEGEND_ANCHOR_RE.search(collapsed):
-                continue
-            if _LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed):
+            if not _is_legend_anchor_text(raw_text):
                 continue
             pt = _entity_insertion(geometry)
             if pt is None:
@@ -896,6 +907,10 @@ async def _build_dwg_legend_from_anchor(
             if row.entity_type in ("text", "mtext"):
                 raw_text = row_geom.get("text")
                 if not isinstance(raw_text, str) or not raw_text.strip():
+                    continue
+                # Exclude the legend title/anchor text itself — it is not a discipline
+                # label and must not win the swatch pairing (#673 anchor-label-exclude).
+                if _is_legend_anchor_text(raw_text):
                     continue
                 pt = _entity_insertion(row_geom)
                 if pt is not None and _in_any_region(pt[0], pt[1]):
