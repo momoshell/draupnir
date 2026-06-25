@@ -311,6 +311,62 @@ class EzdxfAdapter:
                     unsupported_entities += 1
                 else:
                     supported_entities += 1
+            elif entity_type == "SPLINE":
+                try:
+                    canonical_entity = _spline_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                        budget=budget,
+                    )
+                except _PolylineLimitError as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="polyline_vertex_limit_exceeded",
+                            message=(
+                                "DXF SPLINE exceeded the supported vertex limit and "
+                                "was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
+                except ValueError as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="malformed_coordinates",
+                            message=(
+                                "DXF SPLINE entity coordinates were invalid and the entity "
+                                "was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
+                else:
+                    supported_entities += 1
             else:
                 canonical_entity = _unknown_entity_payload(
                     entity,
@@ -1354,6 +1410,165 @@ def _polyline_native_geometry(
             "mode": mode,
         },
     )
+
+
+def _spline_entity_payload(
+    entity: Any,
+    *,
+    layout_name: str,
+    units: dict[str, JSONValue],
+    budget: _CheckpointBudget,
+) -> dict[str, JSONValue]:
+    """Build a canonical 'spline' entity from an ezdxf SPLINE.
+
+    Uses the control polygon (control_points) as the approximation — symmetric with the
+    libredwg _build_spline_entity which also uses ctrl_pts (#369 symmetry).  Flattening
+    is intentionally avoided so vertex-for-vertex endpoints are byte-comparable across
+    adapters and the entity remains purely topological (no length takeoff).
+    """
+    native_type = "SPLINE"
+    handle = _entity_handle(entity)
+    layer_name = _entity_layer(entity)
+    linetype = _optional_string(getattr(entity.dxf, "linetype", None))
+
+    # ezdxf Spline.control_points is a VertexArray that yields numpy arrays ([x, y, z]).
+    # Fall back to fit_points if control_points is empty (fit_points preserve endpoints).
+    # Neither → malformed.  (#369: control_polygon approximation, symmetric with libredwg)
+    native_points = _spline_control_points_payload(entity, budget=budget)
+
+    closed = bool(getattr(entity, "closed", False))
+    flags = int(getattr(entity.dxf, "flags", 0))
+    periodic = bool(flags & getattr(entity, "PERIODIC", 2))
+    # clamped (non-periodic) splines have exact endpoints on the curve; periodic do not
+    endpoints_on_curve = not periodic
+
+    degree_raw = getattr(entity.dxf, "degree", None)
+    source_degree = int(degree_raw) if degree_raw is not None else 3
+
+    points = _scaled_points_payload(native_points, units=units)
+
+    geometry_payload: dict[str, JSONValue] = {
+        "points": points,
+        "closed": closed,
+    }
+    entity_id = _entity_id(
+        native_type=native_type,
+        handle=handle,
+        layout_name=layout_name,
+        layer_name=layer_name,
+        geometry=geometry_payload,
+    )
+
+    if _native_geometry_should_be_preserved(units):
+        adapter_native_geometry: dict[str, JSONValue] = {
+            "points": native_points,
+            "closed": closed,
+            "units": {
+                "normalized": _normalized_unit_name(_source_unit_value(units)),
+                "source_value": _source_unit_value(units),
+            },
+        }
+    else:
+        adapter_native_geometry = {}
+
+    adapter_native: dict[str, JSONValue] = {
+        "layer": layer_name,
+        "linetype": linetype,
+        "flags": flags,
+        "closed": closed,
+        "degree": source_degree,
+    }
+    if adapter_native_geometry:
+        adapter_native["geometry"] = adapter_native_geometry
+
+    geometry_summary: dict[str, JSONValue] = {
+        "kind": "spline",
+        "vertex_count": len(points),
+        "closed": closed,
+        "approximation": "control_polygon",
+        "source_degree": source_degree,
+        "endpoints_on_curve": endpoints_on_curve,
+    }
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": "spline",
+        "entity_schema_version": _CANONICAL_SCHEMA_VERSION,
+        "geometry": {
+            "vertices": points,
+            "points": points,
+            "closed": closed,
+            "bbox": _points_bbox_payload(points),
+            "units": dict(units),
+            "geometry_summary": geometry_summary,
+        },
+        "properties": {
+            "source_type": native_type,
+            "source_handle": handle or None,
+            "quantity_hints": {
+                "count": 1.0,
+            },
+            "adapter_native": {
+                "ezdxf": adapter_native,
+            },
+        },
+        "provenance": _entity_provenance(
+            native_type=native_type,
+            handle=handle,
+            layout_name=layout_name,
+            layer_name=layer_name,
+            entity_id=entity_id,
+            geometry=geometry_payload,
+        ),
+        "confidence": 0.99,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "kind": "spline",
+        "handle": handle,
+        "layer": layer_name,
+        "layout": layout_name,
+        "vertices": points,
+        "points": points,
+        "closed": closed,
+    }
+
+
+def _spline_control_points_payload(
+    entity: Any,
+    *,
+    budget: _CheckpointBudget,
+) -> tuple[dict[str, JSONValue], ...]:
+    """Extract control points from an ezdxf Spline entity as {x,y,z} dicts.
+
+    ezdxf Spline.control_points yields numpy arrays indexed positionally ([0]=x,[1]=y,[2]=z).
+    Falls back to fit_points when control_points is empty (fit_points preserve endpoints).
+    Raises ValueError when fewer than 2 usable points exist.
+    """
+    raw_ctrl = list(getattr(entity, "control_points", []))
+    if raw_ctrl:
+        source = raw_ctrl
+    else:
+        raw_fit = list(getattr(entity, "fit_points", []))
+        if not raw_fit:
+            raise ValueError("SPLINE has neither control_points nor fit_points.")
+        source = raw_fit
+
+    payloads: list[dict[str, JSONValue]] = []
+    for vertex_count, pt in enumerate(source, start=1):
+        budget.check()
+        _enforce_polyline_vertex_limit(vertex_count)
+        x = _finite_float(float(pt[0]), axis="x")
+        y = _finite_float(float(pt[1]), axis="y")
+        z = _finite_float(float(pt[2]), axis="z")
+        payloads.append({"x": x, "y": y, "z": z})
+
+    if len(payloads) < 2:
+        raise ValueError("SPLINE must have at least 2 control points.")
+    return tuple(payloads)
 
 
 def _points_payload(

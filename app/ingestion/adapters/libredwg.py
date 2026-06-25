@@ -795,6 +795,7 @@ def _build_canonical_output(
     supported_line_count = 0
     supported_text_count = 0
     supported_dimension_count = 0
+    supported_spline_count = 0
     unsupported_drawable_count = 0
     malformed_drawable_count = 0
     unsupported_hatch_count = 0
@@ -990,6 +991,20 @@ def _build_canonical_output(
                 malformed_handles.add(handle)
             continue
 
+        if record_type == "SPLINE":
+            spline_entity = _build_spline_entity(record, units=units)
+            if spline_entity is not None:
+                _record_entity(spline_entity)
+                supported_geometry_count += 1
+                supported_spline_count += 1
+                continue
+
+            malformed_drawable_count += 1
+            handle = _record_unknown(record, reason="malformed_spline_geometry")
+            if handle is not None:
+                malformed_handles.add(handle)
+            continue
+
         unsupported_drawable_count += 1
         unsupported_types.add(record_type)
         _record_unknown(record, reason="unsupported_drawable_record")
@@ -1020,6 +1035,7 @@ def _build_canonical_output(
             "supported_lines": supported_line_count,
             "supported_text": supported_text_count,
             "supported_dimensions": supported_dimension_count,
+            "supported_splines": supported_spline_count,
             "unsupported_drawables": unsupported_drawable_count,
             "malformed_drawables": malformed_drawable_count,
             "unsupported_hatches": unsupported_hatch_count,
@@ -1309,6 +1325,7 @@ def _diagnostic_entity_counts(canonical: Mapping[str, Any]) -> _JSONDict | None:
         "supported_lines",
         "supported_text",
         "supported_dimensions",
+        "supported_splines",
         "unsupported_drawables",
         "malformed_drawables",
         "unsupported_hatches",
@@ -2458,6 +2475,117 @@ def _build_lwpolyline_entity(
             "vertices": vertex_json,
             "closed": closed,
             "length": length,
+        },
+    )
+
+
+def _extract_spline_ctrl_pts(
+    record: Mapping[str, Any],
+) -> tuple[tuple[float, float, float], ...] | None:
+    """Extract and de-duplicate consecutive identical control-polygon vertices from a SPLINE record.
+
+    ctrl_pts are `[{x,y,z,w}]` dicts in DWG units (mm for metric drawings).  The `w` weight is
+    ignored — we only need the spatial position for the schematic connection polyline.
+    First and last vertices are always preserved regardless of deduplication.
+    """
+    raw = _first_value(record, "ctrl_pts", "control_pts", "control_points", "ctrlpts")
+    if not isinstance(raw, (list, tuple)) or len(raw) == 0:
+        return None
+
+    points: list[tuple[float, float, float]] = []
+    for item in raw:
+        pt = _coerce_point(item)
+        if pt is None or not _point_is_finite(pt):
+            return None
+        points.append(pt)
+
+    if len(points) < 2:
+        return None
+
+    # De-duplicate consecutive identical interior points but always keep first and last.
+    deduped: list[tuple[float, float, float]] = [points[0]]
+    for pt in points[1:-1]:
+        if pt != deduped[-1]:
+            deduped.append(pt)
+    # Always append last point (spec: never drop first/last).
+    deduped.append(points[-1])
+
+    if len(deduped) < 2:
+        return None
+    return tuple(deduped)
+
+
+def _build_spline_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
+    """Build a canonical 'spline' entity from a SPLINE dwgread record.
+
+    The control polygon (ctrl_pts in order) approximates the spline for topology/endpoint
+    purposes.  SPLINEs are schematic connection wires — length must NOT be emitted so they
+    cannot inadvertently enter length takeoff.
+    """
+    ctrl_pts = _extract_spline_ctrl_pts(record)
+    if ctrl_pts is None:
+        return None
+
+    place, _length_scale, _angle_shift = _resolve_placement(units)
+    vertices = tuple(place(pt) for pt in ctrl_pts)
+    if any(not _point_is_finite(v) for v in vertices):
+        return None
+
+    # periodic → genuinely closed loop; clamped / non-periodic → open wire
+    periodic_raw = _first_value(record, "periodic", "is_periodic", "flag_periodic")
+    closed_b_raw = _first_value(record, "closed_b", "closed", "is_closed", "closed_flag")
+    periodic = bool(periodic_raw) if periodic_raw is not None else False
+    closed_b = bool(closed_b_raw) if closed_b_raw is not None else False
+    closed = periodic or closed_b
+    endpoints_on_curve = not periodic  # clamped splines have exact endpoints; periodic do not
+
+    degree_raw = _first_value(record, "degree", "spline_degree", "order")
+    degree = int(_coerce_float(degree_raw) or 3)
+
+    bbox = _bbox_from_points(vertices)
+    if bbox is None:
+        return None
+
+    vertex_json = tuple(_point_json(v) for v in vertices)
+    geometry_summary: _JSONDict = {
+        "kind": "spline",
+        "vertex_count": len(vertices),
+        "closed": closed,
+        "approximation": "control_polygon",
+        "source_degree": degree,
+        "endpoints_on_curve": endpoints_on_curve,
+    }
+
+    return _build_supported_geometry_entity(
+        record,
+        record_type="SPLINE",
+        entity_type="spline",
+        bbox=bbox,
+        geometry_projection={
+            "vertices": vertex_json,
+            "points": vertex_json,
+            "closed": closed,
+        },
+        geometry={
+            "vertices": vertex_json,
+            "points": vertex_json,
+            "closed": closed,
+            "bbox": bbox,
+            "units": _units_label(units),
+            "geometry_summary": geometry_summary,
+        },
+        properties={
+            "source_type": "SPLINE",
+            "quantity_hints": {
+                "count": 1.0,
+            },
+        },
+        units=units,
+        confidence_basis_prefix="libredwg_spline_mapping",
+        extra_fields={
+            "kind": "spline",
+            "vertices": vertex_json,
+            "closed": closed,
         },
     )
 
