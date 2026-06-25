@@ -221,6 +221,8 @@ def partition_circuits(
                 if any(pat in block_lower for pat in lower_patterns):
                     anchor_candidates.append(dev_id)
         if anchor_candidates:
+            # Lexicographic min on entity_id strings — deterministic; numeric suffixes
+            # like DB-1 vs DB-10 are not expected to need numeric ordering here.
             anchor = min(anchor_candidates)
 
         circuits.append(
@@ -238,13 +240,19 @@ def partition_circuits(
 
     assigned_edge_count = sum(c.edge_count for c in circuits)
     # Conservation invariant — every edge must be in exactly one circuit.
-    assert assigned_edge_count == graph.edge_count, (
-        f"Edge conservation violated: assigned {assigned_edge_count} "
-        f"but graph has {graph.edge_count}"
-    )
+    # Explicit RuntimeError (not assert) so this fires even under python -O.
+    if assigned_edge_count != graph.edge_count:
+        raise RuntimeError(
+            f"cable circuit conservation violated: "
+            f"assigned={assigned_edge_count} graph_edges={graph.edge_count}"
+        )
 
-    # Distinct devices across all circuits (a device cannot belong to two circuits
-    # because a node belongs to exactly one component).
+    # Distinct device_entity_ids across all circuits. NOTE: a device with a large
+    # footprint bbox can legitimately associate to terminal nodes in DIFFERENT
+    # components (e.g. one panel board tagged 8 spline fragments on E-630003), so
+    # the same device_entity_id MAY appear in multiple circuits' device_entity_ids.
+    # device_count here is the DISTINCT union — it is NOT necessarily the sum of
+    # per-circuit device_count values.
     all_device_ids: set[str] = set()
     for c in circuits:
         all_device_ids.update(c.device_entity_ids)

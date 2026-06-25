@@ -107,7 +107,7 @@ def test_two_disjoint_chains_produce_two_circuits() -> None:
 
     # Collect per-circuit spline sets.
     spline_sets = [set(c.spline_entity_ids) for c in result.circuits]
-    assert {"s1", "s2"} in spline_sets or {"s2", "s1"} in spline_sets
+    assert {"s1", "s2"} in spline_sets
     assert {"s3"} in spline_sets
 
     # No overlap between circuits.
@@ -402,6 +402,10 @@ def test_closed_spline_self_loop_forms_singleton_circuit() -> None:
     ]
     graph = build_cable_graph(splines=splines, devices=[])
     result = partition_circuits(graph)
+
+    # The closed spline's endpoints snap to distinct grid cells ((0,0) and (3,3) at
+    # 0.3 m snap), so it forms its own 2-node component; the open spline is disjoint.
+    assert result.circuit_count == 2, f"expected 2 circuits, got {result.circuit_count}"
 
     # Both splines must be in exactly one circuit each (no cross-assignment).
     all_splines: list[str] = []
