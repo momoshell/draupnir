@@ -1062,6 +1062,84 @@ class TestBuildServiceLegend:
         assert entry is not None, f"Expected 00ff00 in {list(colour_entries.keys())}"
         assert entry.discipline == "MECHANICAL EQUIPMENT"
 
+    async def test_anchor_region_chromatic_spline_not_a_swatch(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A chromatic SPLINE whose centroid lands in a legend region is NOT a swatch (#677).
+
+        Splines are routed/connection topology; before #677 they were dropped at ingest
+        so never reached the region-swatch query. Now persisted, they must be excluded
+        (``_DWG_NON_SWATCH_ENTITY_TYPES``) or they pollute the colour legend.
+        """
+        _ = (self, cleanup_projects, enqueued_job_ids)
+
+        magenta_color = {"index": 6, "rgb": "ff00ff", "by_layer": False, "by_block": False}
+        green_color = {"index": 3, "rgb": "00ff00", "by_layer": False, "by_block": False}
+        revision_id = await _ingest_with_payload(
+            async_client,
+            monkeypatch,
+            entities=[
+                _make_entity(
+                    "anchor-001",
+                    "text",
+                    "Z010T",
+                    {"text": "LEGEND", "insertion": {"x": 0.0, "y": 0.0}},
+                ),
+                # Chromatic SPLINE routed through the legend region (centroid ~ (0.25, -0.5)).
+                # Must NOT be collected as a swatch despite a resolved colour.
+                _make_entity(
+                    "spline-001",
+                    "spline",
+                    "Wires",
+                    {
+                        "vertices": [
+                            [0.0, -0.75, 0.0],
+                            [0.25, -0.5, 0.0],
+                            [0.5, -0.25, 0.0],
+                        ],
+                        "points": [
+                            [0.0, -0.75, 0.0],
+                            [0.25, -0.5, 0.0],
+                            [0.5, -0.25, 0.0],
+                        ],
+                    },
+                    style={"color": magenta_color},
+                ),
+                # A genuine green HATCH swatch so the legend is non-empty.
+                _make_entity(
+                    "hatch-001",
+                    "hatch",
+                    "A060G5",
+                    {
+                        "vertices": [
+                            [0.0, -1.75],
+                            [0.5, -1.75],
+                            [0.5, -1.25],
+                            [0.0, -1.25],
+                        ]
+                    },
+                    style={"color": green_color},
+                ),
+                _make_entity(
+                    "label-001",
+                    "text",
+                    "Z010T",
+                    {"text": "MECHANICAL EQUIPMENT", "insertion": {"x": 0.75, "y": -1.5}},
+                ),
+            ],
+        )
+
+        async with _get_session() as db:
+            legend = await build_service_legend(db, revision_id)
+
+        assert isinstance(legend, ServiceLegend)
+        colour_entries = legend.by_colour()
+        assert "ff00ff" not in colour_entries, "Chromatic spline must not be a swatch"
+
     async def test_three_chromatic_swatches_black_borders_notes_excluded(
         self,
         async_client: httpx.AsyncClient,
