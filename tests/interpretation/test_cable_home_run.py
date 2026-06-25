@@ -25,6 +25,7 @@ import pytest
 from app.interpretation.cable_circuits import CableCircuitSet, partition_circuits
 from app.interpretation.cable_home_run import (
     compute_home_runs,
+    no_containment_home_run_result,
 )
 from app.interpretation.cable_topology import (
     DeviceFootprint,
@@ -414,7 +415,14 @@ def test_suppressed_counts_key_order() -> None:
         tray_polylines=tray,
     )
 
-    expected_keys = {"no_anchor", "unreachable_tray", "disconnected_tray", "bad_registration"}
+    # "no_containment_sheet" is always present (added in #698b for the API's no-containment path).
+    expected_keys = {
+        "no_anchor",
+        "unreachable_tray",
+        "disconnected_tray",
+        "bad_registration",
+        "no_containment_sheet",
+    }
     assert set(result.suppressed_counts.keys()) == expected_keys
 
 
@@ -511,3 +519,59 @@ def test_nan_inf_vertices_in_tray() -> None:
         if cr.status == "ok":
             assert cr.home_run_m is not None
             assert _math.isfinite(cr.home_run_m)
+
+
+# ---------------------------------------------------------------------------
+# (13) no_containment_home_run_result factory
+# ---------------------------------------------------------------------------
+
+
+def test_no_containment_factory_empty() -> None:
+    """no_containment_home_run_result with empty circuit_ids returns a valid HomeRunResult."""
+    result = no_containment_home_run_result([])
+
+    assert result.circuit_count == 0
+    assert result.ok_count == 0
+    assert result.total_home_run_m == 0.0
+    assert len(result.per_circuit) == 0
+    assert result.suppressed_counts["no_containment_sheet"] == 0
+
+
+def test_no_containment_factory_multiple_circuits() -> None:
+    """no_containment_home_run_result produces one CircuitHomeRun per id with correct status."""
+    circuit_ids = [3, 1, 2]  # unsorted input
+    result = no_containment_home_run_result(circuit_ids)
+
+    assert result.circuit_count == 3
+    assert result.ok_count == 0
+    assert result.total_home_run_m == 0.0
+    assert len(result.per_circuit) == 3
+
+    # Sorted by circuit_id.
+    assert [c.circuit_id for c in result.per_circuit] == [1, 2, 3]
+
+    for cr in result.per_circuit:
+        assert cr.status == "no_containment_sheet"
+        assert cr.home_run_m is None
+        assert cr.d_panel_m is None
+        assert cr.along_tray_m is None
+        assert cr.d_area_m is None
+        assert cr.lower_bound_m is None
+
+    assert result.suppressed_counts["no_containment_sheet"] == 3
+    # Conservation: ok + suppressed == circuit_count
+    total_accounted = result.ok_count + sum(result.suppressed_counts.values())
+    assert total_accounted == result.circuit_count
+
+
+def test_no_containment_factory_suppressed_counts_keys() -> None:
+    """suppressed_counts contains the full set of status keys including no_containment_sheet."""
+    result = no_containment_home_run_result([1])
+    expected_keys = {
+        "no_anchor",
+        "unreachable_tray",
+        "disconnected_tray",
+        "bad_registration",
+        "no_containment_sheet",
+    }
+    assert set(result.suppressed_counts.keys()) == expected_keys

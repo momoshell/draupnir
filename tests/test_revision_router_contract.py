@@ -559,6 +559,20 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/cable-estimate",
+            "get_revision_cable_estimate",
+            "get_revision_cable_estimate",
+            "CableEstimateResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "containment_revision_id", False, None, None, None, None),
+                ("query", "scope", False, "sheet", None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",
