@@ -450,12 +450,20 @@ def test_circuit_missing_from_home_run_treated_as_no_anchor() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Conservation invariant
+# Cross-checks against upstream totals (real conservation checks)
 # ---------------------------------------------------------------------------
 
 
-def test_conservation_invariant_holds() -> None:
-    """grand_base_m == Σ per-circuit base_total_m + unattributed_device_drop_m."""
+def test_conservation_cross_checks_hold() -> None:
+    """Three assembled per-circuit sums must match the independent upstream totals.
+
+    Circuit 1: device_drop=1.5, in_plan=2.5, home_run=4.0
+    Circuit 2: device_drop=0.5, in_plan=1.0, home_run=2.0
+    unattributed_device_drop=2.0
+    total_device_drop=4.0 (1.5+0.5+2.0 unattributed)
+    total_in_plan=3.5 (2.5+1.0)
+    total_home_run=6.0 (4.0+2.0)
+    """
     spare = 0.15
     params = _params(spare)
 
@@ -464,7 +472,7 @@ def test_conservation_invariant_holds() -> None:
             _circuit_estimate(1, device_drop_m=1.5, in_plan_length_m=2.5),
             _circuit_estimate(2, device_drop_m=0.5, in_plan_length_m=1.0),
         ),
-        total_device_drop_m=4.0,
+        total_device_drop_m=4.0,  # 1.5+0.5 attributed + 2.0 unattributed
         total_in_plan_length_m=3.5,
         unattributed_device_drop_m=2.0,
         unattributed_device_count=1,
@@ -479,9 +487,84 @@ def test_conservation_invariant_holds() -> None:
 
     result = assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
 
-    expected_circuit_sum = sum(c.base_total_m for c in result.per_circuit)
-    expected_grand = expected_circuit_sum + result.unattributed_device_drop_m
-    assert math.isclose(result.grand_base_m, expected_grand, abs_tol=1e-9)
+    # Cross-check 1: device drops vs independent upstream total.
+    assembled_drop = (
+        sum(c.device_drop_m for c in result.per_circuit) + result.unattributed_device_drop_m
+    )
+    assert math.isclose(assembled_drop, in_plan.total_device_drop_m, abs_tol=1e-6)
+
+    # Cross-check 2: in-plan lengths vs independent upstream total.
+    assembled_in_plan = sum(c.in_plan_length_m for c in result.per_circuit)
+    assert math.isclose(assembled_in_plan, in_plan.total_in_plan_length_m, abs_tol=1e-6)
+
+    # Cross-check 3: ok home-runs vs independent upstream total.
+    assembled_hr = sum(c.home_run_m for c in result.per_circuit if c.home_run_m is not None)
+    assert math.isclose(assembled_hr, hr.total_home_run_m, abs_tol=1e-6)
+
+
+def test_conservation_guard_fires_on_device_drop_mismatch() -> None:
+    """Guard raises RuntimeError when per-circuit device_drop sum disagrees with upstream total."""
+    spare = 0.0
+    params = _params(spare)
+
+    # total_device_drop_m=99.0 does NOT equal sum(circuits.device_drop_m)=2.0 + unattributed=0.
+    in_plan = _make_in_plan_result(
+        circuits=(_circuit_estimate(1, device_drop_m=2.0, in_plan_length_m=1.0),),
+        total_device_drop_m=99.0,  # deliberately inconsistent
+        total_in_plan_length_m=1.0,
+        spare_fraction=spare,
+    )
+    hr = _make_home_run_result(circuits=(_circuit_home_run_ok(1, home_run_m=1.0),))
+
+    with pytest.raises(RuntimeError, match="device_drop conservation violated"):
+        assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
+
+
+def test_conservation_guard_fires_on_in_plan_mismatch() -> None:
+    """Guard raises RuntimeError when per-circuit in_plan_length sum disagrees with upstream."""
+    spare = 0.0
+    params = _params(spare)
+
+    in_plan = _make_in_plan_result(
+        circuits=(_circuit_estimate(1, device_drop_m=1.0, in_plan_length_m=3.0),),
+        total_device_drop_m=1.0,
+        total_in_plan_length_m=99.0,  # deliberately inconsistent
+        spare_fraction=spare,
+    )
+    hr = _make_home_run_result(circuits=(_circuit_home_run_ok(1, home_run_m=1.0),))
+
+    with pytest.raises(RuntimeError, match="in_plan_length conservation violated"):
+        assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
+
+
+def test_conservation_guard_fires_on_home_run_mismatch() -> None:
+    """Guard raises RuntimeError when per-circuit ok home_run sum disagrees with upstream total."""
+    spare = 0.0
+    params = _params(spare)
+
+    in_plan = _make_in_plan_result(
+        circuits=(_circuit_estimate(1, device_drop_m=1.0, in_plan_length_m=1.0),),
+        total_device_drop_m=1.0,
+        total_in_plan_length_m=1.0,
+        spare_fraction=spare,
+    )
+    # Build a HomeRunResult whose total_home_run_m is inconsistent with per_circuit.
+    circuit_hr = _circuit_home_run_ok(1, home_run_m=5.0)
+    hr = HomeRunResult(
+        per_circuit=(circuit_hr,),
+        total_home_run_m=999.0,  # deliberately inconsistent with the 5.0 in per_circuit
+        ok_count=1,
+        suppressed_counts={
+            "no_anchor": 0,
+            "unreachable_tray": 0,
+            "disconnected_tray": 0,
+            "bad_registration": 0,
+        },
+        circuit_count=1,
+    )
+
+    with pytest.raises(RuntimeError, match="home_run conservation violated"):
+        assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +686,38 @@ def test_spare_fraction_mismatch_raises() -> None:
 
     with pytest.raises(RuntimeError, match="spare_fraction mismatch"):
         assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
+
+
+# ---------------------------------------------------------------------------
+# spare_fraction > 1.0 is accepted (intentionally unbounded per #695)
+# ---------------------------------------------------------------------------
+
+
+def test_spare_fraction_above_one_accepted() -> None:
+    """spare_fraction=1.5 (150%) must be accepted; with_spare = base * 2.5."""
+    spare = 1.5
+    params = _params(spare)
+
+    # drop=2.0, in_plan=2.0, home_run=0.0 (suppressed) → base=4.0
+    # with_spare = 4.0 * 2.5 = 10.0
+    in_plan = _make_in_plan_result(
+        circuits=(_circuit_estimate(1, device_drop_m=2.0, in_plan_length_m=2.0),),
+        total_device_drop_m=2.0,
+        total_in_plan_length_m=2.0,
+        spare_fraction=spare,
+    )
+    hr = _make_home_run_result(
+        circuits=(_circuit_home_run_suppressed(1, status="no_anchor"),),
+    )
+
+    result = assemble_cable_estimate(in_plan=in_plan, home_run=hr, params=params)
+
+    ce = result.per_circuit[0]
+    assert math.isclose(ce.base_total_m, 4.0)
+    assert math.isclose(ce.total_with_spare_m, 10.0)
+    assert math.isclose(result.grand_base_m, 4.0)
+    assert math.isclose(result.grand_with_spare_m, 10.0)
+    assert result.spare_fraction == 1.5
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,10 @@ Spare fraction comes from ``params.spare_fraction`` (authoritative source).  If
 ``in_plan.spare_fraction`` differs from ``params.spare_fraction`` a RuntimeError
 is raised — the caller is expected to pass a consistent params object.
 
-Conservation invariant (always asserted, fires even under python -O):
-    ``grand_base_m == Σ per_circuit.base_total_m + unattributed_device_drop_m``
+Cross-checks against INDEPENDENT upstream totals (always asserted, fire even under python -O):
+    - ``Σ per_circuit.device_drop_m + unattributed ≈ in_plan.total_device_drop_m``
+    - ``Σ per_circuit.in_plan_length_m ≈ in_plan.total_in_plan_length_m``
+    - ``Σ ok per_circuit.home_run_m ≈ home_run.total_home_run_m``
 
 Pure module — NO DB, ORM, FastAPI, SQLAlchemy, cv2, shapely, or numpy imports.
 """
@@ -33,6 +35,7 @@ Pure module — NO DB, ORM, FastAPI, SQLAlchemy, cv2, shapely, or numpy imports.
 from __future__ import annotations
 
 import math
+import types
 from dataclasses import dataclass, field
 
 from app.interpretation.cable_estimate import CableEstimateResult
@@ -66,12 +69,11 @@ class CircuitCableEstimate:
 class CableAssembly:
     """Complete assembled cable estimate across all circuits.
 
-    Conservation invariant (always asserted):
-        ``grand_base_m == Σ per_circuit.base_total_m + unattributed_device_drop_m``
-
-    ``quantity_kind`` is always ``"estimated"`` — never folded into MEASURED.
-    ``reliability["combined"]`` is always ``"mixed_reliability"`` — the grand
-    totals blend reliable, schematic, and routed terms.
+    Cross-checks against independent upstream totals are asserted on construction
+    (see :func:`assemble_cable_estimate`).  ``quantity_kind`` is always
+    ``"estimated"`` — never folded into MEASURED.  ``reliability["combined"]`` is
+    always ``"mixed_reliability"`` — the grand totals blend reliable, schematic, and
+    routed terms.
     """
 
     per_circuit: tuple[CircuitCableEstimate, ...]  # sorted by circuit_id
@@ -94,12 +96,14 @@ class CableAssembly:
 # Fixed reliability map
 # ---------------------------------------------------------------------------
 
-_RELIABILITY: dict[str, str] = {
-    "device_drop_m": "reliable",
-    "in_plan_length_m": "schematic_provisional",
-    "home_run_m": "estimated_routed",
-    "combined": "mixed_reliability",
-}
+_RELIABILITY: types.MappingProxyType[str, str] = types.MappingProxyType(
+    {
+        "device_drop_m": "reliable",
+        "in_plan_length_m": "schematic_provisional",
+        "home_run_m": "estimated_routed",
+        "combined": "mixed_reliability",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +143,12 @@ def assemble_cable_estimate(
     Raises
     ------
     RuntimeError
-        If ``params.spare_fraction != in_plan.spare_fraction`` (mismatch guard), or
-        if the grand_base_m conservation invariant is violated.
+        If ``params.spare_fraction`` and ``in_plan.spare_fraction`` differ beyond
+        tolerance, or if any of the three cross-checks against upstream totals fails
+        (device drops, in-plan lengths, home-run totals).
     """
     # Guard: spare_fraction must be consistent.
-    if not math.isclose(params.spare_fraction, in_plan.spare_fraction, rel_tol=1e-9, abs_tol=1e-12):
+    if not math.isclose(params.spare_fraction, in_plan.spare_fraction, rel_tol=1e-9, abs_tol=1e-9):
         raise RuntimeError(
             f"spare_fraction mismatch: params={params.spare_fraction!r} "
             f"!= in_plan={in_plan.spare_fraction!r}. "
@@ -188,20 +193,46 @@ def assemble_cable_estimate(
     per_circuit_list.sort(key=lambda x: x.circuit_id)
     per_circuit = tuple(per_circuit_list)
 
-    # Grand totals.
+    # -----------------------------------------------------------------------
+    # Cross-checks against INDEPENDENT upstream totals (catch join/sum/double-count bugs).
+    # These compare assembled per-circuit sums against the pre-computed totals on the
+    # input objects — the two paths are computed independently, so a mismatch is real.
+    # All fire as explicit RuntimeError so they fire even under python -O.
+    # -----------------------------------------------------------------------
+
+    # Check 1: device drops — per-circuit sum + unattributed must equal in_plan total.
+    assembled_drop_sum = (
+        sum(c.device_drop_m for c in per_circuit) + in_plan.unattributed_device_drop_m
+    )
+    if not math.isclose(assembled_drop_sum, in_plan.total_device_drop_m, abs_tol=1e-6):
+        raise RuntimeError(
+            f"device_drop conservation violated: "
+            f"Σ per_circuit.device_drop_m + unattributed={assembled_drop_sum!r} "
+            f"!= in_plan.total_device_drop_m={in_plan.total_device_drop_m!r}"
+        )
+
+    # Check 2: in-plan lengths — per-circuit sum must equal in_plan total.
+    assembled_in_plan_sum = sum(c.in_plan_length_m for c in per_circuit)
+    if not math.isclose(assembled_in_plan_sum, in_plan.total_in_plan_length_m, abs_tol=1e-6):
+        raise RuntimeError(
+            f"in_plan_length conservation violated: "
+            f"Σ per_circuit.in_plan_length_m={assembled_in_plan_sum!r} "
+            f"!= in_plan.total_in_plan_length_m={in_plan.total_in_plan_length_m!r}"
+        )
+
+    # Check 3: home-run totals — per-circuit ok sum must equal home_run total.
+    assembled_hr_sum = sum(c.home_run_m for c in per_circuit if c.home_run_m is not None)
+    if not math.isclose(assembled_hr_sum, home_run.total_home_run_m, abs_tol=1e-6):
+        raise RuntimeError(
+            f"home_run conservation violated: "
+            f"Σ per_circuit ok home_run_m={assembled_hr_sum!r} "
+            f"!= home_run.total_home_run_m={home_run.total_home_run_m!r}"
+        )
+
+    # Grand totals — construction only (cross-checks above protect the inputs).
     circuit_base_sum = sum(c.base_total_m for c in per_circuit)
     grand_base_m = circuit_base_sum + in_plan.unattributed_device_drop_m
     grand_with_spare_m = grand_base_m * (1.0 + spare)
-
-    # Conservation invariant — explicit RuntimeError, fires even under python -O.
-    expected_grand_base = circuit_base_sum + in_plan.unattributed_device_drop_m
-    if not math.isclose(grand_base_m, expected_grand_base, rel_tol=1e-9, abs_tol=1e-6):
-        raise RuntimeError(
-            f"grand_base_m conservation violated: "
-            f"circuit_sum={circuit_base_sum!r} + "
-            f"unattributed={in_plan.unattributed_device_drop_m!r} = {expected_grand_base!r} "
-            f"!= grand_base_m={grand_base_m!r}"
-        )
 
     return CableAssembly(
         per_circuit=per_circuit,
