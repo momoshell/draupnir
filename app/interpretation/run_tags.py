@@ -39,7 +39,7 @@ _UNDERLINE_DIRECTIVE_RE = re.compile(r"^\\L", re.IGNORECASE)
 
 # Pipe-tag content patterns — use re.search so any garbled Ø prefix is skipped.
 # Order matters: rect first (contains 'x'), then round+mm, then bare round.
-_RECT_RE = re.compile(r"(\d+)\s*[xX]\s*(\d+)\s+([A-Za-z/]+)")
+_RECT_RE = re.compile(r"(\d+)\s*[xX]\s*(\d+)\s+(.+)$")
 _ROUND_MM_RE = re.compile(r"(\d+)\s*mm\s+([A-Za-z/]+)", re.IGNORECASE)
 _ROUND_RE = re.compile(r"(\d+)\s+([A-Za-z/]+)")
 
@@ -174,14 +174,33 @@ def _parse_tag_inner(text: str) -> TagObservation | None:
     if not normalized:
         return None
 
-    # 1. Rectangular: WxH SERVICE
+    # 1. Rectangular: WxH SERVICE [SERVICE...]
     m = _RECT_RE.search(normalized)
     if m:
         width = int(m.group(1))
         height = int(m.group(2))
-        service = m.group(3).strip().upper()
-        if not _valid_service(service):
-            return None
+        tail = m.group(3).strip()
+        # Build multi-word TYPE as the maximal leading run of service-like tokens,
+        # stopping at the first function word/unit so note prose doesn't over-capture.
+        type_tokens: list[str] = []
+        prev_was_token = False
+        for tok in tail.split():
+            t = tok.upper()
+            if t == "&":
+                if prev_was_token:
+                    type_tokens.append("&")
+                    prev_was_token = False  # a following & (or end) won't be kept
+                    continue
+                break  # leading or doubled & -> stop the run
+            if t in _NON_SERVICE_WORDS or t in _NON_SERVICE_TOKENS:
+                break
+            type_tokens.append(t)
+            prev_was_token = True
+        while type_tokens and type_tokens[-1] == "&":  # strip dangling trailing &
+            type_tokens.pop()
+        if not type_tokens:
+            return None  # first token was prose / unit — not a real tag
+        service = " ".join(type_tokens)
         raw_size = f"{m.group(1)}x{m.group(2)}"
         return TagObservation(
             service=service,
