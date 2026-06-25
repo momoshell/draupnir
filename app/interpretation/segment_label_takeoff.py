@@ -14,14 +14,16 @@ For each polyline, decompose into consecutive-point segments. For each segment:
    (service) bucket and (service, size_raw, size_kind) bucket.
 4. Else → ``unknown_length_m``.
 
-Tie-break: smallest distance, then lowest ``(service, size_raw)`` lexicographically.
+Tie-break: smallest distance (epsilon-stable — labels within ``_EQ_EPSILON`` metres of each
+other are treated as tied), then lowest ``(service, size_raw, size_kind)`` lexicographically.
+This makes winner selection order-independent of the ``labels`` input list.
 
 **Invariants:**
 
 - ``Σ(per_service lengths) + unknown_length_m == total_length_m`` within ±0.1 m.
 - ``Σ(per_size lengths for a service) == per_service length for that service``.
-- ``per_service`` sorted by ``service``; ``per_size`` sorted by ``(service, size_raw)``.
-- Deterministic (tie-break is fully ordered; label list is consumed in deterministic order).
+- ``per_service`` sorted by ``service``; ``per_size`` sorted by ``(service, size_raw, size_kind)``.
+- Deterministic (tie-break is fully ordered and label-order-independent).
 
 Pure module — NO DB, ORM, FastAPI, SQLAlchemy, cv2, skimage, or shapely.
 All distances are Euclidean in whatever units the caller supplies (expects metres).
@@ -78,6 +80,15 @@ class SegmentLabelResult:
 
 
 # ---------------------------------------------------------------------------
+# Internal constants
+# ---------------------------------------------------------------------------
+
+# Epsilon for float distance comparisons — labels within this many metres of each other
+# are treated as tied and resolved lexicographically, matching run_service_identity precedent.
+_EQ_EPSILON: float = 1e-9
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -90,9 +101,9 @@ def _dist(p: tuple[float, float], q: tuple[float, float]) -> float:
     return math.hypot(p[0] - q[0], p[1] - q[1])
 
 
-def _tie_key(label: SegmentLabel, distance: float) -> tuple[float, str, str]:
-    """Deterministic sort key: (distance, service, size_raw or '')."""
-    return (distance, label.service, label.size_raw or "")
+def _label_lex_key(label: SegmentLabel) -> tuple[str, str, str]:
+    """Lexicographic tie-break key: (service, size_raw or '', size_kind or '')."""
+    return (label.service, label.size_raw or "", label.size_kind or "")
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +163,22 @@ def compute_segment_label_lengths(
                 continue
 
             # Find nearest label by midpoint-to-point euclidean distance.
+            # Epsilon-stable: labels within _EQ_EPSILON metres are tied; lexicographic
+            # key (service, size_raw, size_kind) breaks ties order-independently.
             best_label: SegmentLabel | None = None
             best_dist: float = math.inf
 
             for lbl in labels:
                 d = _dist(mid, lbl.point)
-                bl_key = (best_label.service, best_label.size_raw or "") if best_label else None
-                lbl_key = (lbl.service, lbl.size_raw or "")
-                if d < best_dist or (d == best_dist and bl_key is not None and lbl_key < bl_key):
+                if d < best_dist - _EQ_EPSILON:
+                    # Clearly closer — new best unconditionally.
                     best_dist = d
                     best_label = lbl
+                elif abs(d - best_dist) <= _EQ_EPSILON and best_label is not None:
+                    # Tied within epsilon — pick lexicographically lower label.
+                    if _label_lex_key(lbl) < _label_lex_key(best_label):
+                        best_dist = d
+                        best_label = lbl
 
             if best_label is not None and best_dist <= nearest_max_m:
                 svc = best_label.service
@@ -180,7 +197,7 @@ def compute_segment_label_lengths(
         SegmentSizeLength(service=svc, size_raw=sr, size_kind=sk, length_m=round(length, 6))
         for (svc, sr, sk), length in sorted(
             size_lengths.items(),
-            key=lambda item: (item[0][0], item[0][1] or ""),
+            key=lambda item: (item[0][0], item[0][1] or "", item[0][2] or ""),
         )
     )
 

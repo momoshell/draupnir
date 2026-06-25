@@ -156,6 +156,12 @@ async def _enqueue_centerline_materialization(
 # is the follow-on.
 _DEFAULT_TAG_RADIUS: float = 5.0
 
+# Per-segment nearest-label attribution radius in metres (#687).
+# Calibrated independently from _DEFAULT_TAG_RADIUS (which governs tag→run FUSION).
+# Coincidentally the same value today; kept separate so changing fusion radius does not
+# silently shift segment attribution.
+_SEGMENT_LABEL_MAX_M: float = 5.0
+
 
 @service_takeoff_router.get(
     "/revisions/{revision_id}/service-takeoff",
@@ -386,7 +392,7 @@ async def get_revision_service_takeoff(
         raw_seg: SegmentLabelResult = compute_segment_label_lengths(
             centerline_polylines=flat_polylines,
             labels=seg_labels,
-            nearest_max_m=_DEFAULT_TAG_RADIUS,
+            nearest_max_m=_SEGMENT_LABEL_MAX_M,
         )
         segment_label_attribution = ServiceSegmentLabelAttributionRead(
             per_service=[

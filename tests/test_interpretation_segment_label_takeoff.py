@@ -250,6 +250,39 @@ def test_deterministic_tie_break_consistent_regardless_of_input_order() -> None:
     assert result_a.total_length_m == result_b.total_length_m
 
 
+def test_epsilon_tie_break_order_independent_near_equal_distance() -> None:
+    """Epsilon-stable tie-break: near-equal distances resolve identically regardless of label order.
+
+    Two labels are placed at slightly different distances from the segment midpoint (within
+    _EQ_EPSILON). The lexicographically lower label must always win, independent of which label
+    appears first in the input list. This guards against the exact-float-equality brittleness
+    where floating-point rounding can cause the loop to produce different winners depending on
+    iteration order.
+
+    Arrange: segment from (-0.5, 0) to (0.5, 0), mid=(0, 0).
+      Label OXY at (0, 1.0):      dist = 1.0
+      Label VAC at (0, 1.0 + 5e-10): dist = 1.0 + 5e-10 (within _EQ_EPSILON=1e-9 of OXY)
+    Tie within epsilon: OXY < VAC lexicographically → OXY wins regardless of input order.
+    """
+    oxy = _label(0.0, 1.0, "OXY", "40", "round")
+    # Place VAC at a distance epsilon/2 farther — within the tie-band.
+    vac = SegmentLabel(point=(0.0, 1.0 + 5e-10), service="VAC", size_raw="54", size_kind="round")
+    polylines = [_polyline((-0.5, 0.0), (0.5, 0.0))]
+
+    result_a = compute_segment_label_lengths(
+        centerline_polylines=polylines, labels=[oxy, vac], nearest_max_m=5.0
+    )
+    result_b = compute_segment_label_lengths(
+        centerline_polylines=polylines, labels=[vac, oxy], nearest_max_m=5.0
+    )
+    # Both orderings must produce identical results.
+    assert result_a.per_service == result_b.per_service
+    assert result_a.per_size == result_b.per_size
+    # The lexicographically lower label (OXY) must win.
+    assert len(result_a.per_service) == 1
+    assert result_a.per_service[0].service == "OXY"
+
+
 # ---------------------------------------------------------------------------
 # (8) Multi-point polyline decomposes into consecutive segments
 # ---------------------------------------------------------------------------
