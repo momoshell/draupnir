@@ -114,7 +114,17 @@ def _route_contract() -> list[
 
 def test_revision_router_routes_match_baseline_contract() -> None:
     # Arrange
-    expected_contract = [
+    expected_contract: list[
+        tuple[
+            str,
+            str,
+            str,
+            str,
+            str | None,
+            int | None,
+            tuple[RouteParameterContract, ...],
+        ]
+    ] = [
         (
             "GET",
             "/files/{file_id}/revisions",
@@ -573,6 +583,25 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/floors/takeoff",
+            "get_floor_takeoff",
+            "get_floor_takeoff",
+            "FloorTakeoffResponse",
+            None,
+            (
+                ("query", "reference_revision_id", True, None, None, None, None),
+                ("query", "member", False, [], None, None, None),
+                ("query", "containment_revision_id", False, None, None, None, None),
+                ("query", "scope", False, "sheet", None, None, None),
+                ("query", "strategy", False, "auto", None, None, None),
+                ("query", "snap_tolerance", False, 0.0, 0, None, None),
+                ("query", "min_area", False, 0.0, 0, None, None),
+                ("query", "voronoi_fallback", False, True, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",
@@ -840,6 +869,22 @@ def test_revision_router_routes_match_baseline_contract() -> None:
 
     # Assert
     assert actual_contract == expected_contract
+
+
+def test_floor_takeoff_route_is_mounted_in_revisions_router() -> None:
+    """Mounting-regression guard: /floors/takeoff must be in revisions_router.routes."""
+    floor_route = next(
+        (
+            r
+            for r in revisions_router.routes
+            if isinstance(r, APIRoute) and r.path == "/floors/takeoff"
+        ),
+        None,
+    )
+    assert floor_route is not None, (
+        "/floors/takeoff is not mounted in revisions_router — "
+        "include floor_takeoff_router in app/api/v1/revisions.py"
+    )
 
 
 def test_revision_router_excludes_legacy_entity_and_estimate_post_routes() -> None:

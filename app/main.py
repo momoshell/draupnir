@@ -55,6 +55,12 @@ _OPENAPI_TAGS = [
         "name": "Cable Estimate",
         "description": "Estimated cable per circuit (home-run + in-plan + drops x (1+spare)).",
     },
+    {
+        "name": "Floor Takeoff",
+        "description": (
+            "Fused per-room multi-discipline quantity takeoff across a floor's discipline sheets."
+        ),
+    },
     {"name": "Validation", "description": "Validation reports and extraction coverage."},
     {"name": "Changesets", "description": "Canonical edit changesets: create, validate, apply."},
     {"name": "Quantities", "description": "Quantity takeoffs and their items."},

@@ -1,15 +1,14 @@
-"""Response schema for the per-floor takeoff endpoint (issue #717, Phase R-C skeleton).
+"""Response schema for the per-floor takeoff endpoint (issue #717, Phase R-C/R-G).
 
-This module defines the read schema for a floor-level takeoff response. It is a
-skeleton — R-D (measured quantities), R-E (counted items), and R-F (estimated
-circuits) will each add fields to their respective sub-blocks. Do NOT add
-``extra="forbid"`` to any populatable block; leaf metadata models are fine.
+This module defines the read schema for a floor-level takeoff response, fully
+populated for Phase R-G.
 
-This module must NOT be imported by ``main.py`` or any router until R-G.
+Do NOT add ``extra="forbid"`` to any populatable block; leaf metadata models are fine.
 """
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -20,23 +19,34 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class MemberRegistrationRead(BaseModel):
-    """A member type registered for takeoff on this floor."""
+    """A member revision successfully co-registered for this floor takeoff."""
 
     model_config = ConfigDict(extra="forbid")
 
-    member_type: str = Field(..., description="Member type identifier (e.g. cable, pipe, duct)")
-    display_name: str = Field(..., description="Human-readable display label")
-    unit: str = Field(..., description="Unit of measure for quantities (e.g. m, ea)")
+    revision_id: UUID = Field(..., description="Drawing revision UUID")
+    role: str = Field(..., description="Caller-defined role label (e.g. containment, power)")
+    quality: str = Field(..., description="Registration quality: good | degraded | failed")
+    dx: float = Field(..., description="X translation in drawing units")
+    dy: float = Field(..., description="Y translation in drawing units")
+    rotation_rad: float = Field(..., description="Rotation in radians applied to align member")
+    scale: float = Field(..., description="Scale factor (1.0 = no scale)")
+    matched_count: int = Field(..., description="Number of matched grid fiducials")
+    median_residual_m: float | None = Field(
+        None, description="Median residual in metres after registration"
+    )
+    max_residual_m: float | None = Field(
+        None, description="Max residual in metres after registration"
+    )
 
 
-class FloorMemberRead(BaseModel):
-    """A takeoff member instance on this floor."""
+class FailedMemberRead(BaseModel):
+    """A member revision that failed the floor registration gate."""
 
     model_config = ConfigDict(extra="forbid")
 
-    member_id: str = Field(..., description="Canonical member entity id")
-    member_type: str = Field(..., description="Member type identifier")
-    display_name: str | None = Field(None, description="Display label override for this member")
+    revision_id: UUID = Field(..., description="Drawing revision UUID")
+    role: str = Field(..., description="Caller-defined role label")
+    reason: str = Field(..., description="Reason for registration failure")
 
 
 # ---------------------------------------------------------------------------
@@ -47,18 +57,36 @@ class FloorMemberRead(BaseModel):
 class RoomMeasuredItem(BaseModel):
     """One measured quantity item attributed to a room (R-D, length in metres)."""
 
-    member_type: str = Field(..., description="Member type this measurement covers")
-    length_m: float = Field(..., ge=0.0, description="Total measured length in metres")
-    reliability: str = Field(
-        ..., description="Reliability label: reliable | schematic_provisional | estimated_routed"
+    member_revision_id: str = Field(
+        ..., description="UUID of the drawing revision this geometry came from"
+    )
+    role: str = Field(..., description="Caller-defined role label for this member")
+    service: str = Field(..., description="Resolved service name (or 'unknown')")
+    size_raw: str | None = Field(None, description="Raw size string from the drawing")
+    size_kind: str | None = Field(None, description="Normalised size kind")
+    boundary_basis: str | None = Field(
+        None, description="Evidence path: polygon | voronoi | null (unassigned)"
+    )
+    confidence: float | None = Field(None, ge=0.0, le=1.0, description="Assignment confidence")
+    needs_review: bool = Field(False, description="True when the assignment is heuristic")
+    drawing_length: float = Field(..., ge=0.0, description="Measured length in drawing units")
+    real_length_m: float | None = Field(None, ge=0.0, description="Real-world length in metres")
+    basis: str = Field(..., description="real_world | drawing_units_only")
+    length_provisional: bool = Field(
+        False, description="True when the length is provisional (e.g. from a double-line estimate)"
     )
 
 
 class RoomCountedItem(BaseModel):
     """One counted item attributed to a room (R-E, device/fitting count)."""
 
-    member_type: str = Field(..., description="Member type this count covers")
+    type_name: str = Field(..., description="Device/fitting type name")
     count: int = Field(..., ge=0, description="Number of items in this room")
+    source_revision_id: str | None = Field(
+        None,
+        description="Source revision UUID for this count; null in v1 (counts_by_room doesn't "
+        "retain per-(type,room) source)",
+    )
 
 
 class RoomEstimatedBlock(BaseModel):
@@ -67,6 +95,16 @@ class RoomEstimatedBlock(BaseModel):
     Populated incrementally by R-F; no extra="forbid" so future fields can be added.
     """
 
+    quantity_kind: str = Field(
+        "estimated",
+        description="Always 'estimated' — NEVER summed with MEASURED",
+    )
+    device_drop_m: float = Field(
+        0.0, ge=0.0, description="Total device-drop cable length attributed to this room"
+    )
+    home_run_m: float = Field(
+        0.0, ge=0.0, description="Total home-run cable length attributed to this room"
+    )
     circuit_ids: list[int] = Field(
         default_factory=list,
         description="Circuit identifiers whose estimate is attributed to this room",
@@ -120,11 +158,18 @@ class RoomBlock(BaseModel):
 
 
 class EstimatedCircuitItem(BaseModel):
-    """A single estimated-circuit record in the unassigned block (R-F overflow)."""
+    """A single estimated-circuit record at floor level (R-F, in-plan length)."""
 
     circuit_id: int = Field(..., description="Circuit identifier")
-    length_m: float = Field(..., ge=0.0, description="Estimated length for this circuit in metres")
-    reliability: str = Field(..., description="Reliability label for the estimate")
+    in_plan_length_m: float = Field(
+        ..., ge=0.0, description="In-plan length for this circuit in metres"
+    )
+    rooms_touched: list[str | None] = Field(
+        default_factory=list,
+        description=(
+            "Room numbers touched by this circuit's devices (context only; may include null)"
+        ),
+    )
 
 
 class UnassignedBlock(BaseModel):
@@ -141,9 +186,58 @@ class UnassignedBlock(BaseModel):
         default_factory=list,
         description="Counted items that could not be assigned to a room",
     )
-    estimated_circuits: list[EstimatedCircuitItem] = Field(
-        default_factory=list,
-        description="Estimated circuits that could not be assigned to a room (R-F)",
+    estimated: RoomEstimatedBlock | None = Field(
+        None,
+        description="Estimated-circuit unassigned bucket for this floor (R-F)",
+    )
+
+
+class EstimatedMeta(BaseModel):
+    """Floor-level metadata for estimated quantities."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quantity_kind: str = Field(..., description="Always 'estimated'")
+    reliability: dict[str, str] = Field(..., description="Reliability labels from CableAssembly")
+    params_stamp: dict[str, Any] = Field(
+        ..., description="CableEstimateParams snapshot used to produce this estimate"
+    )
+    source: dict[str, str | None] = Field(
+        ..., description="Provenance: lighting_revision_id, containment_revision_id"
+    )
+
+
+class FloorTakeoffSummary(BaseModel):
+    """Summary statistics for the floor takeoff response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rooms: int = Field(..., description="Total number of rooms in this takeoff")
+    named_rooms: int = Field(..., description="Rooms with a non-null room_name (human label)")
+    members_registered: int = Field(..., description="Members that passed registration")
+    members_failed: int = Field(..., description="Members that failed registration")
+    voronoi_fallback_rooms: int = Field(
+        ..., description="Rooms that received at least one voronoi-basis item"
+    )
+    unscaled: bool = Field(
+        ...,
+        description="True when any measured item could not be converted to real-world metres",
+    )
+    no_anchor_fraction: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of total home-run length that is unassigned "
+            "(home_run_in_unassigned / total_home_run). Informational — not a pass/fail gate."
+        ),
+    )
+    total_measured_m_by_discipline: dict[str, float] = Field(
+        ...,
+        description=(
+            "Total real-world measured length in metres grouped by role "
+            "(discipline). Sums real_length_m for items where basis=='real_world'."
+        ),
     )
 
 
@@ -153,24 +247,42 @@ class UnassignedBlock(BaseModel):
 
 
 class FloorTakeoffResponse(BaseModel):
-    """Per-floor takeoff response — skeleton for Phase R (issue #676).
+    """Per-floor fused multi-discipline quantity takeoff (Phase R-G, issue #721).
 
-    Each room is represented by a :class:`RoomBlock` under ``rooms``. Items
-    that cannot be attributed to any room appear in ``unassigned``. Future
-    phases (R-D through R-G) will populate the kind sub-blocks.
+    Aggregates measured, counted, and estimated quantities across all registered
+    discipline sheets for a single floor, attributed to individual rooms.
     """
 
-    revision_id: UUID = Field(..., description="Drawing revision this takeoff covers")
-    floor_id: str | None = Field(
-        None, description="Floor / storey identifier, if known from the drawing"
+    reference_revision_id: UUID = Field(
+        ..., description="Reference drawing revision that defines the registration frame"
+    )
+    reference_role: str = Field(
+        ..., description="Role label for the reference revision (e.g. 'lighting')"
+    )
+    members: list[MemberRegistrationRead] = Field(
+        default_factory=list,
+        description="Member revisions that passed co-registration",
+    )
+    members_failed: list[FailedMemberRead] = Field(
+        default_factory=list,
+        description="Member revisions that failed co-registration",
     )
     rooms: list[RoomBlock] = Field(
         default_factory=list,
         description="Takeoff data grouped by room, in room-number order",
     )
     unassigned: UnassignedBlock = Field(
-        default_factory=UnassignedBlock,
+        default_factory=lambda: UnassignedBlock(estimated=None),
         description="Items that could not be attributed to any room",
+    )
+    estimated_circuits: list[EstimatedCircuitItem] = Field(
+        default_factory=list,
+        description="Floor-level in-plan circuit contributions (not per-room)",
+    )
+    estimated_meta: EstimatedMeta | None = Field(
+        None,
+        description="Floor-level estimated metadata (reliability, params_stamp, source); "
+        "null when no estimated data is available",
     )
     room_registry_strategy: str = Field(
         ...,
@@ -181,4 +293,7 @@ class FloorTakeoffResponse(BaseModel):
     voronoi_fallback_enabled: bool = Field(
         True,
         description="Whether Voronoi fallback was enabled when building the room registry",
+    )
+    summary: FloorTakeoffSummary = Field(
+        ..., description="Aggregate statistics for this floor takeoff"
     )
