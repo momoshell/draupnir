@@ -27,6 +27,7 @@ _CENTERLINE_PDF_MODULE = "app.ingestion.centerline_pdf"
 _CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
 _FLOOR_REGISTRATION_MODULE = "app.interpretation.floor_registration"
 _ROOM_VORONOI_MODULE = "app.interpretation.room_voronoi"
+_FLOOR_COUNTED_MODULE = "app.interpretation.floor_counted"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -508,4 +509,38 @@ def test_room_fusion_does_not_import_skimage_in_isolation() -> None:
     result = _check_after_isolated_import([_ROOM_FUSION_MODULE], ["skimage"])
     assert result.returncode == 0, (
         f"skimage imported by room_fusion.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- floor_counted (isolated; cv2/skimage banned; shapely allowed, #719)
+# ---------------------------------------------------------------------------
+
+
+def test_floor_counted_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.floor_counted must not pull cv2 when imported alone.
+
+    floor_counted is a pure module (stdlib + shapely + app.interpretation only).
+    ADR-008: no heavy CV libs permitted.
+
+    Arrange: script imports only floor_counted.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_COUNTED_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by floor_counted.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_floor_counted_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.floor_counted must not pull skimage when imported alone.
+
+    Arrange: script imports only floor_counted.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_COUNTED_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by floor_counted.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )

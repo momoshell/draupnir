@@ -25,13 +25,13 @@ from app.interpretation.device_identity import (
     BASIS_NONE,
     KIND_ARCHITECTURE,
     KIND_DEVICE,
-    KIND_LEGEND_EXEMPLAR,
     KIND_UNKNOWN,
     STATUS_UNKNOWN,
     DeviceIdentity,
     resolve_device_identities,
 )
 from app.interpretation.devices import (
+    _typed_from_identities,
     attach_tags,
     enumerate_devices,
     load_tag_candidates,
@@ -163,21 +163,16 @@ async def list_revision_devices(
         "unresolved_count": unresolved_count,
     }
 
-    # Build schedule_by_type — EXCLUDES legend_exemplar from device buckets.
+    # Build schedule_by_type — reuse the identities already resolved above (no second pass).
+    # KIND_LEGEND_EXEMPLAR is excluded from _typed_from_identities output (not counted).
+    typed_devices = _typed_from_identities(all_tagged, identities)
     type_counts: Counter[str] = Counter()
     arch_count = 0
-    for identity in identities:
-        if identity.kind == KIND_LEGEND_EXEMPLAR:
-            # Kept in items but excluded from the device count denominator.
-            continue
-        if identity.kind == KIND_ARCHITECTURE:
+    for td in typed_devices:
+        if td.type_name == "architecture":
             arch_count += 1
-        elif identity.kind == KIND_DEVICE:
-            bucket = identity.type_name if identity.type_name else "unresolved"
-            type_counts[bucket] += 1
         else:
-            # annotation/unknown land in unresolved bucket.
-            type_counts["unresolved"] += 1
+            type_counts[td.type_name] += 1
 
     schedule_by_type: list[dict[str, object]] = []
     for type_name, count in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])):
