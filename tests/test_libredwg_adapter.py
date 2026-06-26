@@ -2103,6 +2103,7 @@ async def test_libredwg_adapter_maps_supported_hatch_entities_into_canonical_pay
             "closed": True,
             "area": 12.0,
             "perimeter": 14.0,
+            "pattern_name": "",
         },
     }
     assert entity["properties"] == {
@@ -2290,6 +2291,7 @@ async def test_libredwg_adapter_maps_point_and_vertex_hatch_variants_into_canoni
         "closed": True,
         "area": 12.0,
         "perimeter": 14.0,
+        "pattern_name": "",
     }
     assert entity["geometry"]["vertices"] == _HATCH_SQUARE_POINTS
     assert entity["geometry"]["boundary_loops"] == (_HATCH_SQUARE_POINTS,)
@@ -5659,3 +5661,147 @@ async def test_libredwg_adapter_spline_entity_counts(
     assert counts["supported_splines"] == 2
     assert counts["unsupported_drawables"] == 0
     assert counts["supported_geometry"] >= 3
+
+
+# ---------------------------------------------------------------------------
+# HATCH pattern_name + is_solid_fill fix (#678)
+# ---------------------------------------------------------------------------
+
+_HATCH_SQUARE_LOOP_EDGES = [
+    {"type": "LINE", "start": {"x": 0, "y": 0, "z": 0}, "end": {"x": 4, "y": 0, "z": 0}},
+    {"type": "LINE", "start": {"x": 4, "y": 0, "z": 0}, "end": {"x": 4, "y": 3, "z": 0}},
+    {"type": "LINE", "start": {"x": 4, "y": 3, "z": 0}, "end": {"x": 0, "y": 3, "z": 0}},
+    {"type": "LINE", "start": {"x": 0, "y": 3, "z": 0}, "end": {"x": 0, "y": 0, "z": 0}},
+]
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_pattern_name_captured_for_named_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_solid_fill=0 + name="FP_6" → fill_type=pattern, pattern_name="FP_6", pattern_type=2."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A1",
+                    "layer": "Containment",
+                    "name": "FP_6",
+                    "is_solid_fill": 0,
+                    "pattern_type": 2,
+                    "is_gradient_fill": 0,
+                    "gradient_name": "",
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "hatch"
+    gs = entity["geometry"]["geometry_summary"]
+    assert gs["fill_type"] == "pattern"
+    assert gs["pattern_name"] == "FP_6"
+    assert gs["pattern_type"] == 2
+    assert "is_gradient_fill" not in gs
+    assert "gradient_name" not in gs
+    assert entity["properties"]["fill_type"] == "pattern"
+    assert entity["pattern_name"] == "FP_6"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_pattern_name_captured_for_solid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_solid_fill=1 + name="SOLID" → fill_type=solid, pattern_name="SOLID", pattern_type=1."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A2",
+                    "layer": "Filled",
+                    "name": "SOLID",
+                    "is_solid_fill": 1,
+                    "pattern_type": 1,
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity["entity_type"] == "hatch"
+    gs = entity["geometry"]["geometry_summary"]
+    assert gs["fill_type"] == "solid"
+    assert gs["pattern_name"] == "SOLID"
+    assert gs["pattern_type"] == 1
+    assert entity["properties"]["fill_type"] == "solid"
+    assert entity["pattern_name"] == "SOLID"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_legacy_solid_key_still_classifies_as_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy 'solid' key=False (back-compat) → fill_type=pattern; no is_solid_fill key present."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A3",
+                    "layer": "Legacy",
+                    "solid": False,
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    gs = entity["geometry"]["geometry_summary"]
+    assert gs["fill_type"] == "pattern"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_gradient_fields_captured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """is_gradient_fill=1 + gradient_name="LINEAR" → geometry_summary carries gradient fields."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A4",
+                    "layer": "Gradient",
+                    "name": "LINEAR",
+                    "is_solid_fill": 0,
+                    "pattern_type": 2,
+                    "is_gradient_fill": 1,
+                    "gradient_name": "LINEAR",
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    entity = entities[0]
+    gs = entity["geometry"]["geometry_summary"]
+    assert gs["is_gradient_fill"] is True
+    assert gs["gradient_name"] == "LINEAR"
+    assert gs["pattern_name"] == "LINEAR"

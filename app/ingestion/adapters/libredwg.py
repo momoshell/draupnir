@@ -2641,6 +2641,19 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
     fill_type = "pattern" if _hatch_is_non_solid_fill(record) else "solid"
     kind = "hatch"
     closed = True
+    # Capture the pattern name from the "name" field (e.g. "SOLID", "FP_6").
+    pattern_name = _first_string(record, "name") or ""
+    # Raw pattern_type int: 1=solid, 2=pattern (corroborates fill_type).
+    raw_pattern_type = _first_value(record, "pattern_type")
+    pattern_type: int | None = (
+        int(raw_pattern_type) if isinstance(raw_pattern_type, (int, float)) else None
+    )
+    # Gradient fields.
+    raw_is_gradient = _first_value(record, "is_gradient_fill")
+    is_gradient_fill: bool = (
+        _coerce_boolish(raw_is_gradient) is True if raw_is_gradient is not None else False
+    )
+    gradient_name = _first_string(record, "gradient_name") or ""
     geometry_summary: _JSONDict = {
         "kind": kind,
         "vertex_count": len(all_vertices),
@@ -2649,7 +2662,14 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
         "closed": closed,
         "area": area,
         "perimeter": perimeter,
+        "pattern_name": pattern_name,
     }
+    if pattern_type is not None:
+        geometry_summary["pattern_type"] = pattern_type
+    if is_gradient_fill:
+        geometry_summary["is_gradient_fill"] = True
+    if gradient_name:
+        geometry_summary["gradient_name"] = gradient_name
     return _HatchBuildResult(
         _build_supported_geometry_entity(
             record,
@@ -2687,6 +2707,7 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
                 "area": area,
                 "perimeter": perimeter,
                 "fill_type": fill_type,
+                "pattern_name": pattern_name,
             },
         )
     )
@@ -4421,7 +4442,9 @@ def _hatch_edge_is_curved(edge: Mapping[str, Any]) -> bool:
 
 
 def _hatch_is_non_solid_fill(record: Mapping[str, Any]) -> bool:
-    solid_value = _first_value(record, "solid", "is_solid", "solid_fill")
+    # "is_solid_fill" is the real dwgread JSON key (1=solid, 0=pattern).
+    # Legacy aliases "solid"/"is_solid"/"solid_fill" are kept for back-compat.
+    solid_value = _first_value(record, "is_solid_fill", "solid", "is_solid", "solid_fill")
     return solid_value is not None and _coerce_boolish(solid_value) is False
 
 
