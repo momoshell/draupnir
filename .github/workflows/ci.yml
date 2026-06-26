@@ -114,8 +114,20 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Run the FULL integration matrix on pull_request AND push. Previously PRs ran
+      # only the db_api lane while db_worker/db_estimation_export/db_lineage/db_migration
+      # ran only on push to main -- so worker-lane regressions were invisible until after
+      # merge and turned main red post-merge (#673 legend leak, #705 CENTERLINE import
+      # cycle both slipped through this blind spot). Running every lane on PRs costs more
+      # CI minutes but catches these pre-merge. Do NOT re-add a pull_request-only subset
+      # without restoring an equivalent pre-merge guard for the worker lanes (#691).
       matrix:
-        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"lane_name":"db_api","marker":"db_api"}]' || '[{"lane_name":"db_api","marker":"db_api"},{"lane_name":"db_worker","marker":"db_worker"},{"lane_name":"db_estimation_export","marker":"db_estimation_export"},{"lane_name":"db_lineage","marker":"db_lineage"},{"lane_name":"db_migration","marker":"db_migration"}]') }}
+        include:
+          - { lane_name: db_api, marker: db_api }
+          - { lane_name: db_worker, marker: db_worker }
+          - { lane_name: db_estimation_export, marker: db_estimation_export }
+          - { lane_name: db_lineage, marker: db_lineage }
+          - { lane_name: db_migration, marker: db_migration }
     services:
       postgres:
         image: postgres:18-alpine
