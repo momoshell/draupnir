@@ -59,5 +59,5 @@ async def test_counted_fusion_realdata_smoke(db: Any) -> None:
 
     assert isinstance(result.excluded_kinds, dict)
     assert isinstance(result.counts_by_room, dict)
-    # At least the reference revision should contribute some devices on a real drawing.
-    assert len(result.assignments) >= 0  # non-negative (may be 0 on a sparse drawing)
+    # The reference revision must contribute at least one counted device on a real drawing.
+    assert len(result.assignments) >= 1

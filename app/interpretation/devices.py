@@ -12,15 +12,19 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.interpretation.legend_dictionary import LegendDictionary
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.interpretation.models import EntityRow
 from app.models.revision_materialization import RevisionBlock, RevisionEntity
+
+if TYPE_CHECKING:
+    from app.interpretation.device_identity import DeviceIdentity
 
 # Layer-name tokens that, by default, mark a text layer as carrying device tags.
 _DEFAULT_TAG_TOKENS: tuple[str, ...] = ("tag", "device")
@@ -394,3 +398,137 @@ def schedule_from_devices(devices: Sequence[Device]) -> list[dict[str, Any]]:
         counts[device.block_ref] = counts.get(device.block_ref, 0) + 1
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0] or "")))
     return [{"block_ref": block_ref, "count": count} for block_ref, count in ordered]
+
+
+# ---------------------------------------------------------------------------
+# TypedDevice — typed, positioned device for cross-member fusion (R-E, #719)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TypedDevice:
+    """A device instance resolved to its type bucket, preserving its world anchor.
+
+    ``kind`` is one of the KIND_* constants from ``device_identity``.
+    ``type_name`` is legend/label-driven (ADR-002) — never derived from block_ref alone.
+    ``position`` mirrors ``Device.position``: None when the INSERT has no resolvable placement.
+    """
+
+    device_id: str
+    type_name: str
+    kind: str
+    position: dict[str, float] | None
+
+
+def _typed_from_identities(
+    devices: Sequence[Device],
+    identities: Sequence[DeviceIdentity],
+) -> list[TypedDevice]:
+    """Apply the schedule_by_type bucketing rule to pre-built identities.
+
+    Internal shared implementation consumed by both ``resolve_typed_devices``
+    (which builds identities itself) and the route (which passes pre-built ones
+    to avoid resolving twice).
+
+    * KIND_LEGEND_EXEMPLAR → excluded from output (not bucketed, not counted).
+    * KIND_ARCHITECTURE    → type_name="architecture".
+    * KIND_DEVICE          → type_name = identity.type_name or "unresolved".
+    * annotation/unknown   → type_name="unresolved".
+    """
+    from app.interpretation.device_identity import (
+        KIND_ARCHITECTURE,
+        KIND_DEVICE,
+        KIND_LEGEND_EXEMPLAR,
+    )
+
+    result: list[TypedDevice] = []
+    for device, identity in zip(devices, identities, strict=True):
+        if identity.kind == KIND_LEGEND_EXEMPLAR:
+            continue
+        if identity.kind == KIND_ARCHITECTURE:
+            type_name = "architecture"
+        elif identity.kind == KIND_DEVICE:
+            type_name = identity.type_name if identity.type_name else "unresolved"
+        else:
+            type_name = "unresolved"
+        result.append(
+            TypedDevice(
+                device_id=device.entity_id,
+                type_name=type_name,
+                kind=identity.kind,
+                position=device.position,
+            )
+        )
+    return result
+
+
+def resolve_typed_devices(
+    devices: Sequence[Device],
+    legend: LegendDictionary,
+) -> list[TypedDevice]:
+    """Resolve ``devices`` against ``legend`` and return typed, positioned records.
+
+    Applies the same bucketing rule used by the ``/revisions/{id}/devices`` route
+    ``schedule_by_type`` output — shared rule guarantees byte-stable counts.
+    Callers that have already built identities should call ``_typed_from_identities``
+    directly to avoid resolving twice.
+    """
+    from app.interpretation.device_identity import resolve_device_identities
+
+    identities = resolve_device_identities(devices, legend)
+    return _typed_from_identities(devices, identities)
+
+
+async def load_typed_devices(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    scope: Literal["sheet", "modelspace"] = "sheet",
+    max_depth: int = _MAX_DEVICE_NESTING_DEPTH,
+    device_layers: Sequence[str] | None = None,
+    tag_layer: Sequence[str] | None = None,
+    max_tag_distance: float | None = None,
+) -> list[TypedDevice]:
+    """Load, tag, legend-resolve and type-bucket all devices for one revision.
+
+    This is the async DB seam that wraps enumerate → tags → legend → resolve_typed_devices
+    in one call, so the floor-counted fusion loader stays thin.
+    """
+    from app.interpretation.legend_dictionary import (
+        FamilyInput,
+        ProseInput,
+        TagInput,
+        from_block_families,
+        from_prose_schedule,
+        from_tag_layers,
+        fuse,
+    )
+    from app.interpretation.loaders import load_legend_text_candidates
+
+    exclude_off_sheet = scope == "sheet"
+
+    raw_devices = await enumerate_devices(
+        db,
+        revision_id,
+        device_layers=list(device_layers) if device_layers is not None else None,
+        max_depth=max_depth,
+        exclude_off_sheet=exclude_off_sheet,
+    )
+    candidates = await load_tag_candidates(
+        db,
+        revision_id,
+        tag_layers=list(tag_layer) if tag_layer is not None else None,
+        exclude_off_sheet=exclude_off_sheet,
+    )
+    all_tagged = attach_tags(raw_devices, candidates, max_distance=max_tag_distance)
+
+    families = [FamilyInput(family_name=d.block_ref) for d in all_tagged if d.block_ref]
+    prose_texts = await load_legend_text_candidates(db, revision_id)
+    prose = [ProseInput(text=t) for t in prose_texts]
+    tag_tokens = list({c.text for c in candidates})
+    tags = [TagInput(token=t) for t in tag_tokens]
+    legend = fuse(
+        [*from_block_families(families), *from_prose_schedule(prose), *from_tag_layers(tags)]
+    )
+
+    return resolve_typed_devices(all_tagged, legend)
