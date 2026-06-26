@@ -11,10 +11,13 @@ import pytest
 from shapely.geometry import Polygon
 
 from app.interpretation.room_fusion import (
+    DEFAULT_POLYGON_VORONOI_CONFIDENCE,
     DEFAULT_VORONOI_CONFIDENCE,
     RoomAssignment,
+    RoomRegistry,
     build_room_registry,
 )
+from app.interpretation.room_voronoi import RoomTag
 from app.interpretation.rooms import Room, room_from_label, room_from_polygon
 
 # ---------------------------------------------------------------------------
@@ -386,3 +389,190 @@ def test_polygon_room_confidence_propagated() -> None:
     result = registry.classify((5.0, 5.0))
     assert result.confidence == pytest.approx(0.75)
     assert result.boundary_basis == "polygon"
+
+
+# ---------------------------------------------------------------------------
+# Multi-tag polygon subdivision (issue #733)
+# ---------------------------------------------------------------------------
+
+# A wide polygon that swallows two labelled rooms A and B.
+_WIDE_POLY = Polygon([(0.0, 0.0), (20.0, 0.0), (20.0, 10.0), (0.0, 10.0)])
+# Tag A anchor near left side; tag B anchor near right side.
+_TAG_A = RoomTag(number="0.9.04", anchors=((3.0, 5.0),))
+_TAG_B = RoomTag(number="0.9.05", anchors=((17.0, 5.0),))
+
+
+def _multi_tag_registry(voronoi_fallback: bool = True) -> RoomRegistry:
+    """Build a registry with one big polygon containing two tags."""
+    poly_room = _polygon_room("big_poly", _WIDE_POLY, number="0.9.04")
+    return build_room_registry(
+        [poly_room],
+        voronoi_fallback=voronoi_fallback,
+        polygon_tags_by_room_id={"big_poly": (_TAG_A, _TAG_B)},
+    )
+
+
+def test_multi_tag_point_near_tag_a_returns_a() -> None:
+    """Point near tag A inside a multi-tag polygon → assigned to A."""
+    registry = _multi_tag_registry()
+    result = registry.classify((2.0, 5.0))
+
+    assert result.room_number == "0.9.04"
+    assert result.room_id == "big_poly"
+    assert result.boundary_basis == "polygon_voronoi"
+    assert result.confidence == pytest.approx(DEFAULT_POLYGON_VORONOI_CONFIDENCE)
+    assert result.needs_review is True
+
+
+def test_multi_tag_point_near_tag_b_returns_b() -> None:
+    """Point near tag B inside a multi-tag polygon → assigned to B."""
+    registry = _multi_tag_registry()
+    result = registry.classify((18.0, 5.0))
+
+    assert result.room_number == "0.9.05"
+    assert result.room_id == "big_poly"
+    assert result.boundary_basis == "polygon_voronoi"
+    assert result.confidence == pytest.approx(DEFAULT_POLYGON_VORONOI_CONFIDENCE)
+    assert result.needs_review is True
+
+
+def test_multi_tag_subdivision_independent_of_voronoi_fallback() -> None:
+    """Multi-tag subdivision fires regardless of voronoi_fallback flag."""
+    registry_on = _multi_tag_registry(voronoi_fallback=True)
+    registry_off = _multi_tag_registry(voronoi_fallback=False)
+
+    pt_near_a = (2.0, 5.0)
+    pt_near_b = (18.0, 5.0)
+
+    # Both registries should sub-partition the same way.
+    assert registry_on.classify(pt_near_a) == registry_off.classify(pt_near_a)
+    assert registry_on.classify(pt_near_b) == registry_off.classify(pt_near_b)
+    assert registry_on.classify(pt_near_a).boundary_basis == "polygon_voronoi"
+    assert registry_on.classify(pt_near_b).boundary_basis == "polygon_voronoi"
+
+
+def test_single_tag_polygon_byte_identical_with_and_without_map_voronoi_on() -> None:
+    """Single-tag polygon: byte-identical with/without map (voronoi=True).
+
+    KEYSTONE invariant: providing polygon_tags_by_room_id=None or an empty map
+    (or a map that has no entry for this polygon) must not change the RoomAssignment
+    for a polygon with only one tag.
+    """
+    poly_room = _polygon_room("P1", _POLY_A, number="1.01")
+
+    registry_no_map = build_room_registry([poly_room], voronoi_fallback=True)
+    registry_with_map = build_room_registry(
+        [poly_room],
+        voronoi_fallback=True,
+        polygon_tags_by_room_id={},
+    )
+
+    pt = (5.0, 5.0)
+    result_no_map = registry_no_map.classify(pt)
+    result_with_map = registry_with_map.classify(pt)
+
+    assert result_no_map == result_with_map, (
+        f"Single-tag polygon byte-identity failed:\n"
+        f"no_map={result_no_map}\nwith_map={result_with_map}"
+    )
+    assert result_no_map.boundary_basis == "polygon"
+
+
+def test_single_tag_polygon_byte_identical_with_and_without_map_voronoi_off() -> None:
+    """Same byte-identity invariant holds with voronoi_fallback=False."""
+    poly_room = _polygon_room("P1", _POLY_A, number="1.01")
+
+    registry_no_map = build_room_registry([poly_room], voronoi_fallback=False)
+    registry_with_map = build_room_registry(
+        [poly_room],
+        voronoi_fallback=False,
+        polygon_tags_by_room_id={},
+    )
+
+    pt = (5.0, 5.0)
+    result_no_map = registry_no_map.classify(pt)
+    result_with_map = registry_with_map.classify(pt)
+
+    assert result_no_map == result_with_map, (
+        f"Single-tag byte-identity failed (voronoi=False):\n"
+        f"no_map={result_no_map}\nwith_map={result_with_map}"
+    )
+    assert result_no_map.boundary_basis == "polygon"
+
+
+def test_multi_tag_determinism_over_20_tag_order_shuffles() -> None:
+    """Classification results are identical across 20 shuffles of contained-tag order."""
+    poly_room = _polygon_room("big_poly", _WIDE_POLY, number="0.9.04")
+    tag_a = RoomTag(number="0.9.04", anchors=((3.0, 5.0),))
+    tag_b = RoomTag(number="0.9.05", anchors=((17.0, 5.0),))
+    tag_c = RoomTag(number="0.9.06", anchors=((10.0, 5.0),))
+
+    tags_base = [tag_a, tag_b, tag_c]
+    test_points = [(2.0, 5.0), (18.0, 5.0), (10.0, 5.0)]
+
+    base_registry = build_room_registry(
+        [poly_room],
+        polygon_tags_by_room_id={"big_poly": tuple(tags_base)},
+    )
+    reference = {pt: base_registry.classify(pt) for pt in test_points}
+
+    rng = random.Random(42)
+    for _ in range(20):
+        shuffled = list(tags_base)
+        rng.shuffle(shuffled)
+        reg = build_room_registry(
+            [poly_room],
+            polygon_tags_by_room_id={"big_poly": tuple(shuffled)},
+        )
+        for pt in test_points:
+            got = reg.classify(pt)
+            assert got == reference[pt], (
+                f"Multi-tag determinism failed at {pt} after shuffle: "
+                f"got={got} want={reference[pt]}"
+            )
+
+
+def test_multi_tag_point_far_from_tags_still_subdivides() -> None:
+    """A point far from all tags (beyond default margin) inside a large polygon still subdivides.
+
+    Root cause guarded: before fix, assign_point_to_room used margin=self._margin so a point
+    inside the polygon but outside tags-bbox+5m returned None and fell back to the aggregate
+    polygon number.  Fix uses margin=inf so any in-polygon point reaches the nearest tag.
+
+    Fixture: very wide polygon x∈[0,200], tag A at x=3, tag B at x=17.  Test point at x=100
+    is 83m from the nearest tag — well beyond the default 5m margin.  With margin=inf the
+    subdivision must still fire (not fall back to the plain polygon number).
+    """
+    very_wide_poly = Polygon([(0.0, 0.0), (200.0, 0.0), (200.0, 10.0), (0.0, 10.0)])
+    poly_room = _polygon_room("wide", very_wide_poly, number="0.9.04")
+    tag_a = RoomTag(number="0.9.04", anchors=((3.0, 5.0),))
+    tag_b = RoomTag(number="0.9.05", anchors=((17.0, 5.0),))
+
+    registry = build_room_registry(
+        [poly_room],
+        polygon_tags_by_room_id={"wide": (tag_a, tag_b)},
+    )
+
+    # x=100 is 83m from the nearest tag — well beyond default 5m margin.
+    result = registry.classify((100.0, 5.0))
+
+    assert result.boundary_basis == "polygon_voronoi", (
+        f"Expected polygon_voronoi but got {result.boundary_basis!r} — "
+        "margin check must not reject in-polygon points during subdivision"
+    )
+    assert result.room_number in ("0.9.04", "0.9.05")
+    assert result.needs_review is True
+
+
+def test_default_polygon_tags_none_existing_tests_unaffected() -> None:
+    """Default polygon_tags_by_room_id=None → _polygon_tags_by_room_id is empty dict."""
+    poly_room = _polygon_room("P1", _POLY_A, number="1.01")
+    label_room = _label_room("L1", 30.0, 30.0, number="9.01")
+
+    registry = build_room_registry([poly_room, label_room])
+    assert registry._polygon_tags_by_room_id == {}
+
+    # All polygon-first behaviour unchanged.
+    result = registry.classify((5.0, 5.0))
+    assert result.boundary_basis == "polygon"
+    assert result.room_number == "1.01"

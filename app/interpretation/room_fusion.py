@@ -7,8 +7,12 @@ The ``RoomRegistry`` returned by ``build_room_registry`` is frozen and safe for 
 read access. Its ``classify`` method implements the D1 hybrid:
 
 1. Polygon-first: point-in-smallest-polygon wins unconditionally (no Voronoi state is read).
-2. Voronoi fallback: ``assign_point_to_room`` over label-only-room anchors, bounded.
-3. Unassigned: outside every polygon and outside the Voronoi envelope.
+2. Multi-tag polygon subdivision (issue #733): when a polygon contains ≥2 distinct numbered
+   tags, the point is sub-partitioned among those tags via the R-B Voronoi primitive.
+   This is independent of the ``voronoi_fallback`` flag (it is interior partitioning of an
+   already-matched polygon, not a label-only rescue).
+3. Voronoi fallback: ``assign_point_to_room`` over label-only-room anchors, bounded.
+4. Unassigned: outside every polygon and outside the Voronoi envelope.
 """
 
 from __future__ import annotations
@@ -31,6 +35,15 @@ from app.interpretation.rooms import (
 
 DEFAULT_VORONOI_CONFIDENCE: float = 0.4
 """Confidence score assigned to all Voronoi-fallback assignments."""
+
+DEFAULT_POLYGON_VORONOI_CONFIDENCE: float = 0.35
+"""Confidence score assigned to polygon-interior Voronoi sub-partitions (issue #733).
+
+Slightly below DEFAULT_VORONOI_CONFIDENCE because the assignment is within a polygon
+whose walls already bound the space (high geometric confidence), but the sub-partition
+relies on label proximity inside an under-segmented polygon — one uncertain level below
+a clean single-label polygon assignment.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +71,11 @@ class RoomRegistry:
     Polygon-first: a point inside any polygon room is resolved before Voronoi
     state is ever consulted — byte-identical results regardless of
     ``voronoi_fallback``.
+
+    Multi-tag polygon subdivision (issue #733): a polygon that swallows ≥2 distinct
+    numbered tags is sub-partitioned by Voronoi nearest-tag assignment within the
+    polygon interior.  This subdivision is independent of ``voronoi_fallback`` (it
+    fires for any polygon with ≥2 tags, regardless of that flag).
     """
 
     # Polygon rooms (Room.polygon is not None).
@@ -72,6 +90,10 @@ class RoomRegistry:
     _voronoi_fallback: bool
     _margin: float
     _voronoi_confidence: float
+    # Multi-tag polygon subdivision map: polygon Room.id → deduped RoomTags whose
+    # anchors fall inside that polygon.  Only polygons with ≥2 distinct numbers
+    # have entries; absent → plain polygon assignment (byte-identical to pre-#733).
+    _polygon_tags_by_room_id: dict[str, tuple[RoomTag, ...]]
 
     @property
     def polygon_rooms(self) -> tuple[Room, ...]:
@@ -81,8 +103,14 @@ class RoomRegistry:
     def classify(self, point: tuple[float, float]) -> RoomAssignment:
         """Classify ``point`` via the D1 hybrid and return a ``RoomAssignment``.
 
-        Step 1 — polygon-first: returns immediately if any polygon room contains
-        the point.  Voronoi state is never read in this branch (byte-identity).
+        Step 1 — polygon-first: finds the smallest containing polygon room.
+        If the polygon has only one tag (or no entry in the subdivision map),
+        the plain polygon assignment is returned immediately — byte-identical
+        to pre-#733 behaviour, regardless of ``voronoi_fallback``.
+
+        Step 1b — multi-tag subdivision (issue #733): when the polygon contains
+        ≥2 distinct numbered tags, ``assign_point_to_room`` sub-partitions the
+        interior.  This step is independent of the ``voronoi_fallback`` flag.
 
         Step 2 — Voronoi fallback (only if enabled): nearest label-only anchor
         within the bounded envelope.
@@ -92,6 +120,23 @@ class RoomRegistry:
         # -- Step 1: polygon-first (must return before touching Voronoi) ------
         polygon_room = _smallest_containing_room(point, self._polygon_rooms)
         if polygon_room is not None:
+            # -- Step 1b: multi-tag polygon subdivision (issue #733) ----------
+            tags = self._polygon_tags_by_room_id.get(polygon_room.id)
+            if tags is not None and len(tags) >= 2:
+                # Use infinite margin: the point is already inside the polygon so
+                # floor_bound rejection would be wrong — any in-polygon point must
+                # reach a tag regardless of how far it sits from the tag cluster bbox.
+                matched = assign_point_to_room(point, tags, margin=float("inf"))
+                if matched is not None:
+                    return RoomAssignment(
+                        room_number=matched,
+                        room_id=polygon_room.id,
+                        room_name=polygon_room.name,
+                        boundary_basis="polygon_voronoi",
+                        confidence=DEFAULT_POLYGON_VORONOI_CONFIDENCE,
+                        needs_review=True,
+                    )
+            # Plain polygon assignment — byte-identical to pre-#733 for single-tag polygons.
             return RoomAssignment(
                 room_number=polygon_room.number,
                 room_id=polygon_room.id,
@@ -134,6 +179,7 @@ def build_room_registry(
     voronoi_fallback: bool = True,
     margin: float = DEFAULT_BOUND_MARGIN_M,
     voronoi_confidence: float = DEFAULT_VORONOI_CONFIDENCE,
+    polygon_tags_by_room_id: dict[str, tuple[RoomTag, ...]] | None = None,
 ) -> RoomRegistry:
     """Build a frozen :class:`RoomRegistry` from a list of interpreted rooms.
 
@@ -150,6 +196,11 @@ def build_room_registry(
 
     Nested detection: a label-only room whose ``location`` falls inside some polygon
     room is flagged; Voronoi assignments to such rooms set ``needs_review=True``.
+
+    ``polygon_tags_by_room_id`` (issue #733): optional map of polygon Room.id →
+    deduped RoomTags for multi-tag polygon sub-partition.  Only polygons with ≥2
+    distinct numbers need entries; the default ``None`` is treated as ``{}`` so all
+    existing callers and tests remain byte-identical.
     """
     polygon_rooms: list[Room] = []
     label_only_rooms: list[Room] = []
@@ -192,6 +243,7 @@ def build_room_registry(
         _voronoi_fallback=voronoi_fallback,
         _margin=margin,
         _voronoi_confidence=voronoi_confidence,
+        _polygon_tags_by_room_id=polygon_tags_by_room_id or {},
     )
 
 

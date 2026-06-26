@@ -407,11 +407,15 @@ async def assemble_floor_takeoff(
     ]
 
     # --- Step 10: Summary ---
-    # Voronoi fallback rooms: rooms where any measured item has boundary_basis="voronoi"
-    voronoi_room_set: set[str] = set()
-    for item in measured_result.items:
-        if item.boundary_basis == "voronoi" and item.room_number is not None:
-            voronoi_room_set.add(item.room_number)
+    # Voronoi-derived rooms: count the assembled room blocks (not just measured items) —
+    # a room's Voronoi basis can come from ANY producer (e.g. the Welbeck subdivided rooms
+    # are COUNTED-only). Includes "voronoi" (label-only R-C fallback) and "polygon_voronoi"
+    # (multi-tag polygon sub-partition, #733) — both are Voronoi-derived assignments.
+    voronoi_room_set: set[str] = {
+        rb.room_number
+        for rb in room_blocks
+        if rb.boundary_basis in ("voronoi", "polygon_voronoi") and rb.room_number is not None
+    }
 
     total_home_run = sum(
         (rb.estimated.home_run_m if rb.estimated else 0.0) for rb in room_blocks
