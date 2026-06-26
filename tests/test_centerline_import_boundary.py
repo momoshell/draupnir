@@ -28,6 +28,7 @@ _CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
 _FLOOR_REGISTRATION_MODULE = "app.interpretation.floor_registration"
 _ROOM_VORONOI_MODULE = "app.interpretation.room_voronoi"
 _FLOOR_COUNTED_MODULE = "app.interpretation.floor_counted"
+_FLOOR_ESTIMATED_MODULE = "app.interpretation.floor_estimated"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -578,4 +579,38 @@ def test_floor_counted_does_not_import_skimage_in_isolation() -> None:
     result = _check_after_isolated_import([_FLOOR_COUNTED_MODULE], ["skimage"])
     assert result.returncode == 0, (
         f"skimage imported by floor_counted.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- floor_estimated (isolated; cv2/skimage banned; shapely not needed, #720)
+# ---------------------------------------------------------------------------
+
+
+def test_floor_estimated_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.floor_estimated must not pull cv2 when imported alone.
+
+    floor_estimated is a pure module (stdlib + app.interpretation only; no shapely).
+    ADR-008: no heavy CV libs permitted.
+
+    Arrange: script imports only floor_estimated.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_ESTIMATED_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by floor_estimated.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_floor_estimated_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.floor_estimated must not pull skimage when imported alone.
+
+    Arrange: script imports only floor_estimated.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_ESTIMATED_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by floor_estimated.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
