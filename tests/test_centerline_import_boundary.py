@@ -36,6 +36,8 @@ _READ_PATH_MODULES = [
     "app.api.v1.revision_routes.canonical",
 ]
 
+_ROOM_PARTITION_MODULE = "app.interpretation.room_partition"
+
 _HEAVY_CV_MODULES = ["cv2", "skimage"]
 _ALL_HEAVY_MODULES = ["cv2", "skimage", "shapely"]
 
@@ -437,4 +439,38 @@ def test_room_voronoi_does_not_import_shapely_in_isolation() -> None:
     result = _check_after_isolated_import([_ROOM_VORONOI_MODULE], ["shapely"])
     assert result.returncode == 0, (
         f"shapely imported by room_voronoi.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- room_partition (isolated; cv2/skimage banned; shapely allowed, #716)
+# ---------------------------------------------------------------------------
+
+
+def test_room_partition_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.room_partition must not pull cv2 when imported alone.
+
+    shapely is an expected transitive dependency and is therefore excluded from this
+    check — only cv2 is guarded (ADR-008, #716).
+
+    Arrange: script imports only room_partition.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_ROOM_PARTITION_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by room_partition.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_room_partition_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.room_partition must not pull skimage when imported alone.
+
+    Arrange: script imports only room_partition.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_ROOM_PARTITION_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by room_partition.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
