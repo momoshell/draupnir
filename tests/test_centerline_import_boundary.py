@@ -38,6 +38,7 @@ _READ_PATH_MODULES = [
 
 _ROOM_PARTITION_MODULE = "app.interpretation.room_partition"
 _ROOM_FUSION_MODULE = "app.interpretation.room_fusion"
+_FLOOR_MEASURED_MODULE = "app.interpretation.floor_measured"
 
 _HEAVY_CV_MODULES = ["cv2", "skimage"]
 _ALL_HEAVY_MODULES = ["cv2", "skimage", "shapely"]
@@ -508,4 +509,38 @@ def test_room_fusion_does_not_import_skimage_in_isolation() -> None:
     result = _check_after_isolated_import([_ROOM_FUSION_MODULE], ["skimage"])
     assert result.returncode == 0, (
         f"skimage imported by room_fusion.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- floor_measured (isolated; cv2/skimage banned; shapely allowed, #718)
+# ---------------------------------------------------------------------------
+
+
+def test_floor_measured_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.floor_measured must not pull cv2 when imported alone.
+
+    shapely is an expected transitive dependency and is therefore excluded from
+    this check — only cv2 is guarded (ADR-008, #718).
+
+    Arrange: script imports only floor_measured.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_MEASURED_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by floor_measured.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_floor_measured_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.floor_measured must not pull skimage when imported alone.
+
+    Arrange: script imports only floor_measured.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_MEASURED_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by floor_measured.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
