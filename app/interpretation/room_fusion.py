@@ -73,6 +73,11 @@ class RoomRegistry:
     _margin: float
     _voronoi_confidence: float
 
+    @property
+    def polygon_rooms(self) -> tuple[Room, ...]:
+        """Return the polygon-room tuple (read-only view for callers that need the set)."""
+        return self._polygon_rooms
+
     def classify(self, point: tuple[float, float]) -> RoomAssignment:
         """Classify ``point`` via the D1 hybrid and return a ``RoomAssignment``.
 
