@@ -26,6 +26,7 @@ _CENTERLINE_DWG_MODULE = "app.ingestion.centerline_dwg"
 _CENTERLINE_PDF_MODULE = "app.ingestion.centerline_pdf"
 _CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
 _FLOOR_REGISTRATION_MODULE = "app.interpretation.floor_registration"
+_ROOM_VORONOI_MODULE = "app.interpretation.room_voronoi"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -392,4 +393,48 @@ def test_floor_registration_does_not_import_shapely_in_isolation() -> None:
     result = _check_after_isolated_import([_FLOOR_REGISTRATION_MODULE], ["shapely"])
     assert result.returncode == 0, (
         f"shapely imported by floor_registration.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- room_voronoi (isolated; pure stdlib module must not pull heavy deps)
+# ---------------------------------------------------------------------------
+
+
+def test_room_voronoi_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.room_voronoi must not pull cv2 when imported alone.
+
+    Arrange: script imports only room_voronoi (isolated subprocess).
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_ROOM_VORONOI_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by room_voronoi.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_room_voronoi_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.room_voronoi must not pull skimage when imported alone.
+
+    Arrange: script imports only room_voronoi (isolated subprocess).
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_ROOM_VORONOI_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by room_voronoi.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_room_voronoi_does_not_import_shapely_in_isolation() -> None:
+    """app.interpretation.room_voronoi must not pull shapely when imported alone.
+
+    Arrange: script imports only room_voronoi (isolated subprocess).
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_ROOM_VORONOI_MODULE], ["shapely"])
+    assert result.returncode == 0, (
+        f"shapely imported by room_voronoi.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
