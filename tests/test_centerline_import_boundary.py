@@ -25,6 +25,7 @@ _CENTERLINE_CONTRACT_MODULE = "app.ingestion.centerline_contract"
 _CENTERLINE_DWG_MODULE = "app.ingestion.centerline_dwg"
 _CENTERLINE_PDF_MODULE = "app.ingestion.centerline_pdf"
 _CENTERLINE_MATERIALIZATION_MODULE = "app.jobs.centerline_materialization"
+_FLOOR_REGISTRATION_MODULE = "app.interpretation.floor_registration"
 
 _READ_PATH_MODULES = [
     "app.interpretation.service_takeoff_loaders",
@@ -344,4 +345,51 @@ def test_centerline_materialization_dispatch_does_not_import_skimage_in_isolatio
     assert result.returncode == 0, (
         f"skimage imported by centerline_materialization at module level (ADR-008 violation).\n"
         f"stderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- floor_registration (pure; must be cv2/skimage/shapely-free in isolation)
+# ---------------------------------------------------------------------------
+
+
+def test_floor_registration_does_not_import_cv2_in_isolation() -> None:
+    """app.interpretation.floor_registration must not pull cv2 when imported alone.
+
+    floor_registration is a pure module (stdlib + grid_registration only).
+    ADR-008: no heavy CV libs permitted.
+
+    Arrange: script imports only floor_registration.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_REGISTRATION_MODULE], ["cv2"])
+    assert result.returncode == 0, (
+        f"cv2 imported by floor_registration.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_floor_registration_does_not_import_skimage_in_isolation() -> None:
+    """app.interpretation.floor_registration must not pull skimage when imported alone.
+
+    Arrange: script imports only floor_registration.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_REGISTRATION_MODULE], ["skimage"])
+    assert result.returncode == 0, (
+        f"skimage imported by floor_registration.\nstderr: {result.stderr}\nstdout: {result.stdout}"
+    )
+
+
+def test_floor_registration_does_not_import_shapely_in_isolation() -> None:
+    """app.interpretation.floor_registration must not pull shapely when imported alone.
+
+    Arrange: script imports only floor_registration.
+    Act:     run in fresh subprocess.
+    Assert:  exit 0.
+    """
+    result = _check_after_isolated_import([_FLOOR_REGISTRATION_MODULE], ["shapely"])
+    assert result.returncode == 0, (
+        f"shapely imported by floor_registration.\nstderr: {result.stderr}\nstdout: {result.stdout}"
     )
