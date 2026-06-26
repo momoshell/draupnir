@@ -2644,9 +2644,12 @@ def _build_hatch_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -
     # Capture the pattern name from the "name" field (e.g. "SOLID", "FP_6").
     pattern_name = _first_string(record, "name") or ""
     # Raw pattern_type int: 1=solid, 2=pattern (corroborates fill_type).
+    # Guard finiteness before int() — int(float('inf')) raises OverflowError.
     raw_pattern_type = _first_value(record, "pattern_type")
     pattern_type: int | None = (
-        int(raw_pattern_type) if isinstance(raw_pattern_type, (int, float)) else None
+        int(raw_pattern_type)
+        if isinstance(raw_pattern_type, (int, float)) and math.isfinite(float(raw_pattern_type))
+        else None
     )
     # Gradient fields.
     raw_is_gradient = _first_value(record, "is_gradient_fill")

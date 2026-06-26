@@ -5805,3 +5805,59 @@ async def test_libredwg_adapter_hatch_gradient_fields_captured(
     assert gs["is_gradient_fill"] is True
     assert gs["gradient_name"] == "LINEAR"
     assert gs["pattern_name"] == "LINEAR"
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_pattern_type_absent_key_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pattern_type key in record → geometry_summary omits pattern_type entirely (not None)."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A5",
+                    "layer": "NoPatType",
+                    "name": "SOLID",
+                    "is_solid_fill": 1,
+                    # pattern_type deliberately absent
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    gs = entities[0]["geometry"]["geometry_summary"]
+    assert "pattern_type" not in gs
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_hatch_non_finite_pattern_type_omitted_no_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-finite pattern_type (inf) → key omitted, no OverflowError."""
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                {
+                    "type": "HATCH",
+                    "handle": "A6",
+                    "layer": "BadPatType",
+                    "name": "SOLID",
+                    "is_solid_fill": 1,
+                    "pattern_type": float("inf"),
+                    "boundary_loops": [{"edges": _HATCH_SQUARE_LOOP_EDGES}],
+                }
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    gs = entities[0]["geometry"]["geometry_summary"]
+    assert "pattern_type" not in gs
