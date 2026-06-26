@@ -161,16 +161,23 @@ async def test_route_422_containment_not_in_member_list() -> None:
 
 _LIGHTING_REVISION_ID = "95015ea4-b4d0-46a6-b676-e3fc7f622a7f"
 _CONTAINMENT_REVISION_ID = "b29fcd01-3eb0-41ad-9f0c-012925d47824"
+_POWER_REVISION_ID = "bd2ac5ee-7de4-448c-b24e-cf0d294aaef0"
+_MEDGAS_REVISION_ID = "1cc72d6e-7723-4189-8a02-a336956a275b"
 
 
 @_SKIP_UNLESS_REALDATA
 @pytest.mark.asyncio
-async def test_floor_takeoff_realdata_smoke() -> None:
-    """Smoke test against the Phase R canonical test data (requires live DB + REALDATA env)."""
+async def test_floor_takeoff_realdata_gate() -> None:
+    """R-H real-data fusion gate (#722): the full Welbeck Level-0 floor end-to-end.
+
+    Requires a live API (DRAUPNIR_API_URL) with project 49140cff ingested + centerlines
+    materialized (GET service-takeoff per member first). Encodes the PASS invariants from
+    docs/phase-r-gate-results.md. Skipped unless DRAUPNIR_REALDATA_SMOKE=1.
+    """
     import httpx
 
     base_url = os.environ.get("DRAUPNIR_API_URL", "http://localhost:8000")
-    async with httpx.AsyncClient(base_url=base_url, timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
         response = await client.get(
             "/v1/floors/takeoff",
             params={
@@ -178,7 +185,10 @@ async def test_floor_takeoff_realdata_smoke() -> None:
                 "member": [
                     f"{_LIGHTING_REVISION_ID}:lighting",
                     f"{_CONTAINMENT_REVISION_ID}:containment",
+                    f"{_POWER_REVISION_ID}:power",
+                    f"{_MEDGAS_REVISION_ID}:med-gas",
                 ],
+                "containment_revision_id": _CONTAINMENT_REVISION_ID,
                 "strategy": "auto",
                 "voronoi_fallback": "true",
             },
@@ -186,11 +196,51 @@ async def test_floor_takeoff_realdata_smoke() -> None:
 
     assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
     body = response.json()
+
+    # --- Registration: all four members register cleanly ---
     assert body["reference_revision_id"] == _LIGHTING_REVISION_ID
     assert body["reference_role"] == "lighting"
-    assert isinstance(body["rooms"], list)
-    assert isinstance(body["summary"], dict)
-    assert body["summary"]["members_registered"] >= 1
-    # Estimated meta must be present
+    assert body["summary"]["members_registered"] == 4, body["summary"]
+    assert body["members_failed"] == []
+    assert all(m["quality"] == "good" for m in body["members"]), body["members"]
+
+    # --- Three kinds present and DISTINCT (no cross-kind summing) ---
+    assert isinstance(body["rooms"], list) and body["rooms"], "expected >=1 room with quantities"
     assert body["estimated_meta"] is not None
     assert body["estimated_meta"]["quantity_kind"] == "estimated"
+    rel = body["estimated_meta"]["reliability"]
+    assert rel["device_drop_m"] == "reliable"
+    assert rel["in_plan_length_m"] == "schematic_provisional"
+    # in-plan cable is reported at floor level, NOT per-room
+    assert isinstance(body["estimated_circuits"], list) and body["estimated_circuits"]
+    for rb in body["rooms"]:
+        est = rb.get("estimated")
+        if est is not None:
+            assert "in_plan_length_m" not in est  # floor-level only
+
+    # --- MEASURED conservation vs each member's single-revision service-takeoff ---
+    def _measured_total(role: str) -> float:
+        blocks = [*body["rooms"], body["unassigned"]]
+        return sum(
+            (i.get("real_length_m") or 0.0)
+            for rb in blocks
+            for i in rb["measured"]
+            if i["role"] == role
+        )
+
+    async with httpx.AsyncClient(base_url=base_url, timeout=120.0) as client:
+        for role, rev in (
+            ("containment", _CONTAINMENT_REVISION_ID),
+            ("med-gas", _MEDGAS_REVISION_ID),
+        ):
+            st = (await client.get(f"/v1/revisions/{rev}/service-takeoff")).json()
+            single = sum((ln.get("real_length_m") or 0.0) for ln in (st.get("items") or []))
+            fused = _measured_total(role)
+            assert single > 0.0, f"{role}: single-revision total should be positive"
+            assert abs(fused - single) <= 0.03 * single, (
+                f"{role}: fused {fused:.1f} m vs single-rev {single:.1f} m exceeds 3% tolerance"
+            )
+
+    # --- no_anchor_fraction surfaced as an informational [0,1] field (bar set in R-H doc) ---
+    naf = body["summary"]["no_anchor_fraction"]
+    assert isinstance(naf, (int, float)) and 0.0 <= naf <= 1.0
