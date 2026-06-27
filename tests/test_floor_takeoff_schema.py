@@ -303,10 +303,12 @@ def test_floor_takeoff_summary_constructs() -> None:
         voronoi_fallback_rooms=1,
         unscaled=False,
         no_anchor_fraction=0.0,
+        no_anchor_status="ok",
         total_measured_m_by_discipline={"lighting": 10.0},
     )
     assert s.rooms == 5
     assert s.no_anchor_fraction == pytest.approx(0.0)
+    assert s.no_anchor_status == "ok"
     assert s.total_measured_m_by_discipline["lighting"] == pytest.approx(10.0)
 
 
@@ -332,6 +334,7 @@ def test_floor_takeoff_response_minimal() -> None:
             voronoi_fallback_rooms=0,
             unscaled=False,
             no_anchor_fraction=0.0,
+            no_anchor_status="ok",
             total_measured_m_by_discipline={},
         ),
     )

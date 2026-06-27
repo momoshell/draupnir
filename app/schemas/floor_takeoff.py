@@ -8,7 +8,7 @@ Do NOT add ``extra="forbid"`` to any populatable block; leaf metadata models are
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -229,7 +229,18 @@ class FloorTakeoffSummary(BaseModel):
         le=1.0,
         description=(
             "Fraction of total home-run length that is unassigned "
-            "(home_run_in_unassigned / total_home_run). Informational — not a pass/fail gate."
+            "(home_run_in_unassigned / total_home_run). See no_anchor_status for "
+            "the derived provisional gate classification."
+        ),
+    )
+    no_anchor_status: Literal["ok", "elevated", "critical"] = Field(
+        ...,
+        description=(
+            "Provisional gate derived from no_anchor_fraction (issue #735). "
+            "Bands: ok (<=0.50), elevated (0.50-0.95, warn), critical (>0.95, regression). "
+            "Thresholds are deliberately generous — single-building observed 0.92 → 'elevated'. "
+            "'critical' only fires on near-total non-resolution. "
+            "Re-evaluate once room coverage improves or a second building is available."
         ),
     )
     total_measured_m_by_discipline: dict[str, float] = Field(

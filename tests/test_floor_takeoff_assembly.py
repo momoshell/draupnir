@@ -502,3 +502,59 @@ async def test_assemble_floor_takeoff_counted_only_room_gets_metadata() -> None:
     # Measured and estimated absent.
     assert room.measured == []
     assert room.estimated is None
+
+
+# ---------------------------------------------------------------------------
+# classify_no_anchor_fraction — provisional gate classifier (issue #735)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_no_anchor_fraction_ok_zero() -> None:
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.0) == "ok"
+
+
+def test_classify_no_anchor_fraction_ok_mid() -> None:
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.30) == "ok"
+
+
+def test_classify_no_anchor_fraction_ok_boundary() -> None:
+    """Exactly 0.50 is still 'ok' (boundary belongs to the lower band)."""
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.50) == "ok"
+
+
+def test_classify_no_anchor_fraction_elevated_just_above_lower() -> None:
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.51) == "elevated"
+
+
+def test_classify_no_anchor_fraction_elevated_welbeck_observed() -> None:
+    """Welbeck Level-0 observed 0.92 must land in 'elevated', not 'critical'."""
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.92) == "elevated"
+
+
+def test_classify_no_anchor_fraction_elevated_upper_boundary() -> None:
+    """Exactly 0.95 is 'elevated' (boundary belongs to the lower band)."""
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.95) == "elevated"
+
+
+def test_classify_no_anchor_fraction_critical_just_above_upper() -> None:
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(0.951) == "critical"
+
+
+def test_classify_no_anchor_fraction_critical_one() -> None:
+    from app.interpretation.floor_takeoff_loaders import classify_no_anchor_fraction
+
+    assert classify_no_anchor_fraction(1.0) == "critical"
