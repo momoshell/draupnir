@@ -166,6 +166,10 @@ _DEFAULT_DROP_LAYER_TOKENS: tuple[str, ...] = ("drop",)
 # Referenced as the default in load_service_fill_bands so the set cannot silently drift.
 _SERVICE_FILL_LAYER_TOKENS: tuple[str, ...] = ("pipe", "rise", "drop")
 
+# Narrow substrings for fitting-block HATCH layers (ilike); intentionally excludes plain "Pipe"
+# so service fill bands and fitting bands are disjoint query sets.
+_SERVICE_FITTING_LAYER_TOKENS: tuple[str, ...] = ("pipe fitting", "pipe accessor")
+
 # Radius (drawing units) within which a legend text entity is matched to a swatch.
 # Sized for a typical legend row height (~5 mm at 1:50 → ~250 drawing units / mm-unit).
 _SWATCH_MATCH_RADIUS: float = 2000.0
@@ -1335,6 +1339,86 @@ async def load_service_fill_bands(
             continue
 
         # Prefer first boundary loop; fall back to vertices field.
+        boundary_loops = geometry.get("boundary_loops")
+        if isinstance(boundary_loops, (list, tuple)) and boundary_loops:
+            pts_raw = boundary_loops[0]
+        else:
+            pts_raw = geometry.get("vertices")
+
+        ring_pts = _xy_list(pts_raw)
+        if len(ring_pts) < 3:
+            continue
+
+        result.append(
+            FillBand(
+                colour_key=ck,
+                colour_index=colour_index,
+                colour_rgb=colour_rgb,
+                ring=tuple(ring_pts),
+            )
+        )
+    return result
+
+
+async def load_service_fitting_bands(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    layer_tokens: tuple[str, ...] = _SERVICE_FITTING_LAYER_TOKENS,
+    exclude_off_sheet: bool = True,
+    input_family: str | None = None,
+) -> list[FillBand]:
+    """Load HATCH entities from Pipe Fittings/Pipe Accessories layers as :class:`FillBand` objects.
+
+    Near-verbatim mirror of :func:`load_service_fill_bands` using the narrower fitting-layer
+    tokens so that fitting blocks are queried separately from service fill bands.  Only
+    ``hatch`` entity types are selected; non-service colours (colour_key is None) are
+    silently skipped.  The boundary_loops/vertices geometry path is identical to the fill
+    loader (confirmed against M-540003 Pipe Fittings entities).
+
+    ``input_family`` is accepted for interface symmetry; fitting bands are DWG-only in
+    Phase 1 (PDF revisions have no HATCH fitting blocks on these layers).
+
+    Returns ``[]`` for degenerate revisions; never raises.
+    """
+    del input_family  # DWG-only in Phase 1; extension point for later phases
+
+    from sqlalchemy import or_, select
+
+    from app.ingestion.centerline_contract import _xy_list
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        q = select(RevisionEntity).where(
+            RevisionEntity.drawing_revision_id == revision_id,
+            RevisionEntity.entity_type == "hatch",
+        )
+        if exclude_off_sheet:
+            q = q.where(RevisionEntity.on_sheet.isnot(False))
+        conditions = [RevisionEntity.layer_ref.ilike(f"%{token}%") for token in layer_tokens]
+        q = q.where(or_(*conditions))
+        q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        rows = list((await db.execute(q)).scalars().all())
+    except Exception:
+        return []
+
+    result: list[FillBand] = []
+    for row in rows:
+        style = row.style or {}
+        color: Mapping[str, Any] | None = style.get("color") if isinstance(style, Mapping) else None
+        ck = _colour_key(color)
+        if ck is None:
+            continue
+
+        colour_index: int | None = color.get("index") if color is not None else None
+        colour_rgb: str | None = color.get("rgb") if color is not None else None
+
+        raw_geom = row.geometry_json
+        geometry: dict[str, Any] | None = raw_geom if isinstance(raw_geom, dict) else None
+        if geometry is None:
+            continue
+
+        # Prefer first boundary loop; fall back to vertices field (same as fill loader).
         boundary_loops = geometry.get("boundary_loops")
         if isinstance(boundary_loops, (list, tuple)) and boundary_loops:
             pts_raw = boundary_loops[0]

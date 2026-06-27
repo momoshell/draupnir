@@ -37,6 +37,7 @@ from app.interpretation.service_takeoff_loaders import (
     load_measured_geometry,
     load_measured_lengths,
     load_service_fill_bands,
+    load_service_fitting_bands,
     load_service_takeoff_inputs,
     load_stack_headers,
     load_tag_stack_texts,
@@ -291,12 +292,15 @@ async def get_revision_service_takeoff(
 
         if centerline_segments:
             fill_bands = await load_service_fill_bands(db, revision_id)
+            # Load fitting-block HATCH bands for the fitting-bridge pass (#668).
+            fitting_bands = await load_service_fitting_bands(db, revision_id)
             # BUG FIX: removed the dead first compute_fill_attributed_lengths call that
             # was immediately overwritten; refine_shared_by_connectivity internally
             # recomputes verdicts via _segment_verdicts and is the authoritative result.
             raw_fill = refine_shared_by_connectivity(
                 centerline_segments=centerline_segments,
                 fill_bands=fill_bands,
+                fitting_bands=fitting_bands,
             )
             fill_attribution = ServiceFillAttributionRead(
                 per_colour=[
