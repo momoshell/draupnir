@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import types
 from collections.abc import Iterator
 from math import isfinite
@@ -2277,3 +2278,326 @@ async def test_ezdxf_spline_symmetry_with_libredwg(
     # Endpoints must match
     assert ez_verts[0] == lb_verts[0]
     assert ez_verts[-1] == lb_verts[-1]
+
+
+# ---------------------------------------------------------------------------
+# HATCH tests (#753)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_solid_hatch_maps_to_canonical_hatch_entity(
+    tmp_path: Path,
+) -> None:
+    """A solid-fill HATCH with a polyline boundary maps to entity_type='hatch', not 'unknown'."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "solid-hatch.dxf"
+    doc = cast(Any, ezdxf).new(units=6)  # metres
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=2)
+    hatch.set_solid_fill()
+    hatch.paths.add_polyline_path(
+        [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 3.0, 0.0), (0.0, 3.0, 0.0)],
+        is_closed=True,
+    )
+    doc.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    assert len(entities) == 1
+    entity = _mapping(entities[0])
+
+    # Must be captured, not unknown
+    assert entity["entity_type"] == "hatch"
+    assert entity["kind"] == "hatch"
+    assert result.warnings == ()
+
+    # fill_type
+    assert entity["fill_type"] == "solid"
+    assert entity["pattern_name"] == "SOLID"
+
+    # Geometry contract
+    geometry = _mapping(entity["geometry"])
+    assert geometry["closed"] is True
+    boundary_loops = geometry["boundary_loops"]
+    assert isinstance(boundary_loops, tuple)
+    assert len(boundary_loops) == 1
+    loop0 = boundary_loops[0]
+    assert isinstance(loop0, tuple)
+    assert len(loop0) >= 3
+    assert geometry["vertices"] == loop0
+
+    gs = _mapping(geometry["geometry_summary"])
+    assert gs["kind"] == "hatch"
+    assert gs["fill_type"] == "solid"
+    assert gs["pattern_name"] == "SOLID"
+    assert gs["closed"] is True
+    assert gs["loop_count"] == 1
+    assert cast(float, gs["area"]) == pytest.approx(12.0)
+    assert cast(float, gs["perimeter"]) == pytest.approx(14.0)
+    assert cast(int, gs["vertex_count"]) >= 3
+
+    # bbox must bound the 4x3 rectangle
+    bbox = _mapping(geometry["bbox"])
+    assert _mapping(bbox["min"])["x"] == pytest.approx(0.0)
+    assert _mapping(bbox["min"])["y"] == pytest.approx(0.0)
+    assert _mapping(bbox["max"])["x"] == pytest.approx(4.0)
+    assert _mapping(bbox["max"])["y"] == pytest.approx(3.0)
+
+    # Properties contract (matches libredwg shape)
+    props = _mapping(entity["properties"])
+    assert props["source_type"] == "HATCH"
+    assert props["fill_type"] == "solid"
+    qh = _mapping(props["quantity_hints"])
+    assert qh["area"] == pytest.approx(12.0)
+    assert qh["length"] == pytest.approx(14.0)
+    assert qh["count"] == 1.0
+
+    # Top-level extra_fields (mirror libredwg)
+    assert entity["area"] == pytest.approx(12.0)
+    assert entity["perimeter"] == pytest.approx(14.0)
+    assert entity["closed"] is True
+    assert entity["vertices"] == loop0
+    assert entity["boundary_loops"] == boundary_loops
+
+    _assert_common_entity_contract(entity, entity_type="hatch", layout_ref="Model", layer_ref="0")
+    _assert_no_nonfinite_numbers(dict(entity))
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_pattern_hatch_maps_fill_type_and_pattern_name(
+    tmp_path: Path,
+) -> None:
+    """A pattern-fill HATCH captures fill_type='pattern' and the pattern name."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "pattern-hatch.dxf"
+    doc = cast(Any, ezdxf).new(units=6)
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=3)
+    hatch.set_pattern_fill("ANSI31", scale=0.5)
+    hatch.paths.add_polyline_path(
+        [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0)],
+        is_closed=True,
+    )
+    doc.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    assert len(entities) == 1
+    entity = _mapping(entities[0])
+    assert entity["entity_type"] == "hatch"
+    assert entity["fill_type"] == "pattern"
+    assert entity["pattern_name"] == "ANSI31"
+
+    gs = _mapping(_mapping(entity["geometry"])["geometry_summary"])
+    assert gs["fill_type"] == "pattern"
+    assert gs["pattern_name"] == "ANSI31"
+    assert cast(float, gs["area"]) == pytest.approx(100.0)
+    assert cast(float, gs["perimeter"]) == pytest.approx(40.0)
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_arc_edge_hatch_tessellates_into_more_vertices(
+    tmp_path: Path,
+) -> None:
+    """An EdgePath hatch with ArcEdge boundaries produces more vertices than the edge count."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "arc-hatch.dxf"
+    doc = cast(Any, ezdxf).new(units=6)
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=4)
+    hatch.set_solid_fill()
+    ep = hatch.paths.add_edge_path()
+    # Build a stadium: two straight edges + two semicircular arcs
+    ep.add_line((0.0, 0.0), (10.0, 0.0))
+    ep.add_arc(center=(10.0, 5.0), radius=5.0, start_angle=270.0, end_angle=90.0, ccw=True)
+    ep.add_line((10.0, 10.0), (0.0, 10.0))
+    ep.add_arc(center=(0.0, 5.0), radius=5.0, start_angle=90.0, end_angle=270.0, ccw=True)
+    doc.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    assert len(entities) == 1
+    entity = _mapping(entities[0])
+    assert entity["entity_type"] == "hatch"
+
+    gs = _mapping(_mapping(entity["geometry"])["geometry_summary"])
+    # Two line edges + two arc edges → many more than 4 vertices due to tessellation
+    assert cast(int, gs["vertex_count"]) > 4
+    # Area should be approximately 10x10 + pi*5^2 (stadium)
+    assert cast(float, gs["area"]) == pytest.approx(100.0 + math.pi * 25.0, rel=0.05)
+    _assert_no_nonfinite_numbers(dict(entity))
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_hatch_increments_supported_count(
+    tmp_path: Path,
+) -> None:
+    """A captured HATCH increments supported_entity_count, not unsupported_entity_count."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "hatch-count.dxf"
+    doc = cast(Any, ezdxf).new(units=6)
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=1)
+    hatch.set_solid_fill()
+    hatch.paths.add_polyline_path(
+        [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)],
+        is_closed=True,
+    )
+    doc.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    assert result.warnings == ()
+    diagnostics_details = {d.code: d.details for d in result.diagnostics}
+    entity_diag = _mapping(diagnostics_details["dxf_entities_extracted"])
+    assert cast(int, entity_diag["supported_entity_count"]) == 1
+    assert cast(int, entity_diag["unsupported_entity_count"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_adapter_malformed_hatch_degrades_to_unknown_with_warning(
+    tmp_path: Path,
+) -> None:
+    """A HATCH with no boundary paths degrades to unknown with a malformed_hatch warning."""
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "empty-hatch.dxf"
+    doc = cast(Any, ezdxf).new(units=6)
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=1)
+    hatch.set_solid_fill()
+    # Deliberately add no boundary path → loops will be empty
+    doc.saveas(source_path)
+
+    result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+
+    entities = _mapping_tuple(result.canonical["entities"])
+    assert len(entities) == 1
+    entity = _mapping(entities[0])
+    assert entity["entity_type"] == "unknown"
+    warning_codes = [w.code for w in result.warnings]
+    assert "malformed_hatch" in warning_codes
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_hatch_symmetry_with_libredwg(
+    tmp_path: Path,
+) -> None:
+    """Cross-adapter symmetry: ezdxf and libredwg produce the same canonical hatch shape.
+
+    A 4x3 rectangle hatch is built via ezdxf (DXF file) and compared against the libredwg
+    builder called directly with equivalent data.  Both must agree on entity_type, fill_type,
+    geometry_summary keys, area, and perimeter.
+    """
+    from app.ingestion.adapters import libredwg as libredwg_module
+
+    # --- ezdxf side ---
+    adapter = _load_ezdxf_adapter()
+    source_path = tmp_path / "sym-hatch.dxf"
+    doc = cast(Any, ezdxf).new(units=6)
+    msp = doc.modelspace()
+    hatch = msp.add_hatch(color=1)
+    hatch.set_solid_fill()
+    hatch.paths.add_polyline_path(
+        [(0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (4.0, 3.0, 0.0), (0.0, 3.0, 0.0)],
+        is_closed=True,
+    )
+    doc.saveas(source_path)
+
+    ezdxf_result = await adapter.ingest(
+        build_contract_source(file_path=source_path, original_name=source_path.name),
+        AdapterExecutionOptions(timeout=AdapterTimeout(seconds=1)),
+    )
+    ezdxf_entities = _mapping_tuple(ezdxf_result.canonical["entities"])
+    ezdxf_hatches = [e for e in ezdxf_entities if e.get("entity_type") == "hatch"]
+    assert len(ezdxf_hatches) == 1
+    ez_h = _mapping(ezdxf_hatches[0])
+
+    # --- libredwg side: call _build_hatch_entity directly ---
+    libredwg_record: dict[str, Any] = {
+        "type": "HATCH",
+        "handle": "99",
+        "layer": "0",
+        "layout": "Model",
+        "boundary_loops": [
+            {
+                "flags": 1,
+                "edges": [
+                    {
+                        "type": "LINE",
+                        "start": {"x": 0, "y": 0, "z": 0},
+                        "end": {"x": 4, "y": 0, "z": 0},
+                    },
+                    {
+                        "type": "LINE",
+                        "start": {"x": 4, "y": 0, "z": 0},
+                        "end": {"x": 4, "y": 3, "z": 0},
+                    },
+                    {
+                        "type": "LINE",
+                        "start": {"x": 4, "y": 3, "z": 0},
+                        "end": {"x": 0, "y": 3, "z": 0},
+                    },
+                    {
+                        "type": "LINE",
+                        "start": {"x": 0, "y": 3, "z": 0},
+                        "end": {"x": 0, "y": 0, "z": 0},
+                    },
+                ],
+            }
+        ],
+    }
+    units_res = libredwg_module._UnitsResolution(
+        payload={
+            "normalized": "meter",
+            "source": "INSUNITS",
+            "source_value": 6,
+            "conversion_target": "meter",
+            "conversion_factor": 1.0,
+        },
+        scale=1.0,
+        confirmed=True,
+    )
+    lb_result = libredwg_module._build_hatch_entity(libredwg_record, units=units_res)
+    assert lb_result.entity is not None
+    lb_h = lb_result.entity
+
+    # Both adapters must agree on the canonical contract
+    assert ez_h["entity_type"] == lb_h["entity_type"] == "hatch"
+    ez_props = _mapping(ez_h["properties"])
+    lb_props = _mapping(lb_h["properties"])
+    assert ez_props["source_type"] == lb_props["source_type"] == "HATCH"
+    assert ez_props["fill_type"] == lb_props["fill_type"] == "solid"
+
+    ez_gs = _mapping(_mapping(ez_h["geometry"])["geometry_summary"])
+    lb_gs = _mapping(_mapping(lb_h["geometry"])["geometry_summary"])
+    assert ez_gs["kind"] == lb_gs["kind"] == "hatch"
+    assert ez_gs["fill_type"] == lb_gs["fill_type"] == "solid"
+    assert ez_gs["closed"] == lb_gs["closed"] is True
+    assert cast(float, ez_gs["area"]) == pytest.approx(cast(float, lb_gs["area"]))
+    assert cast(float, ez_gs["perimeter"]) == pytest.approx(cast(float, lb_gs["perimeter"]))
+    assert ez_gs["loop_count"] == lb_gs["loop_count"] == 1
+
+    # Top-level convenience fields must match
+    assert cast(float, ez_h["area"]) == pytest.approx(cast(float, lb_h["area"]))
+    assert cast(float, ez_h["perimeter"]) == pytest.approx(cast(float, lb_h["perimeter"]))
+    assert ez_h["closed"] == lb_h["closed"] is True
+    assert ez_h["fill_type"] == lb_h["fill_type"] == "solid"

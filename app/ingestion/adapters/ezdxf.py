@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from itertools import pairwise
@@ -354,6 +355,38 @@ class EzdxfAdapter:
                             message=(
                                 "DXF SPLINE entity coordinates were invalid and the entity "
                                 "was retained as unknown."
+                            ),
+                            details={
+                                "entity_type": entity_type,
+                                "handle": _entity_handle(entity),
+                                "layer": _entity_layer(entity),
+                                "layout": layout_name,
+                                "reason": str(exc),
+                            },
+                        )
+                    )
+                    unsupported_entities += 1
+                else:
+                    supported_entities += 1
+            elif entity_type == "HATCH":
+                try:
+                    canonical_entity = _hatch_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                except Exception as exc:
+                    canonical_entity = _unknown_entity_payload(
+                        entity,
+                        layout_name=layout_name,
+                        units=units_payload,
+                    )
+                    warnings.append(
+                        AdapterWarning(
+                            code="malformed_hatch",
+                            message=(
+                                "DXF HATCH entity was malformed or used unsupported boundary "
+                                "geometry and was retained as unknown."
                             ),
                             details={
                                 "entity_type": entity_type,
@@ -1569,6 +1602,340 @@ def _spline_control_points_payload(
     if len(payloads) < 2:
         raise ValueError("SPLINE must have at least 2 control points.")
     return tuple(payloads)
+
+
+def _hatch_polygon_area(points: list[tuple[float, float]]) -> float | None:
+    """Shoelace polygon area for a flat (x, y) loop — matches libredwg's _polygon_area."""
+    n = len(points)
+    if n < 3:
+        return None
+    area = 0.0
+    for i in range(n):
+        x0, y0 = points[i]
+        x1, y1 = points[(i + 1) % n]
+        area += (x0 * y1) - (x1 * y0)
+        if not math.isfinite(area):
+            return None
+    normalized = abs(area) * 0.5
+    return normalized if math.isfinite(normalized) else None
+
+
+def _hatch_loop_perimeter(points: list[tuple[float, float]]) -> float | None:
+    """Closed-loop perimeter for a flat (x, y) point list — matches libredwg's _polyline_length."""
+    if len(points) < 2:
+        return None
+    total = 0.0
+    for i in range(len(points)):
+        x0, y0 = points[i]
+        x1, y1 = points[(i + 1) % len(points)]
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if not math.isfinite(seg):
+            return None
+        total += seg
+        if not math.isfinite(total):
+            return None
+    return total
+
+
+_HATCH_ARC_STEP_DEG = 10.0  # degrees per tessellation chord — matches libredwg's ~10° step
+
+
+def _tessellate_arc_edge(
+    center: tuple[float, float],
+    radius: float,
+    start_angle_deg: float,
+    end_angle_deg: float,
+    ccw: bool,
+) -> list[tuple[float, float]]:
+    """Tessellate a circular arc edge into chord points at ~10° intervals.
+
+    Mirrors libredwg's _tessellate_hatch_arc_seg density (math.pi/18 radians per step).
+    """
+    two_pi = 2.0 * math.pi
+    start_rad = math.radians(start_angle_deg)
+    end_rad = math.radians(end_angle_deg)
+    if ccw:
+        sweep = (end_rad - start_rad) % two_pi or two_pi
+    else:
+        sweep = -((start_rad - end_rad) % two_pi) or -two_pi
+    steps = max(2, math.ceil(abs(sweep) / math.radians(_HATCH_ARC_STEP_DEG)))
+    cx, cy = center
+    pts: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        angle = start_rad + sweep * (i / steps)
+        pts.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return pts
+
+
+def _tessellate_ellipse_edge(
+    center: tuple[float, float],
+    major_axis: tuple[float, float],
+    ratio: float,
+    start_angle_deg: float,
+    end_angle_deg: float,
+    ccw: bool,
+) -> list[tuple[float, float]]:
+    """Tessellate an ellipse edge into chord points at ~10° intervals.
+
+    Mirrors the arc step density.  The ellipse is parametric: the ezdxf
+    start_angle/end_angle are the parametric angles measured from the major axis.
+    """
+    two_pi = 2.0 * math.pi
+    start_rad = math.radians(start_angle_deg)
+    end_rad = math.radians(end_angle_deg)
+    if ccw:
+        sweep = (end_rad - start_rad) % two_pi or two_pi
+    else:
+        sweep = -((start_rad - end_rad) % two_pi) or -two_pi
+    steps = max(2, math.ceil(abs(sweep) / math.radians(_HATCH_ARC_STEP_DEG)))
+    cx, cy = center
+    mx, my = major_axis
+    major_len = math.hypot(mx, my)
+    if major_len == 0.0:
+        return []
+    rot = math.atan2(my, mx)
+    a = major_len
+    b = major_len * ratio
+    pts: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        t = start_rad + sweep * (i / steps)
+        lx = a * math.cos(t)
+        ly = b * math.sin(t)
+        # rotate by the major-axis orientation
+        rx = lx * math.cos(rot) - ly * math.sin(rot)
+        ry = lx * math.sin(rot) + ly * math.cos(rot)
+        pts.append((cx + rx, cy + ry))
+    return pts
+
+
+def _extract_hatch_loops(
+    entity: Any,
+    *,
+    units: dict[str, JSONValue],
+) -> tuple[list[list[tuple[float, float]]], bool]:
+    """Extract boundary loops from an ezdxf Hatch entity, returning (loops, all_supported).
+
+    Each loop is a flat list of (x, y) points in scaled (canonical) units.
+    all_supported is False when a SplineEdge is encountered — caller degrades to unknown.
+    """
+    scale = _unit_scale_factor(units) or 1.0
+    loops: list[list[tuple[float, float]]] = []
+    all_supported = True
+
+    for path in entity.paths:
+        path_type = type(path).__name__
+        pts: list[tuple[float, float]] = []
+
+        if path_type == "PolylinePath":
+            for v in path.vertices:
+                # ezdxf vertex is a 3-tuple (x, y, bulge) or (x, y)
+                x = float(v[0]) * scale
+                y = float(v[1]) * scale
+                pts.append((x, y))
+
+        elif path_type == "EdgePath":
+            for edge in path.edges:
+                edge_type = type(edge).__name__
+                if edge_type == "LineEdge":
+                    if not pts:
+                        sx = float(edge.start[0]) * scale
+                        sy = float(edge.start[1]) * scale
+                        pts.append((sx, sy))
+                    ex = float(edge.end[0]) * scale
+                    ey = float(edge.end[1]) * scale
+                    pts.append((ex, ey))
+                elif edge_type == "ArcEdge":
+                    cx = float(edge.center[0]) * scale
+                    cy = float(edge.center[1]) * scale
+                    r = float(edge.radius) * scale
+                    arc_pts = _tessellate_arc_edge(
+                        (cx, cy), r, float(edge.start_angle), float(edge.end_angle), bool(edge.ccw)
+                    )
+                    if not pts and arc_pts:
+                        pts.extend(arc_pts)
+                    elif arc_pts:
+                        # skip duplicate junction point
+                        pts.extend(arc_pts[1:])
+                elif edge_type == "EllipseEdge":
+                    cx = float(edge.center[0]) * scale
+                    cy = float(edge.center[1]) * scale
+                    mx = float(edge.major_axis[0]) * scale
+                    my = float(edge.major_axis[1]) * scale
+                    ell_pts = _tessellate_ellipse_edge(
+                        (cx, cy),
+                        (mx, my),
+                        float(edge.ratio),
+                        float(edge.start_angle),
+                        float(edge.end_angle),
+                        bool(edge.ccw),
+                    )
+                    if not pts and ell_pts:
+                        pts.extend(ell_pts)
+                    elif ell_pts:
+                        pts.extend(ell_pts[1:])
+                else:
+                    # SplineEdge — not tessellated; mirror libredwg's "unsupported" gate
+                    all_supported = False
+
+        if len(pts) >= 3:
+            loops.append(pts)
+
+    return loops, all_supported
+
+
+def _hatch_entity_payload(
+    entity: Any,
+    *,
+    layout_name: str,
+    units: dict[str, JSONValue],
+) -> dict[str, JSONValue]:
+    """Build a canonical 'hatch' entity from an ezdxf HATCH.
+
+    The output shape exactly mirrors libredwg's _build_hatch_entity so downstream
+    loaders (containment / service fill bands / takeoff) are adapter-agnostic.
+    """
+    native_type = "HATCH"
+    handle = _entity_handle(entity)
+    layer_name = _entity_layer(entity)
+
+    loops, all_supported = _extract_hatch_loops(entity, units=units)
+    if not all_supported:
+        raise ValueError("HATCH contains unsupported SplineEdge boundary.")
+    if not loops:
+        raise ValueError("HATCH has no usable boundary loops.")
+
+    # Compute per-loop area/perimeter; treat largest loop as outer boundary.
+    loop_areas: list[float] = []
+    loop_perimeters: list[float] = []
+    for loop in loops:
+        area_val = _hatch_polygon_area(loop)
+        perim_val = _hatch_loop_perimeter(loop)
+        if (
+            area_val is None
+            or perim_val is None
+            or not isfinite(area_val)
+            or not isfinite(perim_val)
+        ):
+            raise ValueError("HATCH loop has non-finite area or perimeter.")
+        if area_val <= 0.0:
+            raise ValueError("HATCH loop has zero or negative area.")
+        loop_areas.append(area_val)
+        loop_perimeters.append(perim_val)
+
+    outer_index = max(range(len(loop_areas)), key=loop_areas.__getitem__)
+    outer_area = loop_areas[outer_index]
+    holes_area = sum(loop_areas) - outer_area
+    area = outer_area - holes_area
+    if area <= 0.0:
+        area = outer_area
+    perimeter = loop_perimeters[outer_index]
+
+    if not (isfinite(area) and isfinite(perimeter)):
+        raise ValueError("HATCH area/perimeter must be finite.")
+
+    # Convert loops to canonical {x,y,z} dicts for JSON serialisation.
+    def _loop_to_dicts(loop: list[tuple[float, float]]) -> tuple[dict[str, JSONValue], ...]:
+        return tuple({"x": x, "y": y, "z": 0.0} for x, y in loop)
+
+    outer_loop = loops[outer_index]
+    vertex_json = _loop_to_dicts(outer_loop)
+    boundary_loops_json: tuple[tuple[dict[str, JSONValue], ...], ...] = tuple(
+        _loop_to_dicts(lp) for lp in loops
+    )
+    all_points_flat = [pt for loop in loops for pt in loop]
+    bbox = cast(
+        dict[str, JSONValue],
+        canonical_bbox_from_points({"x": x, "y": y, "z": 0.0} for x, y in all_points_flat),
+    )
+
+    fill_type = "solid" if entity.has_solid_fill else "pattern"
+    kind = "hatch"
+    closed = True
+    pattern_name: str = ""
+    try:
+        raw_pn = entity.dxf.pattern_name
+        pattern_name = str(raw_pn) if raw_pn is not None else ""
+    except Exception:
+        pattern_name = ""
+
+    geometry_summary: dict[str, JSONValue] = {
+        "kind": kind,
+        "vertex_count": len(all_points_flat),
+        "loop_count": len(loops),
+        "fill_type": fill_type,
+        "closed": closed,
+        "area": area,
+        "perimeter": perimeter,
+        "pattern_name": pattern_name,
+    }
+
+    geometry_for_id: dict[str, JSONValue] = {
+        "vertices": vertex_json,
+        "closed": closed,
+    }
+    entity_id = _entity_id(
+        native_type=native_type,
+        handle=handle,
+        layout_name=layout_name,
+        layer_name=layer_name,
+        geometry=geometry_for_id,
+    )
+
+    return {
+        "entity_id": entity_id,
+        "entity_type": kind,
+        "entity_schema_version": _CANONICAL_SCHEMA_VERSION,
+        "geometry": {
+            "vertices": vertex_json,
+            "boundary_loops": boundary_loops_json,
+            "closed": closed,
+            "bbox": bbox,
+            "units": dict(units),
+            "geometry_summary": geometry_summary,
+        },
+        "properties": {
+            "source_type": native_type,
+            "source_handle": handle or None,
+            "fill_type": fill_type,
+            "quantity_hints": {
+                "length": perimeter,
+                "area": area,
+                "count": 1.0,
+            },
+            "adapter_native": {
+                "ezdxf": {
+                    "layer": layer_name,
+                    "pattern_name": pattern_name,
+                },
+            },
+        },
+        "provenance": _entity_provenance(
+            native_type=native_type,
+            handle=handle,
+            layout_name=layout_name,
+            layer_name=layer_name,
+            entity_id=entity_id,
+            geometry=geometry_for_id,
+        ),
+        "confidence": 0.99,
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": layer_name,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "kind": kind,
+        "handle": handle,
+        "layer": layer_name,
+        "layout": layout_name,
+        "vertices": vertex_json,
+        "boundary_loops": boundary_loops_json,
+        "closed": closed,
+        "area": area,
+        "perimeter": perimeter,
+        "fill_type": fill_type,
+        "pattern_name": pattern_name,
+    }
 
 
 def _points_payload(
