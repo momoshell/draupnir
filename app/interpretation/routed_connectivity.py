@@ -26,10 +26,14 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+from shapely.geometry import Point
+from shapely.geometry.base import BaseGeometry
+
 from app.interpretation.service_fill_takeoff import (
     FillAttributionResult,
     FillBand,
     FillColourLength,
+    _build_colour_unions,
     _segment_verdicts,
 )
 
@@ -42,6 +46,7 @@ def refine_shared_by_connectivity(
     *,
     centerline_segments: Sequence[tuple[tuple[float, float], tuple[float, float]]],
     fill_bands: Sequence[FillBand],
+    fitting_bands: Sequence[FillBand] = (),
     snap_tol_m: float = 0.030,
     connector_len_m: float = 0.15,
     collinear_dot_min: float = 0.98,
@@ -61,9 +66,10 @@ def refine_shared_by_connectivity(
 
     Returns a ``FillAttributionResult`` with identical ``total_length_m`` and
     ``centerline_segment_count`` to the base fn; ``per_colour`` and ``shared_length_m``
-    reflect the single-pass connectivity refinement.
+    reflect the single-pass connectivity refinement and any fitting-bridge attribution.
 
     Empty or no-colour inputs return the base fn result unchanged.
+    Empty ``fitting_bands`` produces output byte-identical to #667-only (regression guard).
     INVARIANT: Σ(per_colour) + shared_length_m == total_length_m within ±0.1 m.
     """
     # --- Step 1: per-segment verdicts (same thresholds as base fn) ---
@@ -174,9 +180,66 @@ def refine_shared_by_connectivity(
         if qualifies:
             refined[i] = sole_colour
 
-    # --- Step 4: re-tally ---
+    # --- Step 4: fitting-bridge pass (#668) ---
+    # Single frozen pass over still-shared segments; a segment whose endpoint(s) fall inside
+    # exactly ONE fitting-colour grown union inherits that colour.  Two endpoints agreeing on
+    # the same colour → inherit; disagreeing OR ≥2 colours at either endpoint → stays shared.
+    # Empty fitting_bands → this block is a no-op (regression-safe vs #667-only).
+    if fitting_bands:
+        # band_buffer_m=0.011 per OD-3 (provisional; reopen on a 2nd sheet).
+        fitting_unions = _build_colour_unions(fitting_bands, band_buffer_m=0.011)
+
+        if fitting_unions:
+            # Cast to typed dict so mypy resolves .contains() via BaseGeometry.
+            typed_unions: dict[str, BaseGeometry] = dict(fitting_unions.items())
+
+            def _colours_at_point(
+                pt: tuple[float, float],
+                unions: dict[str, BaseGeometry] = typed_unions,
+            ) -> set[str]:
+                """Return fitting colour_keys whose grown union contains pt."""
+                shapely_pt = Point(pt[0], pt[1])
+                return {ck for ck, geom in unions.items() if geom.contains(shapely_pt)}
+
+            # Frozen snapshot of the post-#667 refined labels (single pass; no fixpoint).
+            fitting_frozen: list[str | None] = list(refined)
+
+            for i in range(len(refined)):
+                if fitting_frozen[i] is not None:
+                    # Already attributed by base fn or #667 pass — skip.
+                    continue
+
+                seg_start, seg_end = nondegen_segs[i]
+
+                colours_at_start = _colours_at_point(seg_start)
+                colours_at_end = _colours_at_point(seg_end)
+
+                # Candidate: union of colours seen at either endpoint.
+                candidate_colours = colours_at_start | colours_at_end
+
+                if len(candidate_colours) == 0:
+                    # Neither endpoint near any fitting — stays shared.
+                    continue
+
+                if len(candidate_colours) >= 2:
+                    # Ambiguous overlap (≥2 distinct fitting colours) — stays shared.
+                    continue
+
+                # Exactly one fitting colour touches this segment's endpoints.
+                sole_fitting_colour = next(iter(candidate_colours))
+
+                # Safety: if the two endpoints disagree (one sees the colour, the other sees
+                # a different one via a separate union overlapping at that end) we've already
+                # filtered above via candidate_colours >= 2.  The remaining case is that one
+                # or both endpoints confirm the single colour — safe to inherit.
+                refined[i] = sole_fitting_colour
+
+    # --- Step 5: re-tally ---
     refined_verdicts = [(verdicts[i][0], refined[i]) for i in range(len(verdicts))]
-    return _build_result(refined_verdicts, fill_bands, total_length, seg_count)
+    # Metadata for _build_result needs both fill and fitting bands so all colour_keys
+    # present in the output can resolve their colour_index / colour_rgb.
+    all_bands: list[FillBand] = list(fill_bands) + list(fitting_bands)
+    return _build_result(refined_verdicts, all_bands, total_length, seg_count)
 
 
 # ---------------------------------------------------------------------------

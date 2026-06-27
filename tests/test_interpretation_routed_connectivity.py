@@ -381,3 +381,227 @@ def test_lone_shared_segment_no_coloured_neighbour_stays_shared() -> None:
     _assert_invariant(refined, base)
     assert refined.shared_length_m == pytest.approx(1.0, abs=0.001)
     assert refined.per_colour == ()
+
+
+# ---------------------------------------------------------------------------
+# #668 fitting-bridge pass tests
+# ---------------------------------------------------------------------------
+
+_ORANGE = "c2ff8000"
+_CYAN = "idx:4"
+
+
+def _fitting_band(
+    colour_key: str,
+    cx: float,
+    cy: float,
+    half: float,
+    colour_index: int | None = None,
+    colour_rgb: str | None = None,
+) -> FillBand:
+    """Axis-aligned square fitting band (same shape helper as _square_band)."""
+    ring = (
+        (cx - half, cy - half),
+        (cx + half, cy - half),
+        (cx + half, cy + half),
+        (cx - half, cy + half),
+    )
+    return FillBand(
+        colour_key=colour_key,
+        colour_index=colour_index,
+        colour_rgb=colour_rgb,
+        ring=ring,
+    )
+
+
+def test_fitting_bridge_single_colour_inherits() -> None:
+    """Shared segment with an endpoint inside a single-colour fitting hatch inherits that colour.
+
+    Arrange:
+      - Orange fill band at cx=0.025, half=0.03 → covers only [0.0, 0.1] roughly.
+      - seg0 [(0.0, 0.0) → (0.1, 0.0)] — inside fill band → orange in base fn.
+      - seg1 [(0.1, 0.0) → (0.1, 0.4)] — perpendicular stub (0.4 m); far from fill band
+        (distance ~0.034 m > nearest_max_m=0.030) → shared in base fn.
+      - #667 pass: seg1 fails collinear gate (perpendicular, dot=0) and connector gate
+        (0.4 m > 0.15 m) → stays shared after #667.
+      - Orange fitting band centred at (0.1, 0.4), half=0.06 — covers seg1's far endpoint.
+    Act:     refine_shared_by_connectivity with fitting_bands=[orange_fitting].
+    Assert:  seg1 inherits orange via fitting bridge; shared drops to 0; invariant holds.
+    """
+    # Narrow fill band: barely covers seg0.
+    orange_fill = _square_band(_ORANGE, 0.025, 0.0, 0.03, colour_rgb="c2ff8000")
+    # Fitting band at the far end of the perpendicular segment.
+    orange_fitting = _fitting_band(_ORANGE, 0.1, 0.4, 0.06, colour_rgb="c2ff8000")
+
+    segs = [
+        ((0.0, 0.0), (0.1, 0.0)),  # seg0 — horizontal, overlaps orange fill → orange
+        ((0.1, 0.0), (0.1, 0.4)),  # seg1 — vertical (perpendicular), 0.4 m, shared
+    ]
+
+    base = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        nearest_max_m=0.030,
+    )
+    # seg1 far from fill band → shared in base fn.
+    assert base.shared_length_m == pytest.approx(0.4, abs=0.05)
+
+    # Confirm #667-only leaves seg1 shared (fails both gates).
+    result_667_only = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        fitting_bands=(),
+        connector_len_m=0.15,
+        collinear_dot_min=0.98,
+        nearest_max_m=0.030,
+    )
+    assert result_667_only.shared_length_m == pytest.approx(0.4, abs=0.05)
+
+    # Now add the fitting band → seg1 inherits orange.
+    refined = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        fitting_bands=[orange_fitting],
+        connector_len_m=0.15,
+        collinear_dot_min=0.98,
+        nearest_max_m=0.030,
+    )
+
+    _assert_invariant(refined, base)
+    assert refined.shared_length_m == pytest.approx(0.0, abs=0.05)
+    orange_lengths = {fc.colour_key: fc.length_m for fc in refined.per_colour}
+    assert _ORANGE in orange_lengths
+    # Per-colour metadata must be populated (the all_bands = fill + fitting merge feeds
+    # colour_rgb/index even for a colour that a bridge introduced) — guards the metadata path.
+    orange_fc = next(fc for fc in refined.per_colour if fc.colour_key == _ORANGE)
+    assert orange_fc.colour_rgb == "c2ff8000"
+
+
+def test_fitting_bridge_two_colour_stays_shared() -> None:
+    """Shared segment with endpoints near TWO different-colour fittings stays shared.
+
+    Arrange:
+      - Orange fill: covers seg0 [(0.0,0.0)→(0.1,0.0)].
+      - seg1 [(0.1,0.0)→(0.1,0.4)]: perpendicular, shared in base fn AND after #667.
+      - Orange fitting band at (0.1, 0.0) → covers seg1's start.
+      - Cyan fitting band at (0.1, 0.4) → covers seg1's end.
+      - candidate_colours = {orange, cyan} → ≥2 → stays shared.
+    """
+    orange_fill = _square_band(_ORANGE, 0.025, 0.0, 0.03, colour_rgb="c2ff8000")
+    orange_fitting = _fitting_band(_ORANGE, 0.1, 0.0, 0.06, colour_rgb="c2ff8000")
+    cyan_fitting = _fitting_band(_CYAN, 0.1, 0.4, 0.06, colour_index=4)
+
+    segs = [
+        ((0.0, 0.0), (0.1, 0.0)),  # seg0 — horizontal, orange
+        ((0.1, 0.0), (0.1, 0.4)),  # seg1 — perpendicular, 0.4 m, shared
+    ]
+
+    base = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        nearest_max_m=0.030,
+    )
+    assert base.shared_length_m == pytest.approx(0.4, abs=0.05)
+
+    refined = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        fitting_bands=[orange_fitting, cyan_fitting],
+        connector_len_m=0.15,
+        collinear_dot_min=0.98,
+        nearest_max_m=0.030,
+    )
+
+    _assert_invariant(refined, base)
+    # Two different fitting colours → must stay shared.
+    assert refined.shared_length_m == pytest.approx(base.shared_length_m, abs=0.01)
+
+
+def test_fitting_bridge_empty_bands_identical_to_667() -> None:
+    """Empty fitting_bands produces output byte-identical to #667-only (regression guard).
+
+    Ensures that the fitting-bridge pass is a strict no-op when fitting_bands=().
+    """
+    green_band = _square_band(_GREEN, 0.025, 0.0, 0.03, colour_index=3)
+    segs = [
+        ((0.0, 0.0), (0.1, 0.0)),
+        ((0.1, 0.0), (0.2, 0.0)),
+    ]
+    fill_bands = [green_band]
+
+    result_no_fitting = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=fill_bands,
+        connector_len_m=0.15,
+        nearest_max_m=0.030,
+    )
+    result_empty_fitting = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=fill_bands,
+        fitting_bands=[],
+        connector_len_m=0.15,
+        nearest_max_m=0.030,
+    )
+    result_empty_tuple = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=fill_bands,
+        fitting_bands=(),
+        connector_len_m=0.15,
+        nearest_max_m=0.030,
+    )
+
+    # All three must be byte-identical in all fields.
+    assert result_no_fitting.shared_length_m == result_empty_fitting.shared_length_m
+    assert result_no_fitting.total_length_m == result_empty_fitting.total_length_m
+    assert result_no_fitting.per_colour == result_empty_fitting.per_colour
+    assert (
+        result_no_fitting.centerline_segment_count == result_empty_fitting.centerline_segment_count
+    )
+
+    assert result_no_fitting.shared_length_m == result_empty_tuple.shared_length_m
+    assert result_no_fitting.total_length_m == result_empty_tuple.total_length_m
+    assert result_no_fitting.per_colour == result_empty_tuple.per_colour
+    assert result_no_fitting.centerline_segment_count == result_empty_tuple.centerline_segment_count
+
+
+def test_fitting_bridge_overlapping_unions_stays_shared() -> None:
+    """A point inside two overlapping grown unions of different colours stays shared.
+
+    Arrange:
+      - Orange fill band (narrow): covers seg0 [(0.0,0.0)→(0.1,0.0)].
+      - seg1 [(0.1,0.0)→(0.1,0.4)]: perpendicular stub, shared in base fn AND after #667.
+      - Orange fitting band centred at (0.06, 0.0): grown union (half=0.06+buffer=0.011~0.071)
+        reaches x=[-0.011, 0.131] -- contains (0.1, 0.0).
+      - Cyan fitting band centred at (0.14, 0.0): grown union reaches x=[0.069, 0.211]
+        — also contains (0.1, 0.0).
+      - candidate_colours at seg1's start = {orange, cyan} → ≥2 → stays shared.
+    """
+    orange_fill = _square_band(_ORANGE, 0.025, 0.0, 0.03, colour_rgb="c2ff8000")
+    # Both fitting bands' grown unions contain (0.1, 0.0).
+    orange_fitting = _fitting_band(_ORANGE, 0.06, 0.0, 0.06, colour_rgb="c2ff8000")
+    cyan_fitting = _fitting_band(_CYAN, 0.14, 0.0, 0.06, colour_index=4)
+
+    segs = [
+        ((0.0, 0.0), (0.1, 0.0)),  # seg0 — orange (covered by fill band)
+        ((0.1, 0.0), (0.1, 0.4)),  # seg1 — perpendicular, shared
+    ]
+
+    base = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        nearest_max_m=0.030,
+    )
+    assert base.shared_length_m == pytest.approx(0.4, abs=0.05)
+
+    refined = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=[orange_fill],
+        fitting_bands=[orange_fitting, cyan_fitting],
+        connector_len_m=0.15,
+        collinear_dot_min=0.98,
+        nearest_max_m=0.030,
+    )
+
+    _assert_invariant(refined, base)
+    # Overlapping unions at the start endpoint → ≥2 colours → must stay shared.
+    assert refined.shared_length_m == pytest.approx(base.shared_length_m, abs=0.01)
