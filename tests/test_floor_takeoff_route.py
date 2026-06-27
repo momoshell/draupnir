@@ -241,6 +241,15 @@ async def test_floor_takeoff_realdata_gate() -> None:
                 f"{role}: fused {fused:.1f} m vs single-rev {single:.1f} m exceeds 3% tolerance"
             )
 
-    # --- no_anchor_fraction surfaced as an informational [0,1] field (bar set in R-H doc) ---
+    # --- no_anchor_fraction + no_anchor_status provisional gate (issue #735) ---
     naf = body["summary"]["no_anchor_fraction"]
     assert isinstance(naf, (int, float)) and 0.0 <= naf <= 1.0
+    nas = body["summary"]["no_anchor_status"]
+    assert nas in ("ok", "elevated", "critical"), f"unexpected no_anchor_status: {nas!r}"
+    # Status must be consistent with the fraction and the documented provisional bands.
+    if naf <= 0.50:
+        assert nas == "ok", f"fraction {naf} should be 'ok', got {nas!r}"
+    elif naf <= 0.95:
+        assert nas == "elevated", f"fraction {naf} should be 'elevated', got {nas!r}"
+    else:
+        assert nas == "critical", f"fraction {naf} should be 'critical', got {nas!r}"

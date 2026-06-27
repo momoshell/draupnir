@@ -43,6 +43,48 @@ except ImportError:
     # Deferred — avoids interpretation→api cycle at module-load time.
     load_room_registry = None  # type: ignore[assignment]
 
+# ---------------------------------------------------------------------------
+# no_anchor_fraction gate — provisional thresholds (#735)
+# ---------------------------------------------------------------------------
+
+# These bounds are deliberately GENEROUS and PROVISIONAL.
+# Single-building evidence (Welbeck Level-0) observed 0.92 → "elevated".
+# "critical" only fires on near-total non-resolution (regression detection).
+# Re-evaluate once room-coverage improves or a second building is available.
+# See: docs/phase-r-gate-results.md §no_anchor_fraction, issue #735.
+_NO_ANCHOR_FRACTION_ELEVATED: float = 0.50
+_NO_ANCHOR_FRACTION_CRITICAL: float = 0.95
+
+
+def classify_no_anchor_fraction(
+    fraction: float,
+) -> Literal["ok", "elevated", "critical"]:
+    """Map ``no_anchor_fraction`` to a provisional gate status.
+
+    Parameters
+    ----------
+    fraction:
+        Value in [0, 1] — the share of home-run length in the unassigned bucket.
+
+    Returns
+    -------
+    Literal["ok", "elevated", "critical"]
+        ``"ok"``        when *fraction* <= ``_NO_ANCHOR_FRACTION_ELEVATED`` (0.50).
+        ``"elevated"``  when 0.50 < *fraction* <= ``_NO_ANCHOR_FRACTION_CRITICAL`` (0.95).
+                        Indicates high unanchored share; worth investigating but not a
+                        hard failure — consistent with single-building baseline (0.92).
+        ``"critical"``  when *fraction* > 0.95. Near-total non-resolution; almost
+                        certainly a regression or a data problem.
+
+    Thresholds are PROVISIONAL and should be re-tuned once room coverage improves
+    and/or a second building's data is available (issue #735).
+    """
+    if fraction <= _NO_ANCHOR_FRACTION_ELEVATED:
+        return "ok"
+    if fraction <= _NO_ANCHOR_FRACTION_CRITICAL:
+        return "elevated"
+    return "critical"
+
 
 def parse_member(raw: str) -> tuple[UUID, str]:
     """Parse a single ``"<uuid>:<role>"`` query-param token.
@@ -440,6 +482,7 @@ async def assemble_floor_takeoff(
         voronoi_fallback_rooms=len(voronoi_room_set),
         unscaled=measured_result.unscaled,
         no_anchor_fraction=no_anchor_fraction,
+        no_anchor_status=classify_no_anchor_fraction(no_anchor_fraction),
         total_measured_m_by_discipline=total_measured_m_by_discipline,
     )
 

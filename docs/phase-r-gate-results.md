@@ -54,14 +54,32 @@ Call: `reference_revision_id = E-630003`, all four as `member=<id>:<role>`,
    always the small reliable slice (~8 m of 342 m total cable); this is honest
    degradation, not fabrication.
 
-## The `no_anchor_fraction` bar (TRD §9.7)
+## The `no_anchor_fraction` provisional gate (TRD §9.7, issue #735)
 
 Observed **0.92** on Welbeck Level-0. This is HIGH but expected given the room-coverage
 limitation — it is a function of how many panels sit in polygonized rooms, which on this
-single floor is few. **The bar is NOT set as a hard gate yet**: with single-building
-evidence, a threshold would over-fit. Re-evaluate once room coverage improves (follow-ups
-below) and/or a second building lands. For now it is surfaced as an informational summary
-field.
+single floor is few.
+
+As of issue #735, `no_anchor_fraction` is now paired with a `no_anchor_status` field that
+classifies it into one of three PROVISIONAL, GENEROUS bands:
+
+| Band | Condition | Meaning |
+|---|---|---|
+| `ok` | fraction ≤ 0.50 | Low unanchored share — healthy |
+| `elevated` | 0.50 < fraction ≤ 0.95 | High but tolerable; matches single-building baseline (0.92 → `elevated`) |
+| `critical` | fraction > 0.95 | Near-total non-resolution; almost certainly a regression |
+
+**Why generous bounds?** With a single building, a tighter threshold would over-fit to
+transient data (0.92 on this floor). "critical" is set at 0.95 so it only fires on a
+near-total regression, not on the observed baseline. "ok" is set at 0.50 as a rough
+midpoint — most healthy floors should land here once room coverage is adequate.
+
+**These thresholds are PROVISIONAL.** They are defined as named constants
+(`_NO_ANCHOR_FRACTION_ELEVATED = 0.50`, `_NO_ANCHOR_FRACTION_CRITICAL = 0.95`) in
+`app/interpretation/floor_takeoff_loaders.py` so they can be retightened after:
+
+- Room coverage improves beyond the current 3-of-9 rooms polygonized on this floor, or
+- A second building's data is available to validate the bands.
 
 ## Recommended follow-ups (improve coverage; do not block the epic)
 
@@ -69,7 +87,8 @@ field.
   strengthen wall-polygonize gap-closing on these sheets, or make the Voronoi fallback
   actually engage for the un-polygonized tags (investigate why `voronoi_fallback_rooms=0`
   here despite 6 un-bucketed tags).
-- Once coverage improves, set a real `no_anchor_fraction` pass/fail bar.
+- Once coverage improves, retighten `_NO_ANCHOR_FRACTION_ELEVATED` and
+  `_NO_ANCHOR_FRACTION_CRITICAL` in `floor_takeoff_loaders.py` (issue #735).
 - Validate against a second building to lift the "provisional / single-building" caveat
   on all Phase R thresholds.
 
