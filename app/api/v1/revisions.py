@@ -14,6 +14,9 @@ from app.api.v1.revision_routes.canonical import (
 from app.api.v1.revision_routes.changesets import (
     changesets_router,
 )
+from app.api.v1.revision_routes.containment_takeoff import (
+    containment_takeoff_router,
+)
 from app.api.v1.revision_routes.devices import (
     devices_router,
 )
@@ -81,6 +84,7 @@ revisions_router.include_router(rooms_router, tags=["Rooms"])
 revisions_router.include_router(service_takeoff_router, tags=["Service Takeoff"])
 revisions_router.include_router(cable_estimate_router, tags=["Cable Estimate"])
 revisions_router.include_router(floor_takeoff_router, tags=["Floor Takeoff"])
+revisions_router.include_router(containment_takeoff_router, tags=["Containment Takeoff"])
 revisions_router.include_router(quantity_takeoffs_router, tags=["Quantities"])
 revisions_router.include_router(estimates_router, tags=["Estimates"])
 revisions_router.include_router(exports_router, tags=["Exports"])

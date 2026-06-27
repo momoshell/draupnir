@@ -602,6 +602,19 @@ def test_revision_router_routes_match_baseline_contract() -> None:
         ),
         (
             "GET",
+            "/revisions/{revision_id}/containment-takeoff",
+            "get_revision_containment_takeoff",
+            "get_revision_containment_takeoff",
+            "ContainmentTakeoffResponse",
+            None,
+            (
+                ("path", "revision_id", True, None, None, None, None),
+                ("query", "layer_refs", False, None, None, None, None),
+                ("dependency", "db", None, None, None, None, "get_db"),
+            ),
+        ),
+        (
+            "GET",
             "/revisions/{revision_id}/quantity-takeoffs",
             "list_revision_quantity_takeoffs",
             "list_revision_quantity_takeoffs",
