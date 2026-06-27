@@ -28,7 +28,7 @@ from app.estimating.quantities.contracts import (
 )
 from app.exports._base import ExportArtifact
 from app.ingestion.debug_overlay import plan_svg_debug_overlay
-from app.ingestion.finalization import IngestFinalizationPayload
+from app.ingestion.finalization import IngestFinalizationPayload, build_slim_canonical_for_persist
 from app.jobs.centerline_materialization import materialize_centerline_lengths
 from app.jobs.db_write import _bulk_insert_model_rows
 from app.jobs.estimate_assembly import (
@@ -565,6 +565,11 @@ async def _finalize_ingest_job(
             )
             written_storage_objects.append((stored_overlay.key, stored_overlay.storage_uri))
 
+            # Build a slim canonical blob for storage: entities are stripped out and
+            # stored exclusively in revision_entities rows. The original payload.canonical_json
+            # is NOT mutated — it continues to flow to the materializer and report_lineage
+            # callers further down, which still need the full entity list.
+            _persisted_canonical = build_slim_canonical_for_persist(payload.canonical_json)
             session.add(
                 AdapterRunOutput(
                     id=adapter_run_output_id,
@@ -576,7 +581,7 @@ async def _finalize_ingest_job(
                     adapter_version=payload.adapter_version,
                     input_family=payload.input_family,
                     canonical_entity_schema_version=payload.canonical_entity_schema_version,
-                    canonical_json=payload.canonical_json,
+                    canonical_json=_persisted_canonical,
                     provenance_json=payload.provenance_json,
                     confidence_json=payload.confidence_json,
                     warnings_json=payload.warnings_json,
