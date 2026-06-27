@@ -166,8 +166,11 @@ _DEFAULT_DROP_LAYER_TOKENS: tuple[str, ...] = ("drop",)
 # Referenced as the default in load_service_fill_bands so the set cannot silently drift.
 _SERVICE_FILL_LAYER_TOKENS: tuple[str, ...] = ("pipe", "rise", "drop")
 
-# Narrow substrings for fitting-block HATCH layers (ilike); intentionally excludes plain "Pipe"
-# so service fill bands and fitting bands are disjoint query sets.
+# Narrow substrings for fitting-block HATCH layers (ilike: "Pipe Fittings" / "Pipe
+# Accessories"). NOTE: these are NOT disjoint from _SERVICE_FILL_LAYER_TOKENS — its "pipe"
+# token also ilike-matches "Pipe Fittings"/"Pipe Accessories", so fitting hatches are already
+# fetched into fill_bands too. That overlap is harmless: the #668 bridge pass only re-labels
+# still-shared segments and skips ones already attributed, so no double-count occurs.
 _SERVICE_FITTING_LAYER_TOKENS: tuple[str, ...] = ("pipe fitting", "pipe accessor")
 
 # Radius (drawing units) within which a legend text entity is matched to a swatch.

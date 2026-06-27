@@ -471,6 +471,10 @@ def test_fitting_bridge_single_colour_inherits() -> None:
     assert refined.shared_length_m == pytest.approx(0.0, abs=0.05)
     orange_lengths = {fc.colour_key: fc.length_m for fc in refined.per_colour}
     assert _ORANGE in orange_lengths
+    # Per-colour metadata must be populated (the all_bands = fill + fitting merge feeds
+    # colour_rgb/index even for a colour that a bridge introduced) — guards the metadata path.
+    orange_fc = next(fc for fc in refined.per_colour if fc.colour_key == _ORANGE)
+    assert orange_fc.colour_rgb == "c2ff8000"
 
 
 def test_fitting_bridge_two_colour_stays_shared() -> None:
