@@ -87,9 +87,27 @@ _PERP_OFFSET_MAX_M: float = 2.0  # ~2 m  — generous sanity cap; structurally s
 _OVERLAP_MIN: float = 0.5
 
 # Unpaired rails count at this fraction of their drawn length.  Honest
-# fallback: we know the segment is a boundary rail, but we cannot confirm it
-# is paired (expected residual at junctions).
+# fallback for double-line groups: we know the segment is a boundary rail,
+# but we cannot confirm it is paired (expected residual at junctions).
 _UNPAIRED_LENGTH_FACTOR: float = 0.5
+
+# Per-group double-line detection: if at least this fraction of rails found a
+# match, the group is drawn double-line (paired boundary rails).  Unpaired
+# residuals in a double-line group are junction artefacts -> count 0.5x.
+# If the pair fraction is BELOW this threshold the group is drawn single-line
+# (each rail IS the pipe centerline) -> unpaired rails count FULL (1.0x).
+#
+# Evidence:
+#   med-gas (M-540003): pair_fraction ~0.99 (192 rails, 190 matched)
+#     -> stays double-line -> 0.5x unchanged (no regression).
+#   drainage: drawn single-line -> pair_fraction << 0.5
+#     -> single-line -> 1.0x (fixes ~17% under-count).
+# Both disciplines are far from 0.5 so the exact threshold value is robust.
+_DOUBLE_LINE_PAIR_FRACTION_MIN: float = 0.5
+
+# Factor applied to unpaired rails in a single-line group: the rail IS the
+# centerline, so it should count in full.
+_SINGLE_LINE_UNPAIRED_FACTOR: float = 1.0
 
 # ---------------------------------------------------------------------------
 # Deterministic raster_params_hash for this producer
@@ -97,11 +115,13 @@ _UNPAIRED_LENGTH_FACTOR: float = 0.5
 # ---------------------------------------------------------------------------
 
 _TUNING_CONSTANTS: dict[str, float] = {
+    "double_line_pair_fraction_min": _DOUBLE_LINE_PAIR_FRACTION_MIN,
     "overlap_min": _OVERLAP_MIN,
     "parallel_dot_min": _PARALLEL_DOT_MIN,
     "perp_offset_max_m": _PERP_OFFSET_MAX_M,
     "perp_offset_min_m": _PERP_OFFSET_MIN_M,
     "rung_max_len_m": _RUNG_MAX_LEN_M,
+    "single_line_unpaired_factor": _SINGLE_LINE_UNPAIRED_FACTOR,
     "unpaired_length_factor": _UNPAIRED_LENGTH_FACTOR,
 }
 
@@ -237,10 +257,14 @@ def _derive_centerline(
        - overlap    : projection_overlap / min_length >= _OVERLAP_MIN
        - nearest    : pick the smallest valid offset; each rail ≤ 1 partner.
     4. **Midline** via _midline_polyline; accumulate into total_length.
-    5. **Unpaired rails** (expected residual at junctions) -> 0.5 x drawn length.
+    5. **Unpaired rails**: factor depends on group double-line-ness.
+       If pair_fraction >= _DOUBLE_LINE_PAIR_FRACTION_MIN, the group is
+       double-line; unpaired rails are junction residuals -> 0.5x drawn length.
+       Otherwise the group is single-line; each rail is its own centerline -> 1.0x.
        Rungs contribute neither length nor polylines.
     Conservation invariant: every rail ends up in exactly one of (a) an emitted
-    midline or (b) the 0.5x unpaired residual.  De-dup is intentionally absent:
+    midline or (b) the unpaired residual (0.5x or 1.0x per group type).  De-dup is
+    intentionally absent:
     pairing is mutual+greedy so each rail has at most one partner — a given
     midline cannot be emitted twice.  Two distinct physical runs whose midpoints
     coincide are both kept (double-counting is their honest measurement).
@@ -331,14 +355,25 @@ def _derive_centerline(
         polylines.append(mid_polyline)
         total_length += mid_length
 
-    # Unpaired rails: 0.5 x their drawn length (honest fallback for junction residuals).
-    # Rungs (excluded from rail_indices) contribute nothing.
+    # Determine whether this group is double-line or single-line by the fraction
+    # of rails that found a match.  Double-line groups have paired boundary rails;
+    # unpaired residuals are junction artefacts and count 0.5x.  Single-line
+    # groups (e.g. drainage) have no opposite rail -- each rail IS the centerline
+    # and must count 1.0x to avoid a systematic ~17% under-count.
+    pair_fraction = len(matched) / n_rails  # matched contains both halves of each pair
+    unpaired_factor = (
+        _UNPAIRED_LENGTH_FACTOR
+        if pair_fraction >= _DOUBLE_LINE_PAIR_FRACTION_MIN
+        else _SINGLE_LINE_UNPAIRED_FACTOR
+    )
+
+    # Unpaired rails: apply per-group factor.  Rungs (not in rail_indices) contribute nothing.
     rail_set = set(rail_indices)
     for k in rail_set:
         if k not in matched and all_lengths[k] > 0.0:
             s_k, e_k = raw_segments[k]
             polylines.append((s_k, e_k))
-            total_length += all_lengths[k] * _UNPAIRED_LENGTH_FACTOR
+            total_length += all_lengths[k] * unpaired_factor
 
     return tuple(polylines), total_length
 

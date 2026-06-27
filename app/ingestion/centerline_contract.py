@@ -18,9 +18,12 @@ from typing import Any
 # "c4-rail-1" (#681): derived path rewritten to width-agnostic rail-pair synthesis at
 # metre-scale; rung filter separates long rails from short perpendicular crossbars; pairing
 # bounds are now metre-scale (not drawing-unit-tuned) so metre-scale geometry pairs correctly.
+# "c5-singleline-1" (#645): per-group pair_fraction distinguishes genuine single-line pipes
+# (drainage) from double-line paired walls; unpaired rails in single-line groups count 1.0x
+# instead of 0.5x -- fixes ~17% under-count on single-line-drawn disciplines.
 # ---------------------------------------------------------------------------
 
-CURRENT_ALGO_VERSION: str = "c4-rail-1"
+CURRENT_ALGO_VERSION: str = "c5-singleline-1"
 
 
 # ---------------------------------------------------------------------------

@@ -25,6 +25,8 @@ import random
 from app.ingestion.centerline_contract import entity_group_drawn_length
 from app.ingestion.centerline_dwg import (
     _DEFAULT_CENTERLINE_LAYER_TOKENS,
+    _DOUBLE_LINE_PAIR_FRACTION_MIN,
+    _SINGLE_LINE_UNPAIRED_FACTOR,
     _UNPAIRED_LENGTH_FACTOR,
     dwg_centerlines,
 )
@@ -382,7 +384,9 @@ def test_non_overlapping_parallels_not_paired() -> None:
     Rail A: (0, 0) -> (2.0, 0)
     Rail B: (5.0, 0.3) -> (7.0, 0.3)   — no x-range overlap with A
 
-    Expected: both unpaired -> total = (2.0 + 2.0) * 0.5 = 2.0 m, 2 polylines.
+    Both rails are unpaired -> pair_fraction=0 < _DOUBLE_LINE_PAIR_FRACTION_MIN
+    -> single-line group -> unpaired factor = _SINGLE_LINE_UNPAIRED_FACTOR (1.0).
+    Expected: total = (2.0 + 2.0) * 1.0 = 4.0 m, 2 polylines.
     """
     geom = {
         "rail_a": _line_geom_list(0.0, 0.0, 2.0, 0.0),
@@ -395,7 +399,8 @@ def test_non_overlapping_parallels_not_paired() -> None:
     cl = results[0]
 
     assert len(cl.geometry.polylines) == 2, "Non-overlapping parallels should NOT pair"
-    expected = (2.0 + 2.0) * _UNPAIRED_LENGTH_FACTOR
+    # pair_fraction = 0/2 = 0.0 < _DOUBLE_LINE_PAIR_FRACTION_MIN -> single-line -> 1.0x
+    expected = (2.0 + 2.0) * _SINGLE_LINE_UNPAIRED_FACTOR
     assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9)
 
 
@@ -405,7 +410,9 @@ def test_near_collinear_not_paired() -> None:
     Rail A: (0, 0) -> (3.0, 0)
     Rail B: (0, 0.005) -> (3.0, 0.005)  — offset=0.005 m < 0.01 m minimum
 
-    Expected: both unpaired -> total = (3.0 + 3.0) * 0.5 = 3.0 m.
+    Both rails are unpaired -> pair_fraction=0 < _DOUBLE_LINE_PAIR_FRACTION_MIN
+    -> single-line group -> unpaired factor = _SINGLE_LINE_UNPAIRED_FACTOR (1.0).
+    Expected: total = (3.0 + 3.0) * 1.0 = 6.0 m.
     """
     geom = {
         "rail_a": _line_geom_list(0.0, 0.0, 3.0, 0.0),
@@ -418,7 +425,8 @@ def test_near_collinear_not_paired() -> None:
     cl = results[0]
 
     assert len(cl.geometry.polylines) == 2, "Near-collinear rails should NOT pair"
-    expected = (3.0 + 3.0) * _UNPAIRED_LENGTH_FACTOR
+    # pair_fraction = 0/2 = 0.0 < _DOUBLE_LINE_PAIR_FRACTION_MIN -> single-line -> 1.0x
+    expected = (3.0 + 3.0) * _SINGLE_LINE_UNPAIRED_FACTOR
     assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9)
 
 
@@ -496,12 +504,15 @@ def test_oracle_regression_derived_length() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unpaired_segment_half_length() -> None:
-    """A lone unpaired rail contributes exactly 0.5 x its drawn length.
+def test_unpaired_segment_full_length_single_line() -> None:
+    """A lone unpaired rail in a single-line group contributes its FULL drawn length.
+
+    A group with a single rail has pair_fraction=0/1=0 < _DOUBLE_LINE_PAIR_FRACTION_MIN,
+    so the group is single-line and the rail is the pipe centerline itself -> 1.0x.
 
     Arrange: single horizontal line entity of length 5.0 m, no pairable neighbour.
     Act:     dwg_centerlines on a group with just that entity.
-    Assert:  length_du == 5.0 * 0.5 == 2.5 m.
+    Assert:  length_du == 5.0 * 1.0 == 5.0 m.
     """
     geom = {"lone": _line_geom(0.0, 0.0, 5.0, 0.0)}
     entity_ids: tuple[str, ...] = ("lone",)
@@ -510,7 +521,8 @@ def test_unpaired_segment_half_length() -> None:
     results = dwg_centerlines([group], geom)
     cl = results[0]
 
-    expected = 5.0 * _UNPAIRED_LENGTH_FACTOR
+    # pair_fraction = 0/1 = 0.0 < _DOUBLE_LINE_PAIR_FRACTION_MIN -> single-line -> 1.0x
+    expected = 5.0 * _SINGLE_LINE_UNPAIRED_FACTOR
     assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9)
     assert cl.producer_kind == "dwg_derived"
 
@@ -612,3 +624,134 @@ def test_algo_version_matches_contract() -> None:
     group = _make_group(("e1",), layer_ref="E-TRAY Cable Tray")
     cl = dwg_centerlines([group], geom)[0]
     assert cl.algo_version == CURRENT_ALGO_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Test: single-line vs double-line group detection (#645)
+# ---------------------------------------------------------------------------
+
+
+def test_single_line_group_unpaired_rails_count_full() -> None:
+    """A group of lone non-paired rails (single-line drawing) counts each rail FULL.
+
+    Fixture: 4 horizontal rails with no pairable neighbours (different y positions,
+    no two parallel rails close enough to pair).  pair_fraction = 0/4 = 0.0 <
+    _DOUBLE_LINE_PAIR_FRACTION_MIN -> single-line -> unpaired factor = 1.0.
+
+    Expected: total = sum of all rail lengths (not halved).
+    """
+    rail_lengths = [3.0, 5.0, 2.5, 4.0]
+    geom: dict[str, dict[str, list[float]]] = {}
+    entity_ids_list: list[str] = []
+    for k, ln in enumerate(rail_lengths):
+        eid = f"solo_{k}"
+        # Space rails 20 m apart in y so no two can possibly pair.
+        y = k * 20.0
+        geom[eid] = _line_geom_list(0.0, y, ln, y)
+        entity_ids_list.append(eid)
+
+    entity_ids = tuple(entity_ids_list)
+    group = _make_group(entity_ids, layer_ref="P-DRAIN Drainage")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    assert cl.producer_kind == "dwg_derived"
+    expected = sum(rail_lengths) * _SINGLE_LINE_UNPAIRED_FACTOR  # 1.0x each
+    assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9), (
+        f"Single-line group: expected {expected} m (full), got {cl.geometry.length_du}"
+    )
+    # Each lone rail emits its own polyline.
+    assert len(cl.geometry.polylines) == len(rail_lengths)
+
+
+def test_double_line_group_unpaired_residuals_count_half() -> None:
+    """A double-line group with paired rails + a few residuals: residuals count 0.5x.
+
+    Fixture: 4 paired rails (2 pairs, pair_fraction = 4/5 = 0.8 >= threshold)
+    plus 1 unpaired residual.  The paired rails contribute midline lengths;
+    the residual contributes 0.5x its drawn length (double-line group behaviour
+    unchanged from before #645).
+
+    pair_fraction = 4/5 = 0.8 >= _DOUBLE_LINE_PAIR_FRACTION_MIN -> double-line.
+    """
+    # Pair 1: rails at y=0 / y=0.4, length=5.0 m each.
+    # Pair 2: rails at y=10 / y=10.5, length=6.0 m each.
+    # Residual: lone rail at y=30 (no partner), length=3.0 m.
+    geom = {
+        "p1_a": _line_geom_list(0.0, 0.0, 5.0, 0.0),
+        "p1_b": _line_geom_list(5.0, 0.4, 0.0, 0.4),
+        "p2_a": _line_geom_list(0.0, 10.0, 6.0, 10.0),
+        "p2_b": _line_geom_list(6.0, 10.5, 0.0, 10.5),
+        "residual": _line_geom_list(0.0, 30.0, 3.0, 30.0),
+    }
+    entity_ids: tuple[str, ...] = ("p1_a", "p1_b", "p2_a", "p2_b", "residual")
+    group = _make_group(entity_ids, layer_ref="M-PIPE Med Gas")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    assert cl.producer_kind == "dwg_derived"
+    # pair_fraction = 4/5 = 0.8 >= _DOUBLE_LINE_PAIR_FRACTION_MIN -> double-line -> 0.5x residual
+    expected = 5.0 + 6.0 + 3.0 * _UNPAIRED_LENGTH_FACTOR  # midlines + 0.5x residual
+    assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9), (
+        f"Double-line group: expected {expected} m, got {cl.geometry.length_du}"
+    )
+    # 2 midline polylines + 1 residual polyline
+    assert len(cl.geometry.polylines) == 3
+
+
+def test_threshold_boundary_at_exactly_half() -> None:
+    """A group with pair_fraction exactly at _DOUBLE_LINE_PAIR_FRACTION_MIN is double-line.
+
+    Fixture: 2 rails matched out of 4 total -> pair_fraction = 2/4 = 0.5.
+    At the boundary (>= threshold) the group is treated as double-line -> 0.5x residuals.
+    """
+    # Pair 1: y=0 / y=0.4, length=4.0 m — will match.
+    # Residuals: two lone rails with no partners.
+    geom = {
+        "p1_a": _line_geom_list(0.0, 0.0, 4.0, 0.0),
+        "p1_b": _line_geom_list(4.0, 0.4, 0.0, 0.4),
+        "lone_1": _line_geom_list(0.0, 20.0, 2.0, 20.0),
+        "lone_2": _line_geom_list(0.0, 40.0, 3.0, 40.0),
+    }
+    entity_ids: tuple[str, ...] = ("p1_a", "p1_b", "lone_1", "lone_2")
+    group = _make_group(entity_ids, layer_ref="E-TRAY Cable Tray")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    # pair_fraction = 2/4 = 0.5 == _DOUBLE_LINE_PAIR_FRACTION_MIN -> double-line -> 0.5x
+    assert _DOUBLE_LINE_PAIR_FRACTION_MIN == 0.5, "Threshold constant changed; update fixture"
+    expected = 4.0 + (2.0 + 3.0) * _UNPAIRED_LENGTH_FACTOR
+    assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9), (
+        f"At-threshold group: expected {expected} m, got {cl.geometry.length_du}"
+    )
+
+
+def test_threshold_just_below_is_single_line() -> None:
+    """A group with pair_fraction just below _DOUBLE_LINE_PAIR_FRACTION_MIN is single-line.
+
+    Fixture: 2 rails matched out of 5 total -> pair_fraction = 2/5 = 0.4 < 0.5.
+    Below the threshold the group is single-line -> 1.0x residuals.
+    """
+    # Pair 1: y=0 / y=0.4, length=4.0 m — will match.
+    # Residuals: three lone rails far away.
+    geom = {
+        "p1_a": _line_geom_list(0.0, 0.0, 4.0, 0.0),
+        "p1_b": _line_geom_list(4.0, 0.4, 0.0, 0.4),
+        "lone_1": _line_geom_list(0.0, 20.0, 2.0, 20.0),
+        "lone_2": _line_geom_list(0.0, 40.0, 3.0, 40.0),
+        "lone_3": _line_geom_list(0.0, 60.0, 1.5, 60.0),
+    }
+    entity_ids: tuple[str, ...] = ("p1_a", "p1_b", "lone_1", "lone_2", "lone_3")
+    group = _make_group(entity_ids, layer_ref="P-DRAIN Drainage")
+
+    results = dwg_centerlines([group], geom)
+    cl = results[0]
+
+    # pair_fraction = 2/5 = 0.4 < _DOUBLE_LINE_PAIR_FRACTION_MIN -> single-line -> 1.0x
+    expected = 4.0 + (2.0 + 3.0 + 1.5) * _SINGLE_LINE_UNPAIRED_FACTOR
+    assert math.isclose(cl.geometry.length_du, expected, rel_tol=1e-9), (
+        f"Below-threshold group: expected {expected} m, got {cl.geometry.length_du}"
+    )
