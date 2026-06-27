@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Application settings
     max_upload_mb: int = 200
     libredwg_max_output_mb: int = 32
+    # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
+    # (e.g. 207k+ entities / 447 MB dwgread JSON): set ADAPTER_TIMEOUT_SECONDS=600
+    # together with LIBREDWG_MAX_OUTPUT_MB=700 and worker --concurrency=1 (~3 GB RAM
+    # per sheet). Default preserves existing behaviour / fast-fail on normal inputs.
+    adapter_timeout_seconds: float = 300.0
     # PyMuPDF vector extraction complexity caps. Sized well above real dense CAD
     # sheets (~16.5k path objects / single A0 page) but bounded to cap memory. On
     # exceeding a cap the adapter degrades to a partial, review-gated result with a
@@ -76,6 +81,13 @@ class Settings(BaseSettings):
     def validate_libredwg_max_output_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
+        return value
+
+    @field_validator("adapter_timeout_seconds")
+    @classmethod
+    def validate_adapter_timeout_seconds(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("adapter_timeout_seconds must be positive")
         return value
 
     @field_validator(
