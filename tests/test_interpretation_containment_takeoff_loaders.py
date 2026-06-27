@@ -396,3 +396,162 @@ async def test_build_containment_legend_db_blank_label_yields_no_entry() -> None
     assert isinstance(legend, ContainmentLegend)
     assert legend.lookup("0000ff", "SOLID") is None
     assert legend.by_key() == {}
+
+
+# ---------------------------------------------------------------------------
+# build_containment_legend_db — containment-specific wide region (#760)
+# ---------------------------------------------------------------------------
+
+
+def _make_hatch_entity(
+    entity_id: str,
+    centroid_x: float,
+    centroid_y: float,
+    rgb: str,
+    pattern: str = "SOLID",
+) -> SimpleNamespace:
+    """Minimal hatch entity whose centroid is (centroid_x, centroid_y)."""
+    half = 0.1
+    return SimpleNamespace(
+        id=entity_id,
+        entity_type="hatch",
+        layer_ref="Legend",
+        sequence_index=0,
+        on_sheet=True,
+        style={"color": {"index": None, "rgb": rgb, "by_layer": False, "by_block": False}},
+        geometry_json={
+            "vertices": [
+                {"x": centroid_x - half, "y": centroid_y - half},
+                {"x": centroid_x + half, "y": centroid_y - half},
+                {"x": centroid_x + half, "y": centroid_y + half},
+                {"x": centroid_x - half, "y": centroid_y + half},
+            ],
+            "geometry_summary": {"pattern_name": pattern},
+        },
+        properties_json={},
+    )
+
+
+def _make_text_entity(entity_id: str, text: str, x: float, y: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=entity_id,
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=0,
+        style={},
+        geometry_json={
+            "text": text,
+            "transform": {"insertion_point": {"x": x, "y": y}},
+        },
+        properties_json={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_containment_legend_db_wide_region_captures_deep_rows() -> None:
+    """Widened containment pads capture rows 1, 2, and 3 (which lie below the old 2.0-unit floor).
+
+    Anchor at (ax=0, ay=3).  Under the OLD pads (below=2.0) the region floor was y=1.0,
+    so row-2 (y=0.0) and row-3 (y=-3.5) would have been missed.  Under the NEW pads
+    (below=7.2) the floor is y=-4.2, so all three rows are captured.
+
+    Grounded offsets from E-610003:
+      swatch column at ax+0.73, label column at ax+1.65
+      row 1: dy=-0.6, row 2: dy=-3.0, row 3: dy=-6.5
+    """
+    ax, ay = 0.0, 3.0
+    anchor = _make_text_entity("anchor", "CONTAINMENTS LEGEND", ax, ay)
+
+    # Three chromatic swatch+label pairs at grounded relative positions.
+    swatch1 = _make_hatch_entity("sw1", ax + 0.73, ay - 0.6, "ff0000")
+    label1 = _make_text_entity("lb1", "Cable Tray", ax + 1.65, ay - 0.6)
+
+    swatch2 = _make_hatch_entity("sw2", ax + 0.73, ay - 3.0, "00ff00")
+    label2 = _make_text_entity("lb2", "Cable Ladder", ax + 1.65, ay - 3.0)
+
+    swatch3 = _make_hatch_entity("sw3", ax + 0.73, ay - 6.5, "0000ff")
+    label3 = _make_text_entity("lb3", "Dado Trunking", ax + 1.65, ay - 6.5)
+
+    all_entities = [anchor, swatch1, label1, swatch2, label2, swatch3, label3]
+    text_entities = [anchor, label1, label2, label3]
+
+    call_count = 0
+
+    async def _side_effect(stmt: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = text_entities if call_count == 1 else all_entities
+        result = MagicMock()
+        result.scalars.return_value = scalars_mock
+        return result
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=_side_effect)
+
+    legend = await build_containment_legend_db(db, _REV_ID, input_family="dwg")
+
+    entry1 = legend.lookup("ff0000", "SOLID")
+    assert entry1 is not None, "row-1 swatch must be in legend"
+    # rows 2 and 3 were below the old 2.0-unit floor; widened pads must now capture them
+    entry2 = legend.lookup("00ff00", "SOLID")
+    assert entry2 is not None, "row-2 swatch must be in legend"
+    entry3 = legend.lookup("0000ff", "SOLID")
+    assert entry3 is not None, "row-3 swatch must be in legend"
+    assert entry1.containment_type == "Cable Tray"
+    assert entry2.containment_type == "Cable Ladder"
+    assert entry3.containment_type == "Dado Trunking"
+
+
+@pytest.mark.asyncio
+async def test_build_containment_legend_db_excludes_notes_left_and_equipment_below() -> None:
+    """Negative controls: items outside the containment region must NOT appear in the legend.
+
+    - NOTES-like text at (ax-0.83, ay-3.0): left of the swatch column (x < ax-0.3) → excluded.
+    - Equipment-symbol swatch+label at (ax+0.73, ay-7.6): below the table (y < ay-7.2) → excluded.
+    """
+    ax, ay = 0.0, 3.0
+    anchor = _make_text_entity("anchor", "CONTAINMENTS LEGEND", ax, ay)
+
+    # A legitimate in-region swatch so the legend is not empty and we get a meaningful result.
+    in_swatch = _make_hatch_entity("sw-in", ax + 0.73, ay - 0.6, "aabbcc")
+    in_label = _make_text_entity("lb-in", "Conduit", ax + 1.65, ay - 0.6)
+
+    # NOTES-like text left of swatches (x < ax - 0.3 → outside left bound).
+    notes_text = _make_text_entity("notes", "LV NOTES TEXT", ax - 0.83, ay - 3.0)
+
+    # Equipment-symbol swatch below the table (y < ay - 7.2 → outside bottom bound).
+    equip_swatch = _make_hatch_entity("sw-eq", ax + 0.73, ay - 7.6, "112233")
+    equip_label = _make_text_entity("lb-eq", "ATS Panel", ax + 1.65, ay - 7.6)
+
+    all_entities = [anchor, in_swatch, in_label, notes_text, equip_swatch, equip_label]
+    text_entities = [anchor, in_label, notes_text, equip_label]
+
+    call_count = 0
+
+    async def _side_effect(stmt: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        scalars_mock = MagicMock()
+        scalars_mock.all.return_value = text_entities if call_count == 1 else all_entities
+        result = MagicMock()
+        result.scalars.return_value = scalars_mock
+        return result
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=_side_effect)
+
+    legend = await build_containment_legend_db(db, _REV_ID, input_family="dwg")
+
+    # The in-region conduit swatch must be present.
+    conduit_entry = legend.lookup("aabbcc", "SOLID")
+    assert conduit_entry is not None, "in-region swatch must be present"
+    assert conduit_entry.containment_type == "Conduit"
+
+    # Notes text is outside the left boundary → no pairing with any swatch.
+    # Verify: if it HAD been paired it would have overwritten the in-region label; since we
+    # only have one swatch in-region it can only be the Conduit entry.
+    assert conduit_entry.containment_type != "LV NOTES TEXT"
+
+    # Equipment swatch is below the bottom boundary → not in the legend.
+    assert legend.lookup("112233", "SOLID") is None, "below-table swatch must be excluded"

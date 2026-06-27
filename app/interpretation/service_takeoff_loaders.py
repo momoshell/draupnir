@@ -225,6 +225,15 @@ _DWG_REGION_PAD_RIGHT: float = 3.5  # units right of anchor x; keynotes start ~3
 _DWG_REGION_PAD_ABOVE: float = 0.5  # units above anchor y
 _DWG_REGION_PAD_BELOW: float = 2.0  # units below anchor y; rows span ≈1.6u below
 
+# Containment CONTAINMENTS LEGEND is a tall 12-row table; needs a wider-Y / tight-X region
+# than the service legend so all rows are captured WITHOUT pulling in the adjacent dense
+# notes (x≈anchor-0.8, left of swatches), keynotes (x≈anchor+6, right), or the equipment-
+# symbol legend below (y<anchor-7.5). SINGLE-BUILDING calibration (E-610003) — provisional.
+_DWG_CONTAINMENT_REGION_PAD_LEFT: float = 0.3  # exclude notes left of the swatch column
+_DWG_CONTAINMENT_REGION_PAD_RIGHT: float = 2.5  # label col x≈anchor+1.65; keynotes excluded
+_DWG_CONTAINMENT_REGION_PAD_ABOVE: float = 0.5
+_DWG_CONTAINMENT_REGION_PAD_BELOW: float = 7.2  # row-12 y≈anchor-7.0; equipment legend excluded
+
 # Radius (drawing units) for pairing a label with the nearest in-region swatch.
 # M-540003 swatch↔label gap is ~0.5 units; rows are ~0.4 units apart.
 # 1.5 units keeps each label bound to its own row's swatch.
@@ -1819,7 +1828,9 @@ async def build_containment_legend_db(
     swatch with the nearest text label, and reads ``pattern_name`` from
     ``geometry_json["geometry_summary"]["pattern_name"]``.
 
-    Uses the same region-pad and pair-radius constants as ``_build_dwg_legend_from_anchor``.
+    Uses containment-specific region-pad constants (``_DWG_CONTAINMENT_REGION_PAD_*``) — wider
+    below the anchor to capture all 12 rows of the tall containment table — and the shared
+    ``_DWG_LEGEND_PAIR_RADIUS`` for swatch↔label pairing.
     PDF revisions or no-anchor drawings return an empty :class:`ContainmentLegend`.
     Never raises.
 
@@ -1873,10 +1884,10 @@ async def build_containment_legend_db(
             ax, ay = pt
             regions.append(
                 (
-                    ax - _DWG_REGION_PAD_LEFT,
-                    ay - _DWG_REGION_PAD_BELOW,
-                    ax + _DWG_REGION_PAD_RIGHT,
-                    ay + _DWG_REGION_PAD_ABOVE,
+                    ax - _DWG_CONTAINMENT_REGION_PAD_LEFT,
+                    ay - _DWG_CONTAINMENT_REGION_PAD_BELOW,
+                    ax + _DWG_CONTAINMENT_REGION_PAD_RIGHT,
+                    ay + _DWG_CONTAINMENT_REGION_PAD_ABOVE,
                 )
             )
 
