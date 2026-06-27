@@ -61,6 +61,13 @@ _OPENAPI_TAGS = [
             "Fused per-room multi-discipline quantity takeoff across a floor's discipline sheets."
         ),
     },
+    {
+        "name": "Containment Takeoff",
+        "description": (
+            "Containment-type quantity takeoff (length per tray/duct/conduit type, attributed "
+            "by HATCH band geometry)."
+        ),
+    },
     {"name": "Validation", "description": "Validation reports and extraction coverage."},
     {"name": "Changesets", "description": "Canonical edit changesets: create, validate, apply."},
     {"name": "Quantities", "description": "Quantity takeoffs and their items."},

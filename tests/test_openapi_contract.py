@@ -120,6 +120,7 @@ def test_operation_id_inventory_is_pinned() -> None:
         "get_revision_interpretation",
         "get_revision_quantity_takeoff",
         "get_revision_scale",
+        "get_revision_containment_takeoff",
         "get_revision_service_takeoff",
         "get_revision_summary",
         "get_system_capabilities",
