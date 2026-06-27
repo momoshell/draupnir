@@ -1924,7 +1924,7 @@ async def _execute_ingest_job_attempt(
     run_task = asyncio.create_task(
         _invoke_ingestion_runner(
             request,
-            timeout=AdapterTimeout(seconds=_DEFAULT_ADAPTER_TIMEOUT.total_seconds()),
+            timeout=AdapterTimeout(seconds=settings.adapter_timeout_seconds),
             cancellation=cancellation,
             on_progress=progress_bridge.callback,
         )
