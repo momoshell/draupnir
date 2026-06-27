@@ -157,12 +157,17 @@ class TestBuildSlimCanonicalForPersist:
             "blocks": [{"block_ref": "B-1"}],
         }
 
-        build_slim_canonical_for_persist(canonical)
+        slim = build_slim_canonical_for_persist(canonical)
 
         # Original must be unmodified — the materializer still needs it.
         assert canonical["entities"] == original_entities
         assert len(canonical["entities"]) == 3
         assert canonical["blocks"] == [{"block_ref": "B-1"}]
+        # The slim copy must hold DIFFERENT (emptied) list objects, not the originals —
+        # proves the helper replaced rather than cleared-in-place.
+        assert slim["entities"] is not canonical["entities"]
+        assert slim["blocks"] is not canonical["blocks"]
+        assert slim["entities"] == [] and slim["blocks"] == []
 
     def test_existing_metadata_sibling_keys_are_preserved(self) -> None:
         """Pre-existing metadata keys (e.g. text_blocks) must survive slim.
@@ -245,7 +250,10 @@ _ALLOWED_IN_MEMORY_FILES: frozenset[str] = frozenset(
         "app/ingestion/block_expansion.py",
         # Sheet membership: tags entities with viewport membership in-memory.
         "app/ingestion/sheet_membership.py",
-        # Debug overlay: renders an SVG from the full in-memory canonical.
+        # Debug overlay: renders an SVG from the full in-memory canonical. (Allowlisted
+        # defensively — today it binds the payload to a ``canonical`` param so the patterns
+        # below don't currently match it; listed so a future rename to ``canonical_json``
+        # stays covered.)
         "app/ingestion/debug_overlay.py",
         # Revision materialization: explodes in-memory entities/blocks into rows.
         "app/jobs/revision_materialization.py",
@@ -267,6 +275,14 @@ _ADAPTER_DIR = "app/ingestion/adapters/"
 # We scan for both dict-subscript and .get() forms, with and without the
 # ``payload.`` prefix (all are in-memory; the DB-column form is
 # ``adapter_output.canonical_json[...]`` or ``output.canonical_json.get(...)``).
+#
+# KNOWN GAP (acceptable): this is a source-regex scan, so an *aliased* read bypasses it,
+# e.g. ``cj = adapter_output.canonical_json`` then ``cj["entities"]``. Some readers already
+# alias to a local ``canonical`` (service_takeoff_loaders.py, scale.py) — they read only
+# small metadata keys today, so they're clean. If a future reader aliases AND reads
+# entities/blocks, the guard won't catch it; the convention (read rows, not the blob) plus
+# code review are the backstop. Adding `<alias>["entities"]` detection would need real
+# dataflow analysis, out of scope for this guard.
 _READ_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'canonical_json\["entities"\]'),
     re.compile(r"canonical_json\['entities'\]"),
@@ -490,8 +506,13 @@ class TestSlimCanonicalBackCompat:
     Each test asserts the same result for both blob shapes, proving #741a's
     slim change did not regress existing readers.
 
-    These are pure-unit tests: they call the reader functions directly with
-    a synthetic canonical dict, without touching the database.
+    SCOPE NOTE: these verify blob-SHAPE compatibility, NOT consumer logic. The real
+    readers (resolve_revision_scale, load_adapter_text_blocks, _load_real_world_scale,
+    the canonical route) are async + DB-bound, so these tests exercise the exact dict-access
+    pattern each consumer uses against both shapes rather than invoking the functions. They
+    prove the slim blob is structurally compatible; consumer CORRECTNESS is covered by those
+    consumers' own integration suites, and a future consumer reaching for blob entities/blocks
+    is caught by test_no_post_ingest_code_reads_canonical_entities_or_blocks above.
     """
 
     # -----------------------------------------------------------------------
