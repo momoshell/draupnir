@@ -19,6 +19,11 @@ from app.ingestion.validation import (
     build_validation_outcome,
 )
 
+# NOTE (#741): the slim discriminator is the metadata.entities_storage / blocks_storage
+# breadcrumb, NOT this version. The canonical_entity_schema_version is adapter-controlled
+# (a self-stamping adapter like libredwg keeps its own value), so bumping it here would be
+# an unreliable/misleading signal of slim-vs-full. Left at "0.1"; consumers detect slim via
+# the storage breadcrumb (and tolerate full legacy blobs).
 _CANONICAL_ENTITY_SCHEMA_VERSION = "0.1"
 _INITIAL_INGEST_REVISION_KIND = "ingest"
 _REPROCESS_REVISION_KIND = "reprocess"
@@ -199,6 +204,40 @@ def _resolve_canonical_schema_version(canonical_json: dict[str, Any]) -> str:
     canonical_json["canonical_entity_schema_version"] = _CANONICAL_ENTITY_SCHEMA_VERSION
     canonical_json.setdefault("schema_version", _CANONICAL_ENTITY_SCHEMA_VERSION)
     return _CANONICAL_ENTITY_SCHEMA_VERSION
+
+
+def build_slim_canonical_for_persist(canonical_json: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of *canonical_json* with bulk collections replaced by empty lists.
+
+    Both ``entities`` and ``blocks`` are stripped: entities materialize into
+    ``revision_entities`` rows and blocks into ``revision_blocks`` rows; post-ingest
+    consumers read those rows, not the blob. The ``metadata.*_storage`` breadcrumbs
+    record where each collection lives so readers can locate them without the blob.
+
+    This MUST only be called at the persist site; the original ``canonical_json`` must
+    continue to flow unmodified to the materializer and report_lineage callers, which
+    read both ``["entities"]`` and ``["blocks"]`` from the full in-memory payload.
+    """
+    entity_count = len(canonical_json.get("entities") or [])
+    block_count = len(canonical_json.get("blocks") or [])
+    existing_metadata = canonical_json.get("metadata", {})
+    slim_metadata = {
+        **existing_metadata,
+        "entities_storage": {
+            "location": "revision_entities",
+            "count": entity_count,
+        },
+        "blocks_storage": {
+            "location": "revision_blocks",
+            "count": block_count,
+        },
+    }
+    return {
+        **canonical_json,
+        "entities": [],
+        "blocks": [],
+        "metadata": slim_metadata,
+    }
 
 
 def _json_compatible(value: Any) -> Any:

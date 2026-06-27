@@ -271,10 +271,12 @@ def _assert_debug_overlay_artifact(
         "input_family": adapter_output.input_family,
         "result_checksum_sha256": adapter_output.result_checksum_sha256,
     }
+    # entities[] in the persisted blob is slim (empty list); the authoritative count
+    # is in metadata.entities_storage.count (and also in entity_counts).
     assert lineage["entities"] == {
         "schema_version": adapter_output.canonical_entity_schema_version,
         "counts": adapter_output.canonical_json["entity_counts"],
-        "total": len(adapter_output.canonical_json["entities"]),
+        "total": adapter_output.canonical_json["metadata"]["entities_storage"]["count"],
     }
     assert lineage["options"] == {}
 
@@ -472,47 +474,25 @@ class TestIngestOutputPersistence:
         assert (
             adapter_output.canonical_entity_schema_version == _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION
         )
-        assert adapter_output.canonical_json == {
-            "canonical_entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-            "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-            "layouts": [{"layout_ref": "Model", "name": "Model"}],
-            "layers": [{"layer_ref": "A-WALL", "name": "A-WALL"}],
-            "blocks": [],
-            "entities": [
-                {
-                    "entity_id": "entity-001",
-                    "entity_type": "line",
-                    "entity_schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
-                    "layout_ref": "Model",
-                    "layer_ref": "A-WALL",
-                    "confidence_score": _FAKE_RUNNER_CONFIDENCE_SCORE,
-                    "confidence_json": {
-                        "score": _FAKE_RUNNER_CONFIDENCE_SCORE,
-                        "basis": "adapter",
-                    },
-                    "geometry_json": {
-                        "type": "line",
-                        "coordinates": [[0.0, 0.0], [1.0, 1.0]],
-                    },
-                    "properties_json": {"layer": "A-WALL"},
-                    "provenance_json": {
-                        "origin": "adapter_normalized",
-                        "adapter": {},
-                        "source_ref": None,
-                        "source_identity": "entity-source-001",
-                        "source_hash": None,
-                        "extraction_path": [],
-                        "notes": [],
-                    },
-                }
-            ],
-            "entity_counts": {
-                "layouts": 1,
-                "layers": 1,
-                "blocks": 0,
-                "entities": 1,
-            },
+        # Slim blob: entities + blocks are stripped; breadcrumbs record count + location.
+        assert adapter_output.canonical_json["entities"] == []
+        assert adapter_output.canonical_json["blocks"] == []
+        assert adapter_output.canonical_json["metadata"] == {
+            "entities_storage": {"location": "revision_entities", "count": 1},
+            "blocks_storage": {"location": "revision_blocks", "count": 0},
         }
+        assert adapter_output.canonical_json["entity_counts"] == {
+            "layouts": 1,
+            "layers": 1,
+            "blocks": 0,
+            "entities": 1,
+        }
+        assert adapter_output.canonical_json["layouts"] == [
+            {"layout_ref": "Model", "name": "Model"}
+        ]
+        assert adapter_output.canonical_json["layers"] == [
+            {"layer_ref": "A-WALL", "name": "A-WALL"}
+        ]
         assert adapter_output.provenance_json == {
             "schema_version": _FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
             "bridge": "tests.fake_ingestion_runner",
@@ -2076,6 +2056,97 @@ class TestIngestOutputPersistence:
         assert layers == []
         assert blocks == []
         assert entities == []
+
+    async def test_slim_canonical_blob_entities_and_blocks_storage_invariance(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Persisted blob strips both entities and blocks; row counts match pre-slim lens.
+
+        Ordering-hazard invariance test: proves payload.canonical_json was NOT mutated
+        in place (materializer still received the full entities + blocks lists) and
+        the metadata.*_storage breadcrumbs match the materialized row counts.
+        """
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        # Two entities + one block so both counts are unambiguous.
+        async def _run_two_entity_one_block_ingestion(
+            request: IngestionRunRequest,
+        ) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                blocks=[{"block_ref": "INV-BLOCK-1", "name": "INV-BLOCK-1"}],
+                entities=[
+                    _build_contract_entity(
+                        entity_id="inv-entity-001",
+                        entity_type="line",
+                        layer_ref="A-WALL",
+                        source_id="inv-src-001",
+                    ),
+                    _build_contract_entity(
+                        entity_id="inv-entity-002",
+                        entity_type="polyline",
+                        layer_ref="A-WALL",
+                        source_id="inv-src-002",
+                    ),
+                ],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run_two_entity_one_block_ingestion)
+
+        await process_ingest_job(job.id)
+
+        (adapter_outputs, _, _, _) = await _load_project_outputs(project["id"])
+        _, _, _, rev_blocks, rev_entities = await _load_project_materialization(project["id"])
+
+        assert len(adapter_outputs) == 1
+        adapter_output = adapter_outputs[0]
+
+        # (a) Persisted blob must have both bulk collections stripped.
+        assert adapter_output.canonical_json["entities"] == [], (
+            "persisted canonical_json.entities must be empty (slim blob)"
+        )
+        assert adapter_output.canonical_json["blocks"] == [], (
+            "persisted canonical_json.blocks must be empty (slim blob)"
+        )
+
+        # (b) entities_storage breadcrumb must record the pre-slim entity count.
+        entities_storage = adapter_output.canonical_json["metadata"]["entities_storage"]
+        assert entities_storage["location"] == "revision_entities"
+        assert entities_storage["count"] == 2, (
+            "entities_storage.count must equal the pre-slim entity count"
+        )
+
+        # (c) blocks_storage breadcrumb must record the pre-slim block count.
+        blocks_storage = adapter_output.canonical_json["metadata"]["blocks_storage"]
+        assert blocks_storage["location"] == "revision_blocks"
+        assert blocks_storage["count"] == 1, (
+            "blocks_storage.count must equal the pre-slim block count"
+        )
+
+        # (d) Materializer still received the full lists — row counts == pre-slim lens.
+        assert len(rev_entities) == 2, (
+            "revision_entities row count must equal pre-slim entity count; "
+            "a mismatch means payload.canonical_json['entities'] was mutated before materialization"
+        )
+        assert len(rev_blocks) == 1, (
+            "revision_blocks row count must equal pre-slim block count; "
+            "a mismatch means payload.canonical_json['blocks'] was mutated before materialization"
+        )
+
+        # (e) breadcrumb counts == row counts (all agree).
+        assert entities_storage["count"] == len(rev_entities)
+        assert blocks_storage["count"] == len(rev_blocks)
 
     async def test_process_ingest_job_precommit_cancellation_cleans_storage_without_outputs(
         self,
