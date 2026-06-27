@@ -33,6 +33,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ingestion.centerline_contract import _xy
+from app.interpretation.containment_legend import (
+    ContainmentLegend,
+    ContainmentSwatchInput,
+    build_containment_legend,
+)
+from app.interpretation.containment_takeoff import (
+    ContainmentAttributionResult,
+    ContainmentBand,
+    compute_containment_attributed_lengths,
+)
 from app.interpretation.loaders import (
     load_legend_text_candidates,
     load_revision_entities_by_type,
@@ -83,6 +93,10 @@ _ROW_Y_TOL: float = 6.0
 _PAIR_X_MAX_GAP: float = 320.0
 _LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:legend|key)\b")
 _LEGEND_ANCHOR_EXCLUDE_RE: re.Pattern[str] = re.compile(r"(?i)\b(?:key\s*plan|notes?)\b")
+
+# Anchor pattern for the containments legend block.  More specific than _LEGEND_ANCHOR_RE —
+# must contain BOTH "containment" and "legend" so generic "LEGEND" anchors do not match.
+_CONTAINMENTS_LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\bcontainments?\s+legend\b")
 
 # Stack-header pattern: "FROM TOP TO BOTTOM", "TOP TO BOTTOM TA:", etc.
 # FROM is optional — drawings sometimes omit it (ADR-003: any layer).
@@ -1785,3 +1799,351 @@ async def load_measured_geometry(
             geometry[(row.layer_ref, row.colour_key)] = polylines
 
     return geometry
+
+
+# ---------------------------------------------------------------------------
+# Containment legend + band + centerline loaders (issue #755, Phase 752b-1)
+# ---------------------------------------------------------------------------
+
+
+async def build_containment_legend_db(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    input_family: str | None = None,
+) -> ContainmentLegend:
+    """Build a :class:`ContainmentLegend` from HATCH swatches in the containment legend region.
+
+    Discovers the legend via a text anchor matching ``_CONTAINMENTS_LEGEND_ANCHOR_RE`` (e.g.
+    "CONTAINMENTS LEGEND"), collects HATCH entities in the surrounding region, pairs each
+    swatch with the nearest text label, and reads ``pattern_name`` from
+    ``geometry_json["geometry_summary"]["pattern_name"]``.
+
+    Uses the same region-pad and pair-radius constants as ``_build_dwg_legend_from_anchor``.
+    PDF revisions or no-anchor drawings return an empty :class:`ContainmentLegend`.
+    Never raises.
+
+    TODO(#752): the anchor→region→swatch→pair discovery core here is ~near-verbatim with
+    ``_build_dwg_legend_from_anchor`` (differs only in anchor regex, hatch-only swatch gate, and
+    threading ``pattern_name``). Extract the shared core into one helper returning paired
+    ``(colour_mapping, pattern_name, label)`` tuples so the two legends can't silently diverge.
+    Deferred to keep this PR's blast radius small (the service-legend tests must stay green).
+    """
+    if input_family is None:
+        input_family = await _resolve_input_family(db, revision_id)
+
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
+        # PDF revisions have no DWG HATCH containment swatches.
+        return build_containment_legend([])
+
+    from sqlalchemy import select
+
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        # --- Step 1: load all text/mtext entities for anchor detection ---
+        text_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.entity_type.in_(["text", "mtext"]),
+                    )
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 2: identify containments-legend anchor entities ---
+        regions: list[tuple[float, float, float, float]] = []  # (x_lo, y_lo, x_hi, y_hi)
+        for row in text_rows:
+            geometry = row.geometry_json or {}
+            raw_text = geometry.get("text")
+            if not isinstance(raw_text, str):
+                continue
+            collapsed = _normalize_legend_text(raw_text)
+            if not _CONTAINMENTS_LEGEND_ANCHOR_RE.search(collapsed):
+                continue
+            pt = _entity_insertion(geometry)
+            if pt is None:
+                continue
+            ax, ay = pt
+            regions.append(
+                (
+                    ax - _DWG_REGION_PAD_LEFT,
+                    ay - _DWG_REGION_PAD_BELOW,
+                    ax + _DWG_REGION_PAD_RIGHT,
+                    ay + _DWG_REGION_PAD_ABOVE,
+                )
+            )
+
+        if not regions:
+            return build_containment_legend([])
+
+        def _in_any_region(x: float, y: float) -> bool:
+            for x_lo, y_lo, x_hi, y_hi in regions:
+                if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+                    return True
+            return False
+
+        # --- Step 3: load all entities for the revision (one round-trip) ---
+        all_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 4: collect swatch candidates (HATCH with chromatic colour in region)
+        #             and label text entries (text/mtext in region, not the anchor itself) ---
+        # Swatch candidate: (centroid, colour_mapping, pattern_name)
+        swatch_candidates: list[tuple[tuple[float, float], Mapping[str, Any], str]] = []
+        text_entries: list[tuple[str, tuple[float, float]]] = []
+
+        for row in all_rows:
+            row_geom: dict[str, Any] = row.geometry_json or {}
+
+            if row.entity_type in ("text", "mtext"):
+                raw_text = row_geom.get("text")
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    continue
+                # Exclude the anchor text itself from label candidates.
+                collapsed = _normalize_legend_text(raw_text)
+                if _CONTAINMENTS_LEGEND_ANCHOR_RE.search(collapsed):
+                    continue
+                pt = _entity_insertion(row_geom)
+                if pt is not None and _in_any_region(pt[0], pt[1]):
+                    text_entries.append((raw_text.strip(), pt))
+
+            elif row.entity_type == "hatch":
+                # Only HATCH entities form containment swatches.
+                style = row.style or {}
+                color_val: Any = style.get("color") if isinstance(style, Mapping) else None
+                if not isinstance(color_val, Mapping):
+                    continue
+                if color_val.get("by_layer") or color_val.get("by_block"):
+                    continue
+                if color_val.get("rgb") is None and color_val.get("index") is None:
+                    continue
+                if not _is_chromatic_colour(color_val):
+                    continue
+                centroid = _swatch_centroid(row_geom)
+                if centroid is None:
+                    continue
+                if not _in_any_region(centroid[0], centroid[1]):
+                    continue
+
+                # Read pattern_name from geometry_summary; coerce missing/non-str to "".
+                geom_summary = row_geom.get("geometry_summary")
+                pattern_name_raw = (
+                    geom_summary.get("pattern_name") if isinstance(geom_summary, dict) else None
+                )
+                pattern_name: str = (
+                    str(pattern_name_raw) if isinstance(pattern_name_raw, str) else ""
+                )
+                swatch_candidates.append((centroid, color_val, pattern_name))
+
+        if not swatch_candidates:
+            return build_containment_legend([])
+
+        # --- Step 5: pair each label with the nearest in-region swatch ---
+        inputs: list[ContainmentSwatchInput] = []
+        # Build swatch list in the format expected by _nearest_swatch (centroid, colour_mapping).
+        swatch_list: list[tuple[tuple[float, float], Mapping[str, Any]]] = [
+            (centroid, color_val) for centroid, color_val, _pn in swatch_candidates
+        ]
+        # Recover pattern_name by the colour mapping's object identity (each row yields a
+        # distinct mapping object), NOT by centroid — two swatches can share a centroid but
+        # never share the same colour-mapping object, so identity keying is collision-free.
+        id_to_pn: dict[int, str] = {id(color_val): pn for _c, color_val, pn in swatch_candidates}
+
+        for text, text_pt in text_entries:
+            color = _nearest_swatch(text_pt, swatch_list, _DWG_LEGEND_PAIR_RADIUS)
+            if color is None:
+                continue
+            pn = id_to_pn.get(id(color), "")
+            inputs.append(ContainmentSwatchInput(color=color, pattern_name=pn, text=text))
+
+        return build_containment_legend(inputs)
+
+    except Exception:  # tolerant: never raise
+        return build_containment_legend([])
+
+
+async def load_containment_bands(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    layer_tokens: tuple[str, ...] = _DEFAULT_CONTAINER_LAYER_TOKENS,
+    exclude_off_sheet: bool = True,
+    input_family: str | None = None,
+) -> list[ContainmentBand]:
+    """Load HATCH entities from containment layers as :class:`ContainmentBand` objects.
+
+    Verbatim mirror of :func:`load_service_fill_bands` with two differences:
+
+    1. Default layer tokens are ``_DEFAULT_CONTAINER_LAYER_TOKENS`` (tray/duct/conduit/…).
+    2. ``pattern_name`` is read from
+       ``geometry_json["geometry_summary"]["pattern_name"]``; missing or non-str → ``""``.
+
+    ``colour_key is None`` and rings with <3 points are skipped (same as fill loader).
+    Returns ``[]`` for degenerate revisions; never raises.
+    ADR-003: tokens are params; no hardcoded colours or layers.
+    """
+    del input_family  # accepted for interface symmetry; DWG-only in Phase 1
+
+    from sqlalchemy import or_, select
+
+    from app.ingestion.centerline_contract import _xy_list
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        q = select(RevisionEntity).where(
+            RevisionEntity.drawing_revision_id == revision_id,
+            RevisionEntity.entity_type == "hatch",
+        )
+        if exclude_off_sheet:
+            q = q.where(RevisionEntity.on_sheet.isnot(False))
+        conditions = [RevisionEntity.layer_ref.ilike(f"%{token}%") for token in layer_tokens]
+        q = q.where(or_(*conditions))
+        q = q.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+        rows = list((await db.execute(q)).scalars().all())
+    except Exception:
+        return []
+
+    result: list[ContainmentBand] = []
+    for row in rows:
+        style = row.style or {}
+        color: Mapping[str, Any] | None = style.get("color") if isinstance(style, Mapping) else None
+        ck = _colour_key(color)
+        if ck is None:
+            continue
+
+        colour_index: int | None = color.get("index") if color is not None else None
+        colour_rgb: str | None = color.get("rgb") if color is not None else None
+
+        raw_geom = row.geometry_json
+        geometry: dict[str, Any] | None = raw_geom if isinstance(raw_geom, dict) else None
+        if geometry is None:
+            continue
+
+        # Prefer first boundary loop; fall back to vertices field.
+        boundary_loops = geometry.get("boundary_loops")
+        if isinstance(boundary_loops, (list, tuple)) and boundary_loops:
+            pts_raw = boundary_loops[0]
+        else:
+            pts_raw = geometry.get("vertices")
+
+        ring_pts = _xy_list(pts_raw)
+        if len(ring_pts) < 3:
+            continue
+
+        # Read pattern_name from geometry_summary; coerce missing/non-str → "".
+        geom_summary = geometry.get("geometry_summary")
+        pattern_name_raw = (
+            geom_summary.get("pattern_name") if isinstance(geom_summary, dict) else None
+        )
+        pattern_name: str = str(pattern_name_raw) if isinstance(pattern_name_raw, str) else ""
+
+        result.append(
+            ContainmentBand(
+                colour_key=ck,
+                colour_index=colour_index,
+                colour_rgb=colour_rgb,
+                ring=tuple(ring_pts),
+                pattern_name=pattern_name,
+            )
+        )
+    return result
+
+
+async def load_containment_centerline_segments(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    algo_version: str | None = None,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Load persisted centerline geometry for a revision as flat vertex-pair segments.
+
+    Mirrors the read path of :func:`load_measured_geometry`: filters
+    :class:`~app.models.revision_routed_length.RevisionRoutedLength` rows by
+    ``drawing_revision_id`` and ``algo_version`` (defaults to
+    :data:`~app.ingestion.centerline_contract.CURRENT_ALGO_VERSION`), then calls
+    :func:`~app.ingestion.centerline_contract.polylines_from_geometry_json` and flattens
+    each polyline to consecutive vertex-pair segments.
+
+    Returns ``[]`` on error or when no rows match; never raises.
+    """
+    from app.ingestion.centerline_contract import (
+        CURRENT_ALGO_VERSION,
+        polylines_from_geometry_json,
+    )
+    from app.models.revision_routed_length import RevisionRoutedLength
+
+    resolved_version = algo_version if algo_version is not None else CURRENT_ALGO_VERSION
+
+    try:
+        stmt = select(RevisionRoutedLength).where(
+            RevisionRoutedLength.drawing_revision_id == revision_id,
+            RevisionRoutedLength.algo_version == resolved_version,
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+    except Exception:
+        return []
+
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for row in rows:
+        polylines = polylines_from_geometry_json(row.geometry_json)
+        for polyline in polylines:
+            # Flatten each polyline into consecutive vertex-pair segments.
+            for i in range(len(polyline) - 1):
+                segments.append((polyline[i], polyline[i + 1]))
+
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Containment takeoff assembler (issue #755, Phase 752b-3)
+# ---------------------------------------------------------------------------
+
+
+async def assemble_containment_takeoff(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    layer_tokens: tuple[str, ...] = _DEFAULT_CONTAINER_LAYER_TOKENS,
+    exclude_off_sheet: bool = True,
+    algo_version: str | None = None,
+    input_family: str | None = None,
+) -> ContainmentAttributionResult:
+    """Assemble a :class:`ContainmentAttributionResult` for a revision.
+
+    Glue-only: composes the three loaders and delegates all measurement logic to
+    :func:`~app.interpretation.containment_takeoff.compute_containment_attributed_lengths`.
+    Returns an empty result (no raise) when any loader returns empty data.
+    """
+    legend = await build_containment_legend_db(db, revision_id, input_family=input_family)
+    bands = await load_containment_bands(
+        db,
+        revision_id,
+        layer_tokens=layer_tokens,
+        exclude_off_sheet=exclude_off_sheet,
+        input_family=input_family,
+    )
+    segments = await load_containment_centerline_segments(
+        db, revision_id, algo_version=algo_version
+    )
+
+    return compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+    )
