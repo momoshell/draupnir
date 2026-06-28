@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.interpretation.devices import (
+    DEFAULT_TAG_MAX_DISTANCE_M,
+    LEGEND_FAMILY_MARKER,
     Device,
     _Affine,
     _compose,
@@ -16,7 +18,9 @@ from app.interpretation.devices import (
     _placement,
     _TagCandidate,
     attach_tags,
+    resolve_typed_devices,
     schedule_from_devices,
+    scoped_block_families,
 )
 
 
@@ -116,3 +120,103 @@ def test_schedule_from_devices_counts_by_block_ref() -> None:
         {"block_ref": "Smoke", "count": 2},
         {"block_ref": "Panel", "count": 1},
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tests for shared constants and scoped_block_families (#767, #768)
+# ---------------------------------------------------------------------------
+
+
+def test_legend_family_marker_and_default_distance_constants() -> None:
+    """Canonical constants are exported with the expected calibrated values."""
+    assert LEGEND_FAMILY_MARKER == "legend stage"
+    assert DEFAULT_TAG_MAX_DISTANCE_M == 2.0
+
+
+def test_scoped_block_families_includes_only_marked_families() -> None:
+    """scoped_block_families returns FamilyInput only for block_refs with the legend marker.
+
+    Architectural block refs (no marker) must be excluded so they don't enter the
+    by_symbol_family legend source and pre-empt architecture classification (#767).
+    Case-insensitive match: marker may appear in any casing in the block_ref.
+    """
+    marked = _device("d1", 0.0, 0.0, "Smoke Detector rfa - Rev1 Legend Stage 4")
+    arch_door = _device("d2", 1.0, 0.0, "Door - M_Door_Single-Flush")
+    arch_mullion = _device("d3", 2.0, 0.0, "Mullion - Rectangular Mullion")
+    no_ref = _device("d4", 3.0, 0.0, None)
+
+    result = scoped_block_families([marked, arch_door, arch_mullion, no_ref])
+
+    # Only the marked family should be returned.
+    assert len(result) == 1
+    family = result[0]
+    # FamilyInput is a NamedTuple / dataclass; access the family_name field.
+    assert family.family_name == "Smoke Detector rfa - Rev1 Legend Stage 4"
+
+
+def test_scoped_block_families_case_insensitive() -> None:
+    """Marker match is case-insensitive (block names vary in casing across vendors)."""
+    devices = [
+        _device("x1", 0.0, 0.0, "Heat Detector - LEGEND STAGE 3"),
+        _device("x2", 0.0, 0.0, "Heat Detector - legend stage 3"),
+        _device("x3", 0.0, 0.0, "Heat Detector - Legend Stage 3"),
+    ]
+    result = scoped_block_families(devices)
+    assert len(result) == 3
+
+
+def test_scoped_block_families_empty_input() -> None:
+    assert scoped_block_families([]) == []
+
+
+def test_far_tag_not_attached_with_default_distance_cap() -> None:
+    """Devices more than DEFAULT_TAG_MAX_DISTANCE_M away do not receive a tag.
+
+    Mirrors the Welbeck calibration scenario: a device at (0, 0) with a tag at
+    (2.47, 0) — distance ~2.47 m — must NOT be tagged when the default cap applies.
+    A tag at (1.5, 0) — distance 1.5 m — MUST be attached.
+    """
+    device = _device("dev-far", 0.0, 0.0, "SD rfa - Legend Stage 4")
+
+    far_candidate = _TagCandidate(entity_id="t-far", text="FAR", layer_ref="Tags", x=2.47, y=0.0)
+    near_candidate = _TagCandidate(entity_id="t-near", text="NEAR", layer_ref="Tags", x=1.5, y=0.0)
+
+    tagged_far = attach_tags([device], [far_candidate], max_distance=DEFAULT_TAG_MAX_DISTANCE_M)
+    assert tagged_far[0].tag is None, "tag at 2.47 m must be rejected by the 2.0 m cap"
+
+    tagged_near = attach_tags([device], [near_candidate], max_distance=DEFAULT_TAG_MAX_DISTANCE_M)
+    assert tagged_near[0].tag is not None and tagged_near[0].tag.text == "NEAR"
+
+
+def test_resolve_typed_devices_excludes_architecture() -> None:
+    """Devices whose block_ref lacks the legend marker are classified 'architecture'.
+
+    resolve_typed_devices feeds the devices + legend through device_identity; when no
+    legend entry matches (because scoped_block_families would have excluded the arch family),
+    the architecture-pattern step should classify them accordingly.
+
+    This test uses a minimal empty legend so architecture classification falls through
+    to the known-architecture pattern check in classify_instance_kind.
+    """
+    from app.interpretation.legend_dictionary import LegendDictionary
+
+    # A block_ref matching the architecture pattern used by classify_instance_kind.
+    # _rvt prefix and "Mullion" are known markers in the architecture-pattern classifier.
+    arch_device = _device("arch-1", 0.0, 0.0, "_rvt_Mullion:Rectangular Mullion:293465")
+    legend_device = _device("legend-1", 1.0, 1.0, "Smoke Detector rfa - Rev1 Legend Stage 4")
+
+    # Empty legend: no entries, so only architecture patterns can classify.
+    empty_legend = LegendDictionary(entries=())
+
+    typed = resolve_typed_devices([arch_device, legend_device], empty_legend)
+
+    # Architecture device should be classified "architecture" and excluded from counted output,
+    # or at minimum carry kind=KIND_ARCHITECTURE in the typed result.
+    from app.interpretation.device_identity import KIND_ARCHITECTURE
+
+    arch_typed = next((td for td in typed if td.device_id == "arch-1"), None)
+    if arch_typed is not None:
+        assert arch_typed.kind == KIND_ARCHITECTURE or arch_typed.type_name == "architecture", (
+            f"Expected architecture classification, got kind={arch_typed.kind!r} "
+            f"type_name={arch_typed.type_name!r}"
+        )

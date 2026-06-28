@@ -31,16 +31,17 @@ from app.interpretation.device_identity import (
     resolve_device_identities,
 )
 from app.interpretation.devices import (
+    DEFAULT_TAG_MAX_DISTANCE_M,
     _typed_from_identities,
     attach_tags,
     enumerate_devices,
     load_tag_candidates,
     schedule_from_devices,
+    scoped_block_families,
 )
 from app.interpretation.layer_roles import RULE_VERSION, classify_layer_role
 from app.interpretation.legend import resolve_legend_devices, schedule_from_legend_devices
 from app.interpretation.legend_dictionary import (
-    FamilyInput,
     ProseInput,
     TagInput,
     from_block_families,
@@ -74,12 +75,6 @@ DeviceKind = Literal["all", "device", "architecture"]
 DeviceScope = Literal["sheet", "modelspace"]
 _DEFAULT_DEVICE_SCOPE: DeviceScope = "sheet"
 
-# Legend-defined device families carry this export marker in their block name (e.g.
-# "Smoke Detector with Beaconrfa - …-Legend Stage 4"). Native architecture (mullions,
-# columns, grids) does not. Source A (the legend icon families) is scoped to families
-# carrying this marker, so architecture instances aren't treated as legend devices (#545).
-_LEGEND_FAMILY_MARKER = "legend stage"
-
 
 @devices_router.get(
     "/revisions/{revision_id}/devices",
@@ -92,7 +87,7 @@ async def list_revision_devices(
     cursor: str | None = Query(default=None),
     device_layer: Annotated[list[str] | None, Query()] = None,
     tag_layer: Annotated[list[str] | None, Query()] = None,
-    max_tag_distance: Annotated[float | None, Query(gt=0.0)] = None,
+    max_tag_distance: Annotated[float | None, Query(gt=0.0)] = DEFAULT_TAG_MAX_DISTANCE_M,
     max_depth: Annotated[int, Query(ge=0, le=_MAX_NESTING_DEPTH)] = _MAX_NESTING_DEPTH,
     kind: Annotated[DeviceKind, Query()] = "all",
     scope: Annotated[DeviceScope, Query()] = _DEFAULT_DEVICE_SCOPE,
@@ -133,7 +128,11 @@ async def list_revision_devices(
     all_tagged = attach_tags(devices, candidates, max_distance=max_tag_distance)
 
     # Build the legend over the FULL device set.
-    families = [FamilyInput(family_name=d.block_ref) for d in all_tagged if d.block_ref]
+    # Source A is scoped to legend-key symbols via scoped_block_families (block_refs carrying
+    # the LEGEND_FAMILY_MARKER). MPA architectural blocks (Mullion, Door, _rvt …) lack this
+    # marker and must NOT enter by_symbol_family, otherwise step-2 in classify_instance_kind
+    # pre-empts step-3 architecture patterns (#767).
+    families = scoped_block_families(all_tagged)
     prose_texts = await load_legend_text_candidates(db, revision_id)
     prose = [ProseInput(text=t) for t in prose_texts]
     # Source C: distinct tag tokens from ALL tag candidates (not just associated ones).

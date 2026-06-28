@@ -6,14 +6,12 @@ in-memory fixtures, so they run without a database. Pattern mirrors test_rooms_a
 
 Fixture design notes
 --------------------
-Source A (block families) is derived from ALL enumerated device block_refs. This means any
-device with a non-None block_ref lands in ``by_symbol_family``, which causes step 2 of
-``classify_instance_kind`` to fire and return KIND_DEVICE before the architecture pattern
-check at step 3. Architecture kind therefore only fires for block_refs that are NOT in the
-enumerated set (e.g., when ``device_layer`` filters exclude architectural INSERTs). The
-tests reflect this actual pipeline behavior: the SD and door devices below are all
-classified as KIND_DEVICE (legend-resolvable via symbol_family), and the exemplars on the
-``%LEGEND%`` layer are classified as KIND_LEGEND_EXEMPLAR.
+Source A (block families) is scoped to block_refs carrying the ``_LEGEND_FAMILY_MARKER``
+(``"legend stage"``) so that only legend-key symbols enter ``by_symbol_family``. MPA
+architectural blocks (``Rectangular Mullion…``, ``MPA_Door…``, ``_rvt…``) lack the marker
+and therefore fall through to step-3 architecture-pattern classification (#767). Real placed
+devices that also lack the marker resolve via Source-C tag abbreviation (step 5) or are
+left as tagged-but-unresolved devices (step 6) — they are still classified ``device``.
 
 Empty-legend fixture
 --------------------
@@ -215,10 +213,12 @@ async def test_devices_schedule_by_type_excludes_exemplars_and_is_small(
     type_names = {e["type_name"] for e in sbt}
     assert "legend_exemplar" not in type_names
 
-    # SD should be the most common type.
+    # SD should appear: sd-0 is at the origin next to the SD tag (distance 0) and resolves
+    # as type_name="SD". sd-1 (10 m) and sd-2 (20 m) exceed the 2.0 m default cap and lose
+    # their tag → KIND_UNKNOWN → bucketed as "unresolved" (#768).
     sd_entry = next((e for e in sbt if e["type_name"] == "SD"), None)
     assert sd_entry is not None
-    assert sd_entry["count"] == 3
+    assert sd_entry["count"] == 1
 
 
 async def test_devices_kind_filter_device_returns_only_devices(devices_app: FastAPI) -> None:
@@ -385,8 +385,9 @@ async def test_devices_resolved_device_has_type_name(devices_app: FastAPI) -> No
     sem = sd0["semantics"]
     assert sem["kind"] == "device"
     # Status is resolved because SD tag text hits by_abbreviation (from Source C tag token).
+    # Source A is scoped to legend-marked families; "SD" block_ref lacks the marker, so the
+    # resolution path goes via tag_abbreviation (step 5) using the Source-C entry (#767).
     assert sem["status"] == "resolved"
-    # type_name comes from Source A or C (SD is both a family and a tag token).
     assert sem["type_name"] == "SD"
 
 
@@ -648,16 +649,18 @@ async def test_devices_pagination_schedule_by_type_is_revision_wide(
 ) -> None:
     """schedule_by_type on page 1 must reflect ALL 60 placed devices, not just the 50 on page 1.
 
-    The two exemplars are excluded from the denominator bucket but count is still
-    revision-wide (all 60 placed, not just 50).
+    The two exemplars are excluded from the denominator bucket. The 60 placed SD devices have
+    no tags and "SD" lacks the legend-stage marker, so they are untagged KIND_UNKNOWN instances
+    that land in the ``unresolved`` bucket — but all 60 must appear (not just the 50 on page 1).
     """
     response = await _get_devices(paginated_devices_app)
     assert response.status_code == 200
     body = response.json()
 
     sbt = {entry["type_name"]: entry["count"] for entry in body["schedule_by_type"]}
-    # 60 placed SD devices — all 60 must be in the SD bucket (not just the first 50 on the page).
-    assert sbt.get("SD") == 60
+    # 60 placed SD devices with no tags and no legend-stage marker → classified KIND_UNKNOWN →
+    # bucketed as "unresolved". All 60 must appear revision-wide (not just the 50 on page 1).
+    assert sbt.get("unresolved") == 60
     # Exemplars must not appear as a bucket.
     assert "legend_exemplar" not in sbt
 
@@ -674,3 +677,349 @@ async def test_devices_pagination_legend_is_revision_wide(
     assert body["association"]["total_devices"] == len(_PAGED_ALL_DEVICES)
     # legend must have at least one entry (SD from prose).
     assert body["legend"]["legend_size"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Architecture-exclusion fixture (#767)
+#
+# Verifies that Source A is scoped to legend-key symbols (those carrying the
+# "_LEGEND_FAMILY_MARKER" = "legend stage" in their block_ref), so embedded MPA
+# architectural families are never added to by_symbol_family and correctly
+# classify as KIND_ARCHITECTURE rather than KIND_DEVICE.
+# ---------------------------------------------------------------------------
+
+# Legend-key symbol inserts — block_ref carries "Legend Stage 4" (the marker).
+_ARCH_EXCL_LEGEND_KEY_SYMBOLS = [
+    Device(
+        entity_id=f"legend-key-{i}",
+        sequence_index=i,
+        depth=0,
+        block_ref=f"Fire Alarm Sounder - Standard-Legend Stage 4-{i}",
+        layer_ref="Z010T-LEGEND",
+        position={"x": float(i * 5), "y": 100.0},
+        tag=None,
+    )
+    for i in range(2)
+]
+
+# MPA architectural blocks — NO legend-stage marker in block_ref.
+_ARCH_EXCL_MPA_BLOCKS = [
+    Device(
+        entity_id="mpa-door-1",
+        sequence_index=10,
+        depth=0,
+        block_ref="MPA_Door - Single Flush",
+        layer_ref="A-DOOR",
+        position={"x": 50.0, "y": 0.0},
+        tag=None,
+    ),
+    Device(
+        entity_id="mpa-mullion-1",
+        sequence_index=11,
+        depth=0,
+        block_ref="Rectangular Mullion Type A",
+        layer_ref="A-GLAZ",
+        position={"x": 60.0, "y": 0.0},
+        tag=None,
+    ),
+    Device(
+        entity_id="mpa-rvt-1",
+        sequence_index=12,
+        depth=0,
+        block_ref="3356-MPA-ZZ-ZZ-M3-A-0001_rvt-1",
+        layer_ref="0",
+        position={"x": 70.0, "y": 0.0},
+        tag=None,
+    ),
+]
+
+# A real placed device with a tag (no legend-stage marker in block_ref).
+_ARCH_EXCL_PLACED_DEVICE = Device(
+    entity_id="placed-fas-1",
+    sequence_index=20,
+    depth=0,
+    block_ref="Fire Alarm Sounder",
+    layer_ref="E-FIRE",
+    position={"x": 200.0, "y": 0.0},
+    tag=None,
+)
+
+_ARCH_EXCL_ALL_DEVICES = [
+    *_ARCH_EXCL_LEGEND_KEY_SYMBOLS,
+    *_ARCH_EXCL_MPA_BLOCKS,
+    _ARCH_EXCL_PLACED_DEVICE,
+]
+
+# Tag candidate for the placed device.
+_ARCH_EXCL_TAG_CANDIDATES = [
+    _TagCandidate(
+        entity_id="tag-fas",
+        text="FAS",
+        layer_ref="E-FIRE-TAG",
+        x=200.0,
+        y=0.0,
+    ),
+]
+
+
+@pytest.fixture
+def arch_excl_devices_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """App variant mixing legend-key symbols, MPA architectural blocks, and a tagged device.
+
+    Verifies #767: Source A is scoped to legend-marked block_refs, so MPA architecture
+    blocks fall through to step-3 pattern classification (KIND_ARCHITECTURE) and are
+    excluded from device-type buckets in schedule_by_type.
+    """
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_devices(db: Any, revision_id: uuid.UUID, **_: Any) -> list[Device]:
+        return list(_ARCH_EXCL_ALL_DEVICES)
+
+    async def _fake_tags(db: Any, revision_id: uuid.UUID, **_: Any) -> list[_TagCandidate]:
+        return list(_ARCH_EXCL_TAG_CANDIDATES)
+
+    async def _fake_legend_texts(db: Any, revision_id: uuid.UUID, **_: Any) -> list[str]:
+        return []
+
+    monkeypatch.setattr(devices_route, "_get_active_revision_manifest_or_409", _fake_manifest)
+    monkeypatch.setattr(devices_route, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(devices_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(devices_route, "load_legend_text_candidates", _fake_legend_texts)
+
+    yield app
+    app.dependency_overrides.clear()
+
+
+async def test_arch_excl_mpa_blocks_classify_as_architecture(
+    arch_excl_devices_app: FastAPI,
+) -> None:
+    """MPA architectural blocks must classify as KIND_ARCHITECTURE (not KIND_DEVICE).
+
+    Before the #767 fix, MPA blocks entered by_symbol_family (Source A was unfiltered) and
+    were pre-emptively classified as KIND_DEVICE at step 2. With the fix, Source A is scoped
+    to legend-marked families, so these blocks fall through to the architecture-pattern check.
+    """
+    response = await _get_devices(arch_excl_devices_app, "?kind=all")
+    assert response.status_code == 200
+    body = response.json()
+
+    items_by_id = {item["entity_id"]: item for item in body["items"]}
+
+    for mpa_device in _ARCH_EXCL_MPA_BLOCKS:
+        item = items_by_id.get(mpa_device.entity_id)
+        assert item is not None, f"MPA block {mpa_device.entity_id!r} missing from response"
+        sem = item["semantics"]
+        assert sem["kind"] == "architecture", (
+            f"{mpa_device.entity_id!r} (block_ref={mpa_device.block_ref!r}) "
+            f"expected kind=architecture, got {sem['kind']!r}"
+        )
+        assert sem["basis"].startswith("architecture:"), (
+            f"Expected architecture:* basis, got {sem['basis']!r}"
+        )
+
+
+async def test_arch_excl_mpa_blocks_absent_from_schedule_by_type(
+    arch_excl_devices_app: FastAPI,
+) -> None:
+    """MPA architecture kinds must not appear as device type buckets in schedule_by_type.
+
+    schedule_by_type collapses all architecture-kind items into a single 'architecture'
+    bucket (appended last only when arch_count > 0). No MPA block_ref should appear as its
+    own type bucket.
+    """
+    response = await _get_devices(arch_excl_devices_app)
+    assert response.status_code == 200
+    body = response.json()
+
+    type_names = {entry["type_name"] for entry in body["schedule_by_type"]}
+    mpa_block_refs = {d.block_ref for d in _ARCH_EXCL_MPA_BLOCKS if d.block_ref}
+    for br in mpa_block_refs:
+        assert br not in type_names, f"MPA block_ref {br!r} must not appear as a device-type bucket"
+    # The architecture bucket itself must be present (3 MPA blocks).
+    assert "architecture" in type_names
+
+
+async def test_arch_excl_placed_device_still_classifies_as_device(
+    arch_excl_devices_app: FastAPI,
+) -> None:
+    """A tagged placed device without the legend-stage marker must still classify as device.
+
+    After the fix, placed devices fall through to step 5 (tag abbreviation) or step 6 (any
+    tag present) — they are not silently dropped. The FAS device gets the nearby FAS tag and
+    resolves as a tagged device (unresolved, since there is no prose legend entry for FAS).
+    """
+    response = await _get_devices(arch_excl_devices_app)
+    assert response.status_code == 200
+    body = response.json()
+
+    items_by_id = {item["entity_id"]: item for item in body["items"]}
+    placed = items_by_id.get(_ARCH_EXCL_PLACED_DEVICE.entity_id)
+    assert placed is not None, "Placed device must appear in response"
+    sem = placed["semantics"]
+    assert sem["kind"] == "device", f"Expected kind=device, got {sem['kind']!r}"
+
+
+async def test_arch_excl_legend_built_from_marked_families(
+    arch_excl_devices_app: FastAPI,
+) -> None:
+    """The legend (Source A) must be built from the marked legend-key symbols only.
+
+    legend_size >= 1 (the two marked legend-key symbol families de-duped into one entry, or
+    two entries if their cleaned names differ) — confirms the marked symbols entered Source A.
+    MPA block_refs being absent from Source A is the root invariant of #767.
+    """
+    response = await _get_devices(arch_excl_devices_app)
+    assert response.status_code == 200
+    body = response.json()
+
+    # The two legend-key symbols both carry "Legend Stage 4" in their block_ref; the
+    # legend must have at least one entry from Source A.
+    assert body["legend"]["legend_size"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Default tag-distance cap (#768)
+#
+# Verifies that the 2.0 m default cap on max_tag_distance prevents spurious
+# far-tag associations, while a near tag is still attached, and the cap can
+# be widened via the query param.
+# ---------------------------------------------------------------------------
+
+# A device at the origin with a tag right next to it (distance = 0.5 m).
+_CAP_NEAR_DEVICE = Device(
+    entity_id="cap-near-device",
+    sequence_index=0,
+    depth=0,
+    block_ref="SD",
+    layer_ref="E-FIRE",
+    position={"x": 0.0, "y": 0.0},
+    tag=None,
+)
+
+# Near tag (0.5 m from cap-near-device at origin).
+_CAP_NEAR_TAG = _TagCandidate(
+    entity_id="tag-near",
+    text="SD",
+    layer_ref="E-FIRE-TAG",
+    x=0.5,
+    y=0.0,
+)
+
+# A device at x=100 m with its only tag 10 m away (beyond the 2.0 m default cap).
+_CAP_FAR_DEVICE = Device(
+    entity_id="cap-far-device",
+    sequence_index=1,
+    depth=0,
+    block_ref="FAP",
+    layer_ref="E-FIRE",
+    position={"x": 100.0, "y": 0.0},
+    tag=None,
+)
+
+# Far tag (10 m from cap-far-device at x=100; 109.5 m from cap-near-device — irrelevant).
+_CAP_FAR_TAG = _TagCandidate(
+    entity_id="tag-far",
+    text="FAP",
+    layer_ref="E-FIRE-TAG",
+    x=110.0,
+    y=0.0,
+)
+
+_CAP_ALL_DEVICES = [_CAP_NEAR_DEVICE, _CAP_FAR_DEVICE]
+_CAP_ALL_TAGS = [_CAP_NEAR_TAG, _CAP_FAR_TAG]
+
+
+@pytest.fixture
+def cap_devices_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """App variant with one near-tagged device and one device whose only tag is far (> 2 m).
+
+    Used to exercise the #768 default 2.0 m distance cap on tag association.
+    """
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_devices(db: Any, revision_id: uuid.UUID, **_: Any) -> list[Device]:
+        return list(_CAP_ALL_DEVICES)
+
+    async def _fake_tags(db: Any, revision_id: uuid.UUID, **_: Any) -> list[_TagCandidate]:
+        return list(_CAP_ALL_TAGS)
+
+    async def _fake_legend_texts(db: Any, revision_id: uuid.UUID, **_: Any) -> list[str]:
+        return []
+
+    monkeypatch.setattr(devices_route, "_get_active_revision_manifest_or_409", _fake_manifest)
+    monkeypatch.setattr(devices_route, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(devices_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(devices_route, "load_legend_text_candidates", _fake_legend_texts)
+
+    yield app
+    app.dependency_overrides.clear()
+
+
+async def test_cap_default_blocks_far_tag(cap_devices_app: FastAPI) -> None:
+    """Default 2.0 m cap must prevent the far tag (10 m away) from being associated.
+
+    cap-far-device is at origin; its only candidate tag is 10 m away. With the default
+    cap applied, tag association returns None → the device has no tag attached.
+    """
+    response = await _get_devices(cap_devices_app)
+    assert response.status_code == 200
+    body = response.json()
+
+    items_by_id = {item["entity_id"]: item for item in body["items"]}
+    far = items_by_id.get(_CAP_FAR_DEVICE.entity_id)
+    assert far is not None, "cap-far-device must appear in response"
+    # No tag should be attached because the only candidate is 10 m away (> 2.0 m cap).
+    assert far["tag"] is None, (
+        f"Expected no tag for cap-far-device under default cap, got {far['tag']!r}"
+    )
+
+
+async def test_cap_default_keeps_near_tag(cap_devices_app: FastAPI) -> None:
+    """Default 2.0 m cap must not drop a tag that is within range (0.5 m away).
+
+    cap-near-device is at origin; its tag is 0.5 m away — within the 2.0 m default cap.
+    """
+    response = await _get_devices(cap_devices_app)
+    assert response.status_code == 200
+    body = response.json()
+
+    items_by_id = {item["entity_id"]: item for item in body["items"]}
+    near = items_by_id.get(_CAP_NEAR_DEVICE.entity_id)
+    assert near is not None, "cap-near-device must appear in response"
+    assert near["tag"] is not None, (
+        "Expected tag for cap-near-device (0.5 m away, within 2.0 m cap)"
+    )
+    assert near["tag"]["text"] == "SD"
+
+
+async def test_cap_override_wider_cap_restores_far_tag(cap_devices_app: FastAPI) -> None:
+    """Passing max_tag_distance=20.0 must override the default and re-include the far tag.
+
+    Callers can widen the cap via the query param. With 20 m the far tag (10 m) is within
+    range and must be attached to cap-far-device.
+    """
+    response = await _get_devices(cap_devices_app, "?max_tag_distance=20.0")
+    assert response.status_code == 200
+    body = response.json()
+
+    items_by_id = {item["entity_id"]: item for item in body["items"]}
+    far = items_by_id.get(_CAP_FAR_DEVICE.entity_id)
+    assert far is not None, "cap-far-device must appear in response"
+    assert far["tag"] is not None, (
+        "Expected tag for cap-far-device when max_tag_distance=20.0 overrides the default cap"
+    )
+    assert far["tag"]["text"] == "FAP"

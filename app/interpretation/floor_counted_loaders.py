@@ -18,7 +18,7 @@ from typing import Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.interpretation.devices import TypedDevice, load_typed_devices
+from app.interpretation.devices import DEFAULT_TAG_MAX_DISTANCE_M, TypedDevice, load_typed_devices
 from app.interpretation.floor_counted import CountedFusionResult, bucket_counted_devices
 from app.interpretation.floor_registration import FloorRegistration
 from app.interpretation.grid_registration import GridTransform
@@ -38,7 +38,7 @@ async def load_counted_fusion(
     max_depth: int = _MAX_NESTING_DEPTH,
     device_layer: list[str] | None = None,
     tag_layer: list[str] | None = None,
-    max_tag_distance: float | None = None,
+    max_tag_distance: float | None = DEFAULT_TAG_MAX_DISTANCE_M,
 ) -> CountedFusionResult:
     """Load typed devices for each registered member and return the fused result.
 
@@ -65,7 +65,8 @@ async def load_counted_fusion(
     tag_layer:
         Optional layer-ref filter for tag association (forwarded to ``load_typed_devices``).
     max_tag_distance:
-        Optional max distance for tag association (forwarded to ``load_typed_devices``).
+        Max distance for tag association (forwarded to ``load_typed_devices``).
+        Defaults to ``DEFAULT_TAG_MAX_DISTANCE_M`` (2.0 m cap, #768).
     """
     collected: list[tuple[str, GridTransform, list[TypedDevice]]] = []
 
