@@ -20,11 +20,18 @@ Pure module — NO DB, ORM, FastAPI, or SQLAlchemy imports.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from app.interpretation.containment_legend import ContainmentLegend
+from app.interpretation.segment_label_takeoff import (
+    SegmentLabel,
+    compute_segment_label_lengths,
+)
 from app.interpretation.service_fill_takeoff import FillBand, compute_fill_attributed_lengths
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Reserved token strings — MUST NOT collide with real containment_type values.
@@ -101,20 +108,46 @@ class ContainmentTypeLength:
     member_pattern_names: tuple[str, ...]  # sorted, deduped
 
 
+# Provenance marker for lengths recovered via the run-label mechanism.
+BASIS_RUN_LABEL: str = "run_label"
+
+
+@dataclass(frozen=True, slots=True)
+class ContainmentLabelLength:
+    """Attributed length recovered from an unmapped segment via its nearest run-label.
+
+    Length the legend could not resolve is attributed here instead, with a distinct
+    provenance marker so it is never silently merged into legend totals.
+    """
+
+    containment_type: str  # the run-label SERVICE token, e.g. "FA DECTN ALM"
+    length_m: float
+    basis: str  # provenance marker — always BASIS_RUN_LABEL
+
+
 @dataclass(frozen=True, slots=True)
 class ContainmentAttributionResult:
     """Result of containment-type attribution over the full centerline segment set.
 
-    INVARIANT: Σ(per_type lengths) + shared_length_m == total_length_m within ±0.1 m.
+    Primary invariant: Σ(per_type lengths) + shared_length_m == total_length_m ±0.1 m.
+    Extended invariant (when labels supplied):
+      Σ(real-type per_type) + Σ(label_attributed) + label_unknown_length_m
+      + shared_length_m == total_length_m ±0.1 m.
+    The ``None`` per_type entry, if present, has length_m == label_unknown_length_m.
+
     ``per_type`` is sorted: by containment_type (None sorts LAST, after all real strings).
     ``shared_length_m`` corresponds to the engine's ``__shared__`` bucket (geometrically
     ambiguous — equidistant or unattributable), NOT to the honest-absent (unmapped) bands.
+    ``label_attributed``: sorted by containment_type; basis=BASIS_RUN_LABEL.
+    ``label_unknown_length_m``: unmapped AND no in-cap label — honest-UNKNOWN.
     """
 
     per_type: tuple[ContainmentTypeLength, ...]
     shared_length_m: float
     total_length_m: float
     centerline_segment_count: int
+    label_attributed: tuple[ContainmentLabelLength, ...] = ()
+    label_unknown_length_m: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +164,8 @@ def compute_containment_attributed_lengths(
     nearest_max_m: float = 0.100,
     nearest_margin_m: float = 0.020,
     band_buffer_m: float = 0.011,
+    labels: Sequence[SegmentLabel] = (),
+    label_nearest_max_m: float = 5.0,
 ) -> ContainmentAttributionResult:
     """Attribute centerline segment lengths to containment-type bands.
 
@@ -144,11 +179,22 @@ def compute_containment_attributed_lengths(
     4. Translate result tokens back to containment_type values.
     5. Fold bands sharing the SAME resolved type into one ContainmentTypeLength entry
        (lengths sum; member keys/patterns accumulated, sorted, deduped).
+    6. (Optional) Run the label pass over segments that resolved to ``_TOKEN_UNMAPPED``:
+       those segments are wrapped as 2-vertex polylines and fed to
+       ``compute_segment_label_lengths``.  Recovered length moves into ``label_attributed``
+       (basis=BASIS_RUN_LABEL); the residue stays in the ``None`` per_type bucket as
+       ``label_unknown_length_m`` (honest-UNKNOWN).
 
     ``shared_length_m`` is the engine's geometric-ambiguity bucket (unchanged).
     The honest-absent bucket (``containment_type=None``) is a per_type entry.
+    When ``labels`` is empty (default), ``label_attributed`` and ``label_unknown_length_m``
+    are zero/empty and the result is byte-identical to pre-label behaviour.
 
     Empty inputs return an empty result without raising.
+
+    Extended invariant (when labels supplied):
+      Σ(real-type per_type) + Σ(label_attributed) + label_unknown_length_m
+      + shared_length_m == total_length_m ±0.1 m.
     """
     if not centerline_segments:
         return ContainmentAttributionResult(
@@ -211,6 +257,73 @@ def compute_containment_attributed_lengths(
             cks.add(ck_val)
             pns.add(pn_val)
 
+    # --- Step 6: label pass over unmapped segments (optional) ---
+    # segment_attribution is aligned 1:1 with centerline_segments (including zero-length,
+    # which carry None and contribute nothing to any length bucket).
+    label_attributed: tuple[ContainmentLabelLength, ...] = ()
+    label_unknown_length_m: float = 0.0
+
+    unmapped_token = _type_to_token(None)  # == _TOKEN_UNMAPPED; never hardcode the string
+
+    if labels:
+        seg_attr = fill_result.segment_attribution
+        # Collect exactly those input segments that the legend pass left unmapped.
+        unmapped_segs: list[tuple[tuple[float, float], tuple[float, float]]] = [
+            centerline_segments[i]
+            for i in range(len(centerline_segments))
+            if i < len(seg_attr) and seg_attr[i] == unmapped_token
+        ]
+
+        if unmapped_segs:
+            # Wrap each (start, end) segment as a 2-vertex polyline for the label engine.
+            unmapped_polylines: list[tuple[tuple[float, float], ...]] = [
+                (start, end) for start, end in unmapped_segs
+            ]
+            label_result = compute_segment_label_lengths(
+                centerline_polylines=unmapped_polylines,
+                labels=labels,
+                nearest_max_m=label_nearest_max_m,
+            )
+
+            label_attributed = tuple(
+                sorted(
+                    (
+                        ContainmentLabelLength(
+                            containment_type=svc.service,
+                            length_m=svc.length_m,
+                            basis=BASIS_RUN_LABEL,
+                        )
+                        for svc in label_result.per_service
+                    ),
+                    key=lambda e: e.containment_type,
+                )
+            )
+            label_unknown_length_m = label_result.unknown_length_m
+
+            # Reconcile the None per_type bucket: recovered length moves out of honest-absent
+            # into label_attributed.  After the label pass, None bucket == label_unknown_length_m.
+            if None in type_lengths:
+                total_label_recovered = sum(e.length_m for e in label_attributed)
+                original_unmapped = type_lengths[None]
+                partition_err = total_label_recovered + label_unknown_length_m - original_unmapped
+                if abs(partition_err) >= 0.1:
+                    # Conservation violated beyond tolerance — route residual into unknown
+                    # so the API response stays consistent; never crash a compute-on-read path.
+                    _log.warning(
+                        "containment label-pass partition error %.4f m "
+                        "(recovered=%.4f unknown=%.4f unmapped=%.4f); "
+                        "routing residual into label_unknown_length_m",
+                        partition_err,
+                        total_label_recovered,
+                        label_unknown_length_m,
+                        original_unmapped,
+                    )
+                    label_unknown_length_m = original_unmapped - total_label_recovered
+                    # Clamp to zero — never emit negative unknown.
+                    if label_unknown_length_m < 0.0:
+                        label_unknown_length_m = 0.0
+                type_lengths[None] = label_unknown_length_m
+
     # Sort per_type: real types alphabetically, None (honest-absent) LAST.
     def _sort_key(ct: str | None) -> str:
         return ct if ct is not None else chr(0x10FFFF)
@@ -230,4 +343,6 @@ def compute_containment_attributed_lengths(
         shared_length_m=fill_result.shared_length_m,
         total_length_m=fill_result.total_length_m,
         centerline_segment_count=fill_result.centerline_segment_count,
+        label_attributed=label_attributed,
+        label_unknown_length_m=round(label_unknown_length_m, 6),
     )

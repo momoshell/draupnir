@@ -30,6 +30,17 @@ class ContainmentTypeRead(BaseModel):
     )
 
 
+class ContainmentLabelTypeRead(BaseModel):
+    """Attributed length recovered from an unmapped segment via its nearest run-label."""
+
+    containment_type: str = Field(..., description="Run-label SERVICE token, e.g. 'FA DECTN ALM'")
+    length_m: float = Field(..., ge=0.0, description="Attributed length in metres")
+    basis: str = Field(
+        ...,
+        description="Provenance marker; 'run_label' for lengths recovered via the label mechanism",
+    )
+
+
 class ContainmentTakeoffResponse(BaseModel):
     """Containment-type takeoff for one drawing revision (compute-on-read)."""
 
@@ -57,4 +68,20 @@ class ContainmentTakeoffResponse(BaseModel):
     )
     centerline_segment_count: int = Field(
         ..., ge=0, description="Number of centerline line segments processed"
+    )
+    label_attributed: list[ContainmentLabelTypeRead] = Field(
+        default_factory=list,
+        description=(
+            "Lengths recovered from unmapped segments via the run-label mechanism; "
+            "sorted by containment_type; basis='run_label'. "
+            "Never merged into legend totals."
+        ),
+    )
+    label_unknown_length_m: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Centerline length the legend left unmapped AND with no run-label within "
+            "the distance cap — honest-UNKNOWN; never a fabricated type."
+        ),
     )

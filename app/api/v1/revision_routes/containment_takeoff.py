@@ -16,7 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.revision_lineage import _get_active_revision_manifest_or_409
 from app.db.session import get_db
 from app.interpretation.service_takeoff_loaders import assemble_containment_takeoff
-from app.schemas.containment_takeoff import ContainmentTakeoffResponse, ContainmentTypeRead
+from app.schemas.containment_takeoff import (
+    ContainmentLabelTypeRead,
+    ContainmentTakeoffResponse,
+    ContainmentTypeRead,
+)
 
 containment_takeoff_router = APIRouter()
 
@@ -62,4 +66,13 @@ async def get_revision_containment_takeoff(
         shared_length_m=result.shared_length_m,
         total_length_m=result.total_length_m,
         centerline_segment_count=result.centerline_segment_count,
+        label_attributed=[
+            ContainmentLabelTypeRead(
+                containment_type=entry.containment_type,
+                length_m=entry.length_m,
+                basis=entry.basis,
+            )
+            for entry in result.label_attributed
+        ],
+        label_unknown_length_m=result.label_unknown_length_m,
     )

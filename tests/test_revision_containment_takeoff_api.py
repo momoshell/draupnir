@@ -152,11 +152,16 @@ async def test_containment_takeoff_200_happy_path(monkeypatch: pytest.MonkeyPatc
         "shared_length_m",
         "total_length_m",
         "centerline_segment_count",
+        "label_attributed",
+        "label_unknown_length_m",
     }
 
     assert body["shared_length_m"] == pytest.approx(0.25)
     assert body["total_length_m"] == pytest.approx(18.25)
     assert body["centerline_segment_count"] == 42
+    # New label fields default to empty / zero when no labels supplied.
+    assert body["label_attributed"] == []
+    assert body["label_unknown_length_m"] == pytest.approx(0.0)
 
     per_type = body["per_type"]
     assert len(per_type) == 3

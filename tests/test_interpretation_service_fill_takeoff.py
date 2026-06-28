@@ -384,3 +384,83 @@ def test_degenerate_ring_skipped_gracefully() -> None:
     result = compute_fill_attributed_lengths(centerline_segments=segs, fill_bands=[degenerate])
     assert result.shared_length_m == pytest.approx(1.0, abs=1e-4)
     assert result.per_colour == ()
+
+
+# ---------------------------------------------------------------------------
+# (j) segment_attribution: aligned with input segments in order
+# ---------------------------------------------------------------------------
+
+
+def test_segment_attribution_aligned_to_input_order() -> None:
+    """segment_attribution has exactly one entry per input segment, in input order.
+
+    Three segments: one in red, one in blue, one far from all (→ shared/None).
+    """
+    red_band = _square_band(_RED, 0.0, 0.0, 0.5)
+    blue_band = _square_band(_BLUE, 5.0, 0.0, 0.5)
+    segs = [
+        ((-0.1, 0.0), (0.1, 0.0)),  # inside red
+        ((4.9, 0.0), (5.1, 0.0)),  # inside blue
+        ((50.0, 0.0), (51.0, 0.0)),  # far from all → shared
+    ]
+    result = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[red_band, blue_band],
+    )
+    # One attribution entry per input segment.
+    assert len(result.segment_attribution) == 3
+    # First segment → red.
+    assert result.segment_attribution[0] == _RED
+    # Second segment → blue.
+    assert result.segment_attribution[1] == _BLUE
+    # Third segment → shared (None).
+    assert result.segment_attribution[2] is None
+
+
+def test_segment_attribution_zero_length_segment_gets_none() -> None:
+    """Zero-length degenerate segment gets None in segment_attribution (neutral; contributes 0)."""
+    red_band = _square_band(_RED, 0.0, 0.0, 0.5)
+    segs = [
+        ((-0.1, 0.0), (0.1, 0.0)),  # inside red → red
+        ((0.0, 0.0), (0.0, 0.0)),  # zero-length degenerate → None
+    ]
+    result = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[red_band],
+    )
+    assert len(result.segment_attribution) == 2
+    assert result.segment_attribution[0] == _RED
+    assert result.segment_attribution[1] is None
+
+
+def test_segment_attribution_zero_length_before_real_segment_no_shift() -> None:
+    """Zero-length segment BEFORE a real segment must NOT shift later verdict slots.
+
+    Regression guard: a prior implementation emitted (0.0, None) from _segment_verdicts
+    for zero-length inputs, which shifted verdicts[i] for all subsequent real segments,
+    causing the wrong colour_key to be attributed to them.
+    """
+    red_band = _square_band(_RED, 0.0, 0.0, 0.5)
+    blue_band = _square_band(_BLUE, 5.0, 0.0, 0.5)
+    segs = [
+        ((0.0, 0.0), (0.0, 0.0)),  # zero-length — must NOT consume a verdict slot
+        ((-0.1, 0.0), (0.1, 0.0)),  # inside red — must still be _RED, not shifted to None
+        ((4.9, 0.0), (5.1, 0.0)),  # inside blue
+    ]
+    result = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[red_band, blue_band],
+    )
+    assert len(result.segment_attribution) == 3
+    assert result.segment_attribution[0] is None  # zero-length → neutral None
+    assert result.segment_attribution[1] == _RED  # real segment — must NOT be shifted
+    assert result.segment_attribution[2] == _BLUE
+
+
+def test_segment_attribution_empty_input() -> None:
+    """Empty input yields empty segment_attribution tuple."""
+    result = compute_fill_attributed_lengths(
+        centerline_segments=[],
+        fill_bands=[],
+    )
+    assert result.segment_attribution == ()

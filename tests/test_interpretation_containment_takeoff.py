@@ -12,11 +12,13 @@ from app.interpretation.containment_legend import (
     ContainmentLegendEntry,
 )
 from app.interpretation.containment_takeoff import (
+    BASIS_RUN_LABEL,
     ContainmentBand,
     _token_to_type,
     _type_to_token,
     compute_containment_attributed_lengths,
 )
+from app.interpretation.segment_label_takeoff import SegmentLabel
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -423,6 +425,10 @@ async def test_assemble_containment_takeoff_folding_and_invariant() -> None:
             "app.interpretation.service_takeoff_loaders.load_containment_centerline_segments",
             new=AsyncMock(return_value=segments),
         ),
+        patch(
+            "app.interpretation.service_takeoff_loaders.load_tag_placements",
+            new=AsyncMock(return_value=[]),
+        ),
     ):
         result = await assemble_containment_takeoff(db=db, revision_id=rev_id)
 
@@ -451,3 +457,283 @@ async def test_assemble_containment_takeoff_folding_and_invariant() -> None:
     # INVARIANT
     total_from_types = sum(e.length_m for e in result.per_type)
     assert abs(total_from_types + result.shared_length_m - result.total_length_m) < 0.1
+
+
+# ---------------------------------------------------------------------------
+# Tests: label pass — run-label recovery over unmapped segments (issue #761)
+# ---------------------------------------------------------------------------
+
+
+def _label(x: float, y: float, service: str) -> SegmentLabel:
+    return SegmentLabel(point=(x, y), service=service, size_raw="100", size_kind="rect")
+
+
+def test_label_precedence_legend_type_kept() -> None:
+    """A segment resolving to a real legend type keeps it; label only fills unmapped segments."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="SOLID")]
+    # Segment inside the band → attributed to Cable Tray.
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
+    # Place a label near the segment that would assign a DIFFERENT service.
+    labels = [_label(0.0, 0.0, "SOME OTHER SERVICE")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    # The legend attribution wins; label_attributed is empty (nothing was unmapped).
+    tray_entries = [e for e in result.per_type if e.containment_type == _TRAY_TYPE]
+    assert tray_entries, "Legend attribution must be kept for mapped segments"
+    assert result.label_attributed == ()
+
+
+def test_label_exact_partition_conservation() -> None:
+    """Exact partition: Σ(real per_type) + Σ(label_attributed) + label_unknown + shared == total."""
+    # One mapped band (tray), one unmapped band, one far segment (→ shared).
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),  # mapped
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),  # unmapped (not in legend)
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → Cable Tray (legend)
+        _seg(4.9, 0.0, 5.1, 0.0),  # → unmapped (no legend entry for idx:2)
+        _seg(50.0, 0.0, 51.0, 0.0),  # → shared
+    ]
+    # Label near the unmapped segment.
+    labels = [_label(5.0, 0.0, "FA DECTN ALM")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    real_type_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
+    label_total = sum(e.length_m for e in result.label_attributed)
+    total_check = (
+        real_type_total + label_total + result.label_unknown_length_m + result.shared_length_m
+    )
+    assert abs(total_check - result.total_length_m) < 0.1, (
+        f"Extended invariant violated: {total_check} != {result.total_length_m}"
+    )
+    # Label pass recovered the unmapped segment.
+    assert label_total > 0.0
+    assert any(e.containment_type == "FA DECTN ALM" for e in result.label_attributed)
+
+
+def test_label_unknown_preserved_when_beyond_cap() -> None:
+    """Unmapped segment whose nearest label is beyond the 5 m cap stays in label_unknown."""
+    legend = _legend_from_pairs([])  # all bands unmapped
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="FP_N")]
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]  # unmapped
+    # Label placed 10 m away — beyond the 5 m cap.
+    labels = [_label(10.0, 0.0, "FAR SERVICE")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+        label_nearest_max_m=5.0,
+    )
+    # Segment is beyond cap → honest-UNKNOWN.
+    assert result.label_attributed == ()
+    assert result.label_unknown_length_m > 0.0
+    # The None per_type entry length must equal label_unknown_length_m.
+    none_entries = [e for e in result.per_type if e.containment_type is None]
+    assert none_entries
+    assert abs(none_entries[0].length_m - result.label_unknown_length_m) < 1e-6
+
+
+def test_no_double_count_segment_counted_under_one_basis() -> None:
+    """A segment is counted under exactly one basis: legend OR label, never both."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → legend
+        _seg(4.9, 0.0, 5.1, 0.0),  # → label
+    ]
+    labels = [_label(5.0, 0.0, "LABEL SVC")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    real_type_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
+    label_total = sum(e.length_m for e in result.label_attributed)
+    # Total of both bases must equal total_length_m (minus shared, which is 0 here).
+    no_double_count = real_type_total + label_total + result.label_unknown_length_m
+    assert abs(no_double_count - result.total_length_m) < 0.1
+    # Each segment's length appears exactly once.
+    assert abs(no_double_count - result.total_length_m) < 0.1
+
+
+def test_basis_is_run_label_constant() -> None:
+    """Every label_attributed entry has basis == BASIS_RUN_LABEL."""
+    legend = _legend_from_pairs([])  # all unmapped
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="FP_N")]
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
+    labels = [_label(0.0, 0.0, "MY SERVICE")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    assert result.label_attributed, "Expected at least one label_attributed entry"
+    for entry in result.label_attributed:
+        assert entry.basis == BASIS_RUN_LABEL
+
+
+def test_empty_labels_is_byte_identical_to_pre_label() -> None:
+    """With labels=() (default), result is byte-identical to pre-label behaviour."""
+    legend = _legend_from_pairs(
+        [
+            ("idx:1", "SOLID", _TRAY_TYPE),
+            ("idx:2", "FP_N", None),
+        ]
+    )
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),
+        _seg(4.9, 0.0, 5.1, 0.0),
+    ]
+
+    result_no_labels = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        # labels omitted — default ()
+    )
+    result_empty_labels = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=(),
+    )
+    # Both must be equal (labels=() is the default).
+    assert result_no_labels == result_empty_labels
+    # Additive fields are empty/zero.
+    assert result_no_labels.label_attributed == ()
+    assert result_no_labels.label_unknown_length_m == 0.0
+
+
+def test_label_partition_invariant_unmapped_subset() -> None:
+    """Σ label_attributed + label_unknown_length_m == original unmapped length U ±0.1."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),  # unmapped
+        _band("idx:3", 10.0, 0.0, pattern_name="FP_N"),  # unmapped, no near label
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → tray (legend)
+        _seg(4.9, 0.0, 5.1, 0.0),  # → unmapped; label nearby
+        _seg(9.9, 0.0, 10.1, 0.0),  # → unmapped; no label within 5 m
+    ]
+    # Label only near second unmapped segment.
+    labels = [_label(5.0, 0.0, "RECOVERED SVC")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+        label_nearest_max_m=5.0,
+    )
+    label_total = sum(e.length_m for e in result.label_attributed)
+    # U = label_total + label_unknown_length_m (within tolerance).
+    u_check = label_total + result.label_unknown_length_m
+    # Both unmapped segments contribute ~0.2 m each → U ≈ 0.4 m.
+    none_entries_no_labels = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+    )
+    original_u = sum(
+        e.length_m for e in none_entries_no_labels.per_type if e.containment_type is None
+    )
+    assert abs(u_check - original_u) < 0.1, (
+        f"Label partition: {label_total:.4f}"
+        f" + {result.label_unknown_length_m:.4f} != U={original_u:.4f}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assembler_with_tag_placement_loader_mock() -> None:
+    """Assembler integration: mock tag-placement loader; assert invariant holds with labels."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from uuid import UUID
+
+    from app.interpretation.service_takeoff_loaders import assemble_containment_takeoff
+
+    rev_id = UUID("00000000-0000-0000-0000-000000000002")
+    db = MagicMock()
+
+    # Simple legend: one mapped band, one unmapped.
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        ContainmentBand(
+            colour_key="idx:1",
+            colour_index=None,
+            colour_rgb=None,
+            ring=_square_ring(0.0, 0.0, 0.5),
+            pattern_name="SOLID",
+        ),
+        ContainmentBand(
+            colour_key="idx:2",
+            colour_index=None,
+            colour_rgb=None,
+            ring=_square_ring(5.0, 0.0, 0.5),
+            pattern_name="FP_N",
+        ),
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → tray
+        _seg(4.9, 0.0, 5.1, 0.0),  # → unmapped
+    ]
+
+    # Simulate a tag placement that parse_tag will accept as a valid label.
+    from app.interpretation.run_service_identity import TagPlacement
+
+    tag_placements = [TagPlacement(text="100x200 FA DECTN ALM", point=(5.0, 0.0), layer_ref=None)]
+
+    with (
+        patch(
+            "app.interpretation.service_takeoff_loaders.build_containment_legend_db",
+            new=AsyncMock(return_value=legend),
+        ),
+        patch(
+            "app.interpretation.service_takeoff_loaders.load_containment_bands",
+            new=AsyncMock(return_value=bands),
+        ),
+        patch(
+            "app.interpretation.service_takeoff_loaders.load_containment_centerline_segments",
+            new=AsyncMock(return_value=segments),
+        ),
+        patch(
+            "app.interpretation.service_takeoff_loaders.load_tag_placements",
+            new=AsyncMock(return_value=tag_placements),
+        ),
+    ):
+        result = await assemble_containment_takeoff(db=db, revision_id=rev_id)
+
+    # Label should have recovered the unmapped segment.
+    label_total = sum(e.length_m for e in result.label_attributed)
+    real_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
+    total_check = real_total + label_total + result.label_unknown_length_m + result.shared_length_m
+    assert abs(total_check - result.total_length_m) < 0.1, (
+        f"Assembler extended invariant violated: {total_check} != {result.total_length_m}"
+    )

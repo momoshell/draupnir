@@ -1048,3 +1048,57 @@ def test_long_perpendicular_tee_stays_shared() -> None:
     _assert_invariant(refined, base)
     # Stub must remain shared — both gates fail regardless of the tee split.
     assert refined.shared_length_m == pytest.approx(0.5, abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Regression: zero-length segment interleaved before a real segment must NOT
+# shift verdict alignment (issue #761 / _segment_verdicts contract).
+# ---------------------------------------------------------------------------
+
+
+def test_zero_length_segment_does_not_shift_verdict_alignment() -> None:
+    """Zero-length segment interleaved BEFORE a real segment: the real segment's
+    colour attribution must be correct.
+
+    Regression guard for the contract that _segment_verdicts skips zero-length
+    segments entirely (so routed_connectivity's nondegen_segs + verdicts stay
+    aligned).  A previous change emitted (0.0, None) for zero-length inputs,
+    which shifted verdicts[i] for all subsequent real segments.
+
+    Arrange:
+      - seg0: zero-length (degenerate) at (0, 0)
+      - seg1: inside the red band (0.2 m long)
+    Red band centred at (0, 0), half-side 0.5 m → seg1 overlaps heavily.
+    """
+    red_band = _square_band(_RED, 0.0, 0.0, 0.5, colour_index=1)
+    segs = [
+        ((0.0, 0.0), (0.0, 0.0)),  # zero-length — must not consume a verdict slot
+        ((-0.1, 0.0), (0.1, 0.0)),  # inside red band — must still get _RED attribution
+    ]
+
+    base = compute_fill_attributed_lengths(
+        centerline_segments=segs,
+        fill_bands=[red_band],
+    )
+    # The real segment must be attributed to red, not lost.
+    assert len(base.per_colour) == 1
+    assert base.per_colour[0].colour_key == _RED
+    assert base.per_colour[0].length_m == pytest.approx(0.2, abs=1e-4)
+    assert base.shared_length_m == pytest.approx(0.0, abs=1e-4)
+
+    # segment_attribution must be 2 entries (one per input), with None for the
+    # zero-length slot and _RED for the real segment — NOT shifted.
+    assert len(base.segment_attribution) == 2
+    assert base.segment_attribution[0] is None  # zero-length → neutral None
+    assert base.segment_attribution[1] == _RED  # real segment → correct colour
+
+    # refine_shared_by_connectivity must also handle the interleaved zero correctly.
+    refined = refine_shared_by_connectivity(
+        centerline_segments=segs,
+        fill_bands=[red_band],
+    )
+    _assert_invariant(refined, base)
+    # The real segment's length must still appear in some colour bucket (red or a
+    # refined attribution); nothing should be lost.
+    refined_colour_total = sum(fc.length_m for fc in refined.per_colour)
+    assert refined_colour_total == pytest.approx(0.2, abs=0.05)

@@ -51,6 +51,8 @@ from app.interpretation.measurement import ScaleContext
 from app.interpretation.rise_drop import RiseDropEntity
 from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES, RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
+from app.interpretation.run_tags import parse_tag
+from app.interpretation.segment_label_takeoff import SegmentLabel
 from app.interpretation.service_fill_takeoff import FillBand
 from app.interpretation.service_legend import (
     ProseInput,
@@ -2137,9 +2139,14 @@ async def assemble_containment_takeoff(
 ) -> ContainmentAttributionResult:
     """Assemble a :class:`ContainmentAttributionResult` for a revision.
 
-    Glue-only: composes the three loaders and delegates all measurement logic to
+    Glue-only: composes the loaders and delegates all measurement logic to
     :func:`~app.interpretation.containment_takeoff.compute_containment_attributed_lengths`.
     Returns an empty result (no raise) when any loader returns empty data.
+
+    Tag placements are loaded (``broaden_tag_layers=True``) and converted to
+    :class:`~app.interpretation.segment_label_takeoff.SegmentLabel` objects via
+    :func:`~app.interpretation.run_tags.parse_tag`.  Non-tag text is silently dropped by
+    ``parse_tag``; the label pass only fills segments the legend left unmapped.
     """
     legend = await build_containment_legend_db(db, revision_id, input_family=input_family)
     bands = await load_containment_bands(
@@ -2153,8 +2160,26 @@ async def assemble_containment_takeoff(
         db, revision_id, algo_version=algo_version
     )
 
+    # Build SegmentLabel list from tag placements (parse_tag is the content gate).
+    tag_placements = await load_tag_placements(db, revision_id, broaden_tag_layers=True)
+    seg_labels: list[SegmentLabel] = []
+    for placement in tag_placements:
+        obs = parse_tag(placement.text)
+        if obs is None:
+            continue
+        seg_labels.append(
+            SegmentLabel(
+                point=placement.point,
+                service=obs.service,
+                size_raw=obs.size.raw,
+                size_kind=obs.size.kind,
+            )
+        )
+
     return compute_containment_attributed_lengths(
         centerline_segments=segments,
         containment_bands=bands,
         legend=legend,
+        labels=seg_labels,
+        label_nearest_max_m=5.0,
     )
