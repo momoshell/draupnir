@@ -15,6 +15,14 @@ Sentinel convention
   nearest band is unmapped falls into the ``None`` bucket (containment_type=None), NOT into
   the engine's shared bucket — they have distinct meanings.
 
+Basis values on ContainmentTypeLength
+--------------------------------------
+- ``"legend"``     — entry resolved via legend (colour, pattern) lookup.
+- ``"run_label"``  — entry recovered via the run-label mechanism (label pass over unmapped
+                     segments).
+- ``"unresolved"`` — honest-absent entry (containment_type=None): band present but no
+                     matching legend entry or legend entry has no label.
+
 Pure module — NO DB, ORM, FastAPI, or SQLAlchemy imports.
 """
 
@@ -100,24 +108,32 @@ class ContainmentTypeLength:
     ``containment_type=None`` is the honest-absent sentinel: a band was present in the
     geometry but either had no matching legend entry, or its legend entry had no label.
     It is NOT the same as the engine's ``__shared__`` (geometrically ambiguous) bucket.
+
+    ``basis`` encodes how the attribution was determined:
+      - ``"legend"``     — resolved via legend (colour, pattern) lookup.
+      - ``"run_label"``  — recovered via the run-label mechanism (label pass).
+      - ``"unresolved"`` — honest-absent (containment_type=None): band present but unmapped.
     """
 
     containment_type: str | None  # None = honest-absent
     length_m: float
     member_colour_keys: tuple[str, ...]  # sorted, deduped
     member_pattern_names: tuple[str, ...]  # sorted, deduped
+    basis: str = "legend"  # provenance marker; default for backwards-compat construction
 
 
-# Provenance marker for lengths recovered via the run-label mechanism.
+# Provenance marker constants.
+BASIS_LEGEND: str = "legend"
 BASIS_RUN_LABEL: str = "run_label"
+BASIS_UNRESOLVED: str = "unresolved"
 
 
 @dataclass(frozen=True, slots=True)
 class ContainmentLabelLength:
     """Attributed length recovered from an unmapped segment via its nearest run-label.
 
-    Length the legend could not resolve is attributed here instead, with a distinct
-    provenance marker so it is never silently merged into legend totals.
+    Kept for internal use within compute_containment_attributed_lengths; NOT exposed in
+    ContainmentAttributionResult — label entries are folded into per_type (basis=run_label).
     """
 
     containment_type: str  # the run-label SERVICE token, e.g. "FA DECTN ALM"
@@ -129,16 +145,16 @@ class ContainmentLabelLength:
 class ContainmentAttributionResult:
     """Result of containment-type attribution over the full centerline segment set.
 
-    Primary invariant: Σ(per_type lengths) + shared_length_m == total_length_m ±0.1 m.
-    Extended invariant (when labels supplied):
-      Σ(real-type per_type) + Σ(label_attributed) + label_unknown_length_m
+    Extended invariant: Σ(per_type lengths, all bases) + label_unknown_length_m
       + shared_length_m == total_length_m ±0.1 m.
-    The ``None`` per_type entry, if present, has length_m == label_unknown_length_m.
+    The ``None`` per_type entry (basis="unresolved"), if present, has
+    length_m == label_unknown_length_m.
 
-    ``per_type`` is sorted: by containment_type (None sorts LAST, after all real strings).
+    ``per_type`` contains ALL attributed entries — both legend-resolved (basis="legend") and
+    label-recovered (basis="run_label") — sorted deterministically: by basis then
+    containment_type (None sorts LAST within its basis group).
     ``shared_length_m`` corresponds to the engine's ``__shared__`` bucket (geometrically
     ambiguous — equidistant or unattributable), NOT to the honest-absent (unmapped) bands.
-    ``label_attributed``: sorted by containment_type; basis=BASIS_RUN_LABEL.
     ``label_unknown_length_m``: unmapped AND no in-cap label — honest-UNKNOWN.
     """
 
@@ -146,7 +162,6 @@ class ContainmentAttributionResult:
     shared_length_m: float
     total_length_m: float
     centerline_segment_count: int
-    label_attributed: tuple[ContainmentLabelLength, ...] = ()
     label_unknown_length_m: float = 0.0
 
 
@@ -178,22 +193,32 @@ def compute_containment_attributed_lengths(
     3. Feed all synthetic FillBands to ``compute_fill_attributed_lengths``.
     4. Translate result tokens back to containment_type values.
     5. Fold bands sharing the SAME resolved type into one ContainmentTypeLength entry
-       (lengths sum; member keys/patterns accumulated, sorted, deduped).
+       (lengths sum; member keys/patterns accumulated, sorted, deduped).  These entries
+       carry basis=BASIS_LEGEND.
     6. (Optional) Run the label pass over segments that resolved to ``_TOKEN_UNMAPPED``:
        those segments are wrapped as 2-vertex polylines and fed to
-       ``compute_segment_label_lengths``.  Recovered length moves into ``label_attributed``
-       (basis=BASIS_RUN_LABEL); the residue stays in the ``None`` per_type bucket as
-       ``label_unknown_length_m`` (honest-UNKNOWN).
+       ``compute_segment_label_lengths``.  Recovered entries are folded INTO ``per_type``
+       with basis=BASIS_RUN_LABEL (see step 7); the residue stays in the ``None`` per_type
+       bucket as ``label_unknown_length_m`` (honest-UNKNOWN).
+    7. F2 — merge fragmented label families: when folding label entries into per_type,
+       merge a longer label-service into a shorter one when the shorter is a whole-word
+       prefix of the longer AND the shorter also appears as a label family in the same
+       label pass (e.g. "LIFE SAFETY FB" → "LIFE SAFETY" because "LIFE SAFETY" is present).
+       Cross-basis merging is NEVER done (legend "ESSENTIAL TRUNKING" and label "ESSENTIAL"
+       remain distinct entries).
+    8. per_type is sorted deterministically: by (basis, containment_type, None last).
 
     ``shared_length_m`` is the engine's geometric-ambiguity bucket (unchanged).
-    The honest-absent bucket (``containment_type=None``) is a per_type entry.
-    When ``labels`` is empty (default), ``label_attributed`` and ``label_unknown_length_m``
-    are zero/empty and the result is byte-identical to pre-label behaviour.
+    The honest-absent bucket (``containment_type=None``, basis=BASIS_UNRESOLVED) is a
+    per_type entry.
+    When ``labels`` is empty (default), no label entries appear in per_type and
+    ``label_unknown_length_m`` is zero; the result is byte-identical to pre-label behaviour
+    except that legend entries now carry basis=BASIS_LEGEND.
 
     Empty inputs return an empty result without raising.
 
-    Extended invariant (when labels supplied):
-      Σ(real-type per_type) + Σ(label_attributed) + label_unknown_length_m
+    Extended invariant:
+      Σ(per_type lengths, all bases) + label_unknown_length_m
       + shared_length_m == total_length_m ±0.1 m.
     """
     if not centerline_segments:
@@ -260,7 +285,7 @@ def compute_containment_attributed_lengths(
     # --- Step 6: label pass over unmapped segments (optional) ---
     # segment_attribution is aligned 1:1 with centerline_segments (including zero-length,
     # which carry None and contribute nothing to any length bucket).
-    label_attributed: tuple[ContainmentLabelLength, ...] = ()
+    label_entries_raw: list[ContainmentLabelLength] = []
     label_unknown_length_m: float = 0.0
 
     unmapped_token = _type_to_token(None)  # == _TOKEN_UNMAPPED; never hardcode the string
@@ -285,25 +310,20 @@ def compute_containment_attributed_lengths(
                 nearest_max_m=label_nearest_max_m,
             )
 
-            label_attributed = tuple(
-                sorted(
-                    (
-                        ContainmentLabelLength(
-                            containment_type=svc.service,
-                            length_m=svc.length_m,
-                            basis=BASIS_RUN_LABEL,
-                        )
-                        for svc in label_result.per_service
-                    ),
-                    key=lambda e: e.containment_type,
+            label_entries_raw = [
+                ContainmentLabelLength(
+                    containment_type=svc.service,
+                    length_m=svc.length_m,
+                    basis=BASIS_RUN_LABEL,
                 )
-            )
+                for svc in label_result.per_service
+            ]
             label_unknown_length_m = label_result.unknown_length_m
 
             # Reconcile the None per_type bucket: recovered length moves out of honest-absent
-            # into label_attributed.  After the label pass, None bucket == label_unknown_length_m.
+            # into label entries.  After the label pass, None bucket == label_unknown_length_m.
             if None in type_lengths:
-                total_label_recovered = sum(e.length_m for e in label_attributed)
+                total_label_recovered = sum(e.length_m for e in label_entries_raw)
                 original_unmapped = type_lengths[None]
                 partition_err = total_label_recovered + label_unknown_length_m - original_unmapped
                 if abs(partition_err) >= 0.1:
@@ -324,18 +344,78 @@ def compute_containment_attributed_lengths(
                         label_unknown_length_m = 0.0
                 type_lengths[None] = label_unknown_length_m
 
-    # Sort per_type: real types alphabetically, None (honest-absent) LAST.
-    def _sort_key(ct: str | None) -> str:
-        return ct if ct is not None else chr(0x10FFFF)
+    # --- Step 7: F2 — merge fragmented label families (run_label basis only) ---
+    # Merge a longer label-service into a shorter one when the shorter is a whole-word
+    # prefix of the longer AND the shorter also appears as its own label family.
+    # Example: "LIFE SAFETY FB" → "LIFE SAFETY" because "LIFE SAFETY" is present as a
+    # separate label entry.  Cross-basis merging is never done — a legend entry named
+    # "ESSENTIAL TRUNKING" and a label entry "ESSENTIAL" remain distinct.
+    if label_entries_raw:
+        label_services: set[str] = {lbl.containment_type for lbl in label_entries_raw}
+        # Build a merged accumulator: service → total length.
+        merged_label: dict[str, float] = {}
+        for lbl in label_entries_raw:
+            # Find the longest shorter whole-word prefix that is itself a label family.
+            # "Whole-word prefix" means the prefix is followed by a space in the longer name.
+            target: str = lbl.containment_type
+            for candidate in sorted(label_services, key=len, reverse=True):
+                if (
+                    candidate != target
+                    and len(candidate) < len(target)
+                    and target.startswith(candidate + " ")
+                    and candidate in label_services
+                ):
+                    # Merge this longer entry into the shorter prefix family.
+                    target = candidate
+                    break
+            merged_label[target] = merged_label.get(target, 0.0) + lbl.length_m
 
-    per_type: tuple[ContainmentTypeLength, ...] = tuple(
+        label_entries_raw = [
+            ContainmentLabelLength(
+                containment_type=svc,
+                length_m=length_m,
+                basis=BASIS_RUN_LABEL,
+            )
+            for svc, length_m in merged_label.items()
+        ]
+
+    # --- Step 8: build final per_type: legend entries + folded label entries ---
+    # Legend entries carry basis=BASIS_LEGEND (or BASIS_UNRESOLVED for the None bucket).
+    # Label entries carry basis=BASIS_RUN_LABEL.
+    # Sort deterministically: (basis, containment_type), None sorts LAST within its group.
+    # Sort order: legend first, then run_label (folded label entries), then unresolved (None)
+    # last so the honest-absent bucket remains the last entry regardless of type name.
+    _basis_sort_order = {BASIS_LEGEND: 0, BASIS_RUN_LABEL: 1, BASIS_UNRESOLVED: 2}
+
+    def _sort_key(entry: ContainmentTypeLength) -> tuple[int, str]:
+        basis_order = _basis_sort_order.get(entry.basis, 99)
+        ct_sort = entry.containment_type if entry.containment_type is not None else chr(0x10FFFF)
+        return (basis_order, ct_sort)
+
+    legend_per_type: list[ContainmentTypeLength] = [
         ContainmentTypeLength(
             containment_type=ct,
             length_m=round(type_lengths[ct], 6),
             member_colour_keys=tuple(sorted(type_member_ck.get(ct, set()))),
             member_pattern_names=tuple(sorted(type_member_pn.get(ct, set()))),
+            basis=BASIS_UNRESOLVED if ct is None else BASIS_LEGEND,
         )
-        for ct in sorted(type_lengths, key=_sort_key)
+        for ct in type_lengths
+    ]
+
+    label_per_type: list[ContainmentTypeLength] = [
+        ContainmentTypeLength(
+            containment_type=e.containment_type,
+            length_m=round(e.length_m, 6),
+            member_colour_keys=(),
+            member_pattern_names=(),
+            basis=BASIS_RUN_LABEL,
+        )
+        for e in label_entries_raw
+    ]
+
+    per_type: tuple[ContainmentTypeLength, ...] = tuple(
+        sorted(legend_per_type + label_per_type, key=_sort_key)
     )
 
     return ContainmentAttributionResult(
@@ -343,6 +423,5 @@ def compute_containment_attributed_lengths(
         shared_length_m=fill_result.shared_length_m,
         total_length_m=fill_result.total_length_m,
         centerline_segment_count=fill_result.centerline_segment_count,
-        label_attributed=label_attributed,
         label_unknown_length_m=round(label_unknown_length_m, 6),
     )

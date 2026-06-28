@@ -25,6 +25,8 @@ from httpx import ASGITransport
 import app.api.v1.revision_routes.containment_takeoff as containment_takeoff_route
 from app.db.session import get_db
 from app.interpretation.containment_takeoff import (
+    BASIS_LEGEND,
+    BASIS_UNRESOLVED,
     ContainmentAttributionResult,
     ContainmentTypeLength,
 )
@@ -61,18 +63,21 @@ def _result_with_types() -> ContainmentAttributionResult:
                 length_m=12.5,
                 member_colour_keys=("idx:1",),
                 member_pattern_names=("ANSI31",),
+                basis=BASIS_LEGEND,
             ),
             ContainmentTypeLength(
                 containment_type="conduit",
                 length_m=4.0,
                 member_colour_keys=("idx:2",),
                 member_pattern_names=("SOLID",),
+                basis=BASIS_LEGEND,
             ),
             ContainmentTypeLength(
                 containment_type=None,  # honest-absent
                 length_m=1.5,
                 member_colour_keys=("idx:3",),
                 member_pattern_names=("",),
+                basis=BASIS_UNRESOLVED,
             ),
         ),
         shared_length_m=0.25,
@@ -146,21 +151,18 @@ async def test_containment_takeoff_200_happy_path(monkeypatch: pytest.MonkeyPatc
 
     body = response.json()
 
-    # Top-level fields must be present (extra='forbid' on model).
+    # Top-level fields must be present (extra='forbid' on model); label_attributed is removed.
     assert set(body.keys()) == {
         "per_type",
         "shared_length_m",
         "total_length_m",
         "centerline_segment_count",
-        "label_attributed",
         "label_unknown_length_m",
     }
 
     assert body["shared_length_m"] == pytest.approx(0.25)
     assert body["total_length_m"] == pytest.approx(18.25)
     assert body["centerline_segment_count"] == 42
-    # New label fields default to empty / zero when no labels supplied.
-    assert body["label_attributed"] == []
     assert body["label_unknown_length_m"] == pytest.approx(0.0)
 
     per_type = body["per_type"]
@@ -170,13 +172,16 @@ async def test_containment_takeoff_200_happy_path(monkeypatch: pytest.MonkeyPatc
     assert cable_tray["length_m"] == pytest.approx(12.5)
     assert cable_tray["member_colour_keys"] == ["idx:1"]
     assert cable_tray["member_pattern_names"] == ["ANSI31"]
+    assert cable_tray["basis"] == "legend"
 
     conduit = next(e for e in per_type if e["containment_type"] == "conduit")
     assert conduit["length_m"] == pytest.approx(4.0)
+    assert conduit["basis"] == "legend"
 
-    # Honest-absent: containment_type is null.
+    # Honest-absent: containment_type is null; basis is 'unresolved'.
     absent = next(e for e in per_type if e["containment_type"] is None)
     assert absent["length_m"] == pytest.approx(1.5)
+    assert absent["basis"] == "unresolved"
 
 
 async def test_containment_takeoff_honest_absent_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,6 +204,7 @@ async def test_containment_takeoff_honest_absent_is_null(monkeypatch: pytest.Mon
                     length_m=3.0,
                     member_colour_keys=("idx:5",),
                     member_pattern_names=("",),
+                    basis=BASIS_UNRESOLVED,
                 ),
             ),
             shared_length_m=0.0,
