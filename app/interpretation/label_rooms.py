@@ -17,6 +17,18 @@ from collections.abc import Sequence
 
 from app.interpretation.rooms import Room, RoomLabel, parse_room_number, room_from_label
 
+# Real room names are short labels: "Cooling Plantroom", "Heating & Hot Water",
+# "Life Safety & Essential", "UPS LV plantroom". Spec-prose note text stamped by
+# the wall-polygonizer ("ALL PIPEWORK SHALL BE PR", "ACCORDANCE WITH BUILDING
+# REGULATIONS", "A WIRED THERMOSTAT CONTROL") is ALL-CAPS sentence fragment.
+# Hard backstop: reject if the text exceeds this char length regardless.
+_MAX_ROOM_NAME_CHARS = 40
+# All-caps text with >= this many tokens (split on spaces OR hyphens) is
+# note/spec-prose, not a room name.  Using 2 catches two-word service labels
+# ("VRF CASSETTE", "MECHANICAL EQUIPMENT") and hyphenated service codes
+# ("LTHW-VT-F") while keeping single-token abbreviations like "WC" and "(IPS)".
+_ALL_CAPS_MIN_TOKENS = 2
+
 ROOM_SOURCE_LABEL = "label_cluster"
 
 # A number label is matched to the nearest name label within this distance (drawing units).
@@ -70,14 +82,33 @@ def _looks_like_room_name(text: str) -> bool:
     # Must contain at least one alphabetic character — pure digits/punctuation are not names.
     if not any(ch.isalpha() for ch in stripped):
         return False
-    # Trailing colon → callout / leader line.
-    if stripped.endswith(":"):
+    # Trailing colon → callout / leader line; trailing period → sentence fragment.
+    if stripped.endswith((":", ".")):
+        return False
+    # AutoCAD mtext formatting codes (e.g. "\LLEGEND", "\LCHILLED WATER NOTES") are not names.
+    if stripped.startswith("\\L"):
         return False
     if _ANNOTATION_DIMENSION_RE.search(stripped):
         return False
     if _ANNOTATION_QUANTITY_RE.match(stripped):
         return False
-    return not _ANNOTATION_ROUTING_RE.search(stripped)
+    if _ANNOTATION_ROUTING_RE.search(stripped):
+        return False
+    # Hard backstop: very long strings are never room names.
+    if len(stripped) > _MAX_ROOM_NAME_CHARS:
+        return False
+    # Multi-token all-caps strings are spec-prose / note fragments, not room names.
+    # Real room names use Title Case or mixed case ("Cooling Plantroom", "UPS LV plantroom").
+    # Tokens are split on spaces and hyphens so that service codes like "LTHW-VT-F"
+    # (3 hyphen-tokens, all caps) are rejected alongside sentence fragments.
+    # Single-token all-caps abbreviations ("WC", "(IPS)") are kept.
+    alpha_chars = [ch for ch in stripped if ch.isalpha()]
+    all_caps = bool(alpha_chars) and all(ch.isupper() for ch in alpha_chars)
+    if all_caps:
+        token_count = len(re.split(r"[ -]+", stripped))
+        if token_count >= _ALL_CAPS_MIN_TOKENS:
+            return False
+    return True
 
 
 def room_label_layers(labels: Sequence[RoomLabel]) -> set[str | None] | None:
