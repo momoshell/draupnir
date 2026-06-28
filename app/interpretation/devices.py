@@ -18,7 +18,7 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.interpretation.legend_dictionary import LegendDictionary
+from app.interpretation.legend_dictionary import FamilyInput, LegendDictionary
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.interpretation.models import EntityRow
 from app.models.revision_materialization import RevisionBlock, RevisionEntity
@@ -31,6 +31,18 @@ _DEFAULT_TAG_TOKENS: tuple[str, ...] = ("tag", "device")
 # Guards for the block-instance tree walk (mirror the historical materialization limits).
 _MAX_DEVICE_NESTING_DEPTH = 8
 _MAX_DEVICE_INSTANCES = 20000
+
+# Legend-defined device families carry this export marker in their block name (e.g.
+# "Smoke Detector with Beacon rfa - …-Legend Stage 4"). Native architecture (mullions,
+# columns, grids) does not. Source A (the legend icon families) is scoped to families
+# carrying this marker, so architecture instances aren't treated as legend devices (#545, #767).
+LEGEND_FAMILY_MARKER: str = "legend stage"
+
+# Device tags sit adjacent to their symbol (sub-2 m). Welbeck-calibrated: spurious
+# nearest-tag associations on these sheets start at ~2.47 m (architectural fabric grabbing
+# a far tag), so a 2.0 m cap drops them while keeping genuine adjacent tags. Provisional —
+# refine with a positive near-tag sample across more sheets. (#768)
+DEFAULT_TAG_MAX_DISTANCE_M: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +491,21 @@ def resolve_typed_devices(
     return _typed_from_identities(devices, identities)
 
 
+def scoped_block_families(tagged: Sequence[Device]) -> list[FamilyInput]:
+    """Return ``FamilyInput`` items for block_refs that carry the legend-stage marker.
+
+    Filters out architectural block families (mullions, columns, door/window panels, etc.)
+    that lack the legend export marker, preventing them from entering the by_symbol_family
+    legend source and pre-empting the architecture classification step (#545, #767).
+    Pure helper; no DB access.
+    """
+    return [
+        FamilyInput(family_name=d.block_ref)
+        for d in tagged
+        if d.block_ref and LEGEND_FAMILY_MARKER in d.block_ref.lower()
+    ]
+
+
 async def load_typed_devices(
     db: AsyncSession,
     revision_id: UUID,
@@ -487,7 +514,7 @@ async def load_typed_devices(
     max_depth: int = _MAX_DEVICE_NESTING_DEPTH,
     device_layers: Sequence[str] | None = None,
     tag_layer: Sequence[str] | None = None,
-    max_tag_distance: float | None = None,
+    max_tag_distance: float | None = DEFAULT_TAG_MAX_DISTANCE_M,
 ) -> list[TypedDevice]:
     """Load, tag, legend-resolve and type-bucket all devices for one revision.
 
@@ -495,7 +522,6 @@ async def load_typed_devices(
     in one call, so the floor-counted fusion loader stays thin.
     """
     from app.interpretation.legend_dictionary import (
-        FamilyInput,
         ProseInput,
         TagInput,
         from_block_families,
@@ -522,7 +548,7 @@ async def load_typed_devices(
     )
     all_tagged = attach_tags(raw_devices, candidates, max_distance=max_tag_distance)
 
-    families = [FamilyInput(family_name=d.block_ref) for d in all_tagged if d.block_ref]
+    families = scoped_block_families(all_tagged)
     prose_texts = await load_legend_text_candidates(db, revision_id)
     prose = [ProseInput(text=t) for t in prose_texts]
     tag_tokens = list({c.text for c in candidates})
