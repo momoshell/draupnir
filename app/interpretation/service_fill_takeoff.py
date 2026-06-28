@@ -77,6 +77,10 @@ class FillAttributionResult:
     shared_length_m: float
     total_length_m: float
     centerline_segment_count: int
+    # Per-input-segment verdict: the resolved colour_key for each segment in input order.
+    # None = shared/ambiguous OR degenerate zero-length (contributes nothing).
+    # Exactly one entry per input segment; aligned with centerline_segments by index.
+    segment_attribution: tuple[str | None, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +270,7 @@ def compute_fill_attributed_lengths(
             shared_length_m=0.0,
             total_length_m=0.0,
             centerline_segment_count=0,
+            segment_attribution=(),
         )
 
     # --- Per-segment classification via shared helper ---
@@ -307,9 +312,30 @@ def compute_fill_attributed_lengths(
         for ck in sorted(length_by_colour)
     )
 
+    # --- Reconstruct segment_attribution aligned 1:1 with input centerline_segments ---
+    # _segment_verdicts skips zero-length segments (they're absent from verdicts).
+    # Walk input segments with a pointer into verdicts: zero-length inputs emit None
+    # without consuming a verdict; non-degenerate inputs consume the next verdict.
+    # This keeps segment_attribution[i] == verdict for centerline_segments[i], with
+    # None standing in for degenerate slots — identical degeneracy predicate to
+    # _segment_verdicts (math.hypot == 0.0 ↔ LineString.length == 0.0 for finite floats).
+    v_ptr: int = 0
+    attribution_list: list[str | None] = []
+    for start, end in centerline_segments:
+        if math.hypot(end[0] - start[0], end[1] - start[1]) == 0.0:
+            attribution_list.append(None)
+        else:
+            attribution_list.append(verdicts[v_ptr][1])
+            v_ptr += 1
+    assert v_ptr == len(verdicts), (
+        f"segment_attribution reconstruction consumed {v_ptr} verdicts"
+        f" but _segment_verdicts returned {len(verdicts)}"
+    )
+
     return FillAttributionResult(
         per_colour=per_colour,
         shared_length_m=round(shared_length, 6),
         total_length_m=round(total_length, 6),
         centerline_segment_count=len(centerline_segments),
+        segment_attribution=tuple(attribution_list),
     )
