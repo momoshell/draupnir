@@ -33,6 +33,7 @@ from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_
 from app.interpretation.service_takeoff_loaders import (
     _DEFAULT_CENTERLINE_LAYER_TOKENS,
     INPUT_FAMILY_PDF_VECTOR,
+    build_mech_service_legend_db,
     load_bundle_bands_by_colour,
     load_measured_geometry,
     load_measured_lengths,
@@ -302,6 +303,10 @@ async def get_revision_service_takeoff(
                 fill_bands=fill_bands,
                 fitting_bands=fitting_bands,
             )
+            # Build mechanical colour→service legend (#775); tolerant, never raises.
+            mech_legend = await build_mech_service_legend_db(
+                db, revision_id, input_family=inputs.input_family
+            )
             fill_attribution = ServiceFillAttributionRead(
                 per_colour=[
                     ServiceFillColourRead(
@@ -309,6 +314,11 @@ async def get_revision_service_takeoff(
                         colour_index=fc.colour_index,
                         colour_rgb=fc.colour_rgb,
                         length_m=fc.length_m,
+                        service_name=(
+                            _mech_entry.service
+                            if (_mech_entry := mech_legend.lookup(fc.colour_key)) is not None
+                            else None
+                        ),
                     )
                     for fc in raw_fill.per_colour
                 ],

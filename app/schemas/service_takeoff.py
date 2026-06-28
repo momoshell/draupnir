@@ -96,6 +96,13 @@ class ServiceFillColourRead(BaseModel):
     colour_index: int | None = Field(None, description="DWG ACI colour index, if present")
     colour_rgb: str | None = Field(None, description="RGB hex string, if present")
     length_m: float = Field(..., ge=0.0, description="Total attributed length in metres")
+    service_name: str | None = Field(
+        None,
+        description=(
+            "Service name resolved from the mechanical colour-key legend (#775); "
+            "null when the colour has no legend entry or the legend is absent."
+        ),
+    )
 
 
 class ServiceFillAttributionRead(BaseModel):
