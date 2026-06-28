@@ -310,3 +310,92 @@ def test_rect_double_ampersand_stops_run() -> None:
     result = parse_tag("300 x 125 SP & & COMMS")
     assert result is not None
     assert result.service == "SP"
+
+
+# ---------------------------------------------------------------------------
+# M-560103 real-label regression tests (#769)
+# ---------------------------------------------------------------------------
+
+
+def test_rect_mm_interspersed_refrigerant_tray() -> None:
+    # "100 mmx50 mm REFRIGERANT TRAY" — old _RECT_RE missed interspersed mm units;
+    # new regex accepts optional mm after each dimension.
+    result = parse_tag("100 mmx50 mm REFRIGERANT TRAY")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 100
+    assert result.size.height == 50
+    assert result.service == "REFRIGERANT TRAY"
+
+
+def test_rect_mm_interspersed_reversed_dims() -> None:
+    # "50 mmx100 mm REFRIGERANT TRAY" — dims reversed variant.
+    result = parse_tag("50 mmx100 mm REFRIGERANT TRAY")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 50
+    assert result.size.height == 100
+    assert result.service == "REFRIGERANT TRAY"
+
+
+def test_bare_mm_dims_no_service_returns_none() -> None:
+    # "100 mmx50 mm" — no trailing service; the MMX token is rejected as a unit.
+    assert parse_tag("100 mmx50 mm") is None
+
+
+def test_header_vessel_low_less_returns_none() -> None:
+    # "Ø250 LOW LESS HEADER" — equipment vessel label; must not produce a service.
+    assert parse_tag("Ø250 LOW LESS HEADER") is None
+
+
+def test_header_vessel_low_loss_returns_none() -> None:
+    # "Ø250 mm LOW LOSS HEADER" — with mm unit; still a vessel, not a pipe run.
+    assert parse_tag("Ø250 mm LOW LOSS HEADER") is None
+
+
+def test_round_mm_lthw_vt_f_regression() -> None:
+    # "Ø150 mm LTHW_VT_F" — real pipe run; service extracted up to underscore char class boundary.
+    # _ROUND_MM_RE char class is [A-Za-z/] so captures "LTHW" (stops at _); that is acceptable.
+    result = parse_tag("Ø150 mm LTHW_VT_F")
+    assert result is not None
+    assert result.size.kind == "round"
+    assert result.size.diameter == 150
+    assert result.service == "LTHW"
+
+
+def test_round_mm_chw_f_regression() -> None:
+    # "Ø150 mm ChW-F" — real pipe run; hyphen stops [A-Za-z/] capture → "CHW" is correct.
+    result = parse_tag("Ø150 mm ChW-F")
+    assert result is not None
+    assert result.size.kind == "round"
+    assert result.size.diameter == 150
+    assert result.service == "CHW"
+
+
+def test_med_gas_vac_76mm_unchanged() -> None:
+    # Regression guard: med-gas "Ø76 mm VAC" must be unaffected by #769 changes.
+    result = parse_tag("Ø76 mm VAC")
+    assert result is not None
+    assert result.size.kind == "round"
+    assert result.size.diameter == 76
+    assert result.service == "VAC"
+
+
+def test_containment_lv_dist_unchanged() -> None:
+    # Regression guard: containment "300x125 LV DIST" must be unaffected.
+    result = parse_tag("300x125 LV DIST")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 300
+    assert result.size.height == 125
+    assert result.service == "LV DIST"
+
+
+def test_containment_700x300_da_unchanged() -> None:
+    # Regression guard: "700x300 DA" must be unaffected.
+    result = parse_tag("700x300 DA")
+    assert result is not None
+    assert result.size.kind == "rect"
+    assert result.size.width == 700
+    assert result.size.height == 300
+    assert result.service == "DA"
