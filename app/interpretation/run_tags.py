@@ -39,7 +39,11 @@ _UNDERLINE_DIRECTIVE_RE = re.compile(r"^\\L", re.IGNORECASE)
 
 # Pipe-tag content patterns — use re.search so any garbled Ø prefix is skipped.
 # Order matters: rect first (contains 'x'), then round+mm, then bare round.
-_RECT_RE = re.compile(r"(\d+)\s*[xX]\s*(\d+)\s+(.+)$")
+#
+# _RECT_RE accepts optional "mm" after each dimension so that M-560103 labels like
+# "100 mmx50 mm REFRIGERANT TRAY" or "100mmx50mm SERVICE" parse correctly.
+# The trailing optional mm (group 3 consumed, discarded) precedes the service tail.
+_RECT_RE = re.compile(r"(\d+)\s*(?:mm)?\s*[xX]\s*(\d+)\s*(?:mm)?\s+(.+)$", re.IGNORECASE)
 _ROUND_MM_RE = re.compile(r"(\d+)\s*mm\s+([A-Za-z/]+)", re.IGNORECASE)
 _ROUND_RE = re.compile(r"(\d+)\s+([A-Za-z/]+)")
 
@@ -47,7 +51,9 @@ _ROUND_RE = re.compile(r"(\d+)\s+([A-Za-z/]+)")
 # fabricated "service" (e.g. "42 mm" -> MM, "100 X 50" -> X, a note "...200 MM"). A real service
 # abbreviation is never one of these, so reject them (legend-is-ground-truth: never guess a
 # service from a size-only tag or a stray note).
-_NON_SERVICE_TOKENS: frozenset[str] = frozenset({"MM", "CM", "M", "X"})
+# "MMX" arises from labels like "100 mmx50 mm" when the old rect regex fails and the
+# round-no-mm fallback matches "100" followed by "MMX" — it is never a real service.
+_NON_SERVICE_TOKENS: frozenset[str] = frozenset({"MM", "MMX", "CM", "M", "X"})
 
 # Common English function words (prepositions / conjunctions / articles) that can lead a
 # note fragment containing a size (e.g. "100MM ABOVE THE DESK", "10MM AND NOT EXCEED"); a real
@@ -91,12 +97,30 @@ _NON_SERVICE_WORDS: frozenset[str] = frozenset(
 )
 
 
+# Equipment-vessel keywords that appear in non-pipe labels (e.g. "LOW LOSS HEADER",
+# "LOW LESS HEADER"). These labels carry a Ø diameter but refer to a vessel fitting, not a
+# measurable pipe run; accepting them steals centerline length via nearest-label matching.
+# The set is intentionally tight — add only confirmed equipment-label keywords here.
+_EQUIPMENT_KEYWORDS_RE = re.compile(r"\bHEADER\b", re.IGNORECASE)
+
+
 def _valid_service(service: str) -> bool:
     """A service token must be non-empty, not a bare unit/dimension separator, and not a
     common English function word (which only a note fragment would surface)."""
     return (
         bool(service) and service not in _NON_SERVICE_TOKENS and service not in _NON_SERVICE_WORDS
     )
+
+
+def _is_equipment_label(text: str) -> bool:
+    """Return True when the raw label text contains an equipment-vessel keyword.
+
+    Equipment labels (e.g. 'Ø250 LOW LOSS HEADER') share the Ø-diameter format with pipe
+    run tags but refer to vessels/fittings, not routed lengths. Rejecting them prevents
+    spurious service observations that steal centerline length via nearest-label assignment.
+    Extend _EQUIPMENT_KEYWORDS_RE conservatively — only confirmed equipment terms.
+    """
+    return bool(_EQUIPMENT_KEYWORDS_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +196,10 @@ def _parse_tag_inner(text: str) -> TagObservation | None:
     """Internal implementation — may assume a str argument."""
     normalized = _normalize_text(text)
     if not normalized:
+        return None
+
+    # Reject equipment-vessel labels before any pattern matching (e.g. "Ø250 LOW LOSS HEADER").
+    if _is_equipment_label(normalized):
         return None
 
     # 1. Rectangular: WxH SERVICE [SERVICE...]
