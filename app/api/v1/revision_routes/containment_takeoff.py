@@ -17,7 +17,6 @@ from app.api.v1.revision_lineage import _get_active_revision_manifest_or_409
 from app.db.session import get_db
 from app.interpretation.service_takeoff_loaders import assemble_containment_takeoff
 from app.schemas.containment_takeoff import (
-    ContainmentLabelTypeRead,
     ContainmentTakeoffResponse,
     ContainmentTypeRead,
 )
@@ -40,6 +39,11 @@ async def get_revision_containment_takeoff(
     duct, conduit, …), resolving each band to a containment type via the drawing legend.
     All inputs are loaded from the canonical entity store; nothing is persisted.
 
+    ``per_type`` contains ALL attributed entries — legend-resolved (basis='legend') and
+    label-recovered (basis='run_label') — unified in one list.  Label families fragmented
+    by routing suffixes (e.g. "LIFE SAFETY FB" → "LIFE SAFETY") are merged when the shorter
+    prefix also appears as its own label family.
+
     Honest degradation: a revision with no containment bands or no centerline segments
     returns 200 with an empty per_type list and zero lengths. Never 500 on degenerate input.
 
@@ -60,19 +64,12 @@ async def get_revision_containment_takeoff(
                 length_m=entry.length_m,
                 member_colour_keys=list(entry.member_colour_keys),
                 member_pattern_names=list(entry.member_pattern_names),
+                basis=entry.basis,
             )
             for entry in result.per_type
         ],
         shared_length_m=result.shared_length_m,
         total_length_m=result.total_length_m,
         centerline_segment_count=result.centerline_segment_count,
-        label_attributed=[
-            ContainmentLabelTypeRead(
-                containment_type=entry.containment_type,
-                length_m=entry.length_m,
-                basis=entry.basis,
-            )
-            for entry in result.label_attributed
-        ],
         label_unknown_length_m=result.label_unknown_length_m,
     )

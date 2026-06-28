@@ -12,7 +12,9 @@ from app.interpretation.containment_legend import (
     ContainmentLegendEntry,
 )
 from app.interpretation.containment_takeoff import (
+    BASIS_LEGEND,
     BASIS_RUN_LABEL,
+    BASIS_UNRESOLVED,
     ContainmentBand,
     _token_to_type,
     _type_to_token,
@@ -483,10 +485,12 @@ def test_label_precedence_legend_type_kept() -> None:
         legend=legend,
         labels=labels,
     )
-    # The legend attribution wins; label_attributed is empty (nothing was unmapped).
+    # The legend attribution wins; no run_label entries in per_type (nothing was unmapped).
     tray_entries = [e for e in result.per_type if e.containment_type == _TRAY_TYPE]
     assert tray_entries, "Legend attribution must be kept for mapped segments"
-    assert result.label_attributed == ()
+    assert tray_entries[0].basis == BASIS_LEGEND
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert run_label_entries == []
 
 
 def test_label_exact_partition_conservation() -> None:
@@ -511,17 +515,15 @@ def test_label_exact_partition_conservation() -> None:
         legend=legend,
         labels=labels,
     )
-    real_type_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
-    label_total = sum(e.length_m for e in result.label_attributed)
-    total_check = (
-        real_type_total + label_total + result.label_unknown_length_m + result.shared_length_m
-    )
+    per_type_total = sum(e.length_m for e in result.per_type)
+    total_check = per_type_total + result.label_unknown_length_m + result.shared_length_m
     assert abs(total_check - result.total_length_m) < 0.1, (
         f"Extended invariant violated: {total_check} != {result.total_length_m}"
     )
-    # Label pass recovered the unmapped segment.
-    assert label_total > 0.0
-    assert any(e.containment_type == "FA DECTN ALM" for e in result.label_attributed)
+    # Label pass recovered the unmapped segment — should appear in per_type with basis=run_label.
+    label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert label_entries, "Expected run_label entries in per_type after label pass"
+    assert any(e.containment_type == "FA DECTN ALM" for e in label_entries)
 
 
 def test_label_unknown_preserved_when_beyond_cap() -> None:
@@ -539,12 +541,14 @@ def test_label_unknown_preserved_when_beyond_cap() -> None:
         labels=labels,
         label_nearest_max_m=5.0,
     )
-    # Segment is beyond cap → honest-UNKNOWN.
-    assert result.label_attributed == ()
+    # Segment is beyond cap → honest-UNKNOWN; no run_label entries emitted.
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert run_label_entries == []
     assert result.label_unknown_length_m > 0.0
-    # The None per_type entry length must equal label_unknown_length_m.
+    # The None per_type entry (basis=unresolved) length must equal label_unknown_length_m.
     none_entries = [e for e in result.per_type if e.containment_type is None]
     assert none_entries
+    assert none_entries[0].basis == BASIS_UNRESOLVED
     assert abs(none_entries[0].length_m - result.label_unknown_length_m) < 1e-6
 
 
@@ -567,17 +571,19 @@ def test_no_double_count_segment_counted_under_one_basis() -> None:
         legend=legend,
         labels=labels,
     )
-    real_type_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
-    label_total = sum(e.length_m for e in result.label_attributed)
-    # Total of both bases must equal total_length_m (minus shared, which is 0 here).
-    no_double_count = real_type_total + label_total + result.label_unknown_length_m
+    # All bases are folded into per_type; total must equal total_length_m (shared=0 here).
+    per_type_total = sum(e.length_m for e in result.per_type)
+    no_double_count = per_type_total + result.label_unknown_length_m
     assert abs(no_double_count - result.total_length_m) < 0.1
-    # Each segment's length appears exactly once.
-    assert abs(no_double_count - result.total_length_m) < 0.1
+    # Legend segment appears under basis=legend; label segment under basis=run_label.
+    legend_entries = [e for e in result.per_type if e.basis == BASIS_LEGEND]
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert legend_entries, "Expected legend entry for mapped segment"
+    assert run_label_entries, "Expected run_label entry for label-recovered segment"
 
 
 def test_basis_is_run_label_constant() -> None:
-    """Every label_attributed entry has basis == BASIS_RUN_LABEL."""
+    """Every label-recovered entry in per_type has basis == BASIS_RUN_LABEL."""
     legend = _legend_from_pairs([])  # all unmapped
     bands = [_band("idx:1", 0.0, 0.0, pattern_name="FP_N")]
     segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
@@ -589,8 +595,9 @@ def test_basis_is_run_label_constant() -> None:
         legend=legend,
         labels=labels,
     )
-    assert result.label_attributed, "Expected at least one label_attributed entry"
-    for entry in result.label_attributed:
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert run_label_entries, "Expected at least one run_label entry in per_type"
+    for entry in run_label_entries:
         assert entry.basis == BASIS_RUN_LABEL
 
 
@@ -625,8 +632,9 @@ def test_empty_labels_is_byte_identical_to_pre_label() -> None:
     )
     # Both must be equal (labels=() is the default).
     assert result_no_labels == result_empty_labels
-    # Additive fields are empty/zero.
-    assert result_no_labels.label_attributed == ()
+    # No run_label entries; unknown is zero.
+    run_label_entries = [e for e in result_no_labels.per_type if e.basis == BASIS_RUN_LABEL]
+    assert run_label_entries == []
     assert result_no_labels.label_unknown_length_m == 0.0
 
 
@@ -653,7 +661,7 @@ def test_label_partition_invariant_unmapped_subset() -> None:
         labels=labels,
         label_nearest_max_m=5.0,
     )
-    label_total = sum(e.length_m for e in result.label_attributed)
+    label_total = sum(e.length_m for e in result.per_type if e.basis == BASIS_RUN_LABEL)
     # U = label_total + label_unknown_length_m (within tolerance).
     u_check = label_total + result.label_unknown_length_m
     # Both unmapped segments contribute ~0.2 m each → U ≈ 0.4 m.
@@ -730,10 +738,208 @@ async def test_assembler_with_tag_placement_loader_mock() -> None:
     ):
         result = await assemble_containment_takeoff(db=db, revision_id=rev_id)
 
-    # Label should have recovered the unmapped segment.
-    label_total = sum(e.length_m for e in result.label_attributed)
-    real_total = sum(e.length_m for e in result.per_type if e.containment_type is not None)
-    total_check = real_total + label_total + result.label_unknown_length_m + result.shared_length_m
+    # Label should have recovered the unmapped segment — entry in per_type with basis=run_label.
+    label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    assert label_entries, "Expected run_label entry in per_type after tag-placement label pass"
+    per_type_total = sum(e.length_m for e in result.per_type)
+    total_check = per_type_total + result.label_unknown_length_m + result.shared_length_m
     assert abs(total_check - result.total_length_m) < 0.1, (
         f"Assembler extended invariant violated: {total_check} != {result.total_length_m}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: basis field on per_type entries (issue #770)
+# ---------------------------------------------------------------------------
+
+
+def test_legend_entries_carry_basis_legend() -> None:
+    """Every legend-resolved entry in per_type carries basis='legend'."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="SOLID")]
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+    )
+    assert all(e.basis == BASIS_LEGEND for e in result.per_type if e.containment_type is not None)
+
+
+def test_honest_absent_entry_carries_basis_unresolved() -> None:
+    """The honest-absent (containment_type=None) entry carries basis='unresolved'."""
+    legend = _legend_from_pairs([])  # empty legend — all bands unmapped
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="SOLID")]
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+    )
+    none_entries = [e for e in result.per_type if e.containment_type is None]
+    assert none_entries, "Expected honest-absent (None) entry"
+    assert none_entries[0].basis == BASIS_UNRESOLVED
+
+
+def test_per_type_sorted_deterministically() -> None:
+    """per_type is sorted: legend entries first (alphabetically), then run_label, None last."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),  # unmapped
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → legend (Cable Tray)
+        _seg(4.9, 0.0, 5.1, 0.0),  # → unmapped → label
+    ]
+    labels = [_label(5.0, 0.0, "SOME SERVICE")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    bases = [e.basis for e in result.per_type]
+    # legend entries come before run_label entries; None (unresolved) sorts last within its group.
+    legend_indices = [i for i, b in enumerate(bases) if b == BASIS_LEGEND]
+    run_label_indices = [i for i, b in enumerate(bases) if b == BASIS_RUN_LABEL]
+    unresolved_indices = [i for i, b in enumerate(bases) if b == BASIS_UNRESOLVED]
+    if legend_indices and run_label_indices:
+        assert max(legend_indices) < min(run_label_indices), (
+            "legend entries must precede run_label entries"
+        )
+    if run_label_indices and unresolved_indices:
+        assert max(run_label_indices) < min(unresolved_indices), (
+            "run_label entries must precede unresolved entries"
+        )
+
+
+def test_extended_invariant_all_bases() -> None:
+    """Extended invariant: Σ(per_type all bases) + label_unknown + shared == total ±0.1."""
+    legend = _legend_from_pairs([("idx:1", "SOLID", _TRAY_TYPE)])
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),  # unmapped
+        _band("idx:3", 10.0, 0.0, pattern_name="FP_N"),  # unmapped, no nearby label
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # legend
+        _seg(4.9, 0.0, 5.1, 0.0),  # → label recovery
+        _seg(9.9, 0.0, 10.1, 0.0),  # unmapped, no label → unknown
+        _seg(50.0, 0.0, 51.0, 0.0),  # shared
+    ]
+    labels = [_label(5.0, 0.0, "RECOVERED")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+        label_nearest_max_m=5.0,
+    )
+    total_check = (
+        sum(e.length_m for e in result.per_type)
+        + result.label_unknown_length_m
+        + result.shared_length_m
+    )
+    assert abs(total_check - result.total_length_m) < 0.1, (
+        f"Extended invariant (all bases) violated: {total_check} != {result.total_length_m}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: F2 label-family merge (issue #770)
+# ---------------------------------------------------------------------------
+
+
+def test_f2_merge_life_safety_fb_into_life_safety() -> None:
+    """'LIFE SAFETY FB' merges into 'LIFE SAFETY' when both appear as label families."""
+    legend = _legend_from_pairs([])  # all unmapped — two segments go through label pass
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="FP_N"),  # unmapped
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),  # unmapped
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),
+        _seg(4.9, 0.0, 5.1, 0.0),
+    ]
+    # Two labels: "LIFE SAFETY" near seg 1, "LIFE SAFETY FB" near seg 2.
+    labels = [
+        _label(0.0, 0.0, "LIFE SAFETY"),
+        _label(5.0, 0.0, "LIFE SAFETY FB"),
+    ]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    # "LIFE SAFETY FB" must be merged into "LIFE SAFETY".
+    types = {e.containment_type for e in run_label_entries}
+    assert "LIFE SAFETY FB" not in types, "'LIFE SAFETY FB' must be merged into 'LIFE SAFETY'"
+    assert "LIFE SAFETY" in types, "Merged 'LIFE SAFETY' entry must be present"
+    life_safety_entry = next(e for e in run_label_entries if e.containment_type == "LIFE SAFETY")
+    # Combined length must equal sum of both individual segments.
+    assert life_safety_entry.length_m == pytest.approx(
+        sum(e.length_m for e in run_label_entries), abs=1e-6
+    )
+
+
+def test_f2_no_merge_when_prefix_absent() -> None:
+    """'LIFE SAFETY FB' is NOT merged when 'LIFE SAFETY' is NOT present as a label family."""
+    legend = _legend_from_pairs([])
+    bands = [_band("idx:1", 0.0, 0.0, pattern_name="FP_N")]
+    segments = [_seg(-0.1, 0.0, 0.1, 0.0)]
+    # Only "LIFE SAFETY FB" — prefix not present, so no merge.
+    labels = [_label(0.0, 0.0, "LIFE SAFETY FB")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    types = {e.containment_type for e in run_label_entries}
+    # No merge — "LIFE SAFETY FB" stays as-is.
+    assert "LIFE SAFETY FB" in types
+    assert "LIFE SAFETY" not in types
+
+
+def test_f2_no_cross_basis_merge() -> None:
+    """Legend entry 'ESSENTIAL TRUNKING' and label entry 'ESSENTIAL' stay distinct."""
+    legend = _legend_from_pairs(
+        [
+            ("idx:1", "SOLID", "ESSENTIAL TRUNKING"),
+            ("idx:2", "FP_N", None),  # unmapped
+        ]
+    )
+    bands = [
+        _band("idx:1", 0.0, 0.0, pattern_name="SOLID"),
+        _band("idx:2", 5.0, 0.0, pattern_name="FP_N"),
+    ]
+    segments = [
+        _seg(-0.1, 0.0, 0.1, 0.0),  # → legend (ESSENTIAL TRUNKING)
+        _seg(4.9, 0.0, 5.1, 0.0),  # → unmapped → label
+    ]
+    # Label that matches a prefix of the legend type — must NOT cross-merge.
+    labels = [_label(5.0, 0.0, "ESSENTIAL")]
+
+    result = compute_containment_attributed_lengths(
+        centerline_segments=segments,
+        containment_bands=bands,
+        legend=legend,
+        labels=labels,
+    )
+    legend_entries = [e for e in result.per_type if e.basis == BASIS_LEGEND]
+    run_label_entries = [e for e in result.per_type if e.basis == BASIS_RUN_LABEL]
+    legend_types = {e.containment_type for e in legend_entries}
+    run_label_types = {e.containment_type for e in run_label_entries}
+    # Both exist as distinct entries.
+    assert "ESSENTIAL TRUNKING" in legend_types, "Legend entry must be kept"
+    assert "ESSENTIAL" in run_label_types, "Label entry must be kept separate"

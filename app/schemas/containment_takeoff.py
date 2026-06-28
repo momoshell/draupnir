@@ -28,16 +28,13 @@ class ContainmentTypeRead(BaseModel):
         default_factory=list,
         description="Sorted, deduplicated HATCH pattern names of bands that mapped to this type",
     )
-
-
-class ContainmentLabelTypeRead(BaseModel):
-    """Attributed length recovered from an unmapped segment via its nearest run-label."""
-
-    containment_type: str = Field(..., description="Run-label SERVICE token, e.g. 'FA DECTN ALM'")
-    length_m: float = Field(..., ge=0.0, description="Attributed length in metres")
     basis: str = Field(
         ...,
-        description="Provenance marker; 'run_label' for lengths recovered via the label mechanism",
+        description=(
+            "Provenance: 'legend' = resolved via (colour, pattern) legend lookup; "
+            "'run_label' = recovered via run-label mechanism; "
+            "'unresolved' = honest-absent (band present, no matching legend entry or no label)."
+        ),
     )
 
 
@@ -49,8 +46,8 @@ class ContainmentTakeoffResponse(BaseModel):
     per_type: list[ContainmentTypeRead] = Field(
         default_factory=list,
         description=(
-            "Per-containment-type attributed lengths, sorted by containment_type "
-            "(None sorts last, after all real strings)."
+            "Per-containment-type attributed lengths — all bases unified (legend + run_label). "
+            "Sorted deterministically by (basis, containment_type; None sorts last)."
         ),
     )
     shared_length_m: float = Field(
@@ -64,18 +61,14 @@ class ContainmentTakeoffResponse(BaseModel):
     total_length_m: float = Field(
         ...,
         ge=0.0,
-        description="Total centerline length in metres (Σ per_type + shared_length_m)",
+        description=(
+            "Total centerline length in metres. "
+            "Invariant: Σ(per_type lengths) + label_unknown_length_m + shared_length_m "
+            "== total_length_m ±0.1 m."
+        ),
     )
     centerline_segment_count: int = Field(
         ..., ge=0, description="Number of centerline line segments processed"
-    )
-    label_attributed: list[ContainmentLabelTypeRead] = Field(
-        default_factory=list,
-        description=(
-            "Lengths recovered from unmapped segments via the run-label mechanism; "
-            "sorted by containment_type; basis='run_label'. "
-            "Never merged into legend totals."
-        ),
     )
     label_unknown_length_m: float = Field(
         0.0,
