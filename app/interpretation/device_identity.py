@@ -86,6 +86,14 @@ ARCHITECTURE_FAMILY_PATTERNS: tuple[str, ...] = (
     "Louvre",
     "Hardscape",
     "_rvt",  # linked Revit model master/container block (nesting root) — never a device
+    # MPA Revit building-fabric families — INTENTIONALLY SPECIFIC multi-word patterns to avoid
+    # colliding with real electrical devices (e.g. "System Panel" ≠ "PANEL BOARD",
+    # "Basic Wall" ≠ "Wall-mounted ...", "Top Rail"/"Handrail"/"Railing" are railing fabric).
+    "Top Rail",
+    "Handrail",
+    "Railing",
+    "Basic Wall",
+    "System Panel",
 )
 
 # ---------------------------------------------------------------------------

@@ -927,3 +927,67 @@ def test_legend_exemplar_layer_beats_legend_resolvable_tag() -> None:
     assert kind == KIND_LEGEND_EXEMPLAR, (
         "legend_exemplar (keyed on layer) must still beat legend-resolvable tag"
     )
+
+
+# ---------------------------------------------------------------------------
+# MPA building-fabric family patterns (#773) — each pattern classifies correctly,
+# and no real electrical device is reclassified as architecture.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_architecture_top_rail() -> None:
+    device = _device(block_ref="Top Rail Type - Top Rail_Internal_-V1", layer_ref="A-RAIL")
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_architecture_handrail() -> None:
+    device = _device(block_ref="Handrail - MPA_ExtHandrail_Steel", layer_ref="A-RAIL")
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_architecture_railing() -> None:
+    device = _device(block_ref="Railing - MPA_ExtRailing_Glass", layer_ref="A-RAIL")
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_architecture_basic_wall() -> None:
+    device = _device(block_ref="Basic Wall _ MPA_Ext150Wall_Type3", layer_ref="A-WALL")
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+def test_classify_architecture_system_panel() -> None:
+    device = _device(block_ref="System Panel - MPA_ExtPanel_ConceptGlazed", layer_ref="A-GLAZ")
+    assert classify_instance_kind(device, _EMPTY_LEGEND) == KIND_ARCHITECTURE
+
+
+# Collision guards — real electrical devices must NOT become architecture.
+
+
+def test_collision_guard_panel_board_stays_device() -> None:
+    """'System Panel' must NOT match 'PANEL BOARD' — different words."""
+    legend = _legend(_entry(abbreviation="PB", type_name="Panel Board"))
+    device = _device(block_ref="Pr_elec_PANEL BOARD_ESS", layer_ref="E-PANEL", tag=_tag("PB"))
+    assert classify_instance_kind(device, legend) != KIND_ARCHITECTURE
+
+
+def test_collision_guard_distribution_board_stays_device() -> None:
+    legend = _legend(_entry(abbreviation="DB", type_name="Distribution Board"))
+    device = _device(
+        block_ref="Pr_elec_Distribution_Board_Main", layer_ref="E-PANEL", tag=_tag("DB")
+    )
+    assert classify_instance_kind(device, legend) != KIND_ARCHITECTURE
+
+
+def test_collision_guard_fire_alarm_sounder_stays_device() -> None:
+    legend = _legend(_entry(abbreviation="FAS", type_name="Fire Alarm Sounder"))
+    device = _device(
+        block_ref="Fire Alarm Sounder - Ceiling Mount", layer_ref="E-FIRE", tag=_tag("FAS")
+    )
+    assert classify_instance_kind(device, legend) != KIND_ARCHITECTURE
+
+
+def test_collision_guard_wall_mounted_device_stays_device() -> None:
+    """'Basic Wall' must NOT match a 'Wall-mounted ...' device block_ref."""
+    legend = _legend(_entry(abbreviation="WM", type_name="Wall-mounted Socket"))
+    device = _device(block_ref="Wall-mounted Socket Outlet", layer_ref="E-POWER", tag=_tag("WM"))
+    assert classify_instance_kind(device, legend) != KIND_ARCHITECTURE
