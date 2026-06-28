@@ -555,3 +555,278 @@ async def test_build_containment_legend_db_excludes_notes_left_and_equipment_bel
 
     # Equipment swatch is below the bottom boundary → not in the legend.
     assert legend.lookup("112233", "SOLID") is None, "below-table swatch must be excluded"
+
+
+# ---------------------------------------------------------------------------
+# build_mech_service_legend_db (issue #775)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_build_mech_service_legend_db_empty_on_pdf_family() -> None:
+    """PDF revisions have no DWG HATCH/LINE mechanical swatches → empty MechanicalLegend."""
+    from app.interpretation.mechanical_legend import MechanicalLegend
+    from app.interpretation.service_takeoff_loaders import build_mech_service_legend_db
+
+    db = AsyncMock()
+    legend = await build_mech_service_legend_db(db, _REV_ID, input_family="pdf_vector")
+
+    assert isinstance(legend, MechanicalLegend)
+    assert legend.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_build_mech_service_legend_db_empty_on_exception() -> None:
+    """Any DB error → tolerant empty MechanicalLegend."""
+    from app.interpretation.mechanical_legend import MechanicalLegend
+    from app.interpretation.service_takeoff_loaders import build_mech_service_legend_db
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=RuntimeError("DB down"))
+
+    legend = await build_mech_service_legend_db(db, _REV_ID, input_family="dwg")
+
+    assert isinstance(legend, MechanicalLegend)
+    assert legend.entries == ()
+
+
+@pytest.mark.asyncio
+async def test_build_mech_service_legend_db_pairs_hatch_swatch_with_label() -> None:
+    """DWG path: anchor + chromatic HATCH swatch + label text → lookup resolves service.
+
+    Calibrated to the _DWG_MECH_LEGEND_* constants:
+    - Anchor regex: r'(?i)\\blegend\\b' (matches 'LEGEND')
+    - Region pads: LEFT=0.2, RIGHT=0.8, ABOVE=0.6, BELOW=3.5
+    - Pair radius: 0.8
+    """
+    from app.interpretation.mechanical_legend import MechanicalLegend
+    from app.interpretation.service_legend import colour_key as _ck
+    from app.interpretation.service_takeoff_loaders import build_mech_service_legend_db
+
+    # Anchor text at (10.0, 5.0) — matches 'LEGEND'.
+    anchor_row = SimpleNamespace(
+        id="anchor",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=0,
+        style={},
+        geometry_json={
+            "text": "LEGEND",
+            "insertion": {"x": 10.0, "y": 5.0},
+        },
+        properties_json={},
+    )
+
+    # HATCH swatch centroid at (10.1, 4.5):
+    # Region x: [10.0-0.2, 10.0+0.8] = [9.8, 10.8]; y: [5.0-3.5, 5.0+0.6] = [1.5, 5.6]
+    # Centroid (10.1, 4.5) is inside the region.
+    hatch_row = SimpleNamespace(
+        id="swatch-mech",
+        entity_type="hatch",
+        layer_ref="Legend",
+        sequence_index=1,
+        on_sheet=True,
+        style={"color": {"index": 247, "rgb": "c2873f51", "by_layer": False, "by_block": False}},
+        geometry_json={
+            "vertices": [
+                {"x": 10.05, "y": 4.45},
+                {"x": 10.15, "y": 4.45},
+                {"x": 10.15, "y": 4.55},
+                {"x": 10.05, "y": 4.55},
+            ],
+        },
+        properties_json={},
+    )
+
+    # Label text at (10.3, 4.5) — right of swatch, within pair radius 0.8.
+    # Distance: sqrt((10.3-10.1)^2 + (4.5-4.5)^2) = 0.2 < 0.8 → paired.
+    label_row = SimpleNamespace(
+        id="label-mech",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=2,
+        style={},
+        geometry_json={
+            "text": "LTHW-VT-F",
+            "insertion": {"x": 10.3, "y": 4.5},
+        },
+        properties_json={},
+    )
+
+    call_count = 0
+
+    async def _execute_side_effect(stmt: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        scalars_mock = MagicMock()
+        if call_count == 1:
+            # First call: text/mtext query for anchor detection
+            scalars_mock.all.return_value = [anchor_row, label_row]
+        else:
+            # Second call: all entities query
+            scalars_mock.all.return_value = [anchor_row, hatch_row, label_row]
+        result = MagicMock()
+        result.scalars.return_value = scalars_mock
+        return result
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=_execute_side_effect)
+
+    legend = await build_mech_service_legend_db(db, _REV_ID, input_family="dwg")
+
+    assert isinstance(legend, MechanicalLegend)
+    ck = _ck({"index": 247, "rgb": "c2873f51", "by_layer": False, "by_block": False})
+    entry = legend.lookup(ck)
+    assert entry is not None, "Expected a legend entry for the hatch swatch"
+    assert entry.service == "LTHW-VT-F"
+
+
+@pytest.mark.asyncio
+async def test_build_mech_service_legend_db_line_swatch_accepted_when_short() -> None:
+    """Short LINE entity (< _DWG_MECH_SWATCH_LINE_LEN_MAX) is accepted as a swatch.
+
+    M-560103 happens to use HATCH swatches, but the loader must also accept short line
+    samples for DWG drawings that encode the legend with line swatches.
+    """
+    from app.interpretation.mechanical_legend import MechanicalLegend
+    from app.interpretation.service_legend import colour_key as _ck
+    from app.interpretation.service_takeoff_loaders import build_mech_service_legend_db
+
+    anchor_row = SimpleNamespace(
+        id="anchor",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=0,
+        style={},
+        geometry_json={
+            "text": "LEGEND",
+            "insertion": {"x": 10.0, "y": 5.0},
+        },
+        properties_json={},
+    )
+
+    # Short line swatch at (10.1, 4.5): length = 0.2 < 0.6 threshold → accepted.
+    line_row = SimpleNamespace(
+        id="swatch-line",
+        entity_type="line",
+        layer_ref="Legend",
+        sequence_index=1,
+        on_sheet=True,
+        style={"color": {"index": 243, "rgb": "c2bc7083", "by_layer": False, "by_block": False}},
+        geometry_json={
+            "start": {"x": 10.0, "y": 4.5},
+            "end": {"x": 10.2, "y": 4.5},
+        },
+        properties_json={},
+    )
+
+    label_row = SimpleNamespace(
+        id="label-line",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=2,
+        style={},
+        geometry_json={
+            "text": "LTHW-VT-R",
+            "insertion": {"x": 10.3, "y": 4.5},
+        },
+        properties_json={},
+    )
+
+    call_count = 0
+
+    async def _execute_side_effect(stmt: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        scalars_mock = MagicMock()
+        if call_count == 1:
+            scalars_mock.all.return_value = [anchor_row, label_row]
+        else:
+            scalars_mock.all.return_value = [anchor_row, line_row, label_row]
+        result = MagicMock()
+        result.scalars.return_value = scalars_mock
+        return result
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=_execute_side_effect)
+
+    legend = await build_mech_service_legend_db(db, _REV_ID, input_family="dwg")
+
+    assert isinstance(legend, MechanicalLegend)
+    ck = _ck({"index": 243, "rgb": "c2bc7083", "by_layer": False, "by_block": False})
+    entry = legend.lookup(ck)
+    assert entry is not None, "Short line swatch should produce an entry"
+    assert entry.service == "LTHW-VT-R"
+
+
+@pytest.mark.asyncio
+async def test_build_mech_service_legend_db_long_line_excluded() -> None:
+    """Long LINE entity (> _DWG_MECH_SWATCH_LINE_LEN_MAX) is rejected (floor pipework gate)."""
+    from app.interpretation.mechanical_legend import MechanicalLegend
+    from app.interpretation.service_legend import colour_key as _ck
+    from app.interpretation.service_takeoff_loaders import build_mech_service_legend_db
+
+    anchor_row = SimpleNamespace(
+        id="anchor",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=0,
+        style={},
+        geometry_json={
+            "text": "LEGEND",
+            "insertion": {"x": 10.0, "y": 5.0},
+        },
+        properties_json={},
+    )
+
+    # Long line: length = 2.0 > 0.6 threshold → rejected by length gate.
+    long_line_row = SimpleNamespace(
+        id="swatch-long",
+        entity_type="line",
+        layer_ref="Legend",
+        sequence_index=1,
+        on_sheet=True,
+        style={"color": {"index": 247, "rgb": "c2873f51", "by_layer": False, "by_block": False}},
+        geometry_json={
+            "start": {"x": 10.0, "y": 4.5},
+            "end": {"x": 12.0, "y": 4.5},
+        },
+        properties_json={},
+    )
+
+    label_row = SimpleNamespace(
+        id="label-long",
+        entity_type="text",
+        layer_ref="Legend",
+        sequence_index=2,
+        style={},
+        geometry_json={
+            "text": "LTHW-VT-F",
+            "insertion": {"x": 10.3, "y": 4.5},
+        },
+        properties_json={},
+    )
+
+    call_count = 0
+
+    async def _execute_side_effect(stmt: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        scalars_mock = MagicMock()
+        if call_count == 1:
+            scalars_mock.all.return_value = [anchor_row, label_row]
+        else:
+            scalars_mock.all.return_value = [anchor_row, long_line_row, label_row]
+        result = MagicMock()
+        result.scalars.return_value = scalars_mock
+        return result
+
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=_execute_side_effect)
+
+    legend = await build_mech_service_legend_db(db, _REV_ID, input_family="dwg")
+
+    assert isinstance(legend, MechanicalLegend)
+    # Long line was rejected → no swatch candidates → empty legend
+    ck = _ck({"index": 247, "rgb": "c2873f51", "by_layer": False, "by_block": False})
+    assert legend.lookup(ck) is None, "Long line should be excluded by length gate"

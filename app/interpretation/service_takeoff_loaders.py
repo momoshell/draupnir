@@ -48,6 +48,11 @@ from app.interpretation.loaders import (
     load_revision_entities_by_type,
 )
 from app.interpretation.measurement import ScaleContext
+from app.interpretation.mechanical_legend import (
+    MechanicalLegend,
+    MechSwatchInput,
+    build_mechanical_legend,
+)
 from app.interpretation.rise_drop import RiseDropEntity
 from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES, RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
@@ -240,6 +245,41 @@ _DWG_CONTAINMENT_REGION_PAD_BELOW: float = 7.2  # row-12 y≈anchor-7.0; equipme
 # M-540003 swatch↔label gap is ~0.5 units; rows are ~0.4 units apart.
 # 1.5 units keeps each label bound to its own row's swatch.
 _DWG_LEGEND_PAIR_RADIUS: float = 1.5
+
+# Mechanical service legend region constants (anchor regex + spatial pads + pair radius).
+# SINGLE-BUILDING calibration (M-560103, revision 30da2f50) — provisional (#775).
+#
+# Anchor text: "\LLEGEND" (DXF underline-formatted) at (10.896, 5.012) drawing units.
+# Service texts at x≈11.63; hatch swatch centroids at x≈11.14.
+# Vertical range: LTHW-VT-F at y=4.52 (topmost) → HYDRAULIC EQUIPMENT at y=1.76 (bottommost).
+# Swatch column x: 10.78..11.52 (slightly left of anchor x=10.896).
+#
+# LEFT:  0.2 — swatches start at x≈10.78, anchor at x=10.896; 0.12 left of anchor
+#              (+0.1 margin = 0.2).
+# RIGHT: 0.8 — service text at x≈11.63, anchor at x=10.896; gap=0.73 (+0.1 margin = 0.8).
+# ABOVE: 0.6 — top swatch centroid y=4.45, anchor y=5.012; not above anchor (swatches
+#              are below the anchor title), but allow a small margin for text overrun.
+# BELOW: 3.5 — lowest swatch centroid y=1.72, anchor y=5.012; gap=3.29 (+0.2 margin = 3.5).
+#
+# Pair radius: swatch centroid x≈11.14 vs label x≈11.63 → horiz dist≈0.49; vert dist≈0.07;
+# max distance ≈ 0.5. Use 0.8 for margin; _DWG_LEGEND_PAIR_RADIUS=1.5 is also fine but more
+# generous — use 0.8 to avoid cross-row mismatches in tight tables.
+_DWG_MECH_LEGEND_ANCHOR_RE: re.Pattern[str] = re.compile(r"(?i)\blegend\b")
+_DWG_MECH_LEGEND_ANCHOR_EXCLUDE_RE: re.Pattern[str] = re.compile(
+    r"(?i)\b(?:containments?\s+legend|key\s*plan|notes?)\b"
+)
+_DWG_MECH_REGION_PAD_LEFT: float = 0.2
+_DWG_MECH_REGION_PAD_RIGHT: float = 0.8
+_DWG_MECH_REGION_PAD_ABOVE: float = 0.6
+_DWG_MECH_REGION_PAD_BELOW: float = 3.5
+_DWG_MECH_LEGEND_PAIR_RADIUS: float = 0.8
+# Short line swatch length gate: a legend line sample is shorter than a pipe run.
+# M-560103 legend swatches are hatches (not lines), but accept short line samples too
+# (length < this threshold) for DWG drawings that use lines as legend swatches.
+# Calibrated to exclude floor pipe runs (typically metres long in drawing units = metres).
+_DWG_MECH_SWATCH_LINE_LEN_MAX: float = 0.6  # drawing units (metres); legend lines are short
+# Entity types accepted as mechanical legend swatches (hatch + short line samples).
+_DWG_MECH_SWATCH_TYPES: frozenset[str] = frozenset({"hatch", "line", "lwpolyline", "polyline"})
 
 # Minimum RGB channel spread (max-min across R,G,B in 0-255 space) for a DWG
 # swatch colour to be accepted as a service colour.  Achromatic colours (black,
@@ -2183,3 +2223,184 @@ async def assemble_containment_takeoff(
         labels=seg_labels,
         label_nearest_max_m=5.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Mechanical service legend loader (issue #775)
+# ---------------------------------------------------------------------------
+
+
+async def build_mech_service_legend_db(
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    input_family: str | None = None,
+) -> MechanicalLegend:
+    """Build a :class:`MechanicalLegend` from coloured swatches in the mechanical legend region.
+
+    Discovers the legend via a text anchor matching ``_DWG_MECH_LEGEND_ANCHOR_RE`` (e.g.
+    "LEGEND"), collects chromatic HATCH, line, lwpolyline, and polyline entities in the
+    surrounding region, applies a length gate to exclude floor pipework from line swatches,
+    and pairs each swatch with the nearest text label within ``_DWG_MECH_LEGEND_PAIR_RADIUS``.
+
+    The anchor regex and region pads are calibrated to M-560103 (revision 30da2f50) —
+    SINGLE-BUILDING / provisional (#775, mirrors #681 precedent for containment legend).
+
+    KEY EXTENSION vs containment legend: accepts coloured LINE/LWPOLYLINE/POLYLINE entities
+    in addition to HATCHes as swatches.  Line swatches must be shorter than
+    ``_DWG_MECH_SWATCH_LINE_LEN_MAX`` (drawing units) to exclude long routed pipe runs that
+    accidentally fall in the legend region.  The anchor→region bounding box is the primary
+    guard; the length gate is a belt-and-suspenders defence against stray coloured lines.
+
+    Honest fallback: PDF revisions or no-anchor drawings return an empty
+    :class:`MechanicalLegend`.  Never raises.
+
+    SINGLE-BUILDING calibration (M-560103) — provisional.
+    """
+    if input_family is None:
+        input_family = await _resolve_input_family(db, revision_id)
+
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
+        # PDF revisions have no DWG HATCH/LINE mechanical swatches.
+        return build_mechanical_legend([])
+
+    from sqlalchemy import select
+
+    from app.models.revision_materialization import RevisionEntity
+
+    try:
+        # --- Step 1: load all text/mtext entities for anchor detection ---
+        text_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.entity_type.in_(["text", "mtext"]),
+                    )
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 2: identify mechanical legend anchor entities ---
+        regions: list[tuple[float, float, float, float]] = []  # (x_lo, y_lo, x_hi, y_hi)
+        for row in text_rows:
+            geometry = row.geometry_json or {}
+            raw_text = geometry.get("text")
+            if not isinstance(raw_text, str):
+                continue
+            collapsed = _normalize_legend_text(raw_text)
+            # Must match the mech anchor pattern but NOT be a containments-legend anchor
+            # (to avoid overlapping with build_containment_legend_db).
+            if not _DWG_MECH_LEGEND_ANCHOR_RE.search(collapsed):
+                continue
+            if _DWG_MECH_LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed):
+                continue
+            pt = _entity_insertion(geometry)
+            if pt is None:
+                continue
+            ax, ay = pt
+            regions.append(
+                (
+                    ax - _DWG_MECH_REGION_PAD_LEFT,
+                    ay - _DWG_MECH_REGION_PAD_BELOW,
+                    ax + _DWG_MECH_REGION_PAD_RIGHT,
+                    ay + _DWG_MECH_REGION_PAD_ABOVE,
+                )
+            )
+
+        if not regions:
+            return build_mechanical_legend([])
+
+        def _in_any_region(x: float, y: float) -> bool:
+            for x_lo, y_lo, x_hi, y_hi in regions:
+                if x_lo <= x <= x_hi and y_lo <= y <= y_hi:
+                    return True
+            return False
+
+        # --- Step 3: load all entities for the revision (one round-trip) ---
+        all_rows = list(
+            (
+                await db.execute(
+                    select(RevisionEntity)
+                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # --- Step 4: collect swatch candidates and label text entries ---
+
+        swatch_candidates: list[tuple[tuple[float, float], Mapping[str, Any]]] = []
+        text_entries: list[tuple[str, tuple[float, float]]] = []
+
+        for row in all_rows:
+            row_geom: dict[str, Any] = row.geometry_json or {}
+
+            if row.entity_type in ("text", "mtext"):
+                raw_text = row_geom.get("text")
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    continue
+                # Exclude the anchor text itself from label candidates.
+                collapsed = _normalize_legend_text(raw_text)
+                if _DWG_MECH_LEGEND_ANCHOR_RE.search(
+                    collapsed
+                ) and not _DWG_MECH_LEGEND_ANCHOR_EXCLUDE_RE.search(collapsed):
+                    continue
+                pt = _entity_insertion(row_geom)
+                if pt is not None and _in_any_region(pt[0], pt[1]):
+                    text_entries.append((raw_text.strip(), pt))
+
+            elif row.entity_type in _DWG_MECH_SWATCH_TYPES:
+                # Swatch candidate: chromatic colour (not by_layer/by_block), centroid in region.
+                style = row.style or {}
+                color_val: Any = style.get("color") if isinstance(style, Mapping) else None
+                if not isinstance(color_val, Mapping):
+                    continue
+                if color_val.get("by_layer") or color_val.get("by_block"):
+                    continue
+                if color_val.get("rgb") is None and color_val.get("index") is None:
+                    continue
+                if not _is_chromatic_colour(color_val):
+                    continue
+
+                centroid = _swatch_centroid(row_geom)
+                if centroid is None:
+                    continue
+                if not _in_any_region(centroid[0], centroid[1]):
+                    continue
+
+                # For line entities: apply a length gate to exclude long routed pipe runs.
+                # Hatch entities: no length gate (hatches in the legend region are swatches
+                # by definition; they're bounded by the region constraint above).
+                if row.entity_type == "line":
+                    s = _xy(row_geom.get("start"))
+                    e = _xy(row_geom.get("end"))
+                    if s is None or e is None:
+                        continue
+                    seg_len = math.hypot(e[0] - s[0], e[1] - s[1])
+                    if seg_len > _DWG_MECH_SWATCH_LINE_LEN_MAX:
+                        continue
+
+                swatch_candidates.append((centroid, color_val))
+
+        if not swatch_candidates:
+            return build_mechanical_legend([])
+
+        # --- Step 5: pair each label with the nearest in-region swatch ---
+        inputs_list: list[MechSwatchInput] = []
+        for text, text_pt in text_entries:
+            color = _nearest_swatch(text_pt, swatch_candidates, _DWG_MECH_LEGEND_PAIR_RADIUS)
+            if color is None:
+                continue
+            inputs_list.append(MechSwatchInput(color=color, text=text))
+
+        return build_mechanical_legend(inputs_list)
+
+    except Exception:  # tolerant: never raise
+        return build_mechanical_legend([])
