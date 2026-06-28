@@ -26,6 +26,7 @@ from app.interpretation.devices import (
     load_tag_candidates,
     load_text_candidates,
 )
+from app.interpretation.label_rooms import _looks_like_room_name
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.interpretation.room_pipeline import (
     ROOM_STRATEGIES,
@@ -38,6 +39,7 @@ from app.interpretation.rooms import (
     Room,
     RoomLabel,
     _smallest_containing_room,
+    parse_room_number,
 )
 from app.models.revision_materialization import RevisionEntity
 from app.schemas.revision import RevisionEntityManifestRead
@@ -104,19 +106,43 @@ async def list_revision_rooms(
     )
 
     named_rooms = sum(1 for room in result.rooms if room.name is not None)
+
+    # Presentation filter (#778): surface only rooms with a genuine identity.
+    # A room has genuine identity when it carries a valid room number (parse_room_number
+    # succeeds — e.g. "1.9.01") OR a genuine short room name (_looks_like_room_name passes —
+    # e.g. "Cooling Plantroom", "Heating & Hot Water").
+    #
+    # What we suppress:
+    #   - Anonymous wall-polygon cells (name=None AND number=None): internal registry geometry
+    #     load-bearing for Phase-R conservation and the Voronoi byte-identity guard.
+    #   - Spec-prose-named cells: wall-polygon cells whose name was stamped from note text
+    #     (e.g. "ALL PIPEWORK SHALL BE PR", "ACCORDANCE WITH BUILDING REGULATIONS") — these
+    #     slip past the name=None check but are not reportable rooms.
+    # The registry retains ALL polygons unchanged; this filter only affects the API response.
+    def _has_genuine_identity(room: Room) -> bool:
+        return (room.number is not None and parse_room_number(room.number) is not None) or (
+            room.name is not None and _looks_like_room_name(room.name)
+        )
+
+    identified_rooms = [room for room in result.rooms if _has_genuine_identity(room)]
+    suppressed_count = len(result.rooms) - len(identified_rooms)
+
     return RevisionRoomListResponse(
         manifest=RevisionEntityManifestRead.model_validate(manifest),
         strategy=result.strategy,
         source_layers=list(result.source_layers),
-        items=[_room_read(room) for room in result.rooms],
+        items=[_room_read(room) for room in identified_rooms],
         assignments=[
             DeviceRoomAssignmentRead(device_id=assignment.device_id, room_id=assignment.room_id)
             for assignment in result.device_assignments
         ],
         summary={
-            "rooms": len(result.rooms),
+            "rooms": len(identified_rooms),
             "named_rooms": named_rooms,
             "assigned_devices": len(result.device_assignments),
+            # Count of all suppressed non-room entries: anonymous polygons + spec-prose-named
+            # cells. Kept for transparency so consumers can see internal registry size.
+            "unlabeled_polygon_count": suppressed_count,
         },
     )
 

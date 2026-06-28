@@ -155,6 +155,10 @@ def test_no_labels_yields_no_rooms() -> None:
         "Corridor",
         "AHU Plant",
         "Office",
+        # Short all-caps abbreviations are not spec-prose and must pass.
+        "WC",
+        "(IPS)",
+        "IT Room",
     ],
 )
 def test_looks_like_room_name_accepts_real_names(text: str) -> None:
@@ -177,6 +181,29 @@ def test_looks_like_room_name_accepts_real_names(text: str) -> None:
         "100 x 50",
         "100X50",
         "6No. SOMETHING",
+        # Spec-prose note fragments and service labels stamped on wall-polygon cells
+        # (#778, M-560103). Multi-token all-caps strings (split on spaces/hyphens) are
+        # rejected — sentence fragments, two-word service labels, and hyphenated codes.
+        "ALL PIPEWORK SHALL BE PR",
+        "ACCORDANCE WITH BUILDING",
+        "29/2021. WHERE NEW PIPEW",
+        "A WIRED THERMOSTAT CONTR",
+        "ACCORDANCE WITH BUILDING REGULATIONS",
+        "VRF CASSETTE",
+        "VRF TRAY",
+        "MECHANICAL EQUIPMENT",
+        "HYDRAULIC EQUIPMENT",
+        "LTHW-VT-F",
+        "LTHW-VT-R",
+        # Sentence fragments ending with period (building-spec note text).
+        "AREAS.",
+        "DRAINAGE.",
+        "MAINTENANCE.",
+        "CONCEALMENT.",
+        "CONSULTED.",
+        # AutoCAD mtext formatting codes.
+        "\\LLEGEND",
+        "\\LCHILLED WATER SERVICES NOTES",
         "LOW LOSS HEADER",
         "LOW LESS HEADER",
         "HEADER",
@@ -237,6 +264,49 @@ def test_real_room_name_still_paired_with_number_when_note_nearby() -> None:
     assert numbered.name == "Cooling Plantroom"
     # The note must not surface as a name-only room
     assert not any(room.name and "Ø" in room.name for room in rooms)
+
+
+# ---------------------------------------------------------------------------
+# Spec-prose rejection (#778 — M-560103 extended gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "ALL PIPEWORK SHALL BE PR",
+        "ACCORDANCE WITH BUILDING",
+        "29/2021. WHERE NEW PIPEW",
+        "A WIRED THERMOSTAT CONTR",
+        "ACCORDANCE WITH BUILDING REGULATIONS",
+    ],
+)
+def test_spec_prose_not_emitted_as_name_only_room(prose: str) -> None:
+    """Multi-word all-caps note text must not surface as a name-only room (#778).
+
+    These are wall-polygon cell names stamped from building-spec note text on M-560103;
+    they are NOT room names and must be filtered by _looks_like_room_name.
+    """
+    labels = [
+        RoomLabel("Cooling Plantroom", (0.0, 0.0)),
+        RoomLabel(prose, (20.0, 0.0)),
+    ]
+    rooms = identify_rooms_from_labels(labels)
+    names = [room.name for room in rooms]
+    assert "Cooling Plantroom" in names
+    assert prose not in names
+
+
+def test_spec_prose_not_paired_as_numbered_room_name() -> None:
+    """Spec-prose note near a room number must not become that room's name (#778)."""
+    labels = [
+        RoomLabel("1.9.01", (10.0, 10.0)),
+        RoomLabel("ALL PIPEWORK SHALL BE PR", (10.0, 10.4)),  # within cluster, all-caps prose
+    ]
+    rooms = identify_rooms_from_labels(labels)
+    assert len(rooms) == 1
+    assert rooms[0].number == "1.9.01"
+    assert rooms[0].name is None  # prose dropped, not attached
 
 
 def test_name_only_drawing_real_names_still_yield_rooms() -> None:
