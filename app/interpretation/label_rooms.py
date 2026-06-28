@@ -12,6 +12,7 @@ when they don't, the labeled rooms are surfaced directly. Pure over :class:`Room
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 
 from app.interpretation.rooms import Room, RoomLabel, parse_room_number, room_from_label
@@ -32,6 +33,51 @@ _NAME_STACK_HORIZONTAL_ALIGN = 1.0  # max |dx| to count a line as part of the sa
 
 # Heuristic confidence for a label-only room (no geometry to corroborate the identity).
 LABEL_ROOM_CONFIDENCE = 0.7
+
+# Patterns that identify annotation/note text that should NOT be treated as room names.
+# Conservative by design: real room names (letters, "&", "Plantroom", "Room", proper nouns)
+# must pass. These patterns catch dimension specs, quantity phrases, callout leaders, and
+# routing notes that Revit-export sheets place on the same text layer as room tags.
+_ANNOTATION_DIMENSION_RE = re.compile(
+    r"Ø"  # diameter symbol (Ø250 mm …)
+    r"|\d+\s*mm"  # dimension with mm unit (100 mm, 250mm)
+    r"|\d+\s*[xX]\s*\d+",  # cross-section dimension (100x50, 100 x 50)
+    re.IGNORECASE,
+)
+_ANNOTATION_QUANTITY_RE = re.compile(r"^\s*\d+\s*[Nn][Oo]\.?")  # "6No." / "6 No" quantity prefix
+_ANNOTATION_ROUTING_RE = re.compile(
+    r"\bFROM\s+TOP\b"
+    r"|\bTO\s+BOTTOM\b"
+    r"|\bTO\s+LL\b"
+    r"|\bLOW\s+LOS[SE]\s+HEADER\b"  # LOW LOSS / LOW LESS HEADER
+    r"|\bHEADER\b"
+    r"|\bTB\b",  # standalone "TB" abbreviation in routing notes
+    re.IGNORECASE,
+)
+
+
+def _looks_like_room_name(text: str) -> bool:
+    """Return True when *text* could plausibly be a room name.
+
+    Rejects annotation/note strings that appear on the same text layer as room tags on
+    Revit-export sheets (e.g. "Ø250 mm LOW LESS HEADER", "6No. OUTDOOR DX UNITS",
+    "FROM TOP TO BOTTOM TB :"). Conservative — real room names with letters, spaces,
+    "&", "Plantroom", "Room", etc. must pass.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # Must contain at least one alphabetic character — pure digits/punctuation are not names.
+    if not any(ch.isalpha() for ch in stripped):
+        return False
+    # Trailing colon → callout / leader line.
+    if stripped.endswith(":"):
+        return False
+    if _ANNOTATION_DIMENSION_RE.search(stripped):
+        return False
+    if _ANNOTATION_QUANTITY_RE.match(stripped):
+        return False
+    return not _ANNOTATION_ROUTING_RE.search(stripped)
 
 
 def room_label_layers(labels: Sequence[RoomLabel]) -> set[str | None] | None:
@@ -71,19 +117,21 @@ def identify_rooms_from_labels(
         residual = _strip_number(label.text, number) if number else label.text
         if number is not None and residual:
             # A single tag carrying both name and number.
+            # Drop the residual text as name if it looks like an annotation note (keep the room).
+            clean_name = residual if _looks_like_room_name(residual) else None
             inline.append(
                 room_from_label(
                     "",
                     source=ROOM_SOURCE_LABEL,
                     location=label.point,
-                    name=residual,
+                    name=clean_name,
                     number=number,
                     confidence=LABEL_ROOM_CONFIDENCE,
                 )
             )
         elif number is not None:
             numbers.append((number, label))
-        elif label.text.strip():
+        elif label.text.strip() and _looks_like_room_name(label.text):
             names.append(label)
 
     used_names: set[int] = set()
