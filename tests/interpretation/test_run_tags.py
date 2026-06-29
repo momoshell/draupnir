@@ -105,15 +105,13 @@ class TestBareRoundRePath:
         result = parse_tag("100mm SA")
         assert _matches_round(result, "SA", 100)
 
-    def test_bare_service_with_diameter_glyph_parses(self) -> None:
-        """∅ glyph provides context — but current _ROUND_RE needs a space after digits.
+    def test_bare_service_with_diameter_glyph_no_space_parses(self) -> None:
+        """∅ glyph directly adjacent to digits and service token parses via glyph path.
 
-        '100∅SVP AT HL DROPS TB' → None because _ROUND_RE requires digit+space+word.
-        This is the documented D3 gap; we must not regress it further (it stays None).
+        D3c-A: '100∅SVP AT HL DROPS TB' was previously None; now parses as SVP/100.
         """
-        result = parse_tag("100∅SVP AT HL DROPS TB")
-        # Documented: returns None because _ROUND_RE requires \d+\s+ (D3 scope).
-        assert result is None
+        result = parse_tag("100∅SVP AT HL DROPS TB", strict_content=True)
+        assert _matches_round(result, "SVP", 100)
 
     def test_bare_service_with_unicode_o_diameter_parses(self) -> None:
         """Ø (U+00D8) before a space then digits provides context."""
@@ -255,3 +253,114 @@ class TestStrictContentScoping:
     def test_email_strict_none(self) -> None:
         """Contact prose with email → None under strict_content=True."""
         assert parse_tag("tel 020 7631 5291 london@ramboll.co.uk", strict_content=True) is None
+
+
+# ---------------------------------------------------------------------------
+# D3c Part A — glyph-adjacency path (_ROUND_GLYPH_RE)
+# ---------------------------------------------------------------------------
+
+
+class TestGlyphAdjacency:
+    """Single-entity tags where a diameter glyph sits directly between the size digit
+    and the service token (no space required).  D3a's reassembly only fixed *fragmented*
+    tags; these are single-entity strings that previously returned None."""
+
+    def test_fffd_glyph_adjacent_cdp(self) -> None:
+        """'15�CDP AT HL (TYP.)' → service CDP, diameter 15."""
+        result = parse_tag("15�CDP AT HL (TYP.)", strict_content=True)
+        assert _matches_round(result, "CDP", 15)
+
+    def test_unicode_o_glyph_svp(self) -> None:
+        """'100∅SVP AT HL DROPS TB' → service SVP, diameter 100."""
+        result = parse_tag("100∅SVP AT HL DROPS TB", strict_content=True)
+        assert _matches_round(result, "SVP", 100)
+
+    def test_fffd_glyph_with_space_cdp(self) -> None:
+        """'20� CDP AT HL CONNECTS TO SVP' → service CDP, diameter 20 (first token after glyph)."""
+        result = parse_tag("20� CDP AT HL CONNECTS TO SVP", strict_content=True)
+        assert _matches_round(result, "CDP", 20)
+
+    def test_noise_service_with_legend_returns_none(self) -> None:
+        """Glyph-adjacent tag whose service is not in the supplied legend → None.
+
+        'DEEP' is not a known service; with a non-empty legend gate it should be rejected.
+        """
+        result = parse_tag(
+            "15∅ DEEP SEAL 'P' TRAP",
+            legend_abbreviations=frozenset({"CDP", "SVP", "SA"}),
+            strict_content=True,
+        )
+        assert result is None
+
+    def test_noise_service_empty_legend_returns_none(self) -> None:
+        """D3c Part B: glyph-adjacent tag rejected when legend is empty AND token not in vocab.
+
+        Drainage drawings have an empty legend; '40∅ DEEP SEAL' must return None because
+        'DEEP' is absent from _STANDARD_SERVICE_CODES.  Previously the empty-legend branch
+        accepted any token that passed _valid_service (the live hole this fix closes).
+        """
+        result = parse_tag(
+            "40∅ DEEP SEAL 'P' TRAP",
+            legend_abbreviations=frozenset(),  # empty legend (drainage)
+            strict_content=True,
+        )
+        assert result is None
+
+    def test_noise_service_none_legend_returns_none(self) -> None:
+        """Same as above but with legend_abbreviations=None (no legend at all)."""
+        result = parse_tag(
+            "40∅ DEEP SEAL 'P' TRAP",
+            legend_abbreviations=None,
+            strict_content=True,
+        )
+        assert result is None
+
+    def test_vocab_service_empty_legend_parses(self) -> None:
+        """D3c Part B: standard-vocab service accepted when legend is empty.
+
+        '15∅CDP AT HL' → CDP ∈ _STANDARD_SERVICE_CODES → parses as CDP/15.
+        """
+        result = parse_tag(
+            "15�CDP AT HL",
+            legend_abbreviations=frozenset(),
+            strict_content=True,
+        )
+        assert _matches_round(result, "CDP", 15)
+
+    def test_vocab_svp_empty_legend_parses(self) -> None:
+        """'100∅SVP' with empty legend → SVP ∈ vocab → parses."""
+        result = parse_tag(
+            "100∅SVP",
+            legend_abbreviations=frozenset(),
+            strict_content=True,
+        )
+        assert _matches_round(result, "SVP", 100)
+
+    def test_noise_service_without_legend_returns_none_via_valid_service(self) -> None:
+        """Without a legend, _valid_service still rejects unit/function-word noise tokens.
+
+        'AT' is in _NON_SERVICE_WORDS → None even without a legend.
+        """
+        result = parse_tag("15∅AT HL", strict_content=True)
+        assert result is None
+
+    # --- regression: existing match paths must be unaffected ---
+
+    def test_rect_tag_unaffected(self) -> None:
+        """700x300 DA must still parse as rect (glyph path must not shadow rect path)."""
+        result = parse_tag("700x300 DA")
+        assert _matches_rect(result, "DA", 700, 300)
+
+    def test_round_mm_tag_unaffected(self) -> None:
+        """100mm SA must still parse via _ROUND_MM_RE (glyph path must not shadow mm path)."""
+        result = parse_tag("100mm SA")
+        assert _matches_round(result, "SA", 100)
+
+    def test_o_mm_vac_unaffected(self) -> None:
+        """Ø76 mm VAC must still parse via _ROUND_MM_RE."""
+        result = parse_tag("Ø76 mm VAC")
+        assert _matches_round(result, "VAC", 76)
+
+    def test_5291_london_strict_none_unaffected(self) -> None:
+        """'5291 LONDON' strict without legend must remain None (no glyph, no context)."""
+        assert parse_tag("5291 LONDON", strict_content=True) is None

@@ -29,10 +29,14 @@ from app.interpretation.run_service_identity import (
     ServiceSize,
 )
 from app.interpretation.run_tags import BASIS_TAG_TEXT, PipeSize
+from app.interpretation.segment_label_takeoff import SegmentLabel
 from app.interpretation.service_takeoff import (
     ROOM_UNASSIGNED_ID,
     SERVICE_UNKNOWN,
     ServiceTakeoffResult,
+    _collapse_services_per_service,
+    _dominant_service,
+    _is_achromatic_colour_key,
     _nearest_label_room,
     compute_service_takeoff,
 )
@@ -1454,3 +1458,652 @@ def test_nearest_label_room_deterministic_tie_break() -> None:
     assert result_reversed is not None
     assert result_forward.id == "aaa-room"
     assert result_reversed.id == "aaa-room"
+
+
+# ---------------------------------------------------------------------------
+# D3c (#798): dominant-service collapse for over-tagged runs
+# ---------------------------------------------------------------------------
+
+
+def test_d3c_dominant_service_collapses_duplicate_tags_to_once() -> None:
+    """D3c: a run with services=[SVP/100, SVP/100, SVP/75] contributes length ONCE to SVP/100.
+
+    Pre-D3c the loop added length for each entry (3x the run length).  SVP/100 is dominant
+    (2 occurrences vs 1 for SVP/75).  After collapse: one line for SVP/100, none for SVP/75.
+    run_count in the SVP/100 bucket must be 1, not 3.
+    """
+    entity_ids = ("e1",)
+    run_length = 1500.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+
+    svp_100a = _pipe_size("SVP", 100)
+    svp_100b = ServiceSize(
+        service="SVP",
+        size=svp_100a.size,
+        source_tag_text="100 mm SVP tag2",
+        basis=BASIS_TAG_TEXT,
+    )
+    svp_75 = _pipe_size("SVP", 75)
+
+    # Simulate fuse_run_service_identities output: all 3 nearby tags assigned.
+    # Sorted by (service, size.raw, source_tag_text):
+    #   SVP/100/"100 mm SVP", SVP/100/"100 mm SVP tag2", SVP/75/"75 mm SVP"
+    services = (svp_100a, svp_100b, svp_75)
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    # Only SVP/100 line; SVP/75 must NOT appear.
+    assert len(result.lines) == 1, (
+        f"Expected 1 line (dominant SVP/100 only), got {len(result.lines)}: "
+        f"{[(ln.service, ln.size_raw) for ln in result.lines]}"
+    )
+    ln = result.lines[0]
+    assert ln.service == "SVP"
+    assert ln.size_raw == "100"
+    # Length attributed once, not 3x.
+    assert ln.drawing_length == run_length, (
+        f"drawing_length should be {run_length} (once), got {ln.drawing_length}"
+    )
+    # run_count is 1 (the run, not the number of tags).
+    assert ln.run_count == 1, f"run_count should be 1, got {ln.run_count}"
+    # Collapsed run is not a bundle.
+    assert ln.bundle is False
+
+
+def test_d3c_single_service_run_unchanged() -> None:
+    """D3c: a run with a single service entry is unaffected (pre-D3b byte-identical path)."""
+    entity_ids = ("e1",)
+    run_length = 2000.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    services = (_pipe_size("HWS", 50),)
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.service == "HWS"
+    assert ln.drawing_length == run_length
+    assert ln.run_count == 1
+    assert ln.bundle is False
+
+
+def test_d3c_true_bundle_distinct_services_preserved() -> None:
+    """D3c: a run with all-unique (service, size.raw) pairs keeps the bundle-length model.
+
+    A run with services=[VAC/54, AGSS/42] (distinct pairs) must still produce two lines,
+    each with the full run length.  Dominant collapse must NOT fire when there are no
+    duplicate (service, size.raw) pairs.
+    """
+    entity_ids = ("e1",)
+    run_length = 3000.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    services = (_pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    # Both services must appear; each gets the full length.
+    assert len(result.lines) == 2, f"Expected 2 lines (bundle), got {len(result.lines)}"
+    by_svc = {ln.service: ln for ln in result.lines}
+    assert "VAC" in by_svc
+    assert "AGSS" in by_svc
+    assert by_svc["VAC"].drawing_length == run_length
+    assert by_svc["AGSS"].drawing_length == run_length
+    assert by_svc["VAC"].bundle is True
+    assert by_svc["AGSS"].bundle is True
+
+
+def test_d3c_dominant_service_helper_direct() -> None:
+    """Unit test for _dominant_service directly.
+
+    - Empty / single entry -> None (caller uses bundle model / unchanged).
+    - All-unique pairs -> None (true bundle, no collapse).
+    - Duplicate pairs -> returns representative ServiceSize for the dominant pair.
+    - Tie among duplicates -> deterministic (lowest (service, size.raw, source_tag_text)).
+    """
+    svp_100a = _pipe_size("SVP", 100)
+    svp_100b = ServiceSize(
+        service="SVP",
+        size=svp_100a.size,
+        source_tag_text="100 mm SVP tag2",
+        basis=BASIS_TAG_TEXT,
+    )
+    svp_75 = _pipe_size("SVP", 75)
+    vac_54 = _pipe_size("VAC", 54)
+    agss_42 = _pipe_size("AGSS", 42)
+
+    # Empty tuple.
+    assert _dominant_service(()) is None
+
+    # Single entry.
+    assert _dominant_service((svp_100a,)) is None
+
+    # All-unique -> None (true bundle).
+    assert _dominant_service((vac_54, agss_42)) is None
+
+    # [SVP/100, SVP/100, SVP/75] -> dominant=SVP/100; first entry in sorted order wins.
+    winner = _dominant_service((svp_100a, svp_100b, svp_75))
+    assert winner is not None
+    assert winner.service == "SVP"
+    assert winner.size.raw == "100"
+
+    # Order should not matter (input already sorted by fuse_run_service_identities).
+    winner2 = _dominant_service((svp_75, svp_100a, svp_100b))
+    assert winner2 is not None
+    assert winner2.service == "SVP"
+    assert winner2.size.raw == "100"
+
+
+def test_d3c_dense_tag_inflation_conservation() -> None:
+    """D3c regression: 10 identical SVP/100 tags on one run must not inflate total length.
+
+    Simulates the real-data case where D3b tag reassembly produces dense nearby tags.
+    Pre-fix: run_count=10, drawing_length=10x baseline.
+    Post-fix: run_count=1, drawing_length=baseline.
+    """
+    entity_ids = ("e1",)
+    run_length = 184.0  # drawing units (mirrors the real-data baseline)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+
+    # 10 SVP/100 tags, all with different source_tag_text (as reassembled tags would have).
+    services = tuple(
+        ServiceSize(
+            service="SVP",
+            size=PipeSize(kind="round", diameter=100, width=None, height=None, raw="100"),
+            source_tag_text=f"SVP100-tag-{i}",
+            basis=BASIS_TAG_TEXT,
+        )
+        for i in range(10)
+    )
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.drawing_length == run_length, (
+        f"Expected drawing_length={run_length} (conserved), got {ln.drawing_length} (inflated)"
+    )
+    assert ln.run_count == 1, f"Expected run_count=1, got {ln.run_count}"
+
+
+def test_d3c_med_gas_bundle_all_services_survive() -> None:
+    """D3c round-2: med-gas multi-service bundle must not lose services after per-service collapse.
+
+    Real-data regression: M-540003 had [VAC/54, MA/42, OXY/42, AGSS/42, AGSS/42].
+    The v1 single-dominant collapse saw AGSS/42 as the most-frequent (service,size) pair
+    and emitted only AGSS, dropping VAC/MA/OXY and collapsing 3,660 m to 244 m.
+
+    The per-service fix must:
+    - Emit 4 distinct services (VAC, MA, OXY, AGSS), each with the full run length.
+    - Deduplicate AGSS/42 (appears twice) to a single AGSS/42 entry.
+    - Mark every line as bundle=True.
+    """
+    entity_ids = ("e1",)
+    run_length = 3660.0  # mirrors real-data scale
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+
+    vac_54 = _pipe_size("VAC", 54)
+    ma_42 = _pipe_size("MA", 42)
+    oxy_42 = _pipe_size("OXY", 42)
+    agss_42a = _pipe_size("AGSS", 42)
+    agss_42b = ServiceSize(
+        service="AGSS",
+        size=agss_42a.size,
+        source_tag_text="AGSS-42-tag2",
+        basis=BASIS_TAG_TEXT,
+    )
+
+    # Simulates the reassembled tag output: VAC/54, MA/42, OXY/42, AGSS/42 (x2).
+    services = (vac_54, ma_42, oxy_42, agss_42a, agss_42b)
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+    )
+
+    # All 4 distinct services must appear.
+    assert len(result.lines) == 4, (
+        f"Expected 4 lines (VAC,MA,OXY,AGSS), got {len(result.lines)}: "
+        f"{[(ln.service, ln.size_raw) for ln in result.lines]}"
+    )
+    by_svc = {ln.service: ln for ln in result.lines}
+    assert set(by_svc.keys()) == {"VAC", "MA", "OXY", "AGSS"}
+    # Each service gets the FULL run length.
+    for svc, ln in by_svc.items():
+        assert ln.drawing_length == run_length, (
+            f"{svc}: expected drawing_length={run_length}, got {ln.drawing_length}"
+        )
+    # All lines are in the bundle.
+    for ln in result.lines:
+        assert ln.bundle is True, f"{ln.service} should be bundle=True"
+    # AGSS deduped to size 42.
+    assert by_svc["AGSS"].size_raw == "42"
+
+
+def test_d3c_collapse_services_per_service_helper_direct() -> None:
+    """Unit tests for _collapse_services_per_service.
+
+    - Empty tuple -> empty tuple.
+    - Single entry -> unchanged.
+    - All-unique service names -> unchanged (true bundle, no collapse).
+    - Single-service with duplicate sizes -> deduplicated to dominant size.
+    - Multi-service where one service has duplicates -> that service deduped, others kept.
+    """
+    svp_100a = _pipe_size("SVP", 100)
+    svp_100b = ServiceSize(
+        service="SVP",
+        size=svp_100a.size,
+        source_tag_text="100 mm SVP tag2",
+        basis=BASIS_TAG_TEXT,
+    )
+    svp_75 = _pipe_size("SVP", 75)
+    vac_54 = _pipe_size("VAC", 54)
+    ma_42 = _pipe_size("MA", 42)
+    oxy_42 = _pipe_size("OXY", 42)
+    agss_42a = _pipe_size("AGSS", 42)
+    agss_42b = ServiceSize(
+        service="AGSS",
+        size=agss_42a.size,
+        source_tag_text="AGSS-42-tag2",
+        basis=BASIS_TAG_TEXT,
+    )
+
+    # Empty.
+    assert _collapse_services_per_service(()) == ()
+
+    # Single entry unchanged.
+    result_single = _collapse_services_per_service((svp_100a,))
+    assert len(result_single) == 1
+    assert result_single[0].service == "SVP"
+
+    # All-unique service names -> all preserved.
+    result_bundle = _collapse_services_per_service((vac_54, ma_42))
+    assert len(result_bundle) == 2
+    assert {ss.service for ss in result_bundle} == {"VAC", "MA"}
+
+    # [SVP/100, SVP/100, SVP/75] -> single-service dedup -> [SVP/100].
+    result_svp = _collapse_services_per_service((svp_100a, svp_100b, svp_75))
+    assert len(result_svp) == 1
+    assert result_svp[0].service == "SVP"
+    assert result_svp[0].size.raw == "100"
+
+    # Med-gas: [VAC/54, MA/42, OXY/42, AGSS/42, AGSS/42] -> 4 distinct services.
+    result_med = _collapse_services_per_service((vac_54, ma_42, oxy_42, agss_42a, agss_42b))
+    assert len(result_med) == 4
+    services_in = {ss.service for ss in result_med}
+    assert services_in == {"VAC", "MA", "OXY", "AGSS"}
+    agss_entry = next(ss for ss in result_med if ss.service == "AGSS")
+    assert agss_entry.size.raw == "42"
+
+
+# ---------------------------------------------------------------------------
+# D3c Part B (#798): colour_differentiated gate + achromatic apportionment
+# ---------------------------------------------------------------------------
+
+
+def _seg_label(x: float, y: float, service: str, size_raw: str | None = "100") -> SegmentLabel:
+    return SegmentLabel(point=(x, y), service=service, size_raw=size_raw, size_kind="round")
+
+
+def test_is_achromatic_colour_key_black_six_char() -> None:
+    """000000 (black) is achromatic."""
+    assert _is_achromatic_colour_key("000000") is True
+
+
+def test_is_achromatic_colour_key_white_six_char() -> None:
+    """ffffff (white) is achromatic."""
+    assert _is_achromatic_colour_key("ffffff") is True
+
+
+def test_is_achromatic_colour_key_grey_six_char() -> None:
+    """808080 (mid grey, spread=0) is achromatic."""
+    assert _is_achromatic_colour_key("808080") is True
+
+
+def test_is_achromatic_colour_key_bylayer_eight_char() -> None:
+    """c3000007 (8-char with alpha, stripped to 000007 ≈ black) is achromatic."""
+    assert _is_achromatic_colour_key("c3000007") is True
+
+
+def test_is_achromatic_colour_key_chromatic() -> None:
+    """ff0000 (pure red, spread=255) is chromatic."""
+    assert _is_achromatic_colour_key("ff0000") is False
+
+
+def test_is_achromatic_colour_key_idx_is_chromatic() -> None:
+    """idx:150 (index colour, no parseable RGB) is treated as chromatic (safe default)."""
+    assert _is_achromatic_colour_key("idx:150") is False
+
+
+def test_achromatic_conservation_with_labels() -> None:
+    """Achromatic mode: Σ per-service + unknown == centerline total (±0.1 m).
+
+    Two-segment polyline (100 du + 100 du = 200 du total).
+    Label SVP@50,0 near segment 1 midpoint (25,0); label CDP@150,0 near segment 2 midpoint (150,0).
+    Each segment attributed to its nearest label.
+    """
+    # Single run with two segments in its geometry.
+    entity_ids = ("e1",)
+    run_length_du = 200.0
+    # Polyline: (0,0) -> (100,0) -> (200,0)  [two 100-du segments]
+    polylines = (((0.0, 0.0), (100.0, 0.0), (200.0, 0.0)),)
+
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(
+            _pipe_size("SVP", 100),
+            _pipe_size("CDP", 100),
+        ),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+    geom = {"e1": _line_geom(0.0, 0.0, run_length_du, 0.0)}
+
+    # Two labels: SVP near midpoint of segment 1 (50, 0); CDP near midpoint of segment 2 (150, 0).
+    labels = [
+        _seg_label(50.0, 0.0, "SVP"),
+        _seg_label(150.0, 0.0, "CDP"),
+    ]
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geom,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        colour_differentiated=False,
+        segment_labels=labels,
+        segment_label_max_m=5.0,
+    )
+
+    # Conservation: Σ all lines == total run length.
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length_du) < 0.1, (
+        f"Conservation failed: total={total}, expected {run_length_du}"
+    )
+
+    by_svc = {ln.service: ln for ln in result.lines}
+    # Both services attributed; no unknown (every segment has a label nearby).
+    assert "SVP" in by_svc, f"SVP missing; got {set(by_svc)}"
+    assert "CDP" in by_svc, f"CDP missing; got {set(by_svc)}"
+    if SERVICE_UNKNOWN in by_svc:
+        raise AssertionError(f"Unexpected unknown length: {by_svc[SERVICE_UNKNOWN].drawing_length}")
+
+    # Each segment 100 du → each service gets 100 du.
+    assert by_svc["SVP"].drawing_length == pytest.approx(100.0, abs=0.1)
+    assert by_svc["CDP"].drawing_length == pytest.approx(100.0, abs=0.1)
+
+
+def test_achromatic_honest_unknown_for_orphan_segments() -> None:
+    """Achromatic mode: segments with no label within radius land in SERVICE_UNKNOWN.
+
+    A 200-du run with no labels at all → all length in unknown; nothing forced onto
+    a service.
+    """
+    entity_ids = ("e1",)
+    polylines = (((0.0, 0.0), (100.0, 0.0), (200.0, 0.0)),)
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("SVP", 100),),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 0.0, 200.0, 0.0)},
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        colour_differentiated=False,
+        segment_labels=[],  # no labels → all orphan
+        segment_label_max_m=5.0,
+    )
+
+    by_svc = {ln.service: ln for ln in result.lines}
+    assert SERVICE_UNKNOWN in by_svc, "Orphan segments must land in SERVICE_UNKNOWN"
+    assert "SVP" not in by_svc, "SVP must not appear when no tag is nearby"
+    # Conservation: unknown length == total.
+    assert by_svc[SERVICE_UNKNOWN].drawing_length == pytest.approx(200.0, abs=0.1)
+
+
+def test_achromatic_conservation_with_mixed_attributed_and_orphan() -> None:
+    """Achromatic: partial attribution conserves — attributed + unknown == total."""
+    entity_ids = ("e1",)
+    # Three segments: (0,0)→(100,0)→(200,0)→(300,0); labels near first two midpoints only.
+    polylines = (((0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),)
+    total_du = 300.0
+
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("SVP", 100),),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+    labels = [
+        _seg_label(50.0, 0.0, "SVP"),  # near segment 1 midpoint
+        _seg_label(150.0, 0.0, "CDP"),  # near segment 2 midpoint
+        # segment 3 midpoint (250,0) has no nearby label → orphan
+    ]
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id={"e1": _line_geom(0.0, 0.0, total_du, 0.0)},
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        colour_differentiated=False,
+        segment_labels=labels,
+        segment_label_max_m=5.0,
+    )
+
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - total_du) < 0.1, f"Conservation: {total} != {total_du}"
+
+    by_svc = {ln.service: ln for ln in result.lines}
+    assert "SVP" in by_svc
+    assert "CDP" in by_svc
+    assert SERVICE_UNKNOWN in by_svc  # third segment is orphan
+    assert by_svc[SERVICE_UNKNOWN].drawing_length == pytest.approx(100.0, abs=0.1)
+
+
+def test_bundle_mode_unchanged_with_colour_differentiated_true() -> None:
+    """colour_differentiated=True (default) produces the same result as omitting the flag.
+
+    Regression guard: the new flag must not change the bundle path for any existing caller.
+    """
+    entity_ids = ("e1",)
+    run_length = 3000.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    services = (_pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+    scale = _confirmed_mm_scale()
+
+    result_default = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=scale,
+    )
+    result_explicit_true = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=scale,
+        colour_differentiated=True,
+    )
+
+    assert result_default.lines == result_explicit_true.lines, (
+        "colour_differentiated=True must be byte-identical to default (no flag)"
+    )
+    # Both services get full run length.
+    by_svc = {ln.service: ln for ln in result_default.lines}
+    assert by_svc["VAC"].drawing_length == run_length
+    assert by_svc["AGSS"].drawing_length == run_length
+
+
+def test_achromatic_no_geometry_falls_back_to_anchor() -> None:
+    """Achromatic without measured_geometry falls back to anchor attribution (honest degradation).
+
+    When measured_geometry_by_group is None or the key is absent, the apportionment falls
+    back to the whole-length-to-anchor-room path.  Conservation still holds.
+    """
+    entity_ids = ("e1",)
+    run_length = 500.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("SVP", 100),),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        measured_geometry_by_group=None,  # no geometry → anchor fallback
+        colour_differentiated=False,
+        segment_labels=[],
+        segment_label_max_m=5.0,
+    )
+
+    # Anchor fallback: one line for SVP (from identity.services), whole length.
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length) < 0.1, f"Fallback conservation: {total} != {run_length}"
+
+
+def test_achromatic_no_geometry_multi_service_emits_once_to_unknown() -> None:
+    """D3c Part B: a multi-service run with no geometry must emit Σ == drawn, NOT N x drawn.
+
+    The bug: the no-geometry fallback iterated over all services and appended one row per
+    service, inflating the total by N.  Fix: when >1 distinct service and no geometry, emit
+    the full length once to SERVICE_UNKNOWN (honest — no per-segment evidence to split).
+    """
+    entity_ids = ("e1",)
+    run_length = 600.0
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("VAC", 54), _pipe_size("MA", 42), _pipe_size("OXY", 42)),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_unknown_scale(),
+        measured_geometry_by_group=None,  # no geometry → anchor fallback
+        colour_differentiated=False,
+        segment_labels=[],
+        segment_label_max_m=5.0,
+    )
+
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length) < 0.1, (
+        f"Multi-service no-geometry conservation: Σ={total} != drawn={run_length}"
+    )
+    # Must be attributed to SERVICE_UNKNOWN (no per-segment evidence)
+    services_emitted = {ln.service for ln in result.lines}
+    assert services_emitted == {SERVICE_UNKNOWN}, (
+        f"Expected only SERVICE_UNKNOWN, got {services_emitted}"
+    )
+
+
+def test_achromatic_determinism_under_label_shuffle() -> None:
+    """Achromatic mode is deterministic regardless of label list order."""
+    import random as _random
+
+    entity_ids = ("e1",)
+    polylines = (((0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),)
+    identity = _make_identity(
+        entity_ids=entity_ids,
+        services=(_pipe_size("SVP", 100),),
+        status=IDENTITY_RESOLVED,
+    )
+    run = _make_run(entity_ids=entity_ids)
+    labels = [
+        _seg_label(50.0, 0.0, "SVP"),
+        _seg_label(150.0, 0.0, "CDP"),
+        _seg_label(250.0, 0.0, "SVP"),
+    ]
+    geom = {"e1": _line_geom(0.0, 0.0, 300.0, 0.0)}
+    scale = _confirmed_mm_scale()
+
+    canonical = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geom,
+        rooms=[],
+        scale=scale,
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        colour_differentiated=False,
+        segment_labels=labels,
+        segment_label_max_m=5.0,
+    )
+
+    rng = _random.Random(99)
+    for _ in range(8):
+        shuffled = labels[:]
+        rng.shuffle(shuffled)
+        result = compute_service_takeoff(
+            runs=[run],
+            identities=[identity],
+            geometry_by_entity_id=geom,
+            rooms=[],
+            scale=scale,
+            measured_geometry_by_group={("Pipes", "idx150"): polylines},
+            colour_differentiated=False,
+            segment_labels=shuffled,
+            segment_label_max_m=5.0,
+        )
+        assert result.lines == canonical.lines, (
+            "Non-deterministic: shuffled labels produced different result"
+        )
