@@ -11,6 +11,21 @@ to EACH service independently (a bundle of length L contributes L to VAC and L t
 NOT L/2).  This matches physical reality: both pipe branches exist over the full corridor
 length.
 
+**Discipline gate (D3c Part B, issue #798):**
+Two attribution modes are selected by the ``colour_differentiated`` flag, computed
+revision-level from the HATCH bundle-band colour evidence:
+
+- ``colour_differentiated=True`` (default): genuine multi-service corridor with distinct
+  colour bands per service (e.g. med-gas M-540003 has 5 distinct chromatic colours).
+  Uses the existing per-service bundle model — unchanged behaviour.
+
+- ``colour_differentiated=False``: achromatic / BYLAYER discipline (e.g. drainage) where
+  all bundle bands share a single grey/black colour key.  Coarse runs merge multiple
+  services (SVP+CDP) so per-run attribution inflates counts.  Instead, each segment of
+  the run's centerline polylines is attributed to the nearest parsed tag label (within
+  ``segment_label_max_m``), and orphan segments (no label in radius) land in the
+  ``unknown`` service bucket.  This conserves: Σ per-service + unknown == centerline total.
+
 **Arc geometry:**
 Arcs contribute 0 to drawn length in this phase.  Arc-length computation requires the
 arc's radius and angular span, which the current geometry schema does not supply in a
@@ -27,6 +42,8 @@ Pure module -- NO DB, ORM, FastAPI, or SQLAlchemy imports.
 
 from __future__ import annotations
 
+import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -57,7 +74,9 @@ from app.interpretation.run_service_identity import (
     IDENTITY_RESOLVED,
     IDENTITY_UNKNOWN,
     RunServiceIdentity,
+    ServiceSize,
 )
+from app.interpretation.segment_label_takeoff import SegmentLabel
 
 # ---------------------------------------------------------------------------
 # Constants -- frozen interface contract
@@ -241,6 +260,265 @@ def _worst_status(a: str, b: str) -> str:
     return a if _STATUS_RANK.get(a, 0) <= _STATUS_RANK.get(b, 0) else b
 
 
+# Minimum RGB channel spread (max - min) for a colour to be considered chromatic.
+# Must match ``_DWG_SWATCH_MIN_CHROMA`` in ``service_takeoff_loaders.py`` (both = 30).
+_MIN_CHROMA_SPREAD: int = 30
+
+# Epsilon for float comparisons in segment nearest-label search (metres).
+_LABEL_EQ_EPSILON: float = 1e-9
+
+
+def _is_achromatic_colour_key(ck: str) -> bool:
+    """Return True when ``ck`` represents an achromatic (grey/black/white) colour.
+
+    A colour_key is the lowercased RGB hex string from the adapter (possibly with a
+    leading 2-char alpha byte, e.g. ``"c3000007"`` → strip to ``"000007"``).  If it
+    starts with ``"idx:"`` or cannot be parsed as hex, we conservatively return False
+    (treat as chromatic — the safe direction for the bundle gate).
+
+    Achromatic = max(R,G,B) - min(R,G,B) < ``_MIN_CHROMA_SPREAD``.
+    """
+    if ck.startswith("idx:"):
+        # Index-only colour has no parseable RGB; treat as chromatic.
+        return False
+    rgb_str = ck.lstrip("#")
+    # Strip leading alpha byte if 8-char hex (e.g. "c3000007" → "000007").
+    if len(rgb_str) == 8:
+        rgb_str = rgb_str[2:]
+    if len(rgb_str) != 6:
+        return False
+    try:
+        r = int(rgb_str[0:2], 16)
+        g = int(rgb_str[2:4], 16)
+        b = int(rgb_str[4:6], 16)
+        return max(r, g, b) - min(r, g, b) < _MIN_CHROMA_SPREAD
+    except ValueError:
+        return False
+
+
+def _nearest_label(
+    midpoint: tuple[float, float],
+    labels: Sequence[SegmentLabel],
+    max_dist: float,
+) -> SegmentLabel | None:
+    """Return the nearest SegmentLabel within ``max_dist``, or None.
+
+    Ties within ``_LABEL_EQ_EPSILON`` are broken lexicographically by
+    ``(service, size_raw or "", size_kind or "")`` — order-independent.
+    """
+    best: SegmentLabel | None = None
+    best_dist = math.inf
+    for lbl in labels:
+        d = math.hypot(midpoint[0] - lbl.point[0], midpoint[1] - lbl.point[1])
+        if d > max_dist:
+            continue
+        if d < best_dist - _LABEL_EQ_EPSILON:
+            best = lbl
+            best_dist = d
+        elif abs(d - best_dist) <= _LABEL_EQ_EPSILON and best is not None:
+            # Tie: lexicographic (service, size_raw, size_kind) wins.
+            lbl_key = (lbl.service, lbl.size_raw or "", lbl.size_kind or "")
+            best_key = (best.service, best.size_raw or "", best.size_kind or "")
+            if lbl_key < best_key:
+                best = lbl
+                best_dist = d
+    return best
+
+
+def _achromatic_apportionment(
+    identity: RunServiceIdentity,
+    run_key: tuple[str | None, str | None],
+    rooms: Sequence[Room],
+    geometry_by_entity_id: Mapping[str, Mapping[str, Any]],
+    measured_geometry_by_group: (
+        Mapping[tuple[str | None, str | None], tuple[tuple[tuple[float, float], ...], ...]] | None
+    ),
+    measured_length_by_group: Mapping[tuple[str | None, str | None], float] | None,
+    segment_labels: Sequence[SegmentLabel],
+    segment_label_max_m: float,
+    label_radius: float | None,
+) -> list[tuple[str, str | None, str | None, Room | None, float]]:
+    """Apportion an achromatic run's length per segment → nearest tag → room.
+
+    Returns a list of ``(service, size_raw, size_kind, room, length)`` tuples where
+    ``service`` is ``SERVICE_UNKNOWN`` for orphan segments (no label in radius).
+
+    When the run has no persisted centerline geometry, falls back to
+    ``_anchor_partition`` and attributes the whole length to the identity's own
+    services (collapsed) or ``SERVICE_UNKNOWN`` — the same as bundle mode.
+
+    Conservation invariant: Σ lengths == total centerline length for this run (±float eps).
+    """
+    polylines = (
+        measured_geometry_by_group.get(run_key) if measured_geometry_by_group is not None else None
+    )
+
+    if not polylines:
+        # No geometry: fall back to anchor attribution using the run's own services.
+        partitions = _anchor_partition(
+            identity,
+            rooms,
+            geometry_by_entity_id,
+            measured_length_by_group,
+            run_key,
+            label_radius=label_radius,
+        )
+        # Determine service/size from the identity (collapsed) or unknown.
+        services_to_emit: tuple[ServiceSize, ...] = (
+            _collapse_services_per_service(identity.services)
+            if identity.services
+            else identity.services
+        )
+        result: list[tuple[str, str | None, str | None, Room | None, float]] = []
+        for room, drawn in partitions:
+            if not services_to_emit:
+                result.append((SERVICE_UNKNOWN, None, None, room, drawn))
+            elif len(services_to_emit) == 1:
+                ss = services_to_emit[0]
+                result.append((ss.service, ss.size.raw, ss.size.kind, room, drawn))
+            else:
+                # Multi-service run with no geometry: no per-segment evidence to split.
+                # Attributing the full length to each service would inflate Σ by N x drawn.
+                # Honest fallback: emit once to SERVICE_UNKNOWN (conservation holds).
+                result.append((SERVICE_UNKNOWN, None, None, room, drawn))
+        return result
+
+    # Segment-level apportionment: iterate every segment of every polyline.
+    result_segs: list[tuple[str, str | None, str | None, Room | None, float]] = []
+
+    for polyline in polylines:
+        pts = list(polyline)
+        if len(pts) < 2:
+            continue
+        for i in range(len(pts) - 1):
+            a = pts[i]
+            b = pts[i + 1]
+            seg_len = math.hypot(b[0] - a[0], b[1] - a[1])
+            if seg_len == 0.0:
+                continue
+
+            mid = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
+
+            # Nearest tag attribution.
+            nearest = _nearest_label(mid, segment_labels, segment_label_max_m)
+            if nearest is not None:
+                svc = nearest.service
+                sz_raw = nearest.size_raw
+                sz_kind = nearest.size_kind
+            else:
+                svc = SERVICE_UNKNOWN
+                sz_raw = None
+                sz_kind = None
+
+            # Room attribution via midpoint containment.
+            room = _containing_room(mid, rooms)
+            if room is None and label_radius is not None:
+                room = _nearest_label_room(mid, rooms, radius=label_radius)
+
+            result_segs.append((svc, sz_raw, sz_kind, room, seg_len))
+
+    return result_segs
+
+
+def _collapse_services_per_service(
+    services: tuple[ServiceSize, ...],
+) -> tuple[ServiceSize, ...]:
+    """Collapse over-tagged services to one dominant size PER DISTINCT SERVICE.
+
+    Two physical models must coexist:
+
+    - **Single-service run** (e.g. drainage: ``[SVP/100, SVP/100, SVP/75]``):
+      multiple tags are over-tagging — the run is ONE pipe.  Collapse each distinct
+      service to its dominant ``(service, size.raw)`` pair and count the run length ONCE.
+
+    - **Multi-service bundle** (e.g. med-gas: ``[VAC/54, MA/42, OXY/42, AGSS/42, AGSS/42]``):
+      distinct services share the corridor — EACH service must keep the full run length.
+      Within a service that appears more than once (AGSS twice above) the duplicate is
+      still collapsed to the dominant size, but the service itself is preserved.
+
+    Algorithm:
+
+    1. Group entries by ``service``.
+    2. For each distinct service, if multiple ``(service, size.raw)`` pairs exist,
+       pick the representative ``ServiceSize`` whose ``size.raw`` appears most
+       frequently (tie-break: first in already-sorted ``services`` tuple, which is
+       sorted by ``(service, size.raw, source_tag_text)`` in
+       ``fuse_run_service_identities``).
+    3. Emit exactly one ``ServiceSize`` per distinct service.
+
+    Returns the collapsed tuple (same length as the number of distinct services).
+    An empty input returns an empty tuple.
+    """
+    if not services:
+        return ()
+
+    # Group by service, preserving encounter order for tie-breaking.
+    groups: dict[str, list[ServiceSize]] = {}
+    for ss in services:
+        groups.setdefault(ss.service, []).append(ss)
+
+    result: list[ServiceSize] = []
+    for svc_entries in groups.values():
+        if len(svc_entries) == 1:
+            result.append(svc_entries[0])
+            continue
+        # Multiple entries for this service — pick the size.raw with highest frequency.
+        # Tie-break: first entry in the (already sorted) list wins.
+        size_freq: Counter[str | None] = Counter(ss.size.raw for ss in svc_entries)
+        max_freq = max(size_freq.values())
+        for ss in svc_entries:
+            if size_freq[ss.size.raw] == max_freq:
+                result.append(ss)
+                break
+
+    return tuple(result)
+
+
+# Keep the old name as an alias so existing direct-import tests that reference
+# ``_dominant_service`` continue to resolve.  The alias is intentionally kept
+# narrow: callers that imported it for unit-testing map the new semantics below.
+def _dominant_service(
+    services: tuple[ServiceSize, ...],
+) -> ServiceSize | None:
+    """Legacy helper — returns ``None`` when every ``(service, size.raw)`` pair is unique.
+
+    Preserved for backward-compat with direct test imports.  The coordinator now calls
+    :func:`_collapse_services_per_service` which applies per-service dedup.
+
+    Returns the single dominant ``ServiceSize`` only when ALL services in the tuple share
+    the same ``service`` name AND there are duplicates — i.e. it is a single-service
+    over-tagged run.  For genuine multi-service bundles (distinct service names) it
+    returns ``None`` (caller uses the bundle model).
+
+    For the general per-service collapse use :func:`_collapse_services_per_service`.
+    """
+    if len(services) <= 1:
+        return None
+
+    freq: Counter[tuple[str, str | None]] = Counter((ss.service, ss.size.raw) for ss in services)
+    max_freq = max(freq.values())
+
+    # All pairs unique → true bundle; caller keeps the full iteration.
+    if max_freq == 1:
+        return None
+
+    # If there are multiple distinct service names the run is a multi-service bundle even
+    # if one service appears more than once (e.g. VAC+MA+OXY+AGSS/AGSS).  In that case
+    # the old single-dominant collapse would have silently dropped services — return None
+    # so the caller knows this is a bundle.
+    distinct_services = {ss.service for ss in services}
+    if len(distinct_services) > 1:
+        return None
+
+    # Single-service run with duplicate size tags → collapse to most-frequent size.
+    for ss in services:
+        if freq[(ss.service, ss.size.raw)] == max_freq:
+            return ss
+
+    # Unreachable.
+    return services[0]
+
+
 # ---------------------------------------------------------------------------
 # Public coordinator
 # ---------------------------------------------------------------------------
@@ -259,6 +537,9 @@ def compute_service_takeoff(
     measured_geometry_by_group: (
         Mapping[tuple[str | None, str | None], tuple[tuple[tuple[float, float], ...], ...]] | None
     ) = None,
+    colour_differentiated: bool = True,
+    segment_labels: Sequence[SegmentLabel] = (),
+    segment_label_max_m: float = 5.0,
 ) -> ServiceTakeoffResult:
     """Compose run identities into per-(service, size, room) length totals.
 
@@ -304,6 +585,21 @@ def compute_service_takeoff(
         materialized centerline rows.  When a key is present, the measured length
         overrides the naive ``_entity_drawn_length`` sum for that group.  When
         ``None`` (default) the coordinator is byte-identical to its prior behaviour.
+    colour_differentiated:
+        When True (default), uses the bundle-length model: each service in a
+        multi-service identity receives the full drawn length.  When False
+        (achromatic / BYLAYER discipline), switches to segment-level nearest-tag
+        apportionment — each centerline segment is attributed to its nearest parsed
+        ``SegmentLabel`` within ``segment_label_max_m``; orphan segments land in
+        ``SERVICE_UNKNOWN``.  Conserves: Σ per-service + unknown == centerline total.
+        Default True keeps existing callers unaffected.
+    segment_labels:
+        Parsed tag labels with world-coordinate anchors.  Only consumed when
+        ``colour_differentiated=False``.  Pass the ``SegmentLabel`` list built by the
+        route's Step 5e logic.  Default empty (no-op for bundle mode).
+    segment_label_max_m:
+        Maximum metres from a segment midpoint to a tag label for the label to be
+        eligible.  Default 5.0 (matches ``_SEGMENT_LABEL_MAX_M`` in the route).
     """
     if not identities and not rise_symbols and not drop_symbols:
         return ServiceTakeoffResult(
@@ -351,74 +647,135 @@ def compute_service_takeoff(
     for identity in identities:
         run_key = (identity.layer_ref, identity.colour_key)
 
-        # LP2 (#654): when the group has persisted centerline geometry, distribute its measured
-        # length across rooms by clipping the polylines; otherwise fall back to the pre-LP2 rule
-        # (whole length -> the single anchor-containing room). Honest degradation, no guessing.
-        polylines = (
-            measured_geometry_by_group.get(run_key)
-            if measured_geometry_by_group is not None
-            else None
-        )
-        partitions: list[tuple[Room | None, float]] = []
-        if polylines:
-            partitions = partition_polylines_by_room(polylines, rooms, label_radius=label_radius)
-        if not partitions:
-            partitions = _anchor_partition(
-                identity,
-                rooms,
-                geometry_by_entity_id,
-                measured_length_by_group,
-                run_key,
-                label_radius=label_radius,
-            )
-
-        # Run-level diagnostic counters (counted once per run, not per room partition).
-        if not identity.services:
-            unknown_service_run_count += 1
-        if any(room is None for room, _ in partitions):
-            unassigned_run_count += 1
-
         # Determine competing_disciplines from the matched RunGroup.
         matched_run = runs_by_key.get(run_key)
         has_conflict = bool(matched_run and matched_run.competing_disciplines)
-        # A bundle: this run carries >1 service, so each gets the full corridor length (#655).
-        is_bundle = len(identity.services) > 1
 
-        for room, drawn in partitions:
-            if room is None:
-                room_id = ROOM_UNASSIGNED_ID
-                room_name: str | None = None
-                room_number: str | None = None
-            else:
-                room_id = room.id
-                room_name = room.name
-                room_number = room.number
+        if not colour_differentiated:
+            # --- Achromatic mode (D3c Part B): per-segment nearest-tag apportionment ---
+            # Each segment is attributed to its nearest SegmentLabel within
+            # segment_label_max_m; orphan segments land in SERVICE_UNKNOWN.
+            # Conservation invariant: Σ per-service + unknown == centerline total.
+            seg_attributions = _achromatic_apportionment(
+                identity=identity,
+                run_key=run_key,
+                rooms=rooms,
+                geometry_by_entity_id=geometry_by_entity_id,
+                measured_geometry_by_group=measured_geometry_by_group,
+                measured_length_by_group=measured_length_by_group,
+                segment_labels=segment_labels,
+                segment_label_max_m=segment_label_max_m,
+                label_radius=label_radius,
+            )
 
-            if not identity.services:
-                # No services -> SERVICE_UNKNOWN bucket.
-                key: _BucketKey = (SERVICE_UNKNOWN, None, None, room_id)
-                _accumulate(
-                    key=key,
-                    drawn=drawn,
-                    identity=identity,
-                    has_conflict=has_conflict,
-                    is_bundle=is_bundle,
-                    room_name=room_name,
-                    room_number=room_number,
-                    acc_drawing_length=acc_drawing_length,
-                    acc_run_count=acc_run_count,
-                    acc_entity_ids=acc_entity_ids,
-                    acc_identity_status=acc_identity_status,
-                    acc_has_conflict=acc_has_conflict,
-                    acc_is_bundle=acc_is_bundle,
-                    acc_room_name=acc_room_name,
-                    acc_room_number=acc_room_number,
-                    acc_discipline=acc_discipline,
+            # Run-level diagnostic counters (once per run, not per segment).
+            any_unknown_svc = any(svc == SERVICE_UNKNOWN for svc, _, _, _, _ in seg_attributions)
+            any_unassigned = any(room is None for _, _, _, room, _ in seg_attributions)
+            if any_unknown_svc and not identity.services:
+                # Only increment when the run itself has no services (all segments are unknown
+                # because the run carries no service identity, not because tags are missing).
+                unknown_service_run_count += 1
+            if any_unassigned:
+                unassigned_run_count += 1
+
+            # Accumulate each segment attribution into the bucket grid.
+            # run_count semantics: a run is counted once per distinct (service,size,room)
+            # bucket it contributes to (not per segment), so we track seen keys per run.
+            seen_keys_this_run: set[_BucketKey] = set()
+            for svc, sz_raw, sz_kind, room, seg_len in seg_attributions:
+                room_id = room.id if room is not None else ROOM_UNASSIGNED_ID
+                room_name_seg: str | None = room.name if room is not None else None
+                room_number_seg: str | None = room.number if room is not None else None
+
+                key: _BucketKey = (svc, sz_raw, sz_kind, room_id)
+                # Use run_count=1 only the first time this run touches this bucket.
+                is_first = key not in seen_keys_this_run
+                seen_keys_this_run.add(key)
+
+                if key not in acc_drawing_length:
+                    acc_drawing_length[key] = 0.0
+                    acc_run_count[key] = 0
+                    acc_entity_ids[key] = set()
+                    acc_identity_status[key] = identity.status
+                    acc_has_conflict[key] = False
+                    acc_is_bundle[key] = False
+                    acc_room_name[key] = room_name_seg
+                    acc_room_number[key] = room_number_seg
+                    acc_discipline[key] = identity.discipline
+
+                acc_drawing_length[key] += seg_len
+                if is_first:
+                    acc_run_count[key] += 1
+                acc_entity_ids[key].update(identity.entity_ids)
+                acc_identity_status[key] = _worst_status(acc_identity_status[key], identity.status)
+                acc_has_conflict[key] = acc_has_conflict[key] or has_conflict
+                if identity.discipline is not None:
+                    current = acc_discipline[key]
+                    acc_discipline[key] = (
+                        identity.discipline
+                        if current is None
+                        else min(current, identity.discipline)
+                    )
+
+        else:
+            # --- Bundle mode (colour_differentiated=True): existing per-run attribution ---
+            # LP2 (#654): when the group has persisted centerline geometry, distribute its measured
+            # length across rooms by clipping the polylines; otherwise fall back to the pre-LP2 rule
+            # (whole length -> the single anchor-containing room). Honest degradation, no guessing.
+            polylines = (
+                measured_geometry_by_group.get(run_key)
+                if measured_geometry_by_group is not None
+                else None
+            )
+            partitions: list[tuple[Room | None, float]] = []
+            if polylines:
+                partitions = partition_polylines_by_room(
+                    polylines, rooms, label_radius=label_radius
                 )
-            else:
-                # Bundle-length model: attribute the (per-room) drawn length to EACH service.
-                for ss in identity.services:
-                    key = (ss.service, ss.size.raw, ss.size.kind, room_id)
+            if not partitions:
+                partitions = _anchor_partition(
+                    identity,
+                    rooms,
+                    geometry_by_entity_id,
+                    measured_length_by_group,
+                    run_key,
+                    label_radius=label_radius,
+                )
+
+            # Run-level diagnostic counters (counted once per run, not per room partition).
+            if not identity.services:
+                unknown_service_run_count += 1
+            if any(room is None for room, _ in partitions):
+                unassigned_run_count += 1
+
+            # D3c conservation fix: collapse over-tagged runs to one size PER DISTINCT SERVICE
+            # before the room loop so that is_bundle and services_to_emit are consistent.
+            #
+            # _collapse_services_per_service groups by service name and deduplicates sizes within
+            # each group, preserving all distinct services:
+            #   [SVP/100, SVP/100, SVP/75]               → [SVP/100]   (single-service, length once)
+            #   [VAC/54, MA/42, OXY/42, AGSS/42, AGSS/42] → [VAC/54, MA/42, OXY/42, AGSS/42]
+            services_to_emit: tuple[ServiceSize, ...] = (
+                _collapse_services_per_service(identity.services)
+                if identity.services
+                else identity.services
+            )
+            # A bundle: run contributes full corridor length to EACH of multiple distinct services.
+            is_bundle = len(services_to_emit) > 1
+
+            for room, drawn in partitions:
+                if room is None:
+                    room_id = ROOM_UNASSIGNED_ID
+                    room_name: str | None = None
+                    room_number: str | None = None
+                else:
+                    room_id = room.id
+                    room_name = room.name
+                    room_number = room.number
+
+                if not identity.services:
+                    # No services -> SERVICE_UNKNOWN bucket.
+                    key = (SERVICE_UNKNOWN, None, None, room_id)
                     _accumulate(
                         key=key,
                         drawn=drawn,
@@ -437,6 +794,27 @@ def compute_service_takeoff(
                         acc_room_number=acc_room_number,
                         acc_discipline=acc_discipline,
                     )
+                else:
+                    for ss in services_to_emit:
+                        key = (ss.service, ss.size.raw, ss.size.kind, room_id)
+                        _accumulate(
+                            key=key,
+                            drawn=drawn,
+                            identity=identity,
+                            has_conflict=has_conflict,
+                            is_bundle=is_bundle,
+                            room_name=room_name,
+                            room_number=room_number,
+                            acc_drawing_length=acc_drawing_length,
+                            acc_run_count=acc_run_count,
+                            acc_entity_ids=acc_entity_ids,
+                            acc_identity_status=acc_identity_status,
+                            acc_has_conflict=acc_has_conflict,
+                            acc_is_bundle=acc_is_bundle,
+                            acc_room_name=acc_room_name,
+                            acc_room_number=acc_room_number,
+                            acc_discipline=acc_discipline,
+                        )
 
     # Process rise/drop symbols: map each to its containing room and accumulate counts
     # into the SERVICE_UNKNOWN bucket for that room.  Counts are scale-free; no length

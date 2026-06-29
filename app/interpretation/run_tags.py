@@ -10,7 +10,8 @@ the ``mm`` / service tokens that follow it.
 Recognised forms (first hit wins):
 1. Rectangular duct:   ``WxH SERVICE``       e.g. ``700x300 DA``
 2. Round + mm:         ``NN mm SERVICE``      e.g. ``Ø76 mm VAC``   (Ø ignored)
-3. Round, no mm:       ``NN SERVICE``         e.g. ``Ø150 SA``       (Ø ignored)
+3. Round + glyph:      ``NN∅SERVICE``         e.g. ``100∅SVP``       (glyph is anchor)
+4. Round, no mm:       ``NN SERVICE``         e.g. ``Ø150 SA``       (Ø ignored)
 
 Size-less tags (e.g. a lone service abbreviation ``EA``) are skipped and return ``None``.
 These could be captured in a future follow-up to #610, but without a size the observation
@@ -45,6 +46,11 @@ _UNDERLINE_DIRECTIVE_RE = re.compile(r"^\\L", re.IGNORECASE)
 # The trailing optional mm (group 3 consumed, discarded) precedes the service tail.
 _RECT_RE = re.compile(r"(\d+)\s*(?:mm)?\s*[xX]\s*(\d+)\s*(?:mm)?\s+(.+)$", re.IGNORECASE)
 _ROUND_MM_RE = re.compile(r"(\d+)\s*mm\s+([A-Za-z/]+)", re.IGNORECASE)
+# Glyph-adjacency: <digits><diameter-glyph><service> with no required space between them.
+# Matches the single-entity form "15∅CDP", "100∅SVP", "20∅CDP", "15∅CDP AT HL".
+# The glyph class mirrors _DIAMETER_CONTEXT_RE; \d{2,3} matches real pipe sizes 15-150
+# and rejects single-digit leaders consistent with D3a reassembly.
+_ROUND_GLYPH_RE = re.compile(r"(\d{2,3})\s*[∅Ø�?]\s*([A-Za-z/]+)")
 _ROUND_RE = re.compile(r"(\d+)\s+([A-Za-z/]+)")
 
 # Unit / dimension-separator tokens that the round-no-mm fallback can otherwise capture as a
@@ -93,6 +99,48 @@ _NON_SERVICE_WORDS: frozenset[str] = frozenset(
         "ONTO",
         "OVER",
         "UNDER",
+    }
+)
+
+# Standard-services vocabulary — used as a fallback when no per-sheet legend is supplied.
+# tag_reassembly imports this set (run_tags is lower-level; no circular import).
+# The per-sheet legend (when present) is ground truth and overrides this set entirely.
+# CPD is a tolerated typo-variant of CDP seen in source drawings.
+_STANDARD_SERVICE_CODES: frozenset[str] = frozenset(
+    {
+        # PH / drainage — LENGTH-BEARING pipe runs only. Point fittings that are
+        # counted, not measured (RE rodding-eye, FG floor-gully, SG shower-gully,
+        # AAV air-admittance-valve), are intentionally EXCLUDED: reassembly produces
+        # size+service RUN tags, and a fitting must never capture centerline length.
+        "SVP",
+        "SWP",
+        "VP",
+        "RWP",
+        "CDP",
+        "CPD",
+        "WP",
+        "FW",
+        "SS",
+        "VE",
+        # Med-gas
+        "VAC",
+        "MA",
+        "OXY",
+        "AGSS",
+        "N2O",
+        # HVAC / wet services
+        "SA",
+        "RA",
+        "EA",
+        "OA",
+        "DA",
+        "CHW",
+        "LTHW",
+        "MWS",
+        "CWS",
+        "HWS",
+        "CW",
+        "HW",
     }
 )
 
@@ -326,7 +374,38 @@ def _parse_tag_inner(
             basis=BASIS_TAG_TEXT,
         )
 
-    # 3. Round, no mm: NN SERVICE
+    # 3. Round + glyph (single-entity): NN∅SERVICE — the glyph directly anchors the size.
+    # The glyph itself is the diameter-context marker, so the strict_content tightening
+    # differs from the bare path: we don't require an additional context token.  However
+    # the service token is still subject to legend-OR-standard-vocabulary validation when
+    # strict_content is active (same pattern as tag_reassembly's _classify gate):
+    #   - non-empty legend supplied → service must be in legend (legend is ground truth)
+    #   - empty/absent legend → service must be in _STANDARD_SERVICE_CODES (drainage etc.)
+    # This prevents noise tokens like DEEP/SEAL from being accepted on drainage drawings
+    # where the legend is intentionally empty.
+    m = _ROUND_GLYPH_RE.search(normalized)
+    if m:
+        diameter = int(m.group(1))
+        service = m.group(2).strip().upper()
+        if not _valid_service(service):
+            return None
+        if strict_content:
+            if legend_abbreviations:
+                # Legend supplied: must be a member (legend is ground truth).
+                if service not in legend_abbreviations:
+                    return None
+            else:
+                # No legend: gate on standard vocabulary so noise tokens are rejected.
+                if service not in _STANDARD_SERVICE_CODES:
+                    return None
+        return TagObservation(
+            service=service,
+            size=PipeSize(kind="round", diameter=diameter, width=None, height=None, raw=m.group(1)),
+            raw_text=text,
+            basis=BASIS_TAG_TEXT,
+        )
+
+    # 4. Round, no mm: NN SERVICE
     m = _ROUND_RE.search(normalized)
     if m:
         diameter = int(m.group(1))

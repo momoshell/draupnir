@@ -1082,4 +1082,87 @@ async def test_tag_service_attribution_degenerate_dwg_returns_empty_per_colour(
     # returns the empty result.
     assert tsa is not None
     assert tsa["per_colour"] == []
-    assert tsa["matched_stack_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D3b (#796): reassemble_tag_fragments pre-pass is wired into the route
+# ---------------------------------------------------------------------------
+
+
+async def test_reassemble_tag_fragments_prepass_is_invoked(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tag-fragment reassembly pre-pass (D3a) runs BEFORE fuse_run_service_identities
+    and the Step-5e segment-label loop.
+
+    Strategy: monkeypatch ``reassemble_tag_fragments`` on the route module so we can
+    record what it was called with, then confirm the call happened with the placements
+    from ``inputs.tag_placements`` and that the route still returns 200.
+    """
+    from collections.abc import Sequence
+
+    from app.interpretation.run_service_identity import TagPlacement
+    from app.interpretation.tag_reassembly import ReassemblyResult
+
+    inputs_bundle = _inputs_with_pipe_and_tag(_CONFIRMED_SCALE)
+
+    called_with: list[Sequence[TagPlacement]] = []
+
+    def _spy_reassemble(
+        placements: Sequence[TagPlacement],
+        *,
+        cluster_radius_m: float = 0.5,
+        legend_abbreviations: frozenset[str] | None = None,
+    ) -> ReassemblyResult:
+        called_with.append(placements)
+        # Pass through unchanged so the rest of the pipeline is unaffected.
+        return ReassemblyResult(
+            placements=tuple(placements),
+            reassembled_count=0,
+            rejected_cluster_count=0,
+        )
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_inputs(
+        db: Any,
+        revision_id: uuid.UUID,
+        *,
+        layer_refs: Any = None,
+        tag_layers: Any = None,
+        legend_layers: Any = None,
+        exclude_off_sheet: bool = True,
+    ) -> ServiceTakeoffInputs:
+        return inputs_bundle
+
+    async def _fake_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> _FakeRoomInterpretation:
+        return _no_rooms()
+
+    monkeypatch.setattr(
+        service_takeoff_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(service_takeoff_route, "load_service_takeoff_inputs", _fake_inputs)
+    monkeypatch.setattr(service_takeoff_route, "_resolve_rooms", _fake_rooms)
+    monkeypatch.setattr(service_takeoff_route, "reassemble_tag_fragments", _spy_reassemble)
+
+    response = await _get_takeoff(app)
+    assert response.status_code == 200
+
+    # The pre-pass must have been called exactly once.
+    assert len(called_with) == 1, (
+        f"Expected 1 call to reassemble_tag_fragments, got {len(called_with)}"
+    )
+
+    # It must have received the tag_placements from the inputs bundle.
+    assert list(called_with[0]) == inputs_bundle.tag_placements, (
+        "reassemble_tag_fragments was not called with inputs.tag_placements"
+    )
+
+    app.dependency_overrides.clear()

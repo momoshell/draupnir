@@ -29,7 +29,11 @@ from app.interpretation.segment_label_takeoff import (
     SegmentLabelResult,
     compute_segment_label_lengths,
 )
-from app.interpretation.service_takeoff import SERVICE_UNKNOWN, compute_service_takeoff
+from app.interpretation.service_takeoff import (
+    SERVICE_UNKNOWN,
+    _is_achromatic_colour_key,
+    compute_service_takeoff,
+)
 from app.interpretation.service_takeoff_loaders import (
     _DEFAULT_CENTERLINE_LAYER_TOKENS,
     INPUT_FAMILY_PDF_VECTOR,
@@ -43,7 +47,8 @@ from app.interpretation.service_takeoff_loaders import (
     load_stack_headers,
     load_tag_stack_texts,
 )
-from app.interpretation.tag_stack_service import assign_services_by_tag_stack
+from app.interpretation.tag_reassembly import reassemble_tag_fragments
+from app.interpretation.tag_stack_service import BundleColourBand, assign_services_by_tag_stack
 from app.jobs.worker import enqueue_centerline_job as _enqueue_centerline_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
 from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
@@ -208,6 +213,18 @@ async def get_revision_service_takeoff(
         exclude_off_sheet=exclude_off_sheet,
     )
 
+    # Step 1b -- reassemble spatially fragmented pipe-tag MTEXT (D3a pre-pass, #795/#796).
+    # Fragments like "∅" / "100" / "SVP AT HL DROPS TB" that parse_tag cannot resolve
+    # individually are clustered by proximity and concatenated into parseable strings.
+    # The local `reassembled` variable is used at BOTH Step 3 and Step 5e (inputs is
+    # frozen so we rebind the list rather than mutating the dataclass).
+    # NOTE: Step 5d (tag-stack path) loads its own placements via load_tag_stack_texts and
+    # is intentionally NOT fed the reassembled list — it operates on a different text corpus.
+    reassembled = reassemble_tag_fragments(
+        inputs.tag_placements,
+        legend_abbreviations=frozenset(a.upper() for a in inputs.legend.by_abbreviation()),
+    ).placements
+
     # Step 2 -- identify routed runs (P1).
     runs = identify_routed_runs(inputs.routed_entities, inputs.legend).groups
 
@@ -233,7 +250,7 @@ async def get_revision_service_takeoff(
     identities = fuse_run_service_identities(
         runs,
         inputs.geometry_by_entity_id,
-        inputs.tag_placements,
+        reassembled,
         radius=radius,
     ).identities
 
@@ -254,8 +271,59 @@ async def get_revision_service_takeoff(
         inputs.drop_entities, inputs.legend, kind=KIND_DROP
     ).symbols
 
+    # Detect format family early — used at Steps 5b, 5c, 5d, 5e, 6.
+    is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
+
+    # Step 5b-pre: for DWG revisions, compute the bundle-band colour gate (D3c Part B, #798).
+    # colour_differentiated=True → med-gas / colour-keyed discipline → bundle model (unchanged).
+    # colour_differentiated=False → achromatic / BYLAYER discipline (e.g. drainage) →
+    #   segment-level nearest-tag apportionment (no per-service multiplication).
+    # Gate: count DISTINCT bundle-band colour_keys that are NOT achromatic (grey/black/white).
+    # Med-gas M-540003: 5 distinct chromatic colours → True.
+    # Drainage: only c3000007 (BYLAYER grey) → False.
+    # PDF revisions have no bundle bands → default True (bundle model, no change).
+    bundle_bands: dict[str, list[BundleColourBand]] = {}
+    seg_labels_for_takeoff: list[SegmentLabel] = []
+    colour_differentiated: bool = True
+
+    if not is_pdf:
+        # Load bundle bands once; reused by the colour gate here AND by Step 5d below.
+        bundle_bands = await load_bundle_bands_by_colour(
+            db,
+            revision_id,
+            exclude_off_sheet=exclude_off_sheet,
+            input_family=inputs.input_family,
+        )
+        distinct_chromatic = sum(1 for ck in bundle_bands if not _is_achromatic_colour_key(ck))
+        colour_differentiated = distinct_chromatic >= 2
+
+        # Build SegmentLabel list from reassembled tag placements.  These are consumed by
+        # compute_service_takeoff's achromatic path (colour_differentiated=False) and also
+        # by Step 5e's compute_segment_label_lengths.  Built unconditionally for DWG so
+        # Step 5e can reuse without re-parsing.
+        _legend_abbrevs_takeoff: frozenset[str] = frozenset(
+            a.upper() for a in inputs.legend.by_abbreviation()
+        )
+        for _placement in reassembled:
+            _obs = parse_tag(
+                _placement.text,
+                legend_abbreviations=_legend_abbrevs_takeoff,
+                strict_content=True,
+            )
+            if _obs is None:
+                continue
+            seg_labels_for_takeoff.append(
+                SegmentLabel(
+                    point=_placement.point,
+                    service=_obs.service,
+                    size_raw=_obs.size.raw,
+                    size_kind=_obs.size.kind,
+                )
+            )
+
     # Step 5b -- compute takeoff (P3 coordinator).
     # Pass measured lengths when present; unmeasured groups fall back to naive entity-sum.
+    # colour_differentiated gates the attribution model (see module docstring in service_takeoff).
     result = compute_service_takeoff(
         runs=runs,
         identities=identities,
@@ -266,13 +334,15 @@ async def get_revision_service_takeoff(
         drop_symbols=drop_symbols,
         measured_length_by_group=measured_mapping if measured_mapping else None,
         measured_geometry_by_group=measured_geometry if measured_geometry else None,
+        colour_differentiated=colour_differentiated,
+        segment_labels=seg_labels_for_takeoff,
+        segment_label_max_m=_SEGMENT_LABEL_MAX_M,
     )
 
     # Step 5c -- fill-colour attribution (DWG only; compute-on-read, Phase 1 / #663).
     # Only meaningful for DWG revisions that have Center Line entities. For PDF revisions
     # the HATCH fill bands are absent so attribution is honest-absent (None).
     fill_attribution: ServiceFillAttributionRead | None = None
-    is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
     if not is_pdf:
         # Filter routed_entities to centerline-token layers, line entity type only.
         cl_tokens_lower = tuple(t.lower() for t in _DEFAULT_CENTERLINE_LAYER_TOKENS)
@@ -331,6 +401,7 @@ async def get_revision_service_takeoff(
     # PDF revisions lack HATCH fill bands so the matcher has no bundle geometry; honest-absent.
     # Tag service OVERRIDES legend discipline for routed colours (additive only — lengths
     # are never touched). Discipline from RunServiceIdentity is attached as context.
+    # bundle_bands was already loaded in Step 5b-pre for DWG; reuse it here.
     tag_service_attribution: ServiceTagAttributionRead | None = None
     if not is_pdf:
         tag_texts = await load_tag_stack_texts(
@@ -343,12 +414,7 @@ async def get_revision_service_takeoff(
             revision_id,
             input_family=inputs.input_family,
         )
-        bundle_bands = await load_bundle_bands_by_colour(
-            db,
-            revision_id,
-            exclude_off_sheet=exclude_off_sheet,
-            input_family=inputs.input_family,
-        )
+        # bundle_bands already loaded in Step 5b-pre; no second DB call.
         tag_stack_result = assign_services_by_tag_stack(
             tags=tag_texts,
             headers=stack_headers,
@@ -378,7 +444,7 @@ async def get_revision_service_takeoff(
 
     # Step 5e -- per-segment nearest-label type attribution (DWG only; #687).
     # Consumes the ALREADY-LOADED measured_geometry (flattened across all groups) and the
-    # ALREADY-LOADED tag_placements. parse_tag filters non-tag prose so no pre-filter needed.
+    # ALREADY-BUILT seg_labels_for_takeoff (reused from Step 5b-pre; no re-parsing).
     # Honest-absent (None) when measured_geometry is empty — the CENTERLINE job is already
     # lazily enqueued above for unmaterialized revisions.
     segment_label_attribution: ServiceSegmentLabelAttributionRead | None = None
@@ -388,34 +454,10 @@ async def get_revision_service_takeoff(
         for polylines in measured_geometry.values():
             flat_polylines.extend(polylines)
 
-        # Build SegmentLabel list from parsed tag_placements (parse_tag is the content gate).
-        # Pass legend abbreviations so the bare _ROUND_RE path can rescue real service tags
-        # that lack an explicit mm/∅ context token (e.g. "150 SA" on a drawing whose legend
-        # confirms "SA" is a service).
-        _legend_abbrevs: frozenset[str] = frozenset(
-            a.upper() for a in inputs.legend.by_abbreviation()
-        )
-        seg_labels: list[SegmentLabel] = []
-        for placement in inputs.tag_placements:
-            obs = parse_tag(
-                placement.text,
-                legend_abbreviations=_legend_abbrevs,
-                strict_content=True,
-            )
-            if obs is None:
-                continue
-            seg_labels.append(
-                SegmentLabel(
-                    point=placement.point,
-                    service=obs.service,
-                    size_raw=obs.size.raw,
-                    size_kind=obs.size.kind,
-                )
-            )
-
+        # Reuse the SegmentLabel list built in Step 5b-pre (same parse_tag logic, same inputs).
         raw_seg: SegmentLabelResult = compute_segment_label_lengths(
             centerline_polylines=flat_polylines,
-            labels=seg_labels,
+            labels=seg_labels_for_takeoff,
             nearest_max_m=_SEGMENT_LABEL_MAX_M,
         )
         segment_label_attribution = ServiceSegmentLabelAttributionRead(

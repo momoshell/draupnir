@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 from app.interpretation.run_service_identity import TagPlacement
 from app.interpretation.run_tags import (
+    _STANDARD_SERVICE_CODES,
     _is_annotation_prose,
     parse_tag,
 )
@@ -47,48 +48,6 @@ _CANONICAL_GLYPH = "∅"
 # Tie-break epsilon: two candidates are treated as "equidistant" when their distances
 # differ by less than this (metres).  Calibrated to sub-millimetre drawing noise.
 _TIE_EPSILON: float = 1e-6
-
-# Standard-services fallback used only when the sheet legend yields no abbreviations;
-# the per-sheet legend (when present) is the ground-truth source.
-# Covers PH/drainage, med-gas, and HVAC/wet services.
-# CPD is a tolerated typo-variant of CDP seen in source drawings.
-_STANDARD_SERVICE_CODES: frozenset[str] = frozenset(
-    {
-        # PH / drainage — LENGTH-BEARING pipe runs only. Point fittings that are
-        # counted, not measured (RE rodding-eye, FG floor-gully, SG shower-gully,
-        # AAV air-admittance-valve), are intentionally EXCLUDED: reassembly produces
-        # size+service RUN tags, and a fitting must never capture centerline length.
-        "SVP",
-        "SWP",
-        "VP",
-        "RWP",
-        "CDP",
-        "CPD",
-        "WP",
-        "FW",
-        "SS",
-        "VE",
-        # Med-gas
-        "VAC",
-        "MA",
-        "OXY",
-        "AGSS",
-        "N2O",
-        # HVAC / wet services
-        "SA",
-        "RA",
-        "EA",
-        "OA",
-        "DA",
-        "CHW",
-        "LTHW",
-        "MWS",
-        "CWS",
-        "HWS",
-        "CW",
-        "HW",
-    }
-)
 
 # ---------------------------------------------------------------------------
 # Fragment kind constants
