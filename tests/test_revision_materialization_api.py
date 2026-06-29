@@ -1452,7 +1452,7 @@ class TestRevisionMaterializationApi:
             "pen-00ff00-w1.42": "services",
             "default": "unknown",
         }
-        assert body["rule_version"] == "1"
+        assert body["rule_version"] == "2"
         assert body["summary"]["counts"]["services"] == 1
 
     async def test_materialization_endpoints_return_409_when_manifest_missing(
