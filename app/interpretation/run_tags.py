@@ -103,6 +103,41 @@ _NON_SERVICE_WORDS: frozenset[str] = frozenset(
 # The set is intentionally tight — add only confirmed equipment-label keywords here.
 _EQUIPMENT_KEYWORDS_RE = re.compile(r"\bHEADER\b", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# Content gate — title-block / contact prose rejection
+# ---------------------------------------------------------------------------
+
+# A run of 6+ consecutive digits is a phone/zip number, never a pipe size.
+# (Normal sizes are ≤4 digits; 5-digit postcodes are excluded by the 6-char threshold.)
+_LONG_DIGIT_RUN_RE = re.compile(r"\d{6,}")
+
+# Domain-suffix fragments that only appear in URLs / email addresses.
+_DOMAIN_SUFFIX_RE = re.compile(r"\.co\.|\.uk|\.com", re.IGNORECASE)
+
+# Contact keywords that only appear in title-block / footer prose.
+_CONTACT_KEYWORD_RE = re.compile(r"\b(?:tel|fax|www)\b", re.IGNORECASE)
+
+# Diameter/unit context tokens that justify a bare-number match in _ROUND_RE.
+# When none of these are present the bare path requires a legend hit.
+# U+FFFD (replacement glyph) is the garbled form of Ø from non-UTF-8 DWGs and is treated
+# as a real diameter marker — mirror the [Ø�] convention in service_takeoff_loaders.py.
+_DIAMETER_CONTEXT_RE = re.compile(r"[∅Ø�]|mm", re.IGNORECASE)
+
+
+def _is_annotation_prose(normalized: str) -> bool:
+    """Return True when *normalized* text is contact/title-block prose, not a pipe tag.
+
+    Applied BEFORE any size/service pattern so parse_tag returns None early.
+    Conservative — only patterns that are unambiguously non-tag content.
+    """
+    if "@" in normalized:
+        return True
+    if _CONTACT_KEYWORD_RE.search(normalized):
+        return True
+    if _DOMAIN_SUFFIX_RE.search(normalized):
+        return True
+    return bool(_LONG_DIGIT_RUN_RE.search(normalized))
+
 
 def _valid_service(service: str) -> bool:
     """A service token must be non-empty, not a bare unit/dimension separator, and not a
@@ -174,7 +209,12 @@ def _normalize_text(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_tag(text: str) -> TagObservation | None:
+def parse_tag(
+    text: str,
+    *,
+    legend_abbreviations: frozenset[str] | None = None,
+    strict_content: bool = False,
+) -> TagObservation | None:
     """Parse a pipe-tag text string into a :class:`TagObservation`, or ``None``.
 
     Returns ``None`` when:
@@ -184,18 +224,53 @@ def parse_tag(text: str) -> TagObservation | None:
     - The tag appears to be a size-less service-only label (e.g. ``EA``).
     - The text matches the degenerate ``Ø mm`` pattern (digit absent).
 
+    *strict_content* — when ``True``, two additional gates are applied:
+
+    1. **Prose content gate**: contact/title-block prose (email, phone, URL keywords) is
+       rejected before pattern matching.
+    2. **Bare ``_ROUND_RE`` tightening**: a bare digit+word match (no ``mm``, no rect form)
+       is only accepted when a diameter-context token (∅/Ø/U+FFFD/mm) is present in the
+       text, or the service token is confirmed by *legend_abbreviations*.
+
+    (Because the prose gate runs first, text containing the contact keywords
+    ``tel``/``fax``/``www`` is rejected up front, even with otherwise-valid size context.)
+
+    Default ``False`` preserves byte-identical behaviour for all existing callers
+    (routed/colour-keyed paths: ``run_service_identity.py``, ``tag_stack_service.py``,
+    ``service_takeoff_loaders.py`` containment label pass).  Set ``True`` only at the
+    segment-label call site where tags are sourced from broadened all-text placements.
+
+    *legend_abbreviations* — optional frozenset of known service abbreviations (upper-case).
+    When *strict_content* is ``True``, used as a rescue for the bare ``_ROUND_RE`` path:
+    a match without diameter-context is accepted if the service appears in the set.
+    Has no effect when *strict_content* is ``False``.
+
     Never raises on any input string.
     """
     try:
-        return _parse_tag_inner(text)
+        return _parse_tag_inner(
+            text,
+            legend_abbreviations=legend_abbreviations or frozenset(),
+            strict_content=strict_content,
+        )
     except Exception:  # tolerant by contract
         return None
 
 
-def _parse_tag_inner(text: str) -> TagObservation | None:
+def _parse_tag_inner(
+    text: str,
+    *,
+    legend_abbreviations: frozenset[str],
+    strict_content: bool,
+) -> TagObservation | None:
     """Internal implementation — may assume a str argument."""
     normalized = _normalize_text(text)
     if not normalized:
+        return None
+
+    # Prose content gate — only active under strict_content; legend-less callers
+    # (run_service_identity.py, tag_stack_service.py, containment label pass) are unaffected.
+    if strict_content and _is_annotation_prose(normalized):
         return None
 
     # Reject equipment-vessel labels before any pattern matching (e.g. "Ø250 LOW LOSS HEADER").
@@ -258,6 +333,14 @@ def _parse_tag_inner(text: str) -> TagObservation | None:
         service = m.group(2).strip().upper()
         if not _valid_service(service):
             return None
+        # Bare-path tightening — only active under strict_content.
+        # Requires either a diameter-context token (∅/Ø/U+FFFD/mm) or a legend hit.
+        # Without strict_content the behaviour is byte-identical to pre-D1 (no gate).
+        if strict_content:
+            has_context = bool(_DIAMETER_CONTEXT_RE.search(normalized))
+            in_legend = bool(legend_abbreviations) and service in legend_abbreviations
+            if not has_context and not in_legend:
+                return None
         return TagObservation(
             service=service,
             size=PipeSize(kind="round", diameter=diameter, width=None, height=None, raw=m.group(1)),

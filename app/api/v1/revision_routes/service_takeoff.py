@@ -389,9 +389,19 @@ async def get_revision_service_takeoff(
             flat_polylines.extend(polylines)
 
         # Build SegmentLabel list from parsed tag_placements (parse_tag is the content gate).
+        # Pass legend abbreviations so the bare _ROUND_RE path can rescue real service tags
+        # that lack an explicit mm/∅ context token (e.g. "150 SA" on a drawing whose legend
+        # confirms "SA" is a service).
+        _legend_abbrevs: frozenset[str] = frozenset(
+            a.upper() for a in inputs.legend.by_abbreviation()
+        )
         seg_labels: list[SegmentLabel] = []
         for placement in inputs.tag_placements:
-            obs = parse_tag(placement.text)
+            obs = parse_tag(
+                placement.text,
+                legend_abbreviations=_legend_abbrevs,
+                strict_content=True,
+            )
             if obs is None:
                 continue
             seg_labels.append(

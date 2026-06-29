@@ -327,7 +327,7 @@ def _build_parsed_stack(
 
     entries: list[tuple[str, PipeSize]] = []
     for tag in ordered:
-        obs = parse_tag(tag.text)
+        obs = parse_tag(tag.text, strict_content=True)
         if obs is not None:
             entries.append((obs.service, obs.size))
 

@@ -116,9 +116,11 @@ def _inputs_with_pipe_and_tag(scale: ScaleContext) -> ServiceTakeoffInputs:
     )
     legend = ServiceLegend(entries=(entry,))
 
-    # Tag near the pipe midpoint (500, 0). Pattern: "NN SERVICE" (round, no mm).
+    # Tag near the pipe midpoint (500, 0).
+    # Real service tags carry a size unit / Ø glyph; the bare form is gated under strict_content
+    # (validated against the real med-gas oracle), so the realistic fixture uses "mm".
     tag_placements = [
-        TagPlacement(text="50 VAC", point=(500.0, 0.0), layer_ref="PIPE TAG"),
+        TagPlacement(text="50mm VAC", point=(500.0, 0.0), layer_ref="PIPE TAG"),
     ]
 
     return ServiceTakeoffInputs(
@@ -515,9 +517,11 @@ def _inputs_two_services_two_rooms(scale: ScaleContext) -> ServiceTakeoffInputs:
     )
     legend = ServiceLegend(entries=(entry_red, entry_blue))
 
+    # Real service tags carry a size unit / Ø glyph; the bare form is gated under strict_content
+    # (validated against the real med-gas oracle), so the realistic fixture uses "mm".
     tag_placements = [
-        TagPlacement(text="50 VAC", point=(250.0, 100.0), layer_ref="PIPE TAG"),
-        TagPlacement(text="50 VAC", point=(5250.0, 100.0), layer_ref="PIPE TAG"),
+        TagPlacement(text="50mm VAC", point=(250.0, 100.0), layer_ref="PIPE TAG"),
+        TagPlacement(text="50mm VAC", point=(5250.0, 100.0), layer_ref="PIPE TAG"),
     ]
 
     geometry_by_entity_id: dict[str, Any] = {
