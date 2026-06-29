@@ -283,7 +283,7 @@ def fuse_run_service_identities(
     ambiguous: list[TagObservation] = []
 
     for tag in tags:
-        observation = parse_tag(tag.text)
+        observation = parse_tag(tag.text, strict_content=True)
         if observation is None:
             # Non-parseable: skip entirely (do NOT add to unassigned -- it carries no info).
             continue

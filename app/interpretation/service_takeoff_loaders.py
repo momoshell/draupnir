@@ -2204,7 +2204,8 @@ async def assemble_containment_takeoff(
     tag_placements = await load_tag_placements(db, revision_id, broaden_tag_layers=True)
     seg_labels: list[SegmentLabel] = []
     for placement in tag_placements:
-        obs = parse_tag(placement.text)
+        # ContainmentLegend has no by_abbreviation(); pass strict_content only (no legend rescue).
+        obs = parse_tag(placement.text, strict_content=True)
         if obs is None:
             continue
         seg_labels.append(
