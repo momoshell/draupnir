@@ -4,7 +4,6 @@
 
 import asyncio
 import atexit
-import inspect
 import threading
 import uuid
 from collections.abc import Callable, Coroutine
@@ -42,6 +41,7 @@ from app.jobs import enqueueing as job_enqueueing
 from app.jobs import execution_adapters as job_execution_adapters
 from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
+from app.jobs import ingest_execution as job_ingest_execution
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import registered_processor as job_registered_processor
 from app.jobs import runner as job_runner
@@ -205,19 +205,6 @@ _PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Changeset apply job failed unexpec
 _QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE = (
     "Quantity takeoff detected conflicting contributor inputs."
 )
-_SAFE_RUNNER_ERROR_DETAIL_KEYS = (
-    "adapter_key",
-    "input_family",
-    "reason",
-    "detail",
-    "stage",
-    "detected_format",
-    "media_type",
-    "output_kind",
-    "max_output_bytes",
-    "output_size_bytes",
-)
-
 _WORKER_LOOP_RUNNER: asyncio.Runner | None = None
 _WORKER_LOOP_RUNNER_LOCK = threading.Lock()
 
@@ -801,25 +788,12 @@ _progress_event_data = job_execution_monitoring.progress_event_data
 
 def _runner_error_log_fields(exc: IngestionRunnerError) -> dict[str, Any]:
     """Return whitelisted structured fields for expected runner failures."""
-    data_json: dict[str, Any] = {
-        "error_code": exc.error_code.value,
-        "failure_kind": exc.failure_kind.value,
-        "error_message": exc.message,
-    }
-    for key in _SAFE_RUNNER_ERROR_DETAIL_KEYS:
-        value = exc.details.get(key)
-        if value is not None:
-            data_json[key] = value
-    return data_json
+    return job_ingest_execution.runner_error_log_fields(exc)
 
 
 def _runner_supports_keyword(runner: Any, keyword: str) -> bool:
     """Return whether a runner callable accepts a given keyword."""
-    signature = inspect.signature(runner)
-    parameters = signature.parameters.values()
-    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
-        return True
-    return keyword in signature.parameters
+    return job_ingest_execution.runner_supports_keyword(runner, keyword)
 
 
 async def _invoke_ingestion_runner(
@@ -830,14 +804,13 @@ async def _invoke_ingestion_runner(
     on_progress: Any,
 ) -> IngestFinalizationPayload:
     """Call the runner while remaining compatible with patched test doubles."""
-    kwargs: dict[str, Any] = {}
-    if _runner_supports_keyword(run_ingestion, "timeout"):
-        kwargs["timeout"] = timeout
-    if _runner_supports_keyword(run_ingestion, "cancellation"):
-        kwargs["cancellation"] = cancellation
-    if _runner_supports_keyword(run_ingestion, "on_progress"):
-        kwargs["on_progress"] = on_progress
-    return await run_ingestion(request, **kwargs)
+    return await job_ingest_execution.invoke_ingestion_runner(
+        request,
+        runner=run_ingestion,
+        timeout=timeout,
+        cancellation=cancellation,
+        on_progress=on_progress,
+    )
 
 
 async def _poll_job_cancellation(
