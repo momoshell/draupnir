@@ -3,28 +3,41 @@
 # ===========================================================================
 # Stage 1 — Build LibreDWG (provides the `dwgread` binary for the DWG adapter,
 # ADR-0006). LibreDWG is GPL-3.0+ and is NOT packaged in Debian, so we compile
-# a pinned release from source for version parity with local dev (0.13.3).
+# from source for version parity with local dev. We track master 0.14 (#802):
+# 0.14 parses R2004 files that 0.13.3 cannot (the 0xd40 error) and emits
+# per-entity ACI colours that 0.13.3 collapsed to BYLAYER. There is no 0.14
+# release tarball on the GNU FTP mirror, so we build from a pinned git commit
+# (autotools-generated configure via autogen.sh).
 # Built static (--disable-shared) so the runtime stage needs only dwgread plus
 # its libc/libpcre2 deps, not the full LibreDWG shared library.
 # ===========================================================================
 FROM python:3.12-slim AS libredwg-builder
 
-ARG LIBREDWG_VERSION=0.13.3
+# Pinned to libredwg master commit ce90f755 == dwgread 0.14.8384 (host parity).
+ARG LIBREDWG_GIT_URL=https://github.com/LibreDWG/libredwg.git
+ARG LIBREDWG_GIT_REF=ce90f755
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    xz-utils \
+    git \
+    ca-certificates \
     build-essential \
     pkg-config \
     libpcre2-dev \
     perl \
+    autoconf \
+    automake \
+    libtool \
+    texinfo \
+    gperf \
+    gettext \
+    autopoint \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL "https://ftp.gnu.org/gnu/libredwg/libredwg-${LIBREDWG_VERSION}.tar.xz" \
-        -o /tmp/libredwg.tar.xz \
-    && mkdir -p /tmp/libredwg \
-    && tar -xf /tmp/libredwg.tar.xz -C /tmp/libredwg --strip-components=1 \
+RUN git clone "${LIBREDWG_GIT_URL}" /tmp/libredwg \
     && cd /tmp/libredwg \
+    && git checkout "${LIBREDWG_GIT_REF}" \
+    && git submodule update --init --recursive \
+    && sh autogen.sh \
     && ./configure --disable-shared --enable-static --disable-bindings --disable-werror \
     && make -j2 \
     && make install \
