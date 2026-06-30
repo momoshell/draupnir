@@ -17,6 +17,7 @@ from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.api.v1.revision_routes.scale import resolve_revision_scale
 from app.db.session import get_db
 from app.interpretation.devices import enumerate_devices
+from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.layer_roles import classify_layer_role
 from app.models.revision_materialization import RevisionLayer
 from app.schemas.revision_summary import RevisionSummaryRead
@@ -61,9 +62,11 @@ async def get_revision_summary(
     devices = await enumerate_devices(db, revision_id)
 
     # Rooms — go through the SAME resolver as /rooms (its defaults: auto strategy + printed-sheet
-    # scope + all-text labels) so the two endpoints can never disagree on room counts (#584).
+    # scope + all-text labels) so the two endpoints can never disagree on room counts (#584/#792).
+    # Apply the same presentation filter as /rooms: only genuine rooms (valid number or real name).
     rooms_result = await _resolve_rooms(db, revision_id)
-    named_rooms = sum(1 for room in rooms_result.rooms if room.name is not None)
+    genuine_rooms = [room for room in rooms_result.rooms if has_genuine_room_identity(room)]
+    named_rooms = sum(1 for room in genuine_rooms if room.name is not None)
 
     # Scale/units (A3) + the extraction-coverage block (validation report).
     scale = await resolve_revision_scale(revision_id, db)
@@ -83,7 +86,7 @@ async def get_revision_summary(
         layer_count=len(layer_rows),
         layer_roles=dict(role_counts),
         device_count=len(devices),
-        room_count=len(rooms_result.rooms),
+        room_count=len(genuine_rooms),
         named_room_count=named_rooms,
         scale=scale,
         coverage=coverage,
