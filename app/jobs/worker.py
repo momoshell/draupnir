@@ -9,6 +9,7 @@ import inspect
 import threading
 import uuid
 from collections.abc import Callable, Coroutine
+from contextlib import suppress
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -196,6 +197,7 @@ _ENQUEUE_STATUS_PUBLISHING = "publishing"
 _ENQUEUE_STATUS_PUBLISHED = "published"
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
+_JOB_ATTEMPT_LEASE_RENEW_INTERVAL = _RUNNING_JOB_STALE_AFTER / 3
 _ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 # Capped exponential backoff between job attempts. The first attempt runs with no
@@ -871,6 +873,7 @@ def _claim_job_attempt_lease(
 
 
 _job_attempt_is_current = job_lifecycle._job_attempt_is_current
+_renew_job_attempt_lease_for_update = job_lifecycle._renew_job_attempt_lease_for_update
 
 
 def _job_is_safe_recovery_failure_target(job: Job) -> bool:
@@ -897,6 +900,74 @@ def _is_stale_running_job(
         now=now,
         stale_after=stale_after,
     )
+
+
+async def _renew_job_attempt_lease(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
+) -> _JobAttemptLease | None:
+    """Extend a persisted job-attempt lease if this worker still owns it."""
+    return await _renew_job_attempt_lease_for_update(
+        job_id,
+        attempt_token=attempt_token,
+        stale_after=stale_after,
+        session_maker_factory=get_session_maker,
+    )
+
+
+async def _renew_job_attempt_lease_until_cancelled(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
+    interval: timedelta = _JOB_ATTEMPT_LEASE_RENEW_INTERVAL,
+) -> None:
+    """Keep an active job attempt from being reclaimed while execution is still alive."""
+    while True:
+        await asyncio.sleep(interval.total_seconds())
+        lease = await _renew_job_attempt_lease(
+            job_id,
+            attempt_token=attempt_token,
+            stale_after=stale_after,
+        )
+        if lease is None:
+            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+
+
+async def _with_job_attempt_lease_renewal[ResultT](
+    work: Coroutine[Any, Any, ResultT],
+    *,
+    job_id: UUID,
+    attempt_token: UUID,
+) -> ResultT:
+    """Run job work while a companion task renews the persisted attempt lease."""
+    work_task = asyncio.create_task(work)
+    renewal_task = asyncio.create_task(
+        _renew_job_attempt_lease_until_cancelled(job_id, attempt_token=attempt_token)
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {work_task, renewal_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if renewal_task in done:
+            work_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await work_task
+            await renewal_task
+
+        renewal_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await renewal_task
+        return await work_task
+    finally:
+        for task in (work_task, renewal_task):
+            if not task.done():
+                task.cancel()
+        with suppress(asyncio.CancelledError):
+            await renewal_task
 
 
 def _is_stale_enqueue_intent(job: Job, *, now: datetime) -> bool:
@@ -2024,7 +2095,11 @@ async def _process_registered_job(
     finalize_job = cast(Any, _resolve_registered_job_callable(finalize_name))
 
     try:
-        execution_result = await execute_job(job_id, attempt_token=lease.token, deps=deps)
+        execution_result = await _with_job_attempt_lease_renewal(
+            execute_job(job_id, attempt_token=lease.token, deps=deps),
+            job_id=job_id,
+            attempt_token=lease.token,
+        )
     except _InactiveSourceError:
         if spec.inactive_source_log_event is None:
             raise
@@ -2125,11 +2200,15 @@ async def _process_registered_job(
         finalize_kwargs = {spec.execution_result_arg_name: execution_result}
 
     try:
-        finalized = await finalize_job(
-            job_id,
+        finalized = await _with_job_attempt_lease_renewal(
+            finalize_job(
+                job_id,
+                attempt_token=lease.token,
+                deps=deps,
+                **finalize_kwargs,
+            ),
+            job_id=job_id,
             attempt_token=lease.token,
-            deps=deps,
-            **finalize_kwargs,
         )
     except asyncio.CancelledError:
         await _mark_job_cancelled_with_log(

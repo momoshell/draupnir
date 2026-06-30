@@ -4,7 +4,7 @@ import uuid
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from starlette.testclient import TestClient
 
 from app.core.config import settings
@@ -21,6 +21,11 @@ def create_test_app() -> FastAPI:
 
     @app.get("/test")
     def test_endpoint() -> dict[str, Any]:
+        return {"ok": True}
+
+    @app.post("/test-json")
+    async def json_endpoint(request: Request) -> dict[str, Any]:
+        await request.body()
         return {"ok": True}
 
     @app.post("/v1/projects/{project_id}/files")
@@ -73,9 +78,7 @@ class TestRequestIdMiddleware:
         try:
             uuid.UUID(request_id, version=4)
         except ValueError:
-            raise AssertionError(
-                f"Should have generated valid UUID, got: {request_id}"
-            ) from None
+            raise AssertionError(f"Should have generated valid UUID, got: {request_id}") from None
 
     def test_rejects_malformed_request_id(self) -> None:
         """Should reject request IDs with invalid characters."""
@@ -88,9 +91,7 @@ class TestRequestIdMiddleware:
         try:
             uuid.UUID(request_id, version=4)
         except ValueError:
-            raise AssertionError(
-                f"Should have generated valid UUID, got: {request_id}"
-            ) from None
+            raise AssertionError(f"Should have generated valid UUID, got: {request_id}") from None
 
     def test_different_requests_get_different_ids(self) -> None:
         """Each request should get a unique request ID."""
@@ -128,6 +129,71 @@ class TestRequestIdMiddleware:
             "error": {
                 "code": "INPUT_INVALID",
                 "message": "Request body exceeds maximum allowed size for uploads.",
+                "details": None,
+            }
+        }
+
+    def test_rejects_oversized_non_upload_request_with_413(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-upload body requests should be capped before handler execution."""
+        monkeypatch.setattr(settings, "max_request_body_mb", 1)
+        max_request_body_bytes = settings.max_request_body_mb * 1024 * 1024
+
+        def stream() -> Any:
+            yield b"streamed-json-body"
+
+        request = client.build_request(
+            "POST",
+            "/test-json",
+            content=stream(),
+            headers={"content-length": str(max_request_body_bytes + 1)},
+        )
+        response = client.send(request)
+
+        assert response.status_code == 413
+        assert response.json() == {
+            "error": {
+                "code": "INPUT_INVALID",
+                "message": "Request body exceeds maximum allowed size.",
+                "details": None,
+            }
+        }
+
+    def test_allows_non_upload_request_within_general_body_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regular JSON/API bodies should use the smaller general request cap."""
+        monkeypatch.setattr(settings, "max_request_body_mb", 1)
+
+        response = client.post(
+            "/test-json",
+            content=b'{"ok": true}',
+            headers={"content-type": "application/json"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    def test_rejects_non_upload_request_invalid_content_length_with_400(self) -> None:
+        """Invalid Content-Length is rejected consistently for limited body routes."""
+
+        def stream() -> Any:
+            yield b"streamed-json-body"
+
+        request = client.build_request(
+            "POST",
+            "/test-json",
+            content=stream(),
+            headers={"content-length": "not-an-integer"},
+        )
+
+        response = client.send(request)
+        assert response.status_code == 400
+        assert response.json() == {
+            "error": {
+                "code": "INPUT_INVALID",
+                "message": "Content-Length header must be a valid integer.",
                 "details": None,
             }
         }

@@ -123,6 +123,22 @@ def _job_attempt_is_current(job: Job, *, attempt_token: UUID) -> bool:
     return job.status == "running" and job.attempt_token == attempt_token
 
 
+def _renew_job_attempt_lease(
+    job: Job,
+    *,
+    now: datetime,
+    attempt_token: UUID,
+    stale_after: timedelta,
+) -> _JobAttemptLease | None:
+    """Extend a running job-attempt lease if the caller still owns it."""
+    if not _job_attempt_is_current(job, attempt_token=attempt_token):
+        return None
+
+    lease_expires_at = now + stale_after
+    job.attempt_lease_expires_at = lease_expires_at
+    return _JobAttemptLease(token=attempt_token, lease_expires_at=lease_expires_at)
+
+
 def _is_stale_running_job(job: Job, *, now: datetime, stale_after: timedelta) -> bool:
     """Return whether a running job is old enough to treat as orphaned."""
     lease_expires_at = job.attempt_lease_expires_at
@@ -144,6 +160,39 @@ def _is_stale_running_job(job: Job, *, now: datetime, stale_after: timedelta) ->
 async def _get_job_for_update(session: AsyncSession, job_id: UUID) -> Job | None:
     """Load and lock a persisted job row."""
     return await _get_job_for_update_with_metadata(session, job_id)
+
+
+async def _renew_job_attempt_lease_for_update(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    stale_after: timedelta,
+    session_maker_factory: Callable[[], Any] | None = None,
+    get_job_for_update_func: Callable[[AsyncSession, UUID], Awaitable[Job | None]] | None = None,
+) -> _JobAttemptLease | None:
+    """Persistently extend a running job-attempt lease under the job row lock."""
+    session_maker = (session_maker_factory or get_session_maker)()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    get_job_for_update_impl = get_job_for_update_func or _get_job_for_update
+    now = _utcnow()
+    async with session_maker() as session:
+        job = await get_job_for_update_impl(session, job_id)
+        if job is None:
+            raise LookupError(f"Job with identifier '{job_id}' not found")
+
+        lease = _renew_job_attempt_lease(
+            job,
+            now=now,
+            attempt_token=attempt_token,
+            stale_after=stale_after,
+        )
+        if lease is None:
+            return None
+
+        await session.commit()
+        return lease
 
 
 async def _get_job_lock_bootstrap(

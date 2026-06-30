@@ -33,6 +33,7 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 200
+    max_request_body_mb: int = 10
     libredwg_max_output_mb: int = 32
     # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
     # (e.g. 207k+ entities / 447 MB dwgread JSON): set ADAPTER_TIMEOUT_SECONDS=600
@@ -74,6 +75,13 @@ class Settings(BaseSettings):
     def validate_max_upload_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("max_upload_mb must be positive")
+        return value
+
+    @field_validator("max_request_body_mb")
+    @classmethod
+    def validate_max_request_body_mb(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("max_request_body_mb must be positive")
         return value
 
     @field_validator("libredwg_max_output_mb")

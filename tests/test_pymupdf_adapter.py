@@ -93,7 +93,7 @@ async def test_extract_in_current_process_prepends_isolation_warning(monkeypatch
     assert warnings[1].code == "x"  # original adapter warnings preserved after the caveat
 
 
-async def test_extract_with_process_falls_back_when_spawn_is_blocked(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+async def test_extract_with_process_fails_closed_when_spawn_is_blocked(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     def _blocked(_request: object) -> object:
         raise AssertionError("daemonic processes are not allowed to have children")
 
@@ -104,11 +104,12 @@ async def test_extract_with_process_falls_back_when_spawn_is_blocked(monkeypatch
         upload_format=UploadFormat.PDF,
         input_family=InputFamily.PDF_VECTOR,
     )
-    canonical, warnings = await pdf_adapter._extract_with_process(
-        source, AdapterExecutionOptions(timeout=None)
+    with pytest.raises(pdf_adapter.PyMuPDFIsolationUnavailableError) as exc_info:
+        await pdf_adapter._extract_with_process(source, AdapterExecutionOptions(timeout=None))
+    assert str(exc_info.value) == (
+        "PyMuPDF extraction requires subprocess isolation for untrusted PDF input."
     )
-    assert canonical == {"entities": [], "metadata": {}}
-    assert warnings[0].code == "pymupdf_subprocess_isolation_unavailable"
+    assert exc_info.value.failure_reason == "isolation_unavailable"
 
 
 def test_pen_signature_layer_name_is_deterministic_and_distinct() -> None:
@@ -411,23 +412,15 @@ async def test_extract_with_process_propagates_error_envelope() -> None:
         )
 
 
-async def test_extract_with_process_falls_back_when_runner_cannot_spawn(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    # A runner that can't spawn (daemonic parent) raises AssertionError -> in-process fallback.
+async def test_extract_with_process_fails_closed_when_runner_cannot_spawn() -> None:
+    # A runner that cannot spawn (daemonic parent) must not route untrusted input in-process.
     async def _runner(request: Any, options: Any) -> dict[str, Any]:
         raise AssertionError("daemonic processes are not allowed to have children")
 
-    sentinel: tuple[dict[str, JSONValue], list[AdapterWarning]] = ({"entities": ()}, [])
-
-    async def _fake_in_process(request: Any, *, reason: str) -> Any:
-        assert "daemonic" in reason
-        return sentinel
-
-    monkeypatch.setattr(pdf_adapter, "_extract_in_current_process", _fake_in_process)
-
-    result = await pdf_adapter._extract_with_process(
-        _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
-    )
-    assert result is sentinel
+    with pytest.raises(pdf_adapter.PyMuPDFIsolationUnavailableError):
+        await pdf_adapter._extract_with_process(
+            _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
+        )
 
 
 # ---------------------------------------------------------------------------
