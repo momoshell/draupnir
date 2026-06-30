@@ -1,19 +1,15 @@
 """Project-scoped file upload and retrieval endpoints."""
 
-import hashlib
-import json
 import uuid
 from collections.abc import Sequence
 from contextlib import suppress
 from datetime import datetime
-from pathlib import Path
-from typing import Annotated, Any, NoReturn, cast
+from typing import Annotated, Any, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile, status
 from fastapi import File as FilePart
 from fastapi.responses import Response
-from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,7 +29,19 @@ from app.api.pagination import (
     read_cursor_datetime,
     read_cursor_uuid,
 )
-from app.core.config import settings
+from app.api.v1.file_uploads import (
+    cleanup_uploaded_path as _cleanup_uploaded_path,
+)
+from app.api.v1.file_uploads import (
+    dump_extraction_profile_payload as _dump_extraction_profile_payload,
+)
+from app.api.v1.file_uploads import (
+    parse_upload_extraction_profile as _parse_upload_extraction_profile,
+)
+from app.api.v1.file_uploads import (
+    stage_upload_file,
+    validate_upload_metadata,
+)
 from app.core.errors import ErrorCode
 from app.core.exceptions import create_error_response, raise_not_found
 from app.db.session import get_db
@@ -56,22 +64,6 @@ from app.storage import Storage, get_storage
 from app.storage.keys import build_original_storage_key
 
 files_router = APIRouter()
-_UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
-_UPLOAD_SNIFF_BYTES = 4096
-# UPLOAD_FORMAT_SIGNATURES:
-# _sniff_format accepts these leading-byte signatures for upload detection:
-# - PDF: b"%PDF-"
-# - DWG: b"AC10"
-# - IFC: b"ISO-10303-21"
-# - Binary DXF: b"AutoCAD Binary DXF\r\n\x1a\x00"
-# - Text DXF: optional UTF-8 BOM, then optional ASCII whitespace, then the
-#   DXF group header for group code 0 and SECTION (b"0\nSECTION" or
-#   b"0\r\nSECTION").
-_BINARY_DXF_SENTINEL = b"AutoCAD Binary DXF\r\n\x1a\x00"
-_UTF8_BOM = b"\xef\xbb\xbf"
-_SUPPORTED_FORMATS_MESSAGE = "Unsupported file format. Supported formats: pdf, dwg, dxf, ifc."
-_MAX_ORIGINAL_FILENAME_LENGTH = 512
-_MAX_MEDIA_TYPE_LENGTH = 255
 
 
 def enqueue_ingest_job(job_id: UUID) -> None:
@@ -95,94 +87,6 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
     return read_cursor_datetime(cursor_data, "created_at"), read_cursor_uuid(cursor_data, "id")
 
 
-def _sniff_format(initial_bytes: bytes) -> str | None:
-    """Infer format using file header/early bytes."""
-    if initial_bytes.startswith(b"%PDF-"):
-        return "pdf"
-    if initial_bytes.startswith(b"AC10"):
-        return "dwg"
-    if initial_bytes.startswith(b"ISO-10303-21"):
-        return "ifc"
-    if initial_bytes.startswith(_BINARY_DXF_SENTINEL):
-        return "dxf"
-
-    dxf_probe = initial_bytes
-    if dxf_probe.startswith(_UTF8_BOM):
-        dxf_probe = dxf_probe[len(_UTF8_BOM) :]
-
-    dxf_probe = dxf_probe.lstrip(b" \t\n\r\f\v")
-    if dxf_probe.startswith((b"0\nSECTION", b"0\r\nSECTION")):
-        return "dxf"
-
-    return None
-
-
-def _unsupported_format_exception() -> HTTPException:
-    """Construct a consistent unsupported format error response."""
-    return HTTPException(
-        status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-        detail=create_error_response(
-            code=ErrorCode.INPUT_UNSUPPORTED_FORMAT,
-            message=_SUPPORTED_FORMATS_MESSAGE,
-            details=None,
-        ),
-    )
-
-
-def _upload_size_limit_message(max_upload_mb: int) -> str:
-    """Build an upload-size validation message that includes configured cap."""
-    return f"Uploaded file exceeds maximum allowed size of {max_upload_mb} MB."
-
-
-def _staging_path(file_id: UUID) -> Path:
-    """Build a temporary staging path for upload bytes before promotion."""
-    return _upload_root() / ".staging" / f"{file_id}.{uuid.uuid4().hex}.part"
-
-
-def _upload_root() -> Path:
-    """Return the canonical local storage root for uploads and artifacts."""
-    return Path(settings.storage_local_root).resolve()
-
-
-def _cleanup_uploaded_path(storage_path: Path) -> None:
-    """Best-effort cleanup of a partially or fully written upload path."""
-    upload_root = _upload_root()
-    with suppress(OSError):
-        storage_path.unlink(missing_ok=True)
-
-    current = storage_path.parent
-    while current != upload_root and upload_root in current.parents:
-        with suppress(OSError):
-            current.rmdir()
-        current = current.parent
-
-
-def _ensure_private_directory(path: Path, *, include_parents_until: Path | None = None) -> None:
-    """Ensure a directory exists with owner-only permissions."""
-    path.mkdir(parents=True, exist_ok=True)
-    targets = [path]
-    if include_parents_until is not None:
-        parent = path.parent
-        while include_parents_until in parent.parents or parent == include_parents_until:
-            targets.append(parent)
-            if parent == include_parents_until:
-                break
-            parent = parent.parent
-
-    try:
-        for target in targets:
-            target.chmod(0o700)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=create_error_response(
-                code=ErrorCode.STORAGE_FAILED,
-                message="Failed to persist uploaded file.",
-                details=None,
-            ),
-        ) from exc
-
-
 async def _cleanup_persisted_upload(storage: Storage, storage_key: str, storage_uri: str) -> None:
     """Best-effort cleanup for a persisted upload after downstream failure."""
     with suppress(Exception):
@@ -193,65 +97,6 @@ async def _rollback_upload_cleanup_transaction(db: AsyncSession) -> None:
     """Best-effort rollback before upload cleanup paths."""
     with suppress(BaseException):
         await db.rollback()
-
-
-async def _raise_input_invalid_for_upload_metadata(
-    file: UploadFile,
-    message: str,
-    *,
-    details: Any = None,
-) -> NoReturn:
-    """Close upload and raise standardized client validation error envelope."""
-    await file.close()
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=create_error_response(
-            code=ErrorCode.INPUT_INVALID,
-            message=message,
-            details=details,
-        ),
-    )
-
-
-async def _parse_upload_extraction_profile(
-    file: UploadFile,
-    extraction_profile: str | None,
-) -> ExtractionProfileCreate | None:
-    """Validate an optional multipart upload extraction profile payload."""
-    if extraction_profile is None:
-        return None
-
-    try:
-        profile_payload = json.loads(extraction_profile)
-    except json.JSONDecodeError:
-        await _raise_input_invalid_for_upload_metadata(
-            file,
-            "extraction_profile must be valid JSON.",
-        )
-
-    if not isinstance(profile_payload, dict):
-        await _raise_input_invalid_for_upload_metadata(
-            file,
-            "extraction_profile must be a JSON object.",
-        )
-
-    try:
-        return ExtractionProfileCreate.model_validate(profile_payload)
-    except ValidationError as exc:
-        await _raise_input_invalid_for_upload_metadata(
-            file,
-            "extraction_profile is invalid.",
-            details=exc.errors(),
-        )
-
-
-def _dump_extraction_profile_payload(
-    profile: ExtractionProfileCreate | None,
-) -> dict[str, Any] | None:
-    """Serialize an optional extraction profile for stable request fingerprinting."""
-    if profile is None:
-        return None
-    return profile.model_dump(mode="json")
 
 
 def _build_extraction_profile(
@@ -477,78 +322,23 @@ async def upload_project_file(
     original_filename = file.filename or "upload.bin"
     media_type = file.content_type or "application/octet-stream"
 
-    if len(original_filename) > _MAX_ORIGINAL_FILENAME_LENGTH:
-        await _raise_input_invalid_for_upload_metadata(
-            file,
-            "original_filename exceeds maximum length of 512 characters.",
-        )
-    if len(media_type) > _MAX_MEDIA_TYPE_LENGTH:
-        await _raise_input_invalid_for_upload_metadata(
-            file,
-            "media_type exceeds maximum length of 255 characters.",
-        )
+    await validate_upload_metadata(
+        file,
+        original_filename=original_filename,
+        media_type=media_type,
+    )
 
     upload_extraction_profile = await _parse_upload_extraction_profile(file, extraction_profile)
 
     file_id = uuid.uuid4()
-    staging_path = _staging_path(file_id)
-    detected_format: str | None = None
-    upload_root = _upload_root()
-    _ensure_private_directory(upload_root)
-    _ensure_private_directory(staging_path.parent)
-
-    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
-    total_bytes = 0
-    checksum_builder = hashlib.sha256()
+    staged_upload = await stage_upload_file(file, file_id=file_id)
+    staging_path = staged_upload.staging_path
+    detected_format = staged_upload.detected_format
+    total_bytes = staged_upload.size_bytes
+    checksum = staged_upload.checksum_sha256
     persisted_upload_uri: str | None = None
     try:
-        with staging_path.open("xb") as stream:
-            initial_bytes = await file.read(_UPLOAD_SNIFF_BYTES)
-            sniffed_format = _sniff_format(initial_bytes)
-            if sniffed_format is None:
-                _cleanup_uploaded_path(staging_path)
-                raise _unsupported_format_exception()
-            detected_format = sniffed_format
-
-            if initial_bytes:
-                if len(initial_bytes) > max_upload_bytes:
-                    _cleanup_uploaded_path(staging_path)
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=create_error_response(
-                            code=ErrorCode.INPUT_INVALID,
-                            message=_upload_size_limit_message(settings.max_upload_mb),
-                            details=None,
-                        ),
-                    )
-                stream.write(initial_bytes)
-                checksum_builder.update(initial_bytes)
-                total_bytes = len(initial_bytes)
-
-            while True:
-                chunk = await file.read(_UPLOAD_CHUNK_SIZE_BYTES)
-                if not chunk:
-                    break
-
-                next_total = total_bytes + len(chunk)
-                if next_total > max_upload_bytes:
-                    _cleanup_uploaded_path(staging_path)
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=create_error_response(
-                            code=ErrorCode.INPUT_INVALID,
-                            message=_upload_size_limit_message(settings.max_upload_mb),
-                            details=None,
-                        ),
-                    )
-
-                stream.write(chunk)
-                checksum_builder.update(chunk)
-                total_bytes = next_total
-
-        checksum = checksum_builder.hexdigest()
         storage_key = build_original_storage_key(file_id, checksum)
-        assert detected_format is not None
 
         async def _finalize_upload(persisted_storage_uri: str) -> FileModel:
             try:
