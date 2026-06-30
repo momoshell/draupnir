@@ -30,6 +30,12 @@ _UNITS_CONFIDENCE_VALUES = frozenset({"declared", "confirmed", "inferred", "unkn
 # pymupdf adapter's emitted `real_world_unit` values.
 _PDF_REAL_WORLD_UNITS = frozenset({"millimeter", "centimeter", "meter"})
 
+# Input-family value for PDF vector drawings (pymupdf adapter).
+_INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
+
+# pdf_scale.status value emitted by the pymupdf adapter when a confident ratio + unit were found.
+_PDF_SCALE_STATUS_DERIVED = "derived_from_text"
+
 
 def _units_confidence(units: Mapping[str, Any]) -> str:
     """Derive the unit-certainty label from the persisted units block (#557).
@@ -87,6 +93,59 @@ def _positive_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and value > 0
 
 
+def _resolve_pdf_scale(canonical: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the pdf_scale block from the canonical payload.
+
+    The pymupdf adapter stores it under ``canonical["metadata"]["pdf_scale"]``; older
+    test fixtures and future adapters may place it at the top-level
+    ``canonical["pdf_scale"]``.  Check the top level first (explicit wins) then fall
+    back to the metadata-nested location so both layouts are supported without
+    duplicating the read.
+    """
+    top_level = canonical.get("pdf_scale")
+    if isinstance(top_level, dict):
+        return _as_dict(top_level)
+    metadata = _as_dict(canonical.get("metadata"))
+    nested = metadata.get("pdf_scale")
+    if isinstance(nested, dict):
+        return _as_dict(nested)
+    return None
+
+
+def _enrich_units_from_pdf_scale(
+    units: dict[str, Any],
+    pdf_scale: dict[str, Any] | None,
+    input_family: str | None,
+) -> dict[str, Any]:
+    """For PDF-vector revisions with a confident derived scale, surface the real-world unit
+    and confidence onto the units block so that ``_units_confidence`` and API consumers
+    see a usable ``normalized`` value rather than ``"unknown"``.
+
+    Gate: only when all of the following hold (ADR-004 honesty):
+    - ``input_family`` is ``pdf_vector``
+    - ``pdf_scale`` is present
+    - ``pdf_scale["status"] == "derived_from_text"`` (the adapter found a ratio + unit)
+    - ``pdf_scale["real_world_unit"]`` is a recognised unit
+
+    When the gate fails the original ``units`` dict is returned unchanged, preserving
+    the existing behaviour for DWG/DXF, changeset-origin, and unconfirmed PDF revisions.
+    The returned dict is always a new shallow copy; the original is never mutated.
+    """
+    if input_family != _INPUT_FAMILY_PDF_VECTOR:
+        return units
+    if not isinstance(pdf_scale, Mapping):
+        return units
+    if pdf_scale.get("status") != _PDF_SCALE_STATUS_DERIVED:
+        return units
+    real_world_unit = pdf_scale.get("real_world_unit")
+    if not isinstance(real_world_unit, str) or real_world_unit not in _PDF_REAL_WORLD_UNITS:
+        return units
+    enriched = dict(units)
+    enriched["normalized"] = real_world_unit
+    enriched["confidence"] = "confirmed"
+    return enriched
+
+
 async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> RevisionScaleRead:
     """Resolve the drawing scale + units for an active revision.
 
@@ -126,9 +185,13 @@ async def resolve_revision_scale(revision_id: UUID, db: AsyncSession) -> Revisio
         )
 
     canonical = _as_dict(adapter_output.canonical_json)
-    pdf_scale_raw = canonical.get("pdf_scale")
-    pdf_scale = _as_dict(pdf_scale_raw) if isinstance(pdf_scale_raw, dict) else None
-    units = _as_dict(canonical.get("units")) or {"normalized": "unknown"}
+    pdf_scale = _resolve_pdf_scale(canonical)
+    units_raw = _as_dict(canonical.get("units")) or {"normalized": "unknown"}
+    # For PDF-vector revisions with a confident derived scale, enrich the units block so
+    # consumers see units.normalized = real_world_unit and confidence = "confirmed" rather
+    # than the generic {"normalized": "unknown"} the pymupdf adapter always emits.
+    # DWG/DXF units are never touched — the enrichment gate checks input_family first.
+    units = _enrich_units_from_pdf_scale(units_raw, pdf_scale, adapter_output.input_family)
     return RevisionScaleRead(
         units=units,
         units_confidence=_units_confidence(units),  # type: ignore[arg-type]
