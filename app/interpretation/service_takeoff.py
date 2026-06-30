@@ -126,7 +126,16 @@ class ServiceTakeoffLine:
     # med-gas chase). Under the bundle model each service in the bundle gets the FULL corridor
     # length, so this line's per-service length is "present in the bundle", NOT an individually
     # resolved split (#655). Group/discipline totals and per-room metres are unaffected.
+    # When bundle_service_sets evidence is used (PR-2 gate), bundle=True means "confirmed
+    # bundle — multiplied on evidence from tag-stack sets"; bundle=False means individually
+    # resolved per-segment length.  On the legacy path (bundle_service_sets=None) semantics
+    # are unchanged (bundle=True iff the run had >1 distinct services after collapse).
     bundle: bool
+    # True when a multi-service run (len(collapsed_services) > 1) did NOT overlap any
+    # confidently-matched bundle_service_sets by ≥2 services — so we used per-segment
+    # apportionment but cannot confirm the run is NOT a bundle. Architect must review.
+    # Always False on the legacy path (bundle_service_sets=None) and for single-service runs.
+    bundle_evidence_absent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,6 +549,7 @@ def compute_service_takeoff(
     colour_differentiated: bool = True,
     segment_labels: Sequence[SegmentLabel] = (),
     segment_label_max_m: float = 5.0,
+    bundle_service_sets: tuple[frozenset[str], ...] | None = None,
 ) -> ServiceTakeoffResult:
     """Compose run identities into per-(service, size, room) length totals.
 
@@ -600,6 +610,32 @@ def compute_service_takeoff(
     segment_label_max_m:
         Maximum metres from a segment midpoint to a tag label for the label to be
         eligible.  Default 5.0 (matches ``_SEGMENT_LABEL_MAX_M`` in the route).
+    bundle_service_sets:
+        Per-run bundle gate evidence from ``TagStackServiceResult.bundle_service_sets``
+        (PR-1, issue #813).  When ``None`` (default), the legacy ``colour_differentiated``
+        path is used byte-unchanged — existing callers are unaffected.
+
+        When provided (a tuple of frozensets of service abbreviations from confidently-
+        matched tag stacks), the NEW per-run gate is activated:
+
+        - **Per-segment apportionment is the default** for every run: the existing
+          ``_achromatic_apportionment`` machinery is applied unconditionally, independent
+          of colour chroma.
+        - A run is **bundle-multiplied** iff ``len(collapsed_services) > 1`` AND
+          ``any(len(run_services & s) >= 2 for s in bundle_service_sets)`` — i.e. its
+          collapsed service set overlaps a confirmed tag-stack set by ≥2 services.
+          The full corridor length is attributed to each service (unchanged bundle math).
+        - Otherwise the run uses per-segment apportionment and ``bundle=False``.
+        - Multi-service runs that do NOT meet the bundle gate emit
+          ``bundle_evidence_absent=True`` on each per-segment line to flag that
+          architect review is needed (run may or may not be a true bundle).
+
+        **Conservation invariant:**
+        On the per-segment path (new gate, non-bundle runs) the following holds per run:
+        ``Σ(per-service lengths) + unknown == centerline total`` (±float eps).
+        Confirmed bundles intentionally exceed geometry by N x corridor — each of N
+        services receives the full length.  Do NOT attempt to "fix" this: it is the
+        correct physical model for parallel-piped corridors.
     """
     if not identities and not rise_symbols and not drop_symbols:
         return ServiceTakeoffResult(
@@ -633,6 +669,8 @@ def compute_service_takeoff(
     acc_has_conflict: dict[_BucketKey, bool] = {}
     # True if any contributing run carried multiple services (bundle; #655)
     acc_is_bundle: dict[_BucketKey, bool] = {}
+    # True if any contributing run was multi-service but lacked bundle gate evidence (#813 PR-2)
+    acc_bundle_evidence_absent: dict[_BucketKey, bool] = {}
     acc_room_name: dict[_BucketKey, str | None] = {}
     acc_room_number: dict[_BucketKey, str | None] = {}
     acc_discipline: dict[_BucketKey, str | None] = {}
@@ -651,7 +689,173 @@ def compute_service_takeoff(
         matched_run = runs_by_key.get(run_key)
         has_conflict = bool(matched_run and matched_run.competing_disciplines)
 
-        if not colour_differentiated:
+        if bundle_service_sets is not None:
+            # --- New per-run bundle gate (#813 PR-2): OPT-IN path ---
+            # Per-segment apportionment is the default; a run is bundle-multiplied only
+            # when its collapsed service set overlaps a confident tag-stack set by ≥2.
+            services_to_emit_new: tuple[ServiceSize, ...] = (
+                _collapse_services_per_service(identity.services)
+                if identity.services
+                else identity.services
+            )
+            collapsed_svc_names: frozenset[str] = frozenset(
+                ss.service for ss in services_to_emit_new
+            )
+
+            is_confirmed_bundle = len(collapsed_svc_names) > 1 and any(
+                len(collapsed_svc_names & bss) >= 2 for bss in bundle_service_sets
+            )
+            # Multi-service run that does NOT overlap any evidence set by ≥2.
+            is_multi_no_evidence = len(collapsed_svc_names) > 1 and not is_confirmed_bundle
+
+            if is_confirmed_bundle:
+                # Bundle model: full corridor length to each service.
+                polylines_new = (
+                    measured_geometry_by_group.get(run_key)
+                    if measured_geometry_by_group is not None
+                    else None
+                )
+                partitions_new: list[tuple[Room | None, float]] = []
+                if polylines_new:
+                    partitions_new = partition_polylines_by_room(
+                        polylines_new, rooms, label_radius=label_radius
+                    )
+                if not partitions_new:
+                    partitions_new = _anchor_partition(
+                        identity,
+                        rooms,
+                        geometry_by_entity_id,
+                        measured_length_by_group,
+                        run_key,
+                        label_radius=label_radius,
+                    )
+
+                if not identity.services:
+                    unknown_service_run_count += 1
+                if any(room is None for room, _ in partitions_new):
+                    unassigned_run_count += 1
+
+                for room, drawn in partitions_new:
+                    if room is None:
+                        room_id_new = ROOM_UNASSIGNED_ID
+                        room_name_new: str | None = None
+                        room_number_new: str | None = None
+                    else:
+                        room_id_new = room.id
+                        room_name_new = room.name
+                        room_number_new = room.number
+
+                    if not identity.services:
+                        bkey: _BucketKey = (SERVICE_UNKNOWN, None, None, room_id_new)
+                        _accumulate_with_evidence(
+                            key=bkey,
+                            drawn=drawn,
+                            identity=identity,
+                            has_conflict=has_conflict,
+                            is_bundle=True,
+                            bundle_evidence_absent=False,
+                            room_name=room_name_new,
+                            room_number=room_number_new,
+                            acc_drawing_length=acc_drawing_length,
+                            acc_run_count=acc_run_count,
+                            acc_entity_ids=acc_entity_ids,
+                            acc_identity_status=acc_identity_status,
+                            acc_has_conflict=acc_has_conflict,
+                            acc_is_bundle=acc_is_bundle,
+                            acc_bundle_evidence_absent=acc_bundle_evidence_absent,
+                            acc_room_name=acc_room_name,
+                            acc_room_number=acc_room_number,
+                            acc_discipline=acc_discipline,
+                        )
+                    else:
+                        for ss in services_to_emit_new:
+                            bkey = (ss.service, ss.size.raw, ss.size.kind, room_id_new)
+                            _accumulate_with_evidence(
+                                key=bkey,
+                                drawn=drawn,
+                                identity=identity,
+                                has_conflict=has_conflict,
+                                is_bundle=True,
+                                bundle_evidence_absent=False,
+                                room_name=room_name_new,
+                                room_number=room_number_new,
+                                acc_drawing_length=acc_drawing_length,
+                                acc_run_count=acc_run_count,
+                                acc_entity_ids=acc_entity_ids,
+                                acc_identity_status=acc_identity_status,
+                                acc_has_conflict=acc_has_conflict,
+                                acc_is_bundle=acc_is_bundle,
+                                acc_bundle_evidence_absent=acc_bundle_evidence_absent,
+                                acc_room_name=acc_room_name,
+                                acc_room_number=acc_room_number,
+                                acc_discipline=acc_discipline,
+                            )
+            else:
+                # Per-segment apportionment (single-service or multi-service without evidence).
+                seg_attributions_new = _achromatic_apportionment(
+                    identity=identity,
+                    run_key=run_key,
+                    rooms=rooms,
+                    geometry_by_entity_id=geometry_by_entity_id,
+                    measured_geometry_by_group=measured_geometry_by_group,
+                    measured_length_by_group=measured_length_by_group,
+                    segment_labels=segment_labels,
+                    segment_label_max_m=segment_label_max_m,
+                    label_radius=label_radius,
+                )
+
+                any_unknown_svc_new = any(
+                    svc == SERVICE_UNKNOWN for svc, _, _, _, _ in seg_attributions_new
+                )
+                any_unassigned_new = any(room is None for _, _, _, room, _ in seg_attributions_new)
+                if any_unknown_svc_new and not identity.services:
+                    unknown_service_run_count += 1
+                if any_unassigned_new:
+                    unassigned_run_count += 1
+
+                seen_keys_new: set[_BucketKey] = set()
+                for svc, sz_raw, sz_kind, room, seg_len in seg_attributions_new:
+                    room_id_seg = room.id if room is not None else ROOM_UNASSIGNED_ID
+                    room_name_seg_new: str | None = room.name if room is not None else None
+                    room_number_seg_new: str | None = room.number if room is not None else None
+
+                    skey: _BucketKey = (svc, sz_raw, sz_kind, room_id_seg)
+                    is_first = skey not in seen_keys_new
+                    seen_keys_new.add(skey)
+
+                    if skey not in acc_drawing_length:
+                        acc_drawing_length[skey] = 0.0
+                        acc_run_count[skey] = 0
+                        acc_entity_ids[skey] = set()
+                        acc_identity_status[skey] = identity.status
+                        acc_has_conflict[skey] = False
+                        acc_is_bundle[skey] = False
+                        acc_bundle_evidence_absent[skey] = False
+                        acc_room_name[skey] = room_name_seg_new
+                        acc_room_number[skey] = room_number_seg_new
+                        acc_discipline[skey] = identity.discipline
+
+                    acc_drawing_length[skey] += seg_len
+                    if is_first:
+                        acc_run_count[skey] += 1
+                    acc_entity_ids[skey].update(identity.entity_ids)
+                    acc_identity_status[skey] = _worst_status(
+                        acc_identity_status[skey], identity.status
+                    )
+                    acc_has_conflict[skey] = acc_has_conflict[skey] or has_conflict
+                    # bundle=False (per-segment path); bundle_evidence_absent set iff multi-service
+                    # run without overlapping evidence.
+                    if is_multi_no_evidence:
+                        acc_bundle_evidence_absent[skey] = True
+                    if identity.discipline is not None:
+                        current_new = acc_discipline[skey]
+                        acc_discipline[skey] = (
+                            identity.discipline
+                            if current_new is None
+                            else min(current_new, identity.discipline)
+                        )
+
+        elif not colour_differentiated:
             # --- Achromatic mode (D3c Part B): per-segment nearest-tag apportionment ---
             # Each segment is attributed to its nearest SegmentLabel within
             # segment_label_max_m; orphan segments land in SERVICE_UNKNOWN.
@@ -896,6 +1100,7 @@ def compute_service_takeoff(
                 riser_count=acc_riser_count.get(key, 0),
                 drop_count=acc_drop_count.get(key, 0),
                 bundle=acc_is_bundle.get(key, False),
+                bundle_evidence_absent=acc_bundle_evidence_absent.get(key, False),
             )
         )
 
@@ -953,6 +1158,58 @@ def _accumulate(
     # (alphabetical).  This preserves permutation-invariance when runs with differing
     # disciplines collapse into the same bucket (e.g. SERVICE_UNKNOWN).  When all
     # contributors carry None, the result stays None (discipline genuinely unknown).
+    if identity.discipline is not None:
+        current = acc_discipline[key]
+        acc_discipline[key] = (
+            identity.discipline if current is None else min(current, identity.discipline)
+        )
+
+
+def _accumulate_with_evidence(
+    *,
+    key: _BucketKey,
+    drawn: float,
+    identity: RunServiceIdentity,
+    has_conflict: bool,
+    is_bundle: bool,
+    bundle_evidence_absent: bool,
+    room_name: str | None,
+    room_number: str | None,
+    acc_drawing_length: dict[_BucketKey, float],
+    acc_run_count: dict[_BucketKey, int],
+    acc_entity_ids: dict[_BucketKey, set[str]],
+    acc_identity_status: dict[_BucketKey, str],
+    acc_has_conflict: dict[_BucketKey, bool],
+    acc_is_bundle: dict[_BucketKey, bool],
+    acc_bundle_evidence_absent: dict[_BucketKey, bool],
+    acc_room_name: dict[_BucketKey, str | None],
+    acc_room_number: dict[_BucketKey, str | None],
+    acc_discipline: dict[_BucketKey, str | None],
+) -> None:
+    """Like ``_accumulate`` but also tracks ``bundle_evidence_absent`` (#813 PR-2 gate).
+
+    Used exclusively on the new ``bundle_service_sets`` path so the legacy ``_accumulate``
+    signature stays unchanged (back-compat).
+    """
+    if key not in acc_drawing_length:
+        acc_drawing_length[key] = 0.0
+        acc_run_count[key] = 0
+        acc_entity_ids[key] = set()
+        acc_identity_status[key] = identity.status
+        acc_has_conflict[key] = False
+        acc_is_bundle[key] = False
+        acc_bundle_evidence_absent[key] = False
+        acc_room_name[key] = room_name
+        acc_room_number[key] = room_number
+        acc_discipline[key] = identity.discipline
+
+    acc_drawing_length[key] += drawn
+    acc_run_count[key] += 1
+    acc_is_bundle[key] = acc_is_bundle[key] or is_bundle
+    acc_bundle_evidence_absent[key] = acc_bundle_evidence_absent[key] or bundle_evidence_absent
+    acc_entity_ids[key].update(identity.entity_ids)
+    acc_identity_status[key] = _worst_status(acc_identity_status[key], identity.status)
+    acc_has_conflict[key] = acc_has_conflict[key] or has_conflict
     if identity.discipline is not None:
         current = acc_discipline[key]
         acc_discipline[key] = (
