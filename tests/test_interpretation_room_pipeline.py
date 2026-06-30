@@ -343,6 +343,111 @@ def test_same_number_across_walls_is_flagged_not_merged() -> None:
     assert all(room.needs_review for room in numbered)  # both flagged for review
 
 
+# --- #792: PDF label-anchored room gating ---
+
+
+def _pdf_closed_polyline(entity_id: str, vertices: list[tuple[float, float]]) -> _FakeEntity:
+    """Closed polyline on the PDF default layer (no room-keyword layer)."""
+    return _FakeEntity(
+        entity_id,
+        "default",
+        {
+            "kind": "polyline",
+            "closed": True,
+            "vertices": [{"x": x, "y": y, "z": 0.0} for x, y in vertices],
+        },
+    )
+
+
+# A real-room-sized polygon (10x10 = 100 m2) and a tiny symbol loop (0.01 m2).
+_PDF_ROOM_VERTS = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+_PDF_SYM_VERTS = [(1.0, 1.0), (1.1, 1.0), (1.1, 1.1), (1.0, 1.1)]
+
+
+def test_pdf_path_rooms_anchored_by_numbered_labels() -> None:
+    # PDF scenario: many closed polylines, only the room polygon contains a numbered label.
+    # Expect only that polygon to become a room; symbol loops are excluded.
+    room_poly = _pdf_closed_polyline("pdf-room-1", _PDF_ROOM_VERTS)
+    symbol_polys = [
+        _pdf_closed_polyline(
+            f"sym-{i}",
+            [
+                (30.0 + i * 5, 30.0),
+                (30.2 + i * 5, 30.0),
+                (30.2 + i * 5, 30.2),
+                (30.0 + i * 5, 30.2),
+            ],
+        )
+        for i in range(10)
+    ]
+    entities = [room_poly, *symbol_polys]
+    labels = [
+        RoomLabel("Plantroom", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.2.01", (5.0, 5.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    assert result.strategy == ROOM_STRATEGY_EXPLICIT
+    polygon_rooms = [r for r in result.rooms if r.polygon is not None]
+    assert len(polygon_rooms) == 1
+    assert polygon_rooms[0].id == "pdf-room-1"
+    # The room should be named from the label.
+    assert polygon_rooms[0].name == "Plantroom"
+    assert polygon_rooms[0].number == "0.2.01"
+
+
+def test_pdf_path_numbered_label_without_polygon_surfaces_once() -> None:
+    # Numbered label whose polygon does not exist (or wasn't anchored): surfaces as
+    # one label-only room via _enrich_with_labels, not duplicated.
+    labels = [
+        RoomLabel("Server Room", (20.0, 20.4), layer="A-IDEN"),
+        RoomLabel("0.2.09", (20.0, 20.0), layer="A-IDEN"),
+        RoomLabel("Server Room", (25.0, 20.4), layer="A-IDEN"),  # fragmented second label
+        RoomLabel("0.2.09", (25.0, 20.0), layer="A-IDEN"),  # same number again
+    ]
+    # No polygon entities → explicit path returns no polygon rooms; label-only rooms
+    # are deduped by number to exactly ONE room.
+    result = interpret_rooms([], devices=[], labels=labels)
+    numbered = [r for r in result.rooms if r.number == "0.2.09"]
+    assert len(numbered) == 1
+    assert numbered[0].polygon is None
+    assert numbered[0].name == "Server Room"
+
+
+def test_pdf_path_name_fragment_without_number_does_not_create_room() -> None:
+    # A name-only label fragment (no room number) must NOT spawn a room (#792).
+    entities = [_pdf_closed_polyline("pdf-room-1", _PDF_ROOM_VERTS)]
+    labels = [
+        RoomLabel("0.2.01", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("Plantroom", (5.0, 5.4), layer="A-IDEN"),  # name; consumed by number
+        RoomLabel("Boiler", (80.0, 80.0), layer="A-IDEN"),  # name-only, far away
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    # "Boiler" has no room number and is outside all polygons → must NOT become a room.
+    name_only = [r for r in result.rooms if r.number is None and r.name == "Boiler"]
+    assert name_only == []
+
+
+def test_dwg_boundary_layer_path_count_and_rooms_unchanged() -> None:
+    # DWG scenario: explicit boundary layer present → strategy and rooms byte-identical
+    # to pre-#792 behaviour (the boundary-layer branch in interpret_explicit_rooms is
+    # untouched).
+    entities = [_closed_polyline(SQUARE, layer="A-ROOM")]
+    result_before_labels = interpret_rooms(entities, devices=[], labels=[])
+    assert result_before_labels.strategy == ROOM_STRATEGY_EXPLICIT
+    assert len(result_before_labels.rooms) == 1
+    assert result_before_labels.rooms[0].polygon is not None
+    # With labels inside the polygon — still exactly one room, stamped with name/number.
+    labels = [
+        RoomLabel("Cooling Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("1.2.03", (5.0, 5.0), layer="A-IDEN"),
+    ]
+    result_with_labels = interpret_rooms(entities, devices=[], labels=labels)
+    assert result_with_labels.strategy == ROOM_STRATEGY_EXPLICIT
+    assert len(result_with_labels.rooms) == 1
+    assert result_with_labels.rooms[0].name == "Cooling Plant"
+    assert result_with_labels.rooms[0].number == "1.2.03"
+
+
 def test_dedupe_label_rooms_by_number_unit() -> None:
     from app.interpretation.rooms import (
         dedupe_label_rooms_by_number,

@@ -155,13 +155,17 @@ def _enrich_with_labels(
     if flagged:
         rooms = [replace(r, needs_review=True) if r.number in flagged else r for r in rooms]
 
-    # (c) Label-only identities: drop those whose number a polygon room already carries, then
-    # merge same-number placements into one room with all anchors (#581 — U-shape).
+    # (c) Label-only identities: only NUMBERED identities without a containing polygon become
+    # label-only rooms (#792 — name-only fragments must not spawn rooms).  Drop those whose
+    # number a polygon room already carries, then merge same-number placements into one room
+    # with all anchors (#581 — U-shape).
     numbered_polygons = {r.number for r in rooms if r.polygon is not None and r.number is not None}
     label_only = [
         identity
         for identity, target in pairs
-        if target is None and (identity.number is None or identity.number not in numbered_polygons)
+        if target is None
+        and identity.number is not None
+        and identity.number not in numbered_polygons
     ]
     merged = dedupe_label_rooms_by_number(label_only)
     if not merged:
@@ -206,7 +210,9 @@ def _interpret_geometric(
             )
 
     if strategy in (ROOM_STRATEGY_AUTO, ROOM_STRATEGY_EXPLICIT):
-        explicit = interpret_explicit_rooms(entities, devices=devices, labels=labels)
+        explicit = interpret_explicit_rooms(
+            entities, devices=devices, labels=labels, min_area=min_area
+        )
         if explicit.rooms or strategy == ROOM_STRATEGY_EXPLICIT:
             return RoomInterpretation(
                 rooms=explicit.rooms,
