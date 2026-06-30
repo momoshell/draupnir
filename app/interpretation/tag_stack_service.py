@@ -155,12 +155,21 @@ class TagStackServiceResult:
     ``unmatched_colour_keys``: colour keys left opaque (abstained), sorted.
     ``matched_stack_count``: number of stacks successfully matched.
     ``ambiguous``: True when at least one abstain case was triggered.
+    ``bundle_service_sets``: one frozenset[str] per confidently-matched stack
+        whose fingerprint has ≥2 distinct services (genuine multi-service
+        shared-corridor bundle). Each frozenset is the distinct service names
+        of that stack (e.g. frozenset({"MA", "VAC", "AGSS"})). Duplicate
+        service-sets across stacks are deduplicated. Empty when no multi-service
+        stacks were confidently matched; single-service or abstained stacks
+        contribute nothing. Populated for informational use; no length logic
+        reads this yet.
     """
 
     assignments: tuple[ColourServiceAssignment, ...]
     unmatched_colour_keys: tuple[str, ...]
     matched_stack_count: int
     ambiguous: bool
+    bundle_service_sets: tuple[frozenset[str], ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +789,19 @@ def assign_services_by_tag_stack(
     colour_kind: dict[str, str | None] = {}
     matched_count = len(stack_results)
 
+    # Collect per-stack service sets for stacks with >=2 distinct services
+    # (genuine multi-service shared-corridor bundles). Keyed on services, NOT
+    # colour_keys: fill-colour bands and line colour_keys are independent and
+    # needn't match, so gating on colour_keys would be a category error.
+    # Since _is_degenerate_fingerprint already filters single-service stacks
+    # before they reach stack_results, we still check explicitly for clarity.
+    seen_service_sets: list[frozenset[str]] = []
+
     for ps, _mapping, colour_rle in stack_results:
         fp = ps.fingerprint
+        distinct_services = frozenset(svc for svc, _ in fp)
+        is_multi_service = len(distinct_services) >= 2
+
         entry_idx = 0
         for run_idx, (_svc, run_count) in enumerate(fp):
             colour_key = colour_rle[run_idx][0]  # position-aligned: run i -> colour i
@@ -792,6 +812,9 @@ def assign_services_by_tag_stack(
                 kinds = {size.kind for _, size in run_entries}
                 colour_sizes[colour_key] = sizes
                 colour_kind[colour_key] = next(iter(kinds)) if len(kinds) == 1 else None
+
+        if is_multi_service and distinct_services not in seen_service_sets:
+            seen_service_sets.append(distinct_services)
 
     assignments: list[ColourServiceAssignment] = []
     for ck in sorted(merged_mapping):
@@ -814,4 +837,5 @@ def assign_services_by_tag_stack(
         unmatched_colour_keys=unmatched,
         matched_stack_count=matched_count,
         ambiguous=abstain_triggered,
+        bundle_service_sets=tuple(seen_service_sets),
     )
