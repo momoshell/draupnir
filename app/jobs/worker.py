@@ -9,7 +9,7 @@ import threading
 import uuid
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
@@ -42,6 +42,7 @@ from app.jobs import enqueueing as job_enqueueing
 from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
 from app.jobs import lifecycle as job_lifecycle
+from app.jobs import registered_processor as job_registered_processor
 from app.jobs import runner as job_runner
 from app.jobs.conflict_diagnostics import (
     _build_changeset_apply_conflict_details,
@@ -271,45 +272,8 @@ _QueuedJobEvent = job_execution_monitoring.QueuedJobEvent
 
 
 _ChangeSetApplyJobError = job_changeset_apply_execution.ChangeSetApplyJobError
-
-
-type _RegisteredJobInputError = (
-    _QuantityTakeoffJobError
-    | _EstimateJobInputError
-    | _ExportJobInputError
-    | _ChangeSetApplyJobError
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _RegisteredJobAttemptResult:
-    """Deferred finalization kwargs returned by a registered job execution step."""
-
-    finalize_kwargs: dict[str, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class _RegisteredJobProcessSpec:
-    """Shared shell configuration for registered persisted worker jobs."""
-
-    job_type_name: job_runner.JobTypeName
-    input_error_type: type[Exception] | None
-    input_failure_log_event: str | None
-    stale_attempt_log_event: str
-    revision_conflict_log_event: str
-    cancelled_during_execution_log_event: str
-    cancelled_during_finalization_log_event: str
-    process_failed_log_event: str
-    finalization_failed_log_event: str
-    succeeded_log_event: str
-    process_error_message: str
-    finalize_error_message: str
-    execution_result_arg_name: str | None = None
-    execution_error_type: type[Exception] | None = None
-    execution_error_handler_name: str | None = None
-    inactive_source_log_event: str | None = None
-    finalization_exception_log_fields_name: str | None = None
-    reraise_revision_conflict: bool = False
+_RegisteredJobAttemptResult = job_registered_processor.RegisteredJobAttemptResult
+_RegisteredJobProcessSpec = job_registered_processor.RegisteredJobProcessSpec
 
 
 _INGEST_PROCESS_SPEC = _RegisteredJobProcessSpec(
@@ -1564,208 +1528,44 @@ def _build_ingest_finalization_error_log_fields(exc: Exception) -> dict[str, str
 
 def _get_registered_job_handler(job_type_name: job_runner.JobTypeName) -> job_runner.JobHandler:
     """Return registered worker metadata for one persisted job type."""
-    handler = job_runner.get_job_handler(job_type_name)
-    if handler is None:
-        raise LookupError(f"No worker handler registered for job type '{job_type_name}'")
-    return handler
+    return job_registered_processor.get_registered_job_handler(job_type_name)
 
 
 def _resolve_registered_job_callable(name: str) -> Any:
     """Late-bind a worker callable by name for monkeypatch-friendly wrappers."""
-    resolved = globals().get(name)
-    if resolved is None:
-        raise LookupError(f"Worker callable '{name}' is not defined")
-    return resolved
+    return job_registered_processor.resolve_registered_job_callable(name, namespace=globals())
 
 
 async def _process_registered_job(
     job_id: UUID, *, spec: _RegisteredJobProcessSpec, deps: WorkerDeps
 ) -> None:
     """Run one registered persisted worker job through the shared execution shell."""
-    _ensure_worker_database_configured()
-
-    handler = _get_registered_job_handler(spec.job_type_name)
-    execute_name = handler.execute_name
-    finalize_name = handler.finalize_name
-    if execute_name is None:
-        raise LookupError(f"Worker handler '{spec.job_type_name}' is missing execute_name")
-    if finalize_name is None:
-        raise LookupError(f"Worker handler '{spec.job_type_name}' is missing finalize_name")
-
-    lease = await _begin_or_resume_registered_job(job_id, process_name=handler.process_name)
-    if lease is None:
-        return
-
-    if await _cancel_registered_job_if_requested(
+    await job_registered_processor.process_registered_job(
         job_id,
-        attempt_token=lease.token,
-        log_event=spec.cancelled_during_execution_log_event,
-    ):
-        return
-
-    execute_job = cast(Any, _resolve_registered_job_callable(execute_name))
-    finalize_job = cast(Any, _resolve_registered_job_callable(finalize_name))
-
-    try:
-        execution_result = await _with_job_attempt_lease_renewal(
-            execute_job(job_id, attempt_token=lease.token, deps=deps),
-            job_id=job_id,
-            attempt_token=lease.token,
-        )
-    except _InactiveSourceError:
-        if spec.inactive_source_log_event is None:
-            raise
-        logger.info(spec.inactive_source_log_event, job_id=str(job_id))
-        return
-    except _StaleJobAttemptError:
-        logger.info(spec.stale_attempt_log_event, job_id=str(job_id))
-        return
-    except _RevisionConflictError as exc:
-        if spec.job_type_name == "changeset_apply":
-            await _mark_changeset_apply_job_failed_for_revision_conflict(
-                job_id,
-                attempt_token=lease.token,
-                log_event=spec.revision_conflict_log_event,
-                exc=exc,
-            )
-        else:
-            await _mark_job_failed_for_revision_conflict(
-                job_id,
-                attempt_token=lease.token,
-                log_event=spec.revision_conflict_log_event,
-                exc=exc,
-            )
-        if spec.reraise_revision_conflict:
-            raise
-        return
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event=spec.cancelled_during_execution_log_event,
-        )
-        raise
-    except Exception as exc:
-        if spec.input_error_type is not None and isinstance(exc, spec.input_error_type):
-            input_error = cast(_RegisteredJobInputError, exc)
-            failure_details = input_error.details
-            if spec.input_failure_log_event is None:
-                raise AssertionError(
-                    f"Registered job '{spec.job_type_name}' is missing input_failure_log_event"
-                ) from exc
-            if spec.job_type_name == "changeset_apply":
-                assert isinstance(input_error, _ChangeSetApplyJobError)
-                await _mark_changeset_apply_job_failed_for_input_error(
-                    job_id,
-                    attempt_token=lease.token,
-                    log_event=spec.input_failure_log_event,
-                    exc=input_error,
-                )
-            else:
-                await _mark_job_failed(
-                    job_id,
-                    error_message=input_error.message,
-                    error_code=input_error.error_code,
-                    attempt_token=lease.token,
-                    error_details=failure_details,
-                )
-                logger.warning(
-                    spec.input_failure_log_event,
-                    job_id=str(job_id),
-                    error_code=input_error.error_code.value,
-                    **(failure_details or {}),
-                )
-            return
-
-        if spec.execution_error_type is not None and isinstance(exc, spec.execution_error_type):
-            if spec.execution_error_handler_name is None:
-                raise AssertionError(
-                    f"Registered job '{spec.job_type_name}' is missing execution_error_handler_name"
-                ) from exc
-            handle_execution_error = cast(
-                Any,
-                _resolve_registered_job_callable(spec.execution_error_handler_name),
-            )
-            await handle_execution_error(job_id, attempt_token=lease.token, exc=exc)
-            raise
-
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=spec.process_error_message,
-            log_event=spec.process_failed_log_event,
-        )
-        raise
-
-    if execution_result is None:
-        return
-
-    if isinstance(execution_result, _RegisteredJobAttemptResult):
-        finalize_kwargs = execution_result.finalize_kwargs
-    else:
-        if spec.execution_result_arg_name is None:
-            raise TypeError(
-                "Registered job "
-                f"'{spec.job_type_name}' returned a raw execution result without "
-                "execution_result_arg_name"
-            )
-        finalize_kwargs = {spec.execution_result_arg_name: execution_result}
-
-    try:
-        finalized = await _with_job_attempt_lease_renewal(
-            finalize_job(
-                job_id,
-                attempt_token=lease.token,
-                deps=deps,
-                **finalize_kwargs,
-            ),
-            job_id=job_id,
-            attempt_token=lease.token,
-        )
-    except asyncio.CancelledError:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=lease.token,
-            log_event=spec.cancelled_during_finalization_log_event,
-        )
-        raise
-    except _RevisionConflictError as exc:
-        if spec.job_type_name == "changeset_apply":
-            await _mark_changeset_apply_job_failed_for_revision_conflict(
-                job_id,
-                attempt_token=lease.token,
-                log_event=spec.revision_conflict_log_event,
-                exc=exc,
-            )
-        else:
-            await _mark_job_failed_for_revision_conflict(
-                job_id,
-                attempt_token=lease.token,
-                log_event=spec.revision_conflict_log_event,
-                exc=exc,
-            )
-        if spec.reraise_revision_conflict:
-            raise
-        return
-    except Exception as exc:
-        log_fields: dict[str, Any] | None = None
-        if spec.finalization_exception_log_fields_name is not None:
-            build_log_fields = cast(
-                Callable[[Exception], dict[str, Any]],
-                _resolve_registered_job_callable(spec.finalization_exception_log_fields_name),
-            )
-            log_fields = build_log_fields(exc)
-        await _mark_job_failed_with_internal_error_log(
-            job_id,
-            attempt_token=lease.token,
-            error_message=spec.finalize_error_message,
-            log_event=spec.finalization_failed_log_event,
-            log_fields=log_fields,
-        )
-        raise
-
-    if finalized:
-        logger.info(spec.succeeded_log_event, job_id=str(job_id))
+        spec=spec,
+        deps=deps,
+        ensure_worker_database_configured=_ensure_worker_database_configured,
+        get_registered_job_handler_func=_get_registered_job_handler,
+        begin_or_resume_registered_job=_begin_or_resume_registered_job,
+        cancel_registered_job_if_requested=_cancel_registered_job_if_requested,
+        resolve_registered_job_callable_func=_resolve_registered_job_callable,
+        with_job_attempt_lease_renewal=_with_job_attempt_lease_renewal,
+        mark_job_failed_for_revision_conflict=_mark_job_failed_for_revision_conflict,
+        mark_job_cancelled_with_log=_mark_job_cancelled_with_log,
+        mark_changeset_apply_job_failed_for_revision_conflict=(
+            _mark_changeset_apply_job_failed_for_revision_conflict
+        ),
+        mark_changeset_apply_job_failed_for_input_error=(
+            _mark_changeset_apply_job_failed_for_input_error
+        ),
+        mark_job_failed=_mark_job_failed,
+        mark_job_failed_with_internal_error_log=_mark_job_failed_with_internal_error_log,
+        inactive_source_error_type=_InactiveSourceError,
+        stale_job_attempt_error_type=_StaleJobAttemptError,
+        revision_conflict_error_type=_RevisionConflictError,
+        changeset_apply_job_error_type=_ChangeSetApplyJobError,
+        logger_instance=logger,
+    )
 
 
 async def _execute_quantity_takeoff_job_attempt(
