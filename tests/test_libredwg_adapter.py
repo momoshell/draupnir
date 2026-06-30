@@ -188,6 +188,128 @@ def test_configure_child_process_limits_includes_file_cpu_and_memory(
     ]
 
 
+def test_build_dwgread_execution_plan_uses_direct_command_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_sandbox_command", None)
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    source = _build_source()
+    output_path = Path("/tmp/libredwg-test/dwgread.json")
+    plan = adapter_module._build_dwgread_execution_plan(
+        binary_path="/opt/homebrew/bin/dwgread",
+        source=source,
+        output_path=output_path,
+    )
+
+    assert plan.sandboxed is False
+    assert plan.command == (
+        "/opt/homebrew/bin/dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        str(output_path),
+        str(source.file_path),
+    )
+    assert plan.display_command == (
+        "dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        "<tempdir>/dwgread.json",
+        "<source>",
+    )
+
+
+def test_build_dwgread_execution_plan_formats_sandbox_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "libredwg_sandbox_command",
+        "sandbox-run --ro {source} --out {output} -- {binary} -O JSON -o {output} {source}",
+    )
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    source = _build_source()
+    output_path = Path("/tmp/libredwg-test/dwgread.json")
+    plan = adapter_module._build_dwgread_execution_plan(
+        binary_path="/opt/homebrew/bin/dwgread",
+        source=source,
+        output_path=output_path,
+    )
+
+    assert plan.sandboxed is True
+    assert plan.command == (
+        "sandbox-run",
+        "--ro",
+        str(source.file_path),
+        "--out",
+        str(output_path),
+        "--",
+        "/opt/homebrew/bin/dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        str(output_path),
+        str(source.file_path),
+    )
+    assert plan.display_command == (
+        "sandbox-run",
+        "--ro",
+        "<source>",
+        "--out",
+        "<tempdir>/dwgread.json",
+        "--",
+        "dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        "<tempdir>/dwgread.json",
+        "<source>",
+    )
+
+
+def test_build_dwgread_execution_plan_requires_sandbox_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_sandbox_command", None)
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", True)
+
+    with pytest.raises(AdapterUnavailableError) as exc_info:
+        adapter_module._build_dwgread_execution_plan(
+            binary_path="/opt/homebrew/bin/dwgread",
+            source=_build_source(),
+            output_path=Path("/tmp/libredwg-test/dwgread.json"),
+        )
+
+    assert exc_info.value.availability_reason == AvailabilityReason.DISABLED_BY_CONFIG
+    assert exc_info.value.detail is not None
+    assert "sandbox command is required" in exc_info.value.detail
+
+
+def test_build_dwgread_execution_plan_rejects_incomplete_sandbox_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "libredwg_sandbox_command",
+        "sandbox-run -- {binary} -O JSON",
+    )
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    with pytest.raises(AdapterUnavailableError) as exc_info:
+        adapter_module._build_dwgread_execution_plan(
+            binary_path="/opt/homebrew/bin/dwgread",
+            source=_build_source(),
+            output_path=Path("/tmp/libredwg-test/dwgread.json"),
+        )
+
+    assert exc_info.value.availability_reason == AvailabilityReason.DISABLED_BY_CONFIG
+    assert exc_info.value.detail is not None
+    assert "{source}" in exc_info.value.detail
+
+
 _HATCH_SQUARE_POINTS = (
     {"x": 0.0, "y": 0.0, "z": 0.0},
     {"x": 4.0, "y": 0.0, "z": 0.0},
@@ -6093,6 +6215,8 @@ def test_libredwg_parse_build_memory_guard(tmp_path: Path) -> None:
 
         output_kind, output_key_count = adapter_module._summarize_output_payload(output_payload)
         run_result = adapter_module._DwgreadRunResult(
+            command=("dwgread", "-O", "JSON", "-o", "<tempdir>/dwgread.json", "<source>"),
+            sandboxed=False,
             stdout=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
             stderr=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
             output_size_bytes=fixture_path.stat().st_size,

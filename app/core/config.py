@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     max_upload_mb: int = 200
     max_request_body_mb: int = 10
     libredwg_max_output_mb: int = 32
+    # Optional wrapper around dwgread, e.g. a local sandbox launcher. The command
+    # must include {binary}, {output}, and {source} placeholders.
+    libredwg_sandbox_command: str | None = None
+    libredwg_require_sandbox: bool = False
     parser_subprocess_max_memory_mb: int = 1024
     parser_subprocess_cpu_seconds: int = 300
     # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
@@ -92,6 +96,14 @@ class Settings(BaseSettings):
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
         return value
+
+    @field_validator("libredwg_sandbox_command")
+    @classmethod
+    def validate_libredwg_sandbox_command(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("parser_subprocess_max_memory_mb")
     @classmethod

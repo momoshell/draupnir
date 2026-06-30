@@ -8,6 +8,7 @@ import functools
 import json
 import math
 import re
+import shlex
 import shutil
 import tempfile
 from collections import Counter
@@ -221,12 +222,21 @@ class _CapturedText:
 
 @dataclass(frozen=True, slots=True)
 class _DwgreadRunResult:
+    command: tuple[str, ...]
+    sandboxed: bool
     stdout: _CapturedText
     stderr: _CapturedText
     output_size_bytes: int
     output_kind: str
     output_key_count: int | None
     output_payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _DwgreadExecutionPlan:
+    command: tuple[str, ...]
+    display_command: tuple[str, ...]
+    sandboxed: bool
 
 
 class _OutputLimitExceededError(RuntimeError):
@@ -382,6 +392,8 @@ class LibreDWGAdapter(IngestionAdapter):
         details: dict[str, JSONValue] = {
             "binary": _BINARY_NAME,
             "distribution_review_required": True,
+            "sandbox_configured": _configured_sandbox_command() is not None,
+            "sandbox_required": settings.libredwg_require_sandbox,
         }
         if binary_path is not None:
             details["binary_name"] = Path(binary_path).name
@@ -414,7 +426,8 @@ class LibreDWGAdapter(IngestionAdapter):
         elapsed_ms = (perf_counter() - started_at) * 1000.0
 
         diagnostic_details: dict[str, JSONValue] = {
-            "command": (_BINARY_NAME, "-O", "JSON", "-o", "<tempdir>/dwgread.json", "<source>"),
+            "command": run_result.command,
+            "sandboxed": run_result.sandboxed,
             "stdout_bytes": run_result.stdout.byte_count,
             "stdout_truncated": run_result.stdout.truncated,
             "stdout_excerpt": run_result.stdout.text,
@@ -533,11 +546,14 @@ async def _run_dwgread(
         output_path = temp_path / "dwgread.json"
         stdout_path = temp_path / "dwgread.stdout.log"
         stderr_path = temp_path / "dwgread.stderr.log"
-
-        process = await _spawn_dwgread_process(
+        execution_plan = _build_dwgread_execution_plan(
             binary_path=binary_path,
             source=source,
             output_path=output_path,
+        )
+
+        process = await _spawn_dwgread_process(
+            execution_plan=execution_plan,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
@@ -604,6 +620,8 @@ async def _run_dwgread(
         output_kind, output_key_count = _summarize_output_payload(output_payload)
 
         return _DwgreadRunResult(
+            command=execution_plan.display_command,
+            sandboxed=execution_plan.sandboxed,
             stdout=stdout,
             stderr=stderr,
             output_size_bytes=output_size_bytes,
@@ -615,31 +633,145 @@ async def _run_dwgread(
 
 async def _spawn_dwgread_process(
     *,
-    binary_path: str,
-    source: AdapterSource,
-    output_path: Path,
+    execution_plan: _DwgreadExecutionPlan,
     stdout_path: Path,
     stderr_path: Path,
 ) -> asyncio.subprocess.Process:
     try:
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
             return await asyncio.create_subprocess_exec(
-                binary_path,
-                "-O",
-                "JSON",
-                "-o",
-                str(output_path),
-                str(source.file_path),
+                *execution_plan.command,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 preexec_fn=_configure_child_process_limits,
             )
     except FileNotFoundError as exc:
+        detail = (
+            "LibreDWG sandbox command could not be started."
+            if execution_plan.sandboxed
+            else "LibreDWG dwgread binary is not installed."
+        )
+        availability_reason = (
+            AvailabilityReason.PROBE_FAILED
+            if execution_plan.sandboxed
+            else AvailabilityReason.MISSING_BINARY
+        )
         raise AdapterUnavailableError(
-            AvailabilityReason.MISSING_BINARY,
-            detail="LibreDWG dwgread binary is not installed.",
+            availability_reason,
+            detail=detail,
         ) from exc
+
+
+def _build_dwgread_execution_plan(
+    *,
+    binary_path: str,
+    source: AdapterSource,
+    output_path: Path,
+) -> _DwgreadExecutionPlan:
+    sandbox_command = _configured_sandbox_command()
+    direct_command = (binary_path, "-O", "JSON", "-o", str(output_path), str(source.file_path))
+    if sandbox_command is None:
+        if settings.libredwg_require_sandbox:
+            raise AdapterUnavailableError(
+                AvailabilityReason.DISABLED_BY_CONFIG,
+                detail="LibreDWG sandbox command is required before parsing untrusted DWG input.",
+            )
+        return _DwgreadExecutionPlan(
+            command=direct_command,
+            display_command=_sanitize_execution_command(
+                direct_command,
+                binary_path=binary_path,
+                source_path=source.file_path,
+                output_path=output_path,
+            ),
+            sandboxed=False,
+        )
+
+    _validate_sandbox_command_template(sandbox_command)
+    command = _format_sandbox_command(
+        sandbox_command,
+        binary_path=binary_path,
+        source_path=source.file_path,
+        output_path=output_path,
+    )
+    return _DwgreadExecutionPlan(
+        command=command,
+        display_command=_sanitize_execution_command(
+            command,
+            binary_path=binary_path,
+            source_path=source.file_path,
+            output_path=output_path,
+        ),
+        sandboxed=True,
+    )
+
+
+def _configured_sandbox_command() -> str | None:
+    command = settings.libredwg_sandbox_command
+    if command is None:
+        return None
+    stripped = command.strip()
+    return stripped or None
+
+
+def _validate_sandbox_command_template(command: str) -> None:
+    missing_placeholders = tuple(
+        name for name in ("binary", "output", "source") if f"{{{name}}}" not in command
+    )
+    if missing_placeholders:
+        raise AdapterUnavailableError(
+            AvailabilityReason.DISABLED_BY_CONFIG,
+            detail=(
+                "LibreDWG sandbox command must include placeholders: "
+                "{binary}, {output}, and {source}."
+            ),
+        )
+
+
+def _format_sandbox_command(
+    command: str,
+    *,
+    binary_path: str,
+    source_path: Path,
+    output_path: Path,
+) -> tuple[str, ...]:
+    try:
+        command_parts = shlex.split(command)
+        if not command_parts:
+            raise ValueError("empty command")
+        return tuple(
+            part.format(
+                binary=binary_path,
+                output=str(output_path),
+                source=str(source_path),
+            )
+            for part in command_parts
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        raise AdapterUnavailableError(
+            AvailabilityReason.DISABLED_BY_CONFIG,
+            detail="LibreDWG sandbox command is invalid.",
+        ) from exc
+
+
+def _sanitize_execution_command(
+    command: tuple[str, ...],
+    *,
+    binary_path: str,
+    source_path: Path,
+    output_path: Path,
+) -> tuple[str, ...]:
+    source_text = str(source_path)
+    output_text = str(output_path)
+    sanitized: list[str] = []
+    for part in command:
+        sanitized.append(
+            part.replace(binary_path, _BINARY_NAME)
+            .replace(output_text, "<tempdir>/dwgread.json")
+            .replace(source_text, "<source>")
+        )
+    return tuple(sanitized)
 
 
 async def _wait_for_process(
