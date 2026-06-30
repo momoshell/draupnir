@@ -33,6 +33,7 @@ from app.interpretation.segment_label_takeoff import SegmentLabel
 from app.interpretation.service_takeoff import (
     ROOM_UNASSIGNED_ID,
     SERVICE_UNKNOWN,
+    ServiceTakeoffLine,
     ServiceTakeoffResult,
     _collapse_services_per_service,
     _dominant_service,
@@ -2107,3 +2108,299 @@ def test_achromatic_determinism_under_label_shuffle() -> None:
         assert result.lines == canonical.lines, (
             "Non-deterministic: shuffled labels produced different result"
         )
+
+
+# ---------------------------------------------------------------------------
+# #813 PR-2: per-run bundle-decision gate (bundle_service_sets)
+# ---------------------------------------------------------------------------
+
+
+def _polylines_for_key(
+    length: float,
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Return a single-segment polyline of the given length along x-axis."""
+    return (((0.0, 0.0), (length, 0.0)),)
+
+
+def test_bundle_gate_drainage_per_segment_conserved() -> None:
+    """Drainage shape: multi-service run NOT overlapping bundle_service_sets by >=2.
+
+    One corridor, 2 services (SVP + CDP).  bundle_service_sets = frozenset({"MA","VAC","AGSS"})
+    — no overlap with {SVP, CDP} by >=2.  The run must use per-segment apportionment,
+    NOT be multiplied.  Total == geometry (NOT 2x).  Lines have bundle=False and
+    bundle_evidence_absent=True.
+    """
+    run_length = 184.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    polylines = _polylines_for_key(run_length)
+
+    # Two labels: one per 92 du half-segment midpoint
+    labels = [
+        _seg_label(46.0, 0.0, "SVP"),  # near midpoint of first half
+        _seg_label(138.0, 0.0, "CDP"),  # near midpoint of second half
+    ]
+    services = (_pipe_size("SVP", 100), _pipe_size("CDP", 100))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        segment_labels=labels,
+        segment_label_max_m=50.0,
+        bundle_service_sets=(frozenset({"MA", "VAC", "AGSS"}),),
+    )
+
+    # Conservation: total == geometry, NOT 2x.
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length) < 0.1, (
+        f"Drainage conservation failed: total={total}, expected {run_length} (not {2 * run_length})"
+    )
+
+    # Lines must have bundle=False and bundle_evidence_absent=True.
+    for ln in result.lines:
+        if ln.service != SERVICE_UNKNOWN:
+            assert ln.bundle is False, (
+                f"{ln.service}: expected bundle=False on per-segment drainage run"
+            )
+            assert ln.bundle_evidence_absent is True, (
+                f"{ln.service}: expected bundle_evidence_absent=True for multi-service "
+                f"run without overlapping evidence"
+            )
+
+
+def test_bundle_gate_med_gas_confirmed_bundle_multiplied() -> None:
+    """Med-gas shape: multi-service run overlapping bundle_service_sets by >=2 -> bundle=True.
+
+    Run with services {MA, VAC, AGSS}; bundle_service_sets=(frozenset({"MA","VAC","AGSS"}),).
+    All 3 services overlap the evidence set by 3 >= 2. Each service gets the FULL corridor length.
+    bundle=True, bundle_evidence_absent=False on all lines.
+    """
+    run_length = 290.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    polylines = _polylines_for_key(run_length)
+
+    services = (_pipe_size("MA", 42), _pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        segment_labels=[],
+        segment_label_max_m=5.0,
+        bundle_service_sets=(frozenset({"MA", "VAC", "AGSS"}),),
+    )
+
+    assert len(result.lines) == 3, f"Expected 3 lines (MA, VAC, AGSS), got {len(result.lines)}"
+    by_svc = {ln.service: ln for ln in result.lines}
+    assert set(by_svc.keys()) == {"MA", "VAC", "AGSS"}
+
+    # Each service gets the FULL run length.
+    for svc, ln in by_svc.items():
+        assert ln.drawing_length == run_length, (
+            f"{svc}: expected drawing_length={run_length} (bundle), got {ln.drawing_length}"
+        )
+        assert ln.bundle is True, f"{svc}: expected bundle=True on confirmed bundle run"
+        assert ln.bundle_evidence_absent is False, (
+            f"{svc}: bundle_evidence_absent must be False on confirmed bundle"
+        )
+
+
+def test_bundle_gate_single_service_run_unchanged() -> None:
+    """Single-service run with bundle_service_sets provided: per-segment, bundle=False,
+    bundle_evidence_absent=False (it is not multi-service so no architect flag needed).
+
+    A label is placed near the segment midpoint so the service is attributed (not unknown).
+    """
+    run_length = 150.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    polylines = _polylines_for_key(run_length)
+    # Label near the single segment midpoint (75,0) so VAC is attributed.
+    labels = [_seg_label(75.0, 0.0, "VAC", size_raw="54")]
+
+    services = (_pipe_size("VAC", 54),)
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        segment_labels=labels,
+        segment_label_max_m=80.0,
+        bundle_service_sets=(frozenset({"MA", "VAC", "AGSS"}),),
+    )
+
+    assert len(result.lines) == 1
+    ln = result.lines[0]
+    assert ln.service == "VAC"
+    assert ln.drawing_length == pytest.approx(run_length, abs=0.1)
+    assert ln.bundle is False
+    # Not multi-service: bundle_evidence_absent must be False.
+    assert ln.bundle_evidence_absent is False
+
+
+def test_bundle_gate_legacy_path_byte_identical() -> None:
+    """Legacy path (bundle_service_sets=None, colour_differentiated=True) is byte-identical
+    to the existing behaviour. Regression guard for PR-2 back-compat constraint.
+    """
+    run_length = 3000.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    services = (_pipe_size("VAC", 54), _pipe_size("AGSS", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+    scale = _confirmed_mm_scale()
+
+    shared: dict[str, Any] = {
+        "runs": [run],
+        "identities": [identity],
+        "geometry_by_entity_id": geometry,
+        "rooms": [],
+        "scale": scale,
+    }
+
+    # Existing default (no bundle_service_sets).
+    result_legacy = compute_service_takeoff(**shared)
+    # Explicit None — must be identical.
+    result_explicit_none = compute_service_takeoff(**shared, bundle_service_sets=None)
+
+    assert result_legacy.lines == result_explicit_none.lines, (
+        "bundle_service_sets=None must be byte-identical to the default (legacy path)"
+    )
+    # Both lines are bundles (legacy behaviour).
+    by_svc = {ln.service: ln for ln in result_legacy.lines}
+    assert by_svc["VAC"].bundle is True
+    assert by_svc["AGSS"].bundle is True
+    # bundle_evidence_absent is always False on the legacy path.
+    assert by_svc["VAC"].bundle_evidence_absent is False
+    assert by_svc["AGSS"].bundle_evidence_absent is False
+
+
+def test_bundle_gate_per_segment_conservation() -> None:
+    """Per-segment path (new gate, non-bundle run): Sigma == geometry (±0.1 du).
+
+    Three-segment polyline (300 du total); multi-service run {SVP, CDP} with no overlap
+    against the provided bundle_service_sets. Labels near each segment midpoint ensure
+    all segments are attributed. Total must equal geometry.
+    """
+    run_length = 300.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    polylines = (((0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0)),)
+
+    labels = [
+        _seg_label(50.0, 0.0, "SVP"),
+        _seg_label(150.0, 0.0, "CDP"),
+        _seg_label(250.0, 0.0, "SVP"),
+    ]
+    services = (_pipe_size("SVP", 100), _pipe_size("CDP", 100))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        segment_labels=labels,
+        segment_label_max_m=55.0,
+        bundle_service_sets=(frozenset({"MA", "VAC", "AGSS"}),),
+    )
+
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length) < 0.1, (
+        f"Conservation failed on per-segment path: Sigma={total}, expected {run_length}"
+    )
+    # Confirm all lines are per-segment, not bundle.
+    for ln in result.lines:
+        assert ln.bundle is False, f"{ln.service}: bundle must be False on per-segment path"
+
+
+def test_bundle_gate_partial_overlap_not_enough() -> None:
+    """A run with services {SVP, MA} overlaps bundle_set {"MA","VAC","AGSS"} by only 1
+    (MA only). That is < 2, so it must NOT be confirmed as a bundle.
+    bundle_evidence_absent=True on the resulting per-segment lines.
+    """
+    run_length = 200.0
+    entity_ids = ("e1",)
+    geometry = {"e1": _line_geom(0.0, 0.0, run_length, 0.0)}
+    polylines = _polylines_for_key(run_length)
+
+    labels = [
+        _seg_label(50.0, 0.0, "SVP"),
+        _seg_label(150.0, 0.0, "MA"),
+    ]
+    services = (_pipe_size("SVP", 100), _pipe_size("MA", 42))
+    identity = _make_identity(entity_ids=entity_ids, services=services, status=IDENTITY_RESOLVED)
+    run = _make_run(entity_ids=entity_ids)
+
+    result = compute_service_takeoff(
+        runs=[run],
+        identities=[identity],
+        geometry_by_entity_id=geometry,
+        rooms=[],
+        scale=_confirmed_mm_scale(),
+        measured_geometry_by_group={("Pipes", "idx150"): polylines},
+        segment_labels=labels,
+        segment_label_max_m=55.0,
+        bundle_service_sets=(frozenset({"MA", "VAC", "AGSS"}),),
+    )
+
+    # Per-segment: total conserved, no bundle.
+    total = sum(ln.drawing_length for ln in result.lines)
+    assert abs(total - run_length) < 0.1, (
+        f"Partial-overlap conservation: Sigma={total}, expected {run_length}"
+    )
+    for ln in result.lines:
+        assert ln.bundle is False
+        assert ln.bundle_evidence_absent is True, (
+            f"{ln.service}: expected bundle_evidence_absent=True for partial-overlap run"
+        )
+
+
+def test_bundle_evidence_absent_default_false_on_legacy_dataclass() -> None:
+    """ServiceTakeoffLine.bundle_evidence_absent defaults to False (additive field).
+
+    Construct a line directly without the new field to verify the default works,
+    and confirm no existing code is broken by the new field.
+    """
+    # The field has a default so existing construction patterns stay valid.
+    line = ServiceTakeoffLine(
+        service="VAC",
+        size_raw="54",
+        size_kind="round",
+        discipline="HYDRAULIC",
+        room_id="room-1",
+        room_name="Room 1",
+        room_number="1.01",
+        drawing_length=100.0,
+        real_length_m=0.1,
+        basis="real_world",
+        units_confidence="confirmed",
+        run_count=1,
+        entity_ids=("e1",),
+        identity_status="resolved",
+        confidence=None,
+        riser_count=0,
+        drop_count=0,
+        bundle=False,
+    )
+    assert line.bundle_evidence_absent is False
