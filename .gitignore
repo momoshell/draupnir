@@ -31,3 +31,6 @@ htmlcov/
 
 # Local runtime artifacts
 var/
+
+# Dev profiling / scratch scripts (not for review)
+scratchpad/

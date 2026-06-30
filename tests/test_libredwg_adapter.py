@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import tracemalloc
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -5902,3 +5903,164 @@ async def test_libredwg_adapter_resolves_handle_layer_ref_after_in_place_mutatio
     # The resolved layer name must propagate to the emitted entity — not None or a
     # raw handle list, which would indicate the stale-cache bug is present.
     assert entities[0]["layer_name"] == "A-WALL"
+
+
+# ---------------------------------------------------------------------------
+# Synthetic dwgread-JSON fixture builder
+# ---------------------------------------------------------------------------
+#
+# Produces a dwgread-shaped payload dict that exercises the full
+# _load_output_payload + _build_canonical_output path without requiring a
+# real DWG file.  The shape matches the real P-520001 output (entity/object
+# keys, handle arrays, start/end as 3-element float arrays) so that layer
+# resolution, style resolution, and line-entity mapping all execute.
+#
+# Handle encoding: dwgread uses [code, size, absref, absref] arrays.
+# _handle_abs_key reads the last element as the absolute reference.
+# Layer references on LINE records point at the LAYER object's absolute handle.
+
+_SYNTH_LAYER_ABSREF = 9001
+_SYNTH_LTYPE_ABSREF = 9002
+_SYNTH_BH_ABSREF = 9003
+_SYNTH_LINE_HANDLE_BASE = 10000
+
+
+def _build_synthetic_dwgread_payload(n_lines: int = 25_000) -> dict[str, Any]:
+    """Return a dwgread-shaped JSON payload with *n_lines* LINE entities.
+
+    Includes one LAYER, one LTYPE (Continuous), and one BLOCK_HEADER
+    (*Model_Space) so that handle resolution, style resolution, and block
+    table construction all run at full depth without short-circuiting.
+    """
+    layer_handle = [0, 1, _SYNTH_LAYER_ABSREF, _SYNTH_LAYER_ABSREF]
+    ltype_handle = [0, 1, _SYNTH_LTYPE_ABSREF, _SYNTH_LTYPE_ABSREF]
+    bh_handle = [0, 1, _SYNTH_BH_ABSREF, _SYNTH_BH_ABSREF]
+    # Handle reference that LINE.layer points at (soft pointer, code 5)
+    layer_ref = [5, 1, _SYNTH_LAYER_ABSREF, _SYNTH_LAYER_ABSREF]
+
+    objects: list[dict[str, Any]] = [
+        # LAYER table entry — _resolve_handle_named_refs indexes this by absref
+        {
+            "object": "LAYER",
+            "handle": layer_handle,
+            "name": "A-WALL",
+            "color": {"index": 7, "rgb": "c2000007"},
+            "ltype": ltype_handle,
+            "linewt": 0,
+            "is_xdic_missing": 1,
+        },
+        # LTYPE — _resolve_entity_styles resolves pattern_len=0 → Continuous
+        {
+            "object": "LTYPE",
+            "handle": ltype_handle,
+            "name": "Continuous",
+            "pattern_len": 0.0,
+            "numdashes": 0,
+        },
+        # BLOCK_HEADER — _build_block_header_name_map / _build_block_definition_map
+        {
+            "object": "BLOCK_HEADER",
+            "handle": bh_handle,
+            "name": "*Model_Space",
+            "entities": [],
+        },
+    ]
+
+    for i in range(n_lines):
+        objects.append(
+            {
+                "entity": "LINE",
+                "handle": [0, 2, _SYNTH_LINE_HANDLE_BASE + i, _SYNTH_LINE_HANDLE_BASE + i],
+                # layer is a handle reference — resolved by _resolve_handle_named_refs
+                "layer": layer_ref,
+                "start": [float(i), 0.0, 0.0],
+                "end": [float(i + 1), 1.0, 0.0],
+            }
+        )
+
+    return {
+        # INSUNITS=6 → millimetres; confirmed units, scale=0.001
+        "HEADER": {"INSUNITS": 6},
+        "CLASSES": [],
+        "OBJECTS": objects,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Perf-guard test
+# ---------------------------------------------------------------------------
+
+
+def test_libredwg_parse_build_memory_guard(tmp_path: Path) -> None:
+    """Peak Python-heap usage for parse+build on a synthetic 25k-LINE fixture
+    must stay under a ceiling calibrated to ~1.55x the current measured peak.
+
+    Calibration basis (measured 2026-06-30, N=25_000 on macOS M-series):
+      - _load_output_payload tracemalloc peak:       ~38 MB
+      - _build_canonical_output tracemalloc peak:   ~194 MB  (dominant)
+      - ceiling set at 300 MB (~1.55x build peak)
+
+    A future change that adds another full-size materialisation of all LINE
+    records would push the build peak above 300 MB and trip this guard.
+
+    PR-1 (streaming json.load) and PR-2 (streaming build) will lower this
+    ceiling once each segment is streaming.  The comment here is the audit
+    trail; update it when tightening.
+    """
+    # Ceiling: 300 MB in bytes.  Generous enough to absorb minor growth but
+    # tight enough to catch an O(N) full-copy regression.
+    peak_ceiling_bytes = 300 * 1024 * 1024
+
+    n_lines = 25_000
+    payload = _build_synthetic_dwgread_payload(n_lines)
+
+    fixture_path = tmp_path / "synth_dwgread.json"
+    fixture_path.write_text(json.dumps(payload))
+
+    source = AdapterSource(
+        file_path=fixture_path,
+        upload_format=UploadFormat.DWG,
+        input_family=InputFamily.DWG,
+    )
+
+    tracemalloc.start()
+    try:
+        output_payload = adapter_module._load_output_payload(
+            fixture_path,
+            source_path=fixture_path,
+            temp_path=tmp_path,
+        )
+        _cur, peak_load = tracemalloc.get_traced_memory()
+
+        output_kind, output_key_count = adapter_module._summarize_output_payload(output_payload)
+        run_result = adapter_module._DwgreadRunResult(
+            stdout=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
+            stderr=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
+            output_size_bytes=fixture_path.stat().st_size,
+            output_kind=output_kind,
+            output_key_count=output_key_count,
+            output_payload=output_payload,
+        )
+
+        tracemalloc.reset_peak()
+        canonical_result = adapter_module._build_canonical_output(
+            source=source,
+            run_result=run_result,
+        )
+        _cur, peak_build = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    entities = cast(list[Any], canonical_result.canonical["entities"])
+    assert len(entities) == n_lines, (
+        f"Expected {n_lines} entities, got {len(entities)} — "
+        "fixture may not be exercising the full build path"
+    )
+
+    combined_peak = max(peak_load, peak_build)
+    assert combined_peak <= peak_ceiling_bytes, (
+        f"Parse+build peak {combined_peak / 1024 / 1024:.1f} MB "
+        f"exceeds ceiling {peak_ceiling_bytes / 1024 / 1024:.0f} MB. "
+        "A full-copy regression may have been introduced. "
+        "See test docstring for calibration basis."
+    )
