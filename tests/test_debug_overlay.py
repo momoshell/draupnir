@@ -10,7 +10,12 @@ from app.ingestion.contracts import JSONValue
 from app.ingestion.debug_overlay import (
     SVG_DEBUG_OVERLAY_FILENAME,
     SVG_DEBUG_OVERLAY_MEDIA_TYPE,
+    _BBox,
+    _CueStyle,
     _normalize_text_snippet,
+    _OverlayEntity,
+    _OverlayLayout,
+    _render_layout_panel,
     plan_svg_debug_overlay,
 )
 from app.storage.keys import build_generated_artifact_storage_key
@@ -506,3 +511,204 @@ def test_plan_svg_debug_overlay_degrades_finite_overflow_geometry_to_placeholder
     assert '<line class="geometry' not in payload
     assert '<rect class="layout-box"' not in payload
     assert re.search(r'(?:x|y|x1|y1|x2|y2|width|height|points)="[^"]*(?:nan|inf)', payload) is None
+
+
+def _make_cue(review_state: str = "review_required") -> _CueStyle:
+    return _CueStyle(class_name=f"cue-{review_state}", review_state=review_state)
+
+
+def _make_geometric_entity(stable_id: str, layout_key: str = "Model") -> _OverlayEntity:
+    """Entity whose geometry_bounds() returns a valid bbox."""
+    return _OverlayEntity(
+        stable_id=stable_id,
+        kind="line",
+        layout_key=layout_key,
+        bbox=_BBox(x_min=0.0, y_min=0.0, x_max=10.0, y_max=10.0),
+        points=(),
+        start=None,
+        end=None,
+        cue=_make_cue(),
+        confidence_score=0.9,
+    )
+
+
+def _make_placeholder_entity(stable_id: str, layout_key: str = "Model") -> _OverlayEntity:
+    """Entity whose geometry_bounds() returns None (no bbox, no points, no start/end)."""
+    return _OverlayEntity(
+        stable_id=stable_id,
+        kind="ifc_wall",
+        layout_key=layout_key,
+        bbox=None,
+        points=(),
+        start=None,
+        end=None,
+        cue=_make_cue(),
+        confidence_score=None,
+    )
+
+
+def test_render_layout_panel_partitions_by_identity_not_value_equality() -> None:
+    """Geometric/placeholder partition must use object identity, not value equality.
+
+    Regression: the former `entity not in geometric_entities` list-scan used __eq__ on
+    frozen dataclasses, producing O(n²) behaviour. The fix uses an identity set. This
+    test validates the partition is exhaustive and mutually exclusive: every entity in
+    `entities` appears in exactly one of geometric or placeholder, with no silent drops.
+
+    The identity distinction matters when value-equal duplicate objects exist in the
+    entities list — each must be accounted for independently rather than treated as one
+    logical entity by value equality. Here both copies of the value-twin have geometry
+    so both land in geometric_entities; the placeholder entity lands in placeholders.
+    The entity-count in the SVG summary proves no entity was silently dropped.
+    """
+    layout = _OverlayLayout(
+        key="Model",
+        label="Model",
+        page_number=None,
+        bbox=_BBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0),
+    )
+
+    # Two geometrically identical objects (equal-by-value) that are distinct Python objects.
+    geo_entity = _make_geometric_entity("shared-id")
+    value_twin = _make_geometric_entity("shared-id")  # same field values, different identity
+    assert geo_entity == value_twin, "precondition: objects must be equal-by-value"
+    assert geo_entity is not value_twin, "precondition: objects must be distinct identities"
+
+    non_geo_entity = _make_placeholder_entity("placeholder-1")
+
+    # entities has 3 distinct objects; the SVG summary emits one row per entity (by identity).
+    entities = [geo_entity, non_geo_entity, value_twin]
+
+    lines = _render_layout_panel(layout, entities, x=0.0, y=0.0, width=800.0, height=600.0)
+    svg = "\n".join(lines)
+
+    # Total entity count row is driven by len(entities) — proves no silent drops.
+    assert "Entities: 3" in svg
+    # Both geo entities render (both have bbox → geometry_bounds() is not None).
+    # The summary sidebar emits one row per entity; "shared-id | line" appears twice.
+    assert svg.count("shared-id | line") == 2
+    # placeholder entity renders as a placeholder.
+    assert "placeholder-1 | No canonical geometry" in svg
+
+
+def test_render_layout_panel_all_entities_become_placeholders_when_bounds_is_none() -> None:
+    """When no entity has geometry and layout has no bbox, bounds is None.
+
+    In that case `bounds is not None` is False so geometric_entities is empty and ALL
+    entities must degrade to placeholders — the identity-set fix must preserve this guard.
+    """
+    layout = _OverlayLayout(
+        key="Model",
+        label="Model",
+        page_number=None,
+        bbox=None,  # no layout bbox; combined with no-geometry entities → bounds=None
+    )
+
+    # All entities have no geometry so _panel_bounds returns None.
+    no_geo_a = _make_placeholder_entity("no-geo-a")
+    no_geo_b = _make_placeholder_entity("no-geo-b")
+    no_geo_c = _make_placeholder_entity("no-geo-c")
+    entities = [no_geo_a, no_geo_b, no_geo_c]
+
+    lines = _render_layout_panel(layout, entities, x=0.0, y=0.0, width=800.0, height=600.0)
+    svg = "\n".join(lines)
+
+    # With no valid bounds, ALL entities must degrade to placeholders.
+    assert svg.count("No canonical geometry") == 3
+
+
+def test_render_layout_panel_preserves_input_ordering_in_both_lists() -> None:
+    """Geometric and placeholder sub-lists must appear in their original entities order."""
+    layout = _OverlayLayout(
+        key="Model",
+        label="Model",
+        page_number=None,
+        bbox=_BBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0),
+    )
+
+    # Interleave geometric and placeholder entities so ordering is observable.
+    g1 = _make_geometric_entity("g1")
+    p1 = _make_placeholder_entity("p1")
+    g2 = _make_geometric_entity("g2")
+    p2 = _make_placeholder_entity("p2")
+    g3 = _make_geometric_entity("g3")
+    entities = [g1, p1, g2, p2, g3]
+
+    lines = _render_layout_panel(layout, entities, x=0.0, y=0.0, width=800.0, height=600.0)
+    svg = "\n".join(lines)
+
+    # Geometric entities render as <line>/<rect> geometry elements; their ids appear
+    # in cue-labelled geometry blocks in input order (g1 before g2 before g3).
+    g1_pos = svg.index("g1 | line")
+    g2_pos = svg.index("g2 | line")
+    g3_pos = svg.index("g3 | line")
+    assert g1_pos < g2_pos < g3_pos, "geometric entities must appear in input order"
+
+    # Placeholder entities appear in input order (p1 before p2).
+    p1_pos = svg.index("p1 | No canonical geometry")
+    p2_pos = svg.index("p2 | No canonical geometry")
+    assert p1_pos < p2_pos, "placeholder entities must appear in input order"
+
+
+def test_plan_svg_debug_overlay_identity_partition_renders_without_error_on_large_layout() -> None:
+    """Overlay must render cleanly on a realistic multi-entity layout (partition + counts)."""
+    n_geometric = 50
+    n_placeholder = 10
+    entities: list[dict[str, JSONValue]] = []
+    for i in range(n_geometric):
+        entities.append(
+            {
+                "entity_id": f"pipe-{i}",
+                "kind": "line",
+                "layout": "page-1",
+                "start": {"x": float(i), "y": 0.0},
+                "end": {"x": float(i) + 1.0, "y": 1.0},
+                "bbox": {
+                    "x_min": float(i),
+                    "y_min": 0.0,
+                    "x_max": float(i) + 1.0,
+                    "y_max": 1.0,
+                },
+                "confidence_score": 0.9,
+            }
+        )
+    for j in range(n_placeholder):
+        entities.append(
+            {
+                "entity_id": f"ifc-wall-{j}",
+                "kind": "ifc_wall",
+                "layout": "page-1",
+                "confidence_score": 0.5,
+            }
+        )
+
+    canonical: dict[str, JSONValue] = {
+        "layouts": (
+            {
+                "name": "page-1",
+                "page_number": 1,
+                "bbox": {
+                    "x_min": 0.0,
+                    "y_min": 0.0,
+                    "x_max": 100.0,
+                    "y_max": 100.0,
+                },
+            },
+        ),
+        "entities": tuple(entities),
+    }
+
+    payload = plan_svg_debug_overlay(
+        canonical,
+        title="Large Layout Test",
+        source_label="originals/plan.pdf",
+        review_state="review_required",
+        confidence_score=0.8,
+    ).payload.decode("utf-8")
+
+    # All geometric entities render as geometry elements.
+    assert payload.count('<line class="geometry') == n_geometric
+    # All placeholder entities render as placeholder summaries.
+    assert payload.count("No canonical geometry") == n_placeholder
+    # Verify total entity count label.
+    assert f"Entities: {n_geometric + n_placeholder}" in payload
