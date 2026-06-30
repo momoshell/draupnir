@@ -34,10 +34,11 @@ from app.estimating.catalog.resolver import resolve_formula, resolve_material, r
 from app.estimating.engine.errors import EstimateEngineError
 from app.estimating.engine.service import compose_estimate
 from app.estimating.quantities.engine import compute_quantities
-from app.ingestion.contracts import AdapterTimeout, InputFamily, ProgressUpdate
+from app.ingestion.contracts import AdapterTimeout, InputFamily
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.jobs import enqueueing as job_enqueueing
+from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import runner as job_runner
@@ -265,13 +266,7 @@ _StaleJobAttemptError = job_lifecycle._StaleJobAttemptError
 _RevisionConflictError = job_lifecycle._RevisionConflictError
 
 
-@dataclass(frozen=True, slots=True)
-class _QueuedJobEvent:
-    """Buffered job event persisted by the progress drain."""
-
-    level: str
-    message: str
-    data_json: dict[str, Any]
+_QueuedJobEvent = job_execution_monitoring.QueuedJobEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,69 +442,18 @@ _JobLockBootstrap = job_lifecycle._JobLockBootstrap
 _LockedJobSource = job_lifecycle._LockedJobSource
 
 
-class _PersistedJobCancellationHandle:
-    """Cancellation handle backed by worker polling."""
-
-    def __init__(self) -> None:
-        self._cancel_requested = False
-
-    def is_cancelled(self) -> bool:
-        return self._cancel_requested
-
-    def mark_cancelled(self) -> None:
-        self._cancel_requested = True
+_PersistedJobCancellationHandle = job_execution_monitoring.PersistedJobCancellationHandle
 
 
-class _JobProgressEventBridge:
+class _JobProgressEventBridge(job_execution_monitoring.JobProgressEventBridge):
     """Synchronous progress callback with async DB draining."""
 
-    _STOP = object()
-
     def __init__(self, job_id: UUID, *, attempt_token: UUID) -> None:
-        self._job_id = job_id
-        self._attempt_token = attempt_token
-        self._queue: asyncio.Queue[_QueuedJobEvent | object] = asyncio.Queue()
-        self._drain_task = asyncio.create_task(self._drain())
-        self._closed = False
-
-    def callback(self, update: ProgressUpdate) -> None:
-        if self._closed:
-            raise RuntimeError("Progress callback received update after bridge closed.")
-
-        self._queue.put_nowait(
-            _QueuedJobEvent(
-                level="info",
-                message=update.message or f"Job progress: {update.stage}",
-                data_json=_progress_event_data(update),
-            )
+        super().__init__(
+            job_id,
+            attempt_token=attempt_token,
+            emit_job_event=emit_job_event,
         )
-
-    async def flush(self) -> None:
-        if self._closed:
-            await self._drain_task
-            return
-
-        self._closed = True
-        self._queue.put_nowait(self._STOP)
-        await self._drain_task
-
-    async def _drain(self) -> None:
-        while True:
-            queued = await self._queue.get()
-            try:
-                if queued is self._STOP:
-                    return
-
-                assert isinstance(queued, _QueuedJobEvent)
-                await emit_job_event(
-                    self._job_id,
-                    level=queued.level,
-                    message=queued.message,
-                    data_json=queued.data_json,
-                    attempt_token=self._attempt_token,
-                )
-            finally:
-                self._queue.task_done()
 
 
 celery_app = Celery(
@@ -1030,22 +974,7 @@ async def emit_job_event(
     )
 
 
-def _progress_event_data(update: ProgressUpdate) -> dict[str, Any]:
-    """Build a stable persisted progress event payload."""
-    data_json: dict[str, Any] = {
-        "status": "running",
-        "event": "progress",
-        "stage": update.stage,
-    }
-    if update.message is not None:
-        data_json["detail"] = update.message
-    if update.completed is not None:
-        data_json["completed"] = update.completed
-    if update.total is not None:
-        data_json["total"] = update.total
-    if update.percent is not None:
-        data_json["percent"] = update.percent
-    return data_json
+_progress_event_data = job_execution_monitoring.progress_event_data
 
 
 def _runner_error_log_fields(exc: IngestionRunnerError) -> dict[str, Any]:
@@ -1098,37 +1027,16 @@ async def _poll_job_cancellation(
     stop_event: asyncio.Event,
 ) -> None:
     """Poll persisted cancellation without holding DB locks during execution."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    while not stop_event.is_set() and not cancellation.is_cancelled():
-        async with session_maker() as session:
-            job = await session.get(Job, job_id)
-
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if job.cancel_requested:
-            cancellation.mark_cancelled()
-            run_task.cancel()
-            return
-
-        if job.status == "cancelled":
-            cancellation.mark_cancelled()
-            run_task.cancel()
-            return
-
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            return
-
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=_JOB_CANCELLATION_POLL_INTERVAL_SECONDS,
-            )
-        except TimeoutError:
-            continue
+    await job_execution_monitoring.poll_job_cancellation(
+        job_id,
+        attempt_token=attempt_token,
+        cancellation=cancellation,
+        run_task=run_task,
+        stop_event=stop_event,
+        session_maker_factory=get_session_maker,
+        job_attempt_is_current=_job_attempt_is_current,
+        poll_interval_seconds=_JOB_CANCELLATION_POLL_INTERVAL_SECONDS,
+    )
 
 
 async def _cancel_registered_job_if_requested(
@@ -1148,26 +1056,15 @@ async def _cancel_registered_job_if_requested(
     immediately instead of waiting until finalization. Cancellation that arrives *during*
     a synchronous compute is still only observed at the finalize row-lock.
     """
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await session.get(Job, job_id)
-
-    if job is None:
-        raise LookupError(f"Job with identifier '{job_id}' not found")
-
-    if not _job_attempt_is_current(job, attempt_token=attempt_token):
-        return False
-
-    if not job.cancel_requested and job.status != "cancelled":
-        return False
-
-    cancelled = await _mark_job_cancelled(job_id, attempt_token=attempt_token)
-    if cancelled:
-        logger.info(log_event, job_id=str(job_id))
-    return cancelled
+    return await job_execution_monitoring.cancel_registered_job_if_requested(
+        job_id,
+        attempt_token=attempt_token,
+        log_event=log_event,
+        session_maker_factory=get_session_maker,
+        job_attempt_is_current=_job_attempt_is_current,
+        mark_job_cancelled=_mark_job_cancelled,
+        logger_instance=logger,
+    )
 
 
 async def _stop_job_execution_monitor(
@@ -1177,11 +1074,11 @@ async def _stop_job_execution_monitor(
     cancellation_task: asyncio.Task[None],
 ) -> None:
     """Flush queued progress and stop background execution monitors."""
-    stop_event.set()
-    try:
-        await cancellation_task
-    finally:
-        await progress_bridge.flush()
+    await job_execution_monitoring.stop_job_execution_monitor(
+        progress_bridge=progress_bridge,
+        stop_event=stop_event,
+        cancellation_task=cancellation_task,
+    )
 
 
 async def _persist_job_failed(
