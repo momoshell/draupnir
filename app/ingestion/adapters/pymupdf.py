@@ -19,6 +19,11 @@ from time import perf_counter
 from types import ModuleType
 from typing import Any, cast
 
+from app.core.config import settings
+from app.ingestion.adapters._process_limits import (
+    ParserProcessLimits,
+    apply_parser_process_limits,
+)
 from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
@@ -1818,6 +1823,7 @@ async def _stop_process_handle(handle: _ProcessExtractionHandle) -> None:
 
 def _run_process_extraction_child(sender: Any, request: _ProcessExtractionRequest) -> None:
     try:
+        _configure_child_process_limits(request.timeout_seconds)
         sender.send(_extract_in_child_process(request))
     except BaseException:
         with suppress(Exception):
@@ -1830,6 +1836,18 @@ def _run_process_extraction_child(sender: Any, request: _ProcessExtractionReques
             )
     finally:
         sender.close()
+
+
+def _configure_child_process_limits(timeout_seconds: float | None) -> None:
+    cpu_seconds: int | float = settings.parser_subprocess_cpu_seconds
+    if timeout_seconds is not None:
+        cpu_seconds = min(cpu_seconds, timeout_seconds)
+    apply_parser_process_limits(
+        ParserProcessLimits(
+            max_address_space_bytes=settings.parser_subprocess_max_memory_mb * 1024 * 1024,
+            max_cpu_seconds=cpu_seconds,
+        )
+    )
 
 
 def _extract_in_child_process(request: _ProcessExtractionRequest) -> dict[str, Any]:

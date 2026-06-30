@@ -15,6 +15,7 @@ import pytest
 
 from app.core.config import settings
 from app.ingestion.adapters import libredwg as adapter_module
+from app.ingestion.adapters._process_limits import ParserProcessLimits
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
     AdapterSource,
@@ -161,6 +162,30 @@ def test_iter_mapping_candidates_rejects_excessive_record_candidates(
         adapter_module._iter_mapping_candidates(payload)
 
     assert exc_info.value.reason == "output_record_candidate_cap_exceeded"
+
+
+def test_configure_child_process_limits_includes_file_cpu_and_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_limits: list[ParserProcessLimits] = []
+    monkeypatch.setattr(settings, "libredwg_max_output_mb", 2)
+    monkeypatch.setattr(settings, "parser_subprocess_max_memory_mb", 512)
+    monkeypatch.setattr(settings, "parser_subprocess_cpu_seconds", 17)
+    monkeypatch.setattr(
+        adapter_module,
+        "apply_parser_process_limits",
+        lambda limits: observed_limits.append(limits),
+    )
+
+    adapter_module._configure_child_process_limits()
+
+    assert observed_limits == [
+        ParserProcessLimits(
+            max_file_size_bytes=2 * 1024 * 1024,
+            max_address_space_bytes=512 * 1024 * 1024,
+            max_cpu_seconds=17,
+        )
+    ]
 
 
 _HATCH_SQUARE_POINTS = (
