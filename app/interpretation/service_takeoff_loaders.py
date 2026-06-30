@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,6 +52,7 @@ from app.interpretation.mechanical_legend import (
     MechSwatchInput,
     build_mechanical_legend,
 )
+from app.interpretation.revision_scale import RevisionScaleNotFoundError, resolve_revision_scale
 from app.interpretation.rise_drop import RiseDropEntity
 from app.interpretation.routed_runs import ROUTED_ENTITY_TYPES, RoutedEntity
 from app.interpretation.run_service_identity import TagPlacement
@@ -447,17 +447,12 @@ def _is_chromatic_colour(
 async def _resolve_input_family(db: AsyncSession, revision_id: UUID) -> str | None:
     """Return the input_family for the revision's adapter run, or None when unavailable.
 
-    Swallows HTTPException (revision invisible / no adapter run) — callers treat None
+    Swallows missing-revision errors — callers treat None
     as "unknown origin" and apply DWG/DXF default paths unchanged.
     """
-    # Lazy import: resolve_revision_scale lives in the API layer, and a module-level
-    # import here creates an interpretation->api->interpretation cycle that crashes the
-    # celery worker (CENTERLINE job) when this module is imported before app.api (#705).
-    from app.api.v1.revision_routes.scale import resolve_revision_scale
-
     try:
         return (await resolve_revision_scale(revision_id, db)).source_input_family
-    except HTTPException:
+    except RevisionScaleNotFoundError:
         return None
 
 
@@ -1627,12 +1622,9 @@ async def build_scale_context(
     ``ScaleContext``. Returns an unknown/unavailable ``ScaleContext`` when the revision
     has no adapter run or does not exist (honest, never raises).
     """
-    # Lazy import to avoid the interpretation->api import cycle (see #705).
-    from app.api.v1.revision_routes.scale import resolve_revision_scale
-
     try:
         scale_read = await resolve_revision_scale(revision_id, db)
-    except HTTPException:
+    except RevisionScaleNotFoundError:
         # Revision does not exist or is not visible; return honest unknown.
         return ScaleContext(
             conversion_factor=None,

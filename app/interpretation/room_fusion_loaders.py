@@ -2,10 +2,6 @@
 
 Single entry point: ``load_room_registry`` fetches rooms from the DB and hands them
 to the pure ``build_room_registry``.
-
-The import of ``_resolve_rooms`` from ``app.api.v1.revision_routes.rooms`` is LAZY
-(inside the function body) to avoid an interpretation→api module cycle (#705 class).
-This mirrors the pattern used by ``service_takeoff_loaders``.
 """
 
 from __future__ import annotations
@@ -22,6 +18,7 @@ from app.interpretation.room_fusion import (
     build_room_registry,
 )
 from app.interpretation.room_pipeline import ROOM_STRATEGY_AUTO
+from app.interpretation.room_resolution import resolve_rooms, room_labels
 from app.interpretation.room_voronoi import DEFAULT_BOUND_MARGIN_M, RoomTag
 from app.interpretation.rooms import Room
 
@@ -44,22 +41,17 @@ async def load_room_registry(
     restricts room geometry + labels to the printed sheet; ``"modelspace"``
     interprets the full modelspace.
 
-    The import of ``_resolve_rooms`` is deferred to the function body to avoid
-    an interpretation→api import cycle (#705 class).
-
     Multi-tag polygon subdivision (issue #733): after resolving rooms, compute
     which polygons contain ≥2 distinct numbered tags and build the per-polygon
     RoomTag map.  Passed to ``build_room_registry`` so ``classify`` can
     sub-partition under-segmented polygons.
     """
-    # Lazy import — keeps this module importable without app.api at module level.
-    from app.api.v1.revision_routes.rooms import _resolve_rooms, _room_labels
     from app.interpretation.devices import load_text_candidates
     from app.interpretation.label_rooms import identify_rooms_from_labels
 
     exclude_off_sheet = scope == "sheet"
 
-    result = await _resolve_rooms(
+    result = await resolve_rooms(
         db,
         reference_revision_id,
         strategy=strategy,
@@ -69,13 +61,13 @@ async def load_room_registry(
     )
 
     # -- Multi-tag polygon subdivision (issue #733) ---------------------------
-    # Re-load text candidates (same call as _resolve_rooms uses for labels) and
+    # Re-load text candidates (same call as resolve_rooms uses for labels) and
     # identify room label rooms so we can find which polygon rooms contain ≥2
     # distinct numbered tags.
     label_candidates = await load_text_candidates(
         db, reference_revision_id, exclude_off_sheet=exclude_off_sheet
     )
-    raw_labels = _room_labels(label_candidates)
+    raw_labels = room_labels(label_candidates)
     identities = identify_rooms_from_labels(raw_labels)
 
     # Collect polygon rooms (those with an actual polygon boundary).

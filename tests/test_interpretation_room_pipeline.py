@@ -10,13 +10,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from app.api.v1.revision_routes.rooms import _device_placements, _room_labels
 from app.interpretation.devices import Device, _TagCandidate
 from app.interpretation.room_pipeline import (
     ROOM_STRATEGY_EXPLICIT,
     ROOM_STRATEGY_IFC,
     ROOM_STRATEGY_WALLS,
     interpret_rooms,
+)
+from app.interpretation.room_resolution import (
+    device_placements as _device_placements,
+)
+from app.interpretation.room_resolution import (
+    room_labels as _room_labels,
 )
 from app.interpretation.rooms import DevicePlacement, RoomLabel
 

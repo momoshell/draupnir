@@ -20,6 +20,7 @@ from httpx import ASGITransport
 
 import app.api.v1.revision_routes.rooms as rooms_route
 from app.db.session import get_db
+from app.interpretation import room_resolution
 from app.interpretation.devices import Device, _TagCandidate
 
 REVISION_ID = uuid.uuid4()
@@ -104,11 +105,11 @@ def rooms_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI
         return [_TagCandidate(entity_id="t1", text="Kitchen", layer_ref="A-ANNO", x=5.0, y=5.0)]
 
     monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
-    monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
-    monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(room_resolution, "load_revision_entities_by_type", _fake_entities)
+    monkeypatch.setattr(room_resolution, "enumerate_devices", _fake_devices)
     # Room labels now come from all text (#549); device-tag source kept for the override path.
-    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
-    monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_text_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_tag_candidates", _fake_tags)
 
     yield app
     app.dependency_overrides.clear()
@@ -195,9 +196,9 @@ def rooms_app_capture_scope(
         return [_TagCandidate(entity_id="t1", text="Kitchen", layer_ref="A-ANNO", x=5.0, y=5.0)]
 
     monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
-    monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
-    monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
-    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_text)
+    monkeypatch.setattr(room_resolution, "load_revision_entities_by_type", _fake_entities)
+    monkeypatch.setattr(room_resolution, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(room_resolution, "load_text_candidates", _fake_text)
     yield app, seen
     app.dependency_overrides.clear()
 
@@ -283,10 +284,10 @@ def rooms_app_mixed(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[F
         ]
 
     monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
-    monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
-    monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
-    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
-    monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_revision_entities_by_type", _fake_entities)
+    monkeypatch.setattr(room_resolution, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(room_resolution, "load_text_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_tag_candidates", _fake_tags)
 
     yield app
     app.dependency_overrides.clear()
@@ -399,10 +400,10 @@ def rooms_app_prose(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[F
         ]
 
     monkeypatch.setattr(rooms_route, "_get_active_revision_manifest_or_409", _fake_manifest)
-    monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
-    monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
-    monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
-    monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_revision_entities_by_type", _fake_entities)
+    monkeypatch.setattr(room_resolution, "enumerate_devices", _fake_devices)
+    monkeypatch.setattr(room_resolution, "load_text_candidates", _fake_tags)
+    monkeypatch.setattr(room_resolution, "load_tag_candidates", _fake_tags)
 
     yield app
     app.dependency_overrides.clear()
