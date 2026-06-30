@@ -6064,3 +6064,222 @@ def test_libredwg_parse_build_memory_guard(tmp_path: Path) -> None:
         "A full-copy regression may have been introduced. "
         "See test docstring for calibration basis."
     )
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_stream adversarial byte-identity tests
+# ---------------------------------------------------------------------------
+
+
+def _reference_sanitize(raw: bytes, *, source_path: Path, temp_path: Path) -> str:
+    """One-shot reference implementation (the old approach)."""
+    return adapter_module._sanitize_text(
+        raw.decode("utf-8", errors="replace"),
+        source_path=source_path,
+        temp_path=temp_path,
+    )
+
+
+def _streaming_sanitize(
+    raw: bytes,
+    *,
+    tmp_path: Path,
+    source_path: Path,
+    temp_path: Path,
+    chunk_size: int,
+) -> str:
+    """Write *raw* to a temp file, run _sanitize_stream, return the result."""
+    target = tmp_path / "stream_input.bin"
+    target.write_bytes(raw)
+    return adapter_module._sanitize_stream(
+        target,
+        source_path=source_path,
+        temp_path=temp_path,
+        chunk_size=chunk_size,
+    )
+
+
+@pytest.mark.parametrize(
+    "label, raw_factory, chunk_size",
+    [
+        # ---- path tokens split across chunk boundary ----
+        pytest.param(
+            "source_path_split",
+            lambda src, _tmp: b'{"key": "' + str(src).encode() + b'", "v": 1}',
+            # chunk_size chosen so the token straddles the boundary
+            8,
+            id="source_path_split",
+        ),
+        pytest.param(
+            "temp_path_split",
+            lambda _src, tmp: b'{"key": "' + str(tmp).encode() + b'", "v": 2}',
+            8,
+            id="temp_path_split",
+        ),
+        # ---- multi-byte UTF-8 sequence split across chunk boundary ----
+        pytest.param(
+            "euro_sign_split",
+            # € is 3 bytes: e2 82 ac; force split at byte 1 and 2
+            lambda _src, _tmp: b"hello \xe2\x82\xac world",
+            2,  # chunks of 2 bytes — splits the 3-byte sequence
+            id="euro_sign_split",
+        ),
+        pytest.param(
+            "checkmark_split",
+            # ✓ is 3 bytes: e2 9c 93
+            lambda _src, _tmp: b"ok \xe2\x9c\x93 done",
+            2,
+            id="checkmark_split",
+        ),
+        pytest.param(
+            "emoji_split",
+            # 😀 is 4 bytes: f0 9f 98 80
+            lambda _src, _tmp: b"hi \xf0\x9f\x98\x80 there",
+            3,  # split across 4-byte sequence
+            id="emoji_split",
+        ),
+        # ---- non-printable bytes ----
+        pytest.param(
+            "nul_and_bel",
+            lambda _src, _tmp: b"a\x00b\x07c",
+            4,
+            id="nul_and_bel",
+        ),
+        pytest.param(
+            "escape_byte",
+            lambda _src, _tmp: b"esc\x1bseq",
+            3,
+            id="escape_byte",
+        ),
+        pytest.param(
+            "cr_lf_boundary",
+            # \r adjacent to \n; \r is non-printable so becomes '?'
+            lambda _src, _tmp: b"line1\r\nline2",
+            6,  # split exactly at \r|\n boundary
+            id="cr_lf_boundary",
+        ),
+        # ---- leading / trailing whitespace ----
+        pytest.param(
+            "leading_trailing_whitespace",
+            lambda _src, _tmp: b"  \n  hello world  \n  ",
+            5,
+            id="leading_trailing_whitespace",
+        ),
+        pytest.param(
+            "all_whitespace",
+            lambda _src, _tmp: b"   \t  \n  ",
+            3,
+            id="all_whitespace",
+        ),
+        # ---- realistic dwgread-shaped JSON with embedded source path ----
+        pytest.param(
+            "realistic_json_with_source_path",
+            lambda src, tmp: json.dumps(
+                {
+                    "HEADER": {"INSUNITS": 4},
+                    "CLASSES": [],
+                    "OBJECTS": [
+                        {
+                            "object": "LINE",
+                            "handle": "0x1A",
+                            "source_file": str(src),
+                            "tempdir": str(tmp),
+                            "coords": {"x": 1.0, "y": 2.0},
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+            16,
+            id="realistic_json_with_source_path",
+        ),
+    ],
+)
+def test_sanitize_stream_byte_identical(
+    tmp_path: Path,
+    label: str,
+    raw_factory: Any,
+    chunk_size: int,
+) -> None:
+    """_sanitize_stream must produce output byte-identical to the one-shot
+    reference (_sanitize_text on the fully decoded string) for every adversarial
+    case.
+    """
+    source_path = Path("/some/project/drawing.dwg")
+    temp_path = Path("/var/folders/ab/cdef/T/dwgread_xyz")
+
+    raw: bytes = raw_factory(source_path, temp_path)
+
+    reference = _reference_sanitize(raw, source_path=source_path, temp_path=temp_path)
+    streamed = _streaming_sanitize(
+        raw,
+        tmp_path=tmp_path,
+        source_path=source_path,
+        temp_path=temp_path,
+        chunk_size=chunk_size,
+    )
+
+    assert streamed == reference, (
+        f"[{label}] streaming output differs from reference.\n"
+        f"  reference ({len(reference)} chars): {reference!r}\n"
+        f"  streamed  ({len(streamed)} chars):  {streamed!r}"
+    )
+
+
+def test_sanitize_stream_load_payload_agrees(tmp_path: Path) -> None:
+    """_load_output_payload (streaming) must return the same parsed object as
+    json.loads applied to the one-shot sanitized string.
+    """
+    source_path = tmp_path / "drawing.dwg"
+    temp_path = tmp_path
+
+    payload = {
+        "HEADER": {"INSUNITS": 4},
+        "CLASSES": [],
+        "OBJECTS": [
+            {
+                "object": "LINE",
+                "handle": "0x2B",
+                "source": str(source_path),
+                "tempdir": str(temp_path),
+            }
+        ],
+    }
+    raw = json.dumps(payload).encode("utf-8")
+    output_file = tmp_path / "output.json"
+    output_file.write_bytes(raw)
+
+    # New streaming path
+    result_streaming = adapter_module._load_output_payload(
+        output_file,
+        source_path=source_path,
+        temp_path=temp_path,
+    )
+
+    # Reference: one-shot sanitize then json.loads
+    reference_text = _reference_sanitize(raw, source_path=source_path, temp_path=temp_path)
+    result_reference = json.loads(reference_text)
+
+    assert result_streaming == result_reference
+
+
+def test_sanitize_stream_oserror_raises_runtime(tmp_path: Path) -> None:
+    """OSError (missing file) must surface as RuntimeError."""
+    missing = tmp_path / "nonexistent.json"
+    with pytest.raises(RuntimeError, match="could not be read"):
+        adapter_module._load_output_payload(
+            missing,
+            source_path=tmp_path / "draw.dwg",
+            temp_path=tmp_path,
+        )
+
+
+def test_sanitize_stream_json_decode_error_raises_runtime(tmp_path: Path) -> None:
+    """Invalid JSON must surface as RuntimeError."""
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_bytes(b"not json {{{{")
+    with pytest.raises(RuntimeError, match="was invalid"):
+        adapter_module._load_output_payload(
+            bad_json,
+            source_path=tmp_path / "draw.dwg",
+            temp_path=tmp_path,
+        )
