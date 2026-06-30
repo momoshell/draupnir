@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import functools
 import json
 import math
@@ -720,9 +721,8 @@ def _load_output_payload(
     temp_path: Path,
 ) -> Any:
     try:
-        output_bytes = output_path.read_bytes()
-        output_text = _sanitize_text(
-            output_bytes.decode("utf-8", errors="replace"),
+        output_text = _sanitize_stream(
+            output_path,
             source_path=source_path,
             temp_path=temp_path,
         )
@@ -781,6 +781,73 @@ def _sanitize_text(text: str, *, source_path: Path, temp_path: Path) -> str:
         character if character.isprintable() or character in {"\n", "\t"} else "?"
         for character in sanitized
     ).strip()
+
+
+_SANITIZE_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB per chunk
+
+
+def _sanitize_stream(
+    path: Path,
+    *,
+    source_path: Path,
+    temp_path: Path,
+    chunk_size: int = _SANITIZE_CHUNK_SIZE,
+) -> str:
+    """Read *path* in chunks, incrementally decode UTF-8, redact paths, scrub
+    non-printable characters, and return the final stripped string.
+
+    This avoids holding raw bytes + decoded string + sanitized string in memory
+    simultaneously.  The result is byte-identical to::
+
+        _sanitize_text(path.read_bytes().decode("utf-8", errors="replace"), ...)
+    """
+    src_token = str(source_path)
+    tmp_token = str(temp_path)
+    # We need a carry-over tail to catch tokens that straddle chunk boundaries.
+    # A tail of (max_token_len - 1) chars guarantees the full token is visible
+    # in either the current-chunk or the carry+current window.
+    carry_len = max(len(src_token), len(tmp_token)) - 1
+
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    parts: list[str] = []
+    carry = ""
+
+    with path.open("rb") as fh:
+        while True:
+            raw = fh.read(chunk_size)
+            is_last = len(raw) < chunk_size
+
+            decoded = decoder.decode(raw, final=is_last)
+            # Prepend carry-over so straddling tokens are replaced correctly.
+            window = carry + decoded
+
+            # Apply redactions in the same order as _sanitize_text.
+            window = window.replace(src_token, "<source>")
+            window = window.replace(tmp_token, "<tempdir>")
+
+            if is_last:
+                # Flush the full window on the final chunk.
+                safe = window
+                carry = ""
+            else:
+                # Emit everything except the last carry_len characters; keep
+                # those as carry-over for the next iteration.
+                if carry_len > 0 and len(window) > carry_len:
+                    safe = window[:-carry_len]
+                    carry = window[-carry_len:]
+                else:
+                    # Window is shorter than carry_len (very small file or
+                    # large tokens); defer everything.
+                    safe = ""
+                    carry = window
+
+            # Scrub non-printable characters (same predicate as _sanitize_text).
+            parts.append("".join(c if c.isprintable() or c in {"\n", "\t"} else "?" for c in safe))
+
+            if is_last:
+                break
+
+    return "".join(parts).strip()
 
 
 def _build_canonical_output(
