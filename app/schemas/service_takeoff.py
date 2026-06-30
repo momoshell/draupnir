@@ -87,6 +87,25 @@ class ServiceTakeoffSummaryRead(BaseModel):
     )
     total_risers: int = Field(..., ge=0, description="Distinct rise symbols in this revision")
     total_drops: int = Field(..., ge=0, description="Distinct drop symbols in this revision")
+    bundle_abstained: bool = Field(
+        default=False,
+        description=(
+            "True when the tag-stack bundle detector abstained (ambiguous result or no "
+            "confident multi-service sets found). When True, at least one multi-service "
+            "run may be present but the system could not confirm bundle identity — "
+            "reviewer must check bundle_evidence_absent_lines for affected items."
+        ),
+    )
+    bundle_evidence_absent_lines: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Count of output lines where bundle_evidence_absent=True: multi-service runs "
+            "that did NOT overlap any confidently-matched bundle_service_sets by >=2 services "
+            "and were therefore apportioned per-segment (not multiplied). "
+            "Non-zero only when bundle_service_sets evidence is active (DWG, non-PDF)."
+        ),
+    )
 
 
 class ServiceFillColourRead(BaseModel):

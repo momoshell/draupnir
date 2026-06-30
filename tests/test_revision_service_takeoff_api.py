@@ -1166,3 +1166,308 @@ async def test_reassemble_tag_fragments_prepass_is_invoked(
     )
 
     app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------
+# #813 PR-3: route bundle-gate flip — bundle_service_sets drives takeoff
+# ---------------------------------------------------------------------------
+
+
+def _inputs_dwg_multi_service_bundle(scale: ScaleContext) -> ServiceTakeoffInputs:
+    """DWG inputs: one run on a shared-corridor with two services (VAC + AGSS).
+
+    The run has a single entity. fuse_run_service_identities assigns both services
+    when two nearby tags fire (VAC + AGSS). This makes it a confirmed-bundle candidate.
+    """
+    from app.interpretation.routed_runs import RoutedEntity
+    from app.interpretation.run_service_identity import TagPlacement
+    from app.interpretation.service_legend import ServiceEntry, ServiceLegend
+
+    # One entity: a 1000-unit line on a shared-colour layer.
+    color: dict[str, Any] = {"index": 2, "rgb": "#00ff00"}
+    geom = _line_entity_geometry(0.0, 0.0, 1000.0, 0.0)
+
+    routed_entities = [
+        RoutedEntity(
+            entity_id="bundle-pipe",
+            entity_type="line",
+            layer_ref="MGAS",
+            color=color,
+            geometry=geom,
+        )
+    ]
+
+    # Legend has VAC for the green colour.
+    entry_vac = ServiceEntry(
+        colour_key="#00ff00",
+        colour_index=2,
+        colour_rgb="#00ff00",
+        discipline="medical-gas",
+        abbreviation="VAC",
+        description="Vacuum",
+        sources=("swatch",),
+        confidence=None,
+        competing_disciplines=(),
+    )
+    legend = ServiceLegend(entries=(entry_vac,))
+
+    # Two tags near the pipe midpoint: VAC and AGSS (simulating a bundle corridor).
+    tag_placements = [
+        TagPlacement(text="54mm VAC", point=(490.0, 0.0), layer_ref="MGAS TAG"),
+        TagPlacement(text="42mm AGSS", point=(510.0, 0.0), layer_ref="MGAS TAG"),
+    ]
+
+    return ServiceTakeoffInputs(
+        routed_entities=routed_entities,
+        legend=legend,
+        tag_placements=tag_placements,
+        geometry_by_entity_id={"bundle-pipe": geom},
+        scale=scale,
+        rise_entities=[],
+        drop_entities=[],
+        input_family="dwg",
+    )
+
+
+def _inputs_dwg_drainage_multi_service(scale: ScaleContext) -> ServiceTakeoffInputs:
+    """DWG drainage-like inputs: one run carrying SVP + CDP services.
+
+    No bundle evidence is provided (the tag-stack will abstain or return no multi-service
+    sets). The run should be apportioned per-segment (no double-count).
+    """
+    from app.interpretation.routed_runs import RoutedEntity
+    from app.interpretation.run_service_identity import TagPlacement
+    from app.interpretation.service_legend import ServiceEntry, ServiceLegend
+
+    color: dict[str, Any] = {"index": 3, "rgb": "#888888"}  # grey — achromatic
+    geom = _line_entity_geometry(0.0, 0.0, 1000.0, 0.0)
+
+    routed_entities = [
+        RoutedEntity(
+            entity_id="drain-pipe",
+            entity_type="line",
+            layer_ref="DRAIN",
+            color=color,
+            geometry=geom,
+        )
+    ]
+
+    entry_svp = ServiceEntry(
+        colour_key="#888888",
+        colour_index=3,
+        colour_rgb="#888888",
+        discipline="drainage",
+        abbreviation="SVP",
+        description="SVP",
+        sources=("swatch",),
+        confidence=None,
+        competing_disciplines=(),
+    )
+    legend = ServiceLegend(entries=(entry_svp,))
+
+    # Two tags: SVP and CDP on the same grey run.
+    tag_placements = [
+        TagPlacement(text="100mm SVP", point=(250.0, 0.0), layer_ref="DRAIN TAG"),
+        TagPlacement(text="100mm CDP", point=(750.0, 0.0), layer_ref="DRAIN TAG"),
+    ]
+
+    return ServiceTakeoffInputs(
+        routed_entities=routed_entities,
+        legend=legend,
+        tag_placements=tag_placements,
+        geometry_by_entity_id={"drain-pipe": geom},
+        scale=scale,
+        rise_entities=[],
+        drop_entities=[],
+        input_family="dwg",
+    )
+
+
+async def test_bundle_gate_confirmed_by_tag_stack_yields_bundle_true(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#813 PR-3 gate: when assign_services_by_tag_stack returns bundle_service_sets
+    that overlaps the run's services by >=2, the takeoff lines carry bundle=True and
+    the summary has bundle_abstained=False.
+
+    Strategy: monkeypatch assign_services_by_tag_stack to return a result with
+    bundle_service_sets=(frozenset({"VAC","AGSS"}),) so the multi-service VAC+AGSS run
+    is confirmed as a bundle.  Each service line gets the full corridor length.
+    """
+    from app.interpretation.tag_stack_service import TagStackServiceResult
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_inputs(
+        db: Any,
+        revision_id: uuid.UUID,
+        *,
+        layer_refs: Any = None,
+        tag_layers: Any = None,
+        legend_layers: Any = None,
+        exclude_off_sheet: bool = True,
+    ) -> ServiceTakeoffInputs:
+        return _inputs_dwg_multi_service_bundle(_CONFIRMED_SCALE)
+
+    async def _fake_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> _FakeRoomInterpretation:
+        return _no_rooms()
+
+    # Confirmed bundle evidence: {VAC, AGSS}.
+    _confirmed_result = TagStackServiceResult(
+        assignments=(),
+        unmatched_colour_keys=(),
+        matched_stack_count=1,
+        ambiguous=False,
+        bundle_service_sets=(frozenset({"VAC", "AGSS"}),),
+    )
+
+    def _fake_assign_services(*args: Any, **kwargs: Any) -> TagStackServiceResult:
+        return _confirmed_result
+
+    monkeypatch.setattr(
+        service_takeoff_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(service_takeoff_route, "load_service_takeoff_inputs", _fake_inputs)
+    monkeypatch.setattr(service_takeoff_route, "_resolve_rooms", _fake_rooms)
+    monkeypatch.setattr(
+        service_takeoff_route, "assign_services_by_tag_stack", _fake_assign_services
+    )
+
+    response = await _get_takeoff(app)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    services_found = {i["service"] for i in items}
+    # VAC and/or AGSS should appear (bundle model: each gets the full corridor length).
+    assert services_found & {"VAC", "AGSS"}, (
+        f"Expected VAC or AGSS in confirmed-bundle response; got services: {services_found}"
+    )
+
+    # All resolved-service lines must be bundle=True (confirmed via tag-stack evidence).
+    for item in items:
+        if item["service"] not in ("unknown",):
+            assert item["bundle"] is True, (
+                f"Confirmed-bundle line for {item['service']} must have bundle=True; got {item}"
+            )
+
+    # Summary: bundle_abstained=False (detector did not abstain).
+    summary = body["summary"]
+    assert summary["bundle_abstained"] is False, (
+        f"Expected bundle_abstained=False on confirmed-bundle run; got "
+        f"{summary['bundle_abstained']}"
+    )
+
+    app.dependency_overrides.clear()
+
+
+async def test_bundle_gate_abstained_tag_stack_surfaces_in_summary(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#813 PR-3 gate: when assign_services_by_tag_stack returns ambiguous=True and no
+    bundle_service_sets, the multi-service drainage run is apportioned per-segment (no
+    double-count) and the summary surfaces bundle_abstained=True.
+
+    This prevents a silently-ambiguous multi-service run from looking like a resolved result.
+    """
+    from app.interpretation.tag_stack_service import TagStackServiceResult
+
+    async def _no_db() -> AsyncGenerator[None, None]:
+        yield None
+
+    app.dependency_overrides[get_db] = _no_db
+
+    async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
+        return _manifest()
+
+    async def _fake_inputs(
+        db: Any,
+        revision_id: uuid.UUID,
+        *,
+        layer_refs: Any = None,
+        tag_layers: Any = None,
+        legend_layers: Any = None,
+        exclude_off_sheet: bool = True,
+    ) -> ServiceTakeoffInputs:
+        return _inputs_dwg_drainage_multi_service(_CONFIRMED_SCALE)
+
+    async def _fake_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> _FakeRoomInterpretation:
+        return _no_rooms()
+
+    # Abstained: ambiguous=True, no bundle_service_sets.
+    _abstained_result = TagStackServiceResult(
+        assignments=(),
+        unmatched_colour_keys=(),
+        matched_stack_count=0,
+        ambiguous=True,
+        bundle_service_sets=(),
+    )
+
+    def _fake_assign_services(*args: Any, **kwargs: Any) -> TagStackServiceResult:
+        return _abstained_result
+
+    monkeypatch.setattr(
+        service_takeoff_route, "_get_active_revision_manifest_or_409", _fake_manifest
+    )
+    monkeypatch.setattr(service_takeoff_route, "load_service_takeoff_inputs", _fake_inputs)
+    monkeypatch.setattr(service_takeoff_route, "_resolve_rooms", _fake_rooms)
+    monkeypatch.setattr(
+        service_takeoff_route, "assign_services_by_tag_stack", _fake_assign_services
+    )
+
+    response = await _get_takeoff(app)
+    assert response.status_code == 200
+    body = response.json()
+
+    items = body["items"]
+    # Per-segment: total length must be conserved (not doubled).
+    # The run is 1000 drawing units; with bundle_service_sets=() it goes per-segment.
+    # The total across all resolved-service lines must not exceed 1000 du.
+    total_drawing_length = sum(i["drawing_length"] for i in items if i["service"] != "unknown")
+    assert total_drawing_length <= 1001.0, (
+        f"Abstained gate must not double-count lengths; total={total_drawing_length} "
+        f"(expected <=1000 du for a 1000 du run)"
+    )
+
+    # Summary must surface the abstention.
+    summary = body["summary"]
+    assert summary["bundle_abstained"] is True, (
+        f"Expected bundle_abstained=True when tag-stack abstained; got "
+        f"{summary['bundle_abstained']}"
+    )
+
+    # bundle_evidence_absent_lines is an int.
+    assert isinstance(summary["bundle_evidence_absent_lines"], int), (
+        "summary.bundle_evidence_absent_lines must be an int"
+    )
+
+    app.dependency_overrides.clear()
+
+
+async def test_pdf_bundle_gate_not_applied_legacy_path(
+    takeoff_app_pdf: FastAPI,
+) -> None:
+    """PDF revision: bundle_service_sets is None (legacy path); summary.bundle_abstained=False
+    and bundle_evidence_absent_lines=0 (no gate applied for PDF).
+    """
+    response = await _get_takeoff(takeoff_app_pdf)
+    assert response.status_code == 200
+    body = response.json()
+
+    summary = body["summary"]
+    # PDF uses the legacy path — no tag-stack gate, so no abstention signal.
+    assert summary["bundle_abstained"] is False, (
+        f"PDF should have bundle_abstained=False; got {summary['bundle_abstained']}"
+    )
+    assert summary["bundle_evidence_absent_lines"] == 0, (
+        f"PDF should have bundle_evidence_absent_lines=0; got "
+        f"{summary['bundle_evidence_absent_lines']}"
+    )
