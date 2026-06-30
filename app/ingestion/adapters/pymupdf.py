@@ -53,6 +53,8 @@ _VECTOR_CONFIDENCE_SCORE = 0.75
 # Confidence for a partial extraction that hit a configurable complexity cap and
 # was truncated; lowered (and still review-gated) to flag the missing geometry.
 _DEGRADED_CONFIDENCE_SCORE = 0.4
+# Embedded font text is high-confidence: glyphs are present verbatim, no OCR guessing.
+_EMBEDDED_TEXT_CONFIDENCE_SCORE = 0.9
 _MAX_PAGES = 256
 _MAX_PATH_ITEMS_PER_DRAWING = 10_000
 _MAX_POINTS_PER_ENTITY = 5_000
@@ -432,19 +434,22 @@ def _extract_document_canonical(
                 layer_names.append(layer_name)
 
         budget.checkpoint(options)
-        page_text_blocks, page_text_warnings, page_text_bytes = _extract_text_blocks(
-            page,
-            page_number=page_number,
-            layout_name=layout_name,
-            options=options,
-            budget=budget,
-            text_block_limit=_MAX_TEXT_BLOCKS - len(text_blocks),
-            text_byte_limit=_MAX_TEXT_BYTES - text_bytes,
+        page_text_blocks, page_text_warnings, page_text_bytes, page_text_entities = (
+            _extract_text_blocks(
+                page,
+                page_number=page_number,
+                layout_name=layout_name,
+                options=options,
+                budget=budget,
+                text_block_limit=_MAX_TEXT_BLOCKS - len(text_blocks),
+                text_byte_limit=_MAX_TEXT_BYTES - text_bytes,
+            )
         )
         budget.checkpoint(options)
         text_blocks.extend(page_text_blocks)
         warnings.extend(page_text_warnings)
         text_bytes += page_text_bytes
+        entities.extend(page_text_entities)
 
     metadata: dict[str, JSONValue] = {
         "source_format": source.upload_format.value,
@@ -787,10 +792,21 @@ def _extract_text_blocks(
     budget: _ExtractionBudget,
     text_block_limit: int,
     text_byte_limit: int,
-) -> tuple[list[dict[str, JSONValue]], list[AdapterWarning], int]:
+) -> tuple[list[dict[str, JSONValue]], list[AdapterWarning], int, list[dict[str, JSONValue]]]:
+    """Extract text blocks for metadata AND canonical text entities from a page.
+
+    Returns ``(text_blocks, warnings, text_bytes, text_entities)``.  The
+    ``text_blocks`` list feeds ``metadata.text_blocks`` (unchanged consumer);
+    ``text_entities`` are per-line canonical ``text`` entities that are added to
+    the main ``entities`` list so that interpretation (room labels, pipe tags)
+    sees the embedded-font text.  Both outputs are derived from the single
+    ``get_text("dict")`` call so no second PDF parse is required.
+    """
     extracted: list[dict[str, JSONValue]] = []
+    text_entities: list[dict[str, JSONValue]] = []
     warnings: list[AdapterWarning] = []
     text_bytes = 0
+    line_index = 0  # global line counter across all blocks on this page
 
     if text_block_limit < 0:
         raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded text block limit.")
@@ -807,12 +823,40 @@ def _extract_text_blocks(
         if len(extracted) >= text_block_limit:
             raise PyMuPDFExtractionLimitError("PyMuPDF extraction exceeded text block limit.")
 
+        block_number = int(block.get("number", 0))
         lines = cast(list[dict[str, Any]], block.get("lines", []))
         line_text: list[str] = []
         for line in lines:
             budget.checkpoint(options)
             spans = cast(list[dict[str, Any]], line.get("spans", []))
-            line_text.append("".join(str(span.get("text", "")) for span in spans))
+            span_text = "".join(str(span.get("text", "")) for span in spans)
+            line_text.append(span_text)
+
+            # Emit a canonical text entity for each non-empty line.
+            if span_text.strip():
+                try:
+                    entity = _build_pdf_text_entity(
+                        line=line,
+                        line_text=span_text,
+                        page_number=page_number,
+                        layout_name=layout_name,
+                        block_number=block_number,
+                        line_index=line_index,
+                    )
+                    text_entities.append(entity)
+                except PyMuPDFNonFiniteValueError:
+                    warnings.append(
+                        AdapterWarning(
+                            code="pymupdf_text_line_non_finite",
+                            message="Skipping PyMuPDF text line entity with non-finite bbox.",
+                            details={
+                                "page_number": page_number,
+                                "block_number": block_number,
+                                "line_index": line_index,
+                            },
+                        )
+                    )
+            line_index += 1
 
         text = "\n".join(part for part in line_text if part)
         block_text_bytes = len(text.encode("utf-8"))
@@ -824,7 +868,7 @@ def _extract_text_blocks(
                 {
                     "page_number": page_number,
                     "layout": layout_name,
-                    "block_number": int(block.get("number", 0)),
+                    "block_number": block_number,
                     "bbox": _bbox_from_tuple(_rect_tuple(block.get("bbox"))),
                     "text": text,
                 }
@@ -836,13 +880,129 @@ def _extract_text_blocks(
                     message="Skipping PyMuPDF text block with non-finite numeric values.",
                     details={
                         "page_number": page_number,
-                        "block_number": int(block.get("number", 0)),
+                        "block_number": block_number,
                     },
                 )
             )
             continue
         text_bytes += block_text_bytes
-    return extracted, warnings, text_bytes
+    return extracted, warnings, text_bytes, text_entities
+
+
+def _build_pdf_text_entity(
+    *,
+    line: dict[str, Any],
+    line_text: str,
+    page_number: int,
+    layout_name: str,
+    block_number: int,
+    line_index: int,
+) -> dict[str, JSONValue]:
+    """Build a canonical ``text`` entity from a single PyMuPDF text line.
+
+    Position is the bbox centre of the line — the natural insertion point for a
+    placed text label.  Embedded-font text carries a high confidence score because
+    the glyphs are present verbatim (no OCR guessing involved).
+
+    The entity shape matches the DWG ``text``/MTEXT contract that interpretation
+    consumers (room label, tag, legend loaders) expect:
+    ``geometry.text``      — the string content
+    ``geometry.insertion`` — ``{"x": cx, "y": cy}`` (2-D; consumers read .get("x")/.get("y"))
+    ``entity_type``        — ``"text"``
+    ``layer_ref``          — ``_DEFAULT_LAYER_NAME`` (PDF text carries no layer)
+    """
+    bbox_raw = _bbox_from_tuple(_rect_tuple(line.get("bbox")))
+    x_min = float(cast(float, bbox_raw["x_min"]))
+    y_min = float(cast(float, bbox_raw["y_min"]))
+    x_max = float(cast(float, bbox_raw["x_max"]))
+    y_max = float(cast(float, bbox_raw["y_max"]))
+    cx = _round_float((x_min + x_max) / 2.0)
+    cy = _round_float((y_min + y_max) / 2.0)
+    insertion: dict[str, JSONValue] = {"x": cx, "y": cy}
+
+    entity_id = f"page-{page_number}:text-block-{block_number}:line-{line_index}"
+    source_ref = f"pdf://page-{page_number}/text/block-{block_number}/line-{line_index}"
+    source_hash = _entity_source_hash(
+        {
+            "page_number": page_number,
+            "block_number": block_number,
+            "line_index": line_index,
+            "source": "pymupdf.get_text",
+            "text": line_text,
+        }
+    )
+
+    provenance = cast(
+        dict[str, JSONValue],
+        build_entity_provenance(
+            origin="adapter_normalized",
+            adapter={"key": _DESCRIPTOR.key},
+            source_ref=source_ref,
+            source_identity=entity_id,
+            source_hash=source_hash,
+            extraction_path=[
+                "get_text",
+                f"page-{page_number}",
+                f"block-{block_number}",
+                f"line-{line_index}",
+            ],
+            notes=["embedded_font_text"],
+            extra={
+                "native": {
+                    "pymupdf": {
+                        "page_number": page_number,
+                        "block_number": block_number,
+                        "line_index": line_index,
+                        "source": "get_text",
+                    }
+                }
+            },
+        ),
+    )
+    provenance["adapter_key"] = _DESCRIPTOR.key
+    provenance["page_number"] = page_number
+
+    text_length = len(line_text)
+    return {
+        "entity_id": entity_id,
+        "entity_type": "text",
+        "entity_schema_version": _SCHEMA_VERSION,
+        "id": entity_id,
+        "layout": layout_name,
+        "layer": _DEFAULT_LAYER_NAME,
+        "bbox": bbox_raw,
+        "geometry": {
+            "text": line_text,
+            "insertion": insertion,
+            "units": "pdf_points",
+            "geometry_summary": {
+                "kind": "text",
+                "source_type": "embedded_font",
+                "text_length": text_length,
+            },
+        },
+        "properties": {
+            "source_type": "embedded_font",
+            "text": line_text,
+            "text_length": text_length,
+        },
+        **provenance,
+        "provenance": provenance,
+        "confidence": {
+            "score": _EMBEDDED_TEXT_CONFIDENCE_SCORE,
+            "review_required": True,
+            "basis": "embedded_font_text",
+        },
+        "drawing_revision_id": None,
+        "source_file_id": None,
+        "layout_ref": layout_name,
+        "layer_ref": _DEFAULT_LAYER_NAME,
+        "block_ref": None,
+        "parent_entity_ref": None,
+        "kind": "text",
+        "text": line_text,
+        "text_length": text_length,
+    }
 
 
 def _build_lineish_entity(

@@ -1250,8 +1250,13 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
     assert result.canonical["layer_source"] == "pen_signature"
 
     entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
-    assert len(entities) == 1
-    entity = entities[0]
+    # The smoke PDF has one vector drawing (polyline) and one embedded-font text span "V".
+    # Text entities are emitted as "text" type entities alongside the geometry (#790).
+    polyline_entities = [e for e in entities if e["entity_type"] == "polyline"]
+    text_entities = [e for e in entities if e["entity_type"] == "text"]
+    assert len(polyline_entities) == 1
+    assert len(text_entities) == 1  # "V" text span from the fixture
+    entity = polyline_entities[0]
     assert entity["entity_id"] == "page-1:drawing-0:entity-0"
     assert entity["entity_type"] == "polyline"
     assert entity["entity_schema_version"] == "0.1"
@@ -1361,7 +1366,8 @@ async def test_pymupdf_vector_fixture_extracts_metadata_only_text() -> None:
             "text": "V",
         },
     )
-    assert all("text" not in entity for entity in entities)
+    # Geometry (line/polyline) entities must not carry a "text" key.
+    assert all("text" not in entity for entity in polyline_entities)
     assert result.warnings == ()
 
 
@@ -1931,9 +1937,13 @@ async def test_pymupdf_ingest_skips_non_finite_entities_and_text_blocks_with_san
     assert result.provenance[0].source_ref == "originals/plan.pdf"
 
     entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
-    assert len(entities) == 1
-    assert entities[0]["start"] == {"x": 30.0, "y": 30.0}
-    assert entities[0]["end"] == {"x": 40.0, "y": 40.0}
+    # One surviving line entity + two text entities (one per non-empty text line from each block).
+    # The "bad" block's block-level bbox has math.inf but its line dict has no bbox, so the line
+    # entity uses a zero bbox (finite) and is emitted; only the block-level metadata record fails.
+    line_entities = [e for e in entities if e["entity_type"] == "line"]
+    assert len(line_entities) == 1
+    assert line_entities[0]["start"] == {"x": 30.0, "y": 30.0}
+    assert line_entities[0]["end"] == {"x": 40.0, "y": 40.0}
 
     metadata = cast(dict[str, Any], result.canonical["metadata"])
     assert metadata["text_blocks"] == (

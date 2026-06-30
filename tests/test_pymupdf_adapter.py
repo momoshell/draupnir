@@ -557,3 +557,254 @@ def test_style_on_polyline_entity() -> None:
     properties = entity["properties"]
     assert isinstance(properties, dict)
     assert properties["stroke_width"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# PDF text entity emission (#790)
+# ---------------------------------------------------------------------------
+
+
+def _fake_line(text: str, bbox: tuple[float, float, float, float]) -> dict[str, Any]:
+    """Minimal PyMuPDF ``get_text("dict")`` line dict."""
+    return {
+        "bbox": bbox,
+        "spans": [{"text": text}],
+    }
+
+
+def _fake_block(
+    block_number: int,
+    lines: list[dict[str, Any]],
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 100.0, 20.0),
+) -> dict[str, Any]:
+    return {
+        "type": 0,
+        "number": block_number,
+        "bbox": bbox,
+        "lines": lines,
+    }
+
+
+class _FakePage:
+    """Minimal page stub that returns a ``get_text("dict")`` payload."""
+
+    def __init__(self, blocks: list[dict[str, Any]]) -> None:
+        self._blocks = blocks
+
+    def get_text(self, mode: str) -> dict[str, Any]:
+        assert mode == "dict"
+        return {"blocks": self._blocks}
+
+
+def _run_extract_text_blocks(
+    page: _FakePage,
+    *,
+    page_number: int = 1,
+    layout_name: str = "page-1",
+) -> tuple[
+    list[dict[str, JSONValue]],
+    list[AdapterWarning],
+    int,
+    list[dict[str, JSONValue]],
+]:
+    budget = pdf_adapter._ExtractionBudget(started_at=0.0, timeout_seconds=None)
+    return pdf_adapter._extract_text_blocks(
+        page,
+        page_number=page_number,
+        layout_name=layout_name,
+        options=AdapterExecutionOptions(timeout=None),
+        budget=budget,
+        text_block_limit=pdf_adapter._MAX_TEXT_BLOCKS,
+        text_byte_limit=pdf_adapter._MAX_TEXT_BYTES,
+    )
+
+
+def test_extract_text_blocks_emits_canonical_text_entities_for_each_non_empty_line() -> None:
+    """Each non-empty text line becomes a canonical ``text`` entity (#790)."""
+    blocks = [
+        _fake_block(
+            0,
+            [
+                _fake_line("0.2.17", (10.0, 20.0, 50.0, 30.0)),  # room number
+                _fake_line("100∅SVP", (10.0, 30.0, 70.0, 40.0)),  # pipe tag
+            ],
+        ),
+        _fake_block(
+            1,
+            [
+                _fake_line("Server Room", (100.0, 50.0, 200.0, 60.0)),  # room name
+            ],
+        ),
+    ]
+    page = _FakePage(blocks)
+    _text_blocks, _warnings, _text_bytes, text_entities = _run_extract_text_blocks(page)
+
+    # Three non-empty lines → three text entities.
+    assert len(text_entities) == 3
+    texts = [str(e["text"]) for e in text_entities]
+    assert "0.2.17" in texts
+    assert "100∅SVP" in texts
+    assert "Server Room" in texts
+
+    # Each entity must satisfy the canonical contract.
+    for entity in text_entities:
+        assert entity["entity_type"] == "text"
+        assert entity["kind"] == "text"
+        assert entity["layout_ref"] == "page-1"
+        assert entity["layer_ref"] == "default"
+        assert entity["block_ref"] is None
+        assert entity["drawing_revision_id"] is None
+        # geometry must carry both "text" and "insertion" with x/y.
+        geometry = entity["geometry"]
+        assert isinstance(geometry, dict)
+        assert isinstance(geometry["text"], str)
+        insertion = geometry["insertion"]
+        assert isinstance(insertion, dict)
+        assert "x" in insertion and "y" in insertion
+        # Confidence must be the high embedded-font score, not the vector score.
+        confidence = entity["confidence"]
+        assert isinstance(confidence, dict)
+        assert confidence["basis"] == "embedded_font_text"
+        assert float(confidence["score"]) == pdf_adapter._EMBEDDED_TEXT_CONFIDENCE_SCORE
+
+
+def test_extract_text_blocks_insertion_is_bbox_centre() -> None:
+    """Insertion point must be the centre of the line bbox."""
+    line = _fake_line("0.2.17", (10.0, 20.0, 50.0, 30.0))
+    block = _fake_block(0, [line])
+    page = _FakePage([block])
+    _, _, _, text_entities = _run_extract_text_blocks(page)
+
+    assert len(text_entities) == 1
+    geometry = text_entities[0]["geometry"]
+    assert isinstance(geometry, dict)
+    insertion = geometry["insertion"]
+    assert isinstance(insertion, dict)
+    # cx = (10 + 50) / 2 = 30, cy = (20 + 30) / 2 = 25
+    assert float(insertion["x"]) == pytest.approx(30.0)
+    assert float(insertion["y"]) == pytest.approx(25.0)
+
+
+def test_extract_text_blocks_metadata_blocks_still_populated() -> None:
+    """metadata.text_blocks output is unaffected by text entity emission."""
+    blocks = [
+        _fake_block(0, [_fake_line("0.2.17", (0.0, 0.0, 50.0, 10.0))]),
+        _fake_block(1, [_fake_line("Server Room", (0.0, 10.0, 100.0, 20.0))]),
+    ]
+    page = _FakePage(blocks)
+    text_blocks, _warnings, text_bytes, _text_entities = _run_extract_text_blocks(page)
+
+    assert len(text_blocks) == 2
+    assert text_blocks[0]["text"] == "0.2.17"
+    assert text_blocks[1]["text"] == "Server Room"
+    # text_bytes must reflect actual content.
+    assert text_bytes > 0
+
+
+def test_extract_text_blocks_skips_empty_lines_as_entities() -> None:
+    """Blank / whitespace-only lines do NOT produce text entities."""
+    blocks = [
+        _fake_block(
+            0,
+            [
+                _fake_line("", (0.0, 0.0, 50.0, 10.0)),
+                _fake_line("   ", (0.0, 10.0, 50.0, 20.0)),
+                _fake_line("0.2.17", (0.0, 20.0, 50.0, 30.0)),
+            ],
+        )
+    ]
+    page = _FakePage(blocks)
+    _, _, _, text_entities = _run_extract_text_blocks(page)
+
+    assert len(text_entities) == 1
+    assert text_entities[0]["text"] == "0.2.17"
+
+
+def test_extract_text_blocks_drawings_only_page_yields_no_text_entities() -> None:
+    """A page with no text blocks (drawings only) must return an empty text entity list."""
+    page = _FakePage([])
+    _, warnings, _, text_entities = _run_extract_text_blocks(page)
+    assert text_entities == []
+    assert warnings == []
+
+
+def test_extract_text_blocks_non_text_blocks_ignored() -> None:
+    """Image blocks (type != 0) must not produce text entities."""
+    blocks = [
+        {"type": 1, "number": 0, "bbox": (0.0, 0.0, 100.0, 100.0)},  # image block
+        _fake_block(0, [_fake_line("Label", (0.0, 0.0, 50.0, 10.0))]),
+    ]
+    page = _FakePage(blocks)
+    _, _, _, text_entities = _run_extract_text_blocks(page)
+    assert len(text_entities) == 1
+    assert text_entities[0]["text"] == "Label"
+
+
+def test_extract_text_blocks_entities_do_not_affect_line_entity_count() -> None:
+    """Drawing-path entities produced by ``_populate_page_entities`` are unaffected."""
+    drawings = [
+        {
+            "color": (0.0, 0.0, 0.0),
+            "width": 0.5,
+            "closePath": False,
+            "items": [("l", _FakePoint(0.0, 0.0), _FakePoint(1.0, 1.0))],
+        },
+        {
+            "color": (0.0, 0.0, 0.0),
+            "width": 0.5,
+            "closePath": False,
+            "items": [("l", _FakePoint(2.0, 0.0), _FakePoint(3.0, 1.0))],
+        },
+    ]
+    entities: list[dict[str, JSONValue]] = []
+    warnings: list[AdapterWarning] = []
+    layer_names: list[str] = []
+    budget = pdf_adapter._ExtractionBudget(started_at=0.0, timeout_seconds=None)
+
+    pdf_adapter._populate_page_entities(
+        drawings,
+        entities=entities,
+        warnings=warnings,
+        layer_names=layer_names,
+        page_number=1,
+        layout_name="page-1",
+        options=AdapterExecutionOptions(timeout=None),
+        budget=budget,
+        entity_limit=100,
+    )
+
+    assert len(entities) == 2
+    assert all(e["entity_type"] == "line" for e in entities)
+
+
+def test_build_pdf_text_entity_contract() -> None:
+    """Direct unit-test of the builder: verify every load-bearing field is present."""
+    line = _fake_line("Plantroom", (100.0, 200.0, 300.0, 220.0))
+    entity = pdf_adapter._build_pdf_text_entity(
+        line=line,
+        line_text="Plantroom",
+        page_number=2,
+        layout_name="page-2",
+        block_number=3,
+        line_index=7,
+    )
+    assert entity["entity_type"] == "text"
+    assert entity["entity_id"] == "page-2:text-block-3:line-7"
+    assert entity["text"] == "Plantroom"
+    assert entity["text_length"] == len("Plantroom")
+    assert entity["layout_ref"] == "page-2"
+    assert entity["layer_ref"] == "default"
+    geometry = entity["geometry"]
+    assert isinstance(geometry, dict)
+    assert geometry["text"] == "Plantroom"
+    insertion = geometry["insertion"]
+    assert isinstance(insertion, dict)
+    # cx = (100+300)/2 = 200, cy = (200+220)/2 = 210
+    assert float(insertion["x"]) == pytest.approx(200.0)
+    assert float(insertion["y"]) == pytest.approx(210.0)
+    confidence = entity["confidence"]
+    assert isinstance(confidence, dict)
+    assert confidence["basis"] == "embedded_font_text"
+    assert float(confidence["score"]) == pdf_adapter._EMBEDDED_TEXT_CONFIDENCE_SCORE
+    # Provenance must not be absent.
+    assert "provenance" in entity
