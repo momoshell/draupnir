@@ -5861,3 +5861,44 @@ async def test_libredwg_adapter_hatch_non_finite_pattern_type_omitted_no_crash(
     assert len(entities) == 1
     gs = entities[0]["geometry"]["geometry_summary"]
     assert "pattern_type" not in gs
+
+
+@pytest.mark.asyncio
+async def test_libredwg_adapter_resolves_handle_layer_ref_after_in_place_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_handle_named_refs mutates records in-place; the field cache must not
+    return the pre-mutation (handle-array) value after the overwrite.
+
+    Regression test for the round-1 cache bug: _mapping_normalized_cache was storing
+    (norm_key, value) pairs, so a later _mapping_get call returned the stale handle
+    array instead of the resolved layer name written by _resolve_handle_named_refs.
+    """
+    result = await _ingest_output_payload(
+        monkeypatch,
+        {
+            "OBJECTS": [
+                # LAYER table entry: handle [0, 1, 10, 10] → name "A-WALL"
+                {
+                    "type": "LAYER",
+                    "handle": [0, 1, 10, 10],
+                    "name": "A-WALL",
+                },
+                # LINE whose layer field is a handle reference (not yet a string).
+                # _resolve_handle_named_refs will overwrite layer with "A-WALL" in-place.
+                {
+                    "type": "LINE",
+                    "handle": "2A",
+                    "layer": [4, 1, 10, 10],
+                    "start": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "end": {"x": 1.0, "y": 0.0, "z": 0.0},
+                },
+            ]
+        },
+    )
+
+    entities = cast(tuple[dict[str, Any], ...], result.canonical["entities"])
+    assert len(entities) == 1
+    # The resolved layer name must propagate to the emitted entity — not None or a
+    # raw handle list, which would indicate the stale-cache bug is present.
+    assert entities[0]["layer_name"] == "A-WALL"

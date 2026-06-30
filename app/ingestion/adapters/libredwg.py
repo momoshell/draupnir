@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import math
 import re
@@ -787,6 +788,7 @@ def _build_canonical_output(
     source: AdapterSource,
     run_result: _DwgreadRunResult,
 ) -> _CanonicalBuildResult:
+    _clear_field_caches()
     entities: list[JSONValue] = []
     layouts_seen: set[str] = {_DEFAULT_LAYOUT_NAME}
     layers_seen: set[str] = set()
@@ -4640,10 +4642,37 @@ def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
     return f"OBJECTS/{record_type}/{_entity_id(record, record_type='record')}"
 
 
+# Sentinel for "key not present" — distinct from None (a valid field value).
+_MISSING: object = object()
+
+# Build-scoped caches, keyed by (id(), len()).  Cleared once per
+# _build_canonical_output call via _clear_field_caches().  Within one build the
+# dicts stay alive so id() values are stable.  Including len() in the key
+# prevents false cache hits when Python reuses an id() for a different-sized
+# dict between calls (e.g. in tests that never go through _build_canonical_output).
+#
+# IMPORTANT: field-accessed records are MUTATED in-place mid-build
+# (_resolve_handle_named_refs does `record["layer"] = resolved`), so values MUST
+# be read fresh from the live mapping — only the key normalization is cached here.
+_mapping_normalized_cache: dict[tuple[int, int], list[tuple[str, str]]] = {}
+_record_views_cache: dict[tuple[int, int], tuple[Mapping[str, Any], ...]] = {}
+
+
+def _clear_field_caches() -> None:
+    _mapping_normalized_cache.clear()
+    _record_views_cache.clear()
+
+
 def _record_views(record: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    cache_key = (id(record), len(record))
+    cached = _record_views_cache.get(cache_key)
+    if cached is not None:
+        return cached
     views: list[Mapping[str, Any]] = []
     _append_record_views(record, views=views, seen=set())
-    return tuple(views)
+    result = tuple(views)
+    _record_views_cache[cache_key] = result
+    return result
 
 
 def _append_record_views(
@@ -4699,15 +4728,27 @@ def _sanitize_text_content(value: str) -> str:
 
 
 def _mapping_get(mapping: Mapping[str, Any], *candidates: str) -> Any:
+    # Build (or fetch) the pre-normalized [(norm_key, orig_key), ...] pairs for this
+    # mapping, preserving original iteration order so the first-match semantics
+    # are identical to the original loop.  Values are NOT cached — they must be read
+    # fresh because records are mutated in-place during _resolve_handle_named_refs
+    # (e.g. `record["layer"] = resolved_name`).  The (id, len) key is stable within
+    # one build because dicts stay alive; an add/delete changes len → miss → rebuild.
+    cache_key = (id(mapping), len(mapping))
+    normalized_pairs = _mapping_normalized_cache.get(cache_key)
+    if normalized_pairs is None:
+        normalized_pairs = [(_normalize_lookup_key(k), k) for k in mapping if isinstance(k, str)]
+        _mapping_normalized_cache[cache_key] = normalized_pairs
     normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
-    for key, value in mapping.items():
-        if not isinstance(key, str):
-            continue
-        if _normalize_lookup_key(key) in normalized_candidates:
-            return value
+    for norm_key, orig_key in normalized_pairs:
+        if norm_key in normalized_candidates:
+            v = mapping.get(orig_key, _MISSING)
+            if v is not _MISSING:
+                return v
     return None
 
 
+@functools.cache
 def _normalize_lookup_key(value: str) -> str:
     return "".join(character for character in value.lower() if character.isalnum())
 
