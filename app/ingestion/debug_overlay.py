@@ -520,7 +520,8 @@ def _render_layout_panel(
     geometric_entities = [
         entity for entity in entities if bounds is not None and entity.geometry_bounds() is not None
     ]
-    placeholder_entities = [entity for entity in entities if entity not in geometric_entities]
+    geometric_ids = {id(entity) for entity in geometric_entities}
+    placeholder_entities = [entity for entity in entities if id(entity) not in geometric_ids]
     layout_bbox = _validated_bbox(layout.bbox)
 
     if layout_bbox is not None and bounds is not None:
