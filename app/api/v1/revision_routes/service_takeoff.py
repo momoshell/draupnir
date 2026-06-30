@@ -31,7 +31,6 @@ from app.interpretation.segment_label_takeoff import (
 )
 from app.interpretation.service_takeoff import (
     SERVICE_UNKNOWN,
-    _is_achromatic_colour_key,
     compute_service_takeoff,
 )
 from app.interpretation.service_takeoff_loaders import (
@@ -48,7 +47,11 @@ from app.interpretation.service_takeoff_loaders import (
     load_tag_stack_texts,
 )
 from app.interpretation.tag_reassembly import reassemble_tag_fragments
-from app.interpretation.tag_stack_service import BundleColourBand, assign_services_by_tag_stack
+from app.interpretation.tag_stack_service import (
+    BundleColourBand,
+    TagStackServiceResult,
+    assign_services_by_tag_stack,
+)
 from app.jobs.worker import enqueue_centerline_job as _enqueue_centerline_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
 from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
@@ -274,33 +277,48 @@ async def get_revision_service_takeoff(
     # Detect format family early — used at Steps 5b, 5c, 5d, 5e, 6.
     is_pdf = inputs.input_family == INPUT_FAMILY_PDF_VECTOR
 
-    # Step 5b-pre: for DWG revisions, compute the bundle-band colour gate (D3c Part B, #798).
-    # colour_differentiated=True → med-gas / colour-keyed discipline → bundle model (unchanged).
-    # colour_differentiated=False → achromatic / BYLAYER discipline (e.g. drainage) →
-    #   segment-level nearest-tag apportionment (no per-service multiplication).
-    # Gate: count DISTINCT bundle-band colour_keys that are NOT achromatic (grey/black/white).
-    # Med-gas M-540003: 5 distinct chromatic colours → True.
-    # Drainage: only c3000007 (BYLAYER grey) → False.
-    # PDF revisions have no bundle bands → default True (bundle model, no change).
+    # Step 5b-pre: for DWG revisions, load bundle bands and build the tag-stack result.
+    # The tag-stack result's bundle_service_sets is used as the per-run bundle gate in
+    # compute_service_takeoff (PR-3, issue #813).  The tag-stack result is also reused at
+    # Step 5d for tag_service_attribution to avoid a second DB call.
+    # PDF revisions have no bundle bands → bundle_service_sets=None (legacy path on takeoff).
     bundle_bands: dict[str, list[BundleColourBand]] = {}
     seg_labels_for_takeoff: list[SegmentLabel] = []
-    colour_differentiated: bool = True
+    # tag_stack_result_early is set for DWG below; None means legacy path (PDF or degenerate).
+    _tag_stack_result_early: TagStackServiceResult | None = None
 
     if not is_pdf:
-        # Load bundle bands once; reused by the colour gate here AND by Step 5d below.
+        # Load bundle bands once; reused by the bundle gate here AND by Step 5d below.
         bundle_bands = await load_bundle_bands_by_colour(
             db,
             revision_id,
             exclude_off_sheet=exclude_off_sheet,
             input_family=inputs.input_family,
         )
-        distinct_chromatic = sum(1 for ck in bundle_bands if not _is_achromatic_colour_key(ck))
-        colour_differentiated = distinct_chromatic >= 2
+
+        # Compute tag-stack result early so bundle_service_sets is available for the
+        # coordinator.  Step 5d reuses _tag_stack_result_early and skips the second
+        # assign_services_by_tag_stack call.
+        _tag_texts_early = await load_tag_stack_texts(
+            db,
+            revision_id,
+            input_family=inputs.input_family,
+        )
+        _stack_headers_early = await load_stack_headers(
+            db,
+            revision_id,
+            input_family=inputs.input_family,
+        )
+        _tag_stack_result_early = assign_services_by_tag_stack(
+            tags=_tag_texts_early,
+            headers=_stack_headers_early,
+            bundle_bands_by_colour=bundle_bands,
+        )
 
         # Build SegmentLabel list from reassembled tag placements.  These are consumed by
-        # compute_service_takeoff's achromatic path (colour_differentiated=False) and also
-        # by Step 5e's compute_segment_label_lengths.  Built unconditionally for DWG so
-        # Step 5e can reuse without re-parsing.
+        # compute_service_takeoff's per-segment path and also by Step 5e's
+        # compute_segment_label_lengths.  Built unconditionally for DWG so Step 5e can
+        # reuse without re-parsing.
         _legend_abbrevs_takeoff: frozenset[str] = frozenset(
             a.upper() for a in inputs.legend.by_abbreviation()
         )
@@ -323,7 +341,13 @@ async def get_revision_service_takeoff(
 
     # Step 5b -- compute takeoff (P3 coordinator).
     # Pass measured lengths when present; unmeasured groups fall back to naive entity-sum.
-    # colour_differentiated gates the attribution model (see module docstring in service_takeoff).
+    # bundle_service_sets from the tag-stack result gates the per-run bundle decision:
+    #   - When provided (DWG): per-segment default; confirmed bundles (≥2 services overlap
+    #     a confident tag-stack set) are multiplied; others flag bundle_evidence_absent.
+    #   - When None (PDF / degenerate): legacy colour_differentiated path is used unchanged.
+    _bss: tuple[frozenset[str], ...] | None = (
+        _tag_stack_result_early.bundle_service_sets if _tag_stack_result_early is not None else None
+    )
     result = compute_service_takeoff(
         runs=runs,
         identities=identities,
@@ -334,9 +358,9 @@ async def get_revision_service_takeoff(
         drop_symbols=drop_symbols,
         measured_length_by_group=measured_mapping if measured_mapping else None,
         measured_geometry_by_group=measured_geometry if measured_geometry else None,
-        colour_differentiated=colour_differentiated,
         segment_labels=seg_labels_for_takeoff,
         segment_label_max_m=_SEGMENT_LABEL_MAX_M,
+        bundle_service_sets=_bss,
     )
 
     # Step 5c -- fill-colour attribution (DWG only; compute-on-read, Phase 1 / #663).
@@ -401,25 +425,11 @@ async def get_revision_service_takeoff(
     # PDF revisions lack HATCH fill bands so the matcher has no bundle geometry; honest-absent.
     # Tag service OVERRIDES legend discipline for routed colours (additive only — lengths
     # are never touched). Discipline from RunServiceIdentity is attached as context.
-    # bundle_bands was already loaded in Step 5b-pre for DWG; reuse it here.
+    # _tag_stack_result_early was already computed in Step 5b-pre for DWG; reuse it here
+    # to avoid a second assign_services_by_tag_stack call.
     tag_service_attribution: ServiceTagAttributionRead | None = None
-    if not is_pdf:
-        tag_texts = await load_tag_stack_texts(
-            db,
-            revision_id,
-            input_family=inputs.input_family,
-        )
-        stack_headers = await load_stack_headers(
-            db,
-            revision_id,
-            input_family=inputs.input_family,
-        )
-        # bundle_bands already loaded in Step 5b-pre; no second DB call.
-        tag_stack_result = assign_services_by_tag_stack(
-            tags=tag_texts,
-            headers=stack_headers,
-            bundle_bands_by_colour=bundle_bands,
-        )
+    if not is_pdf and _tag_stack_result_early is not None:
+        tag_stack_result = _tag_stack_result_early
         # Build a colour_key → discipline lookup from Step 3 identities for context.
         _discipline_by_colour: dict[str, str | None] = {
             ident.colour_key: ident.discipline
@@ -523,6 +533,18 @@ async def get_revision_service_takeoff(
     distinct_sizes = len({(item.service, item.size_raw) for item in items})
     distinct_rooms = len({item.room_id for item in items})
 
+    # Abstention signals (#813 PR-3): surface whether the bundle detector abstained and
+    # how many output lines have bundle_evidence_absent=True (multi-service runs that could
+    # not be confirmed as bundles). These allow reviewers to identify silently-ambiguous runs.
+    # Counted from result.lines (internal dataclass) since ServiceTakeoffLineRead does not
+    # expose bundle_evidence_absent (it is a summary-level signal only).
+    _bundle_abstained: bool = (
+        _tag_stack_result_early.ambiguous if _tag_stack_result_early is not None else False
+    )
+    _bundle_evidence_absent_lines: int = sum(
+        1 for line in result.lines if line.bundle_evidence_absent
+    )
+
     scale_read = ServiceTakeoffScaleRead(
         units_confidence=inputs.scale.units_confidence,
         real_world_available=inputs.scale.real_world_available,
@@ -539,6 +561,8 @@ async def get_revision_service_takeoff(
         unknown_service_runs=result.unknown_service_run_count,
         total_risers=result.total_risers,
         total_drops=result.total_drops,
+        bundle_abstained=_bundle_abstained,
+        bundle_evidence_absent_lines=_bundle_evidence_absent_lines,
     )
 
     return ServiceTakeoffResponse(
