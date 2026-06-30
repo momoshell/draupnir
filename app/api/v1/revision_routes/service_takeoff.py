@@ -19,6 +19,7 @@ from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.core.logging import get_logger
 from app.db.session import get_db, get_session_maker
 from app.ingestion.centerline_contract import _xy
+from app.interpretation.mechanical_legend import MechanicalLegend
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
 from app.interpretation.routed_connectivity import refine_shared_by_connectivity
 from app.interpretation.routed_runs import identify_routed_runs
@@ -74,6 +75,31 @@ from app.schemas.service_takeoff import (
 service_takeoff_router = APIRouter()
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fill-service name resolution (exact → tolerant hue fallback; #813 PR-4)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_fill_service_name(
+    colour_key_value: str | None,
+    mech_legend: MechanicalLegend,
+) -> str | None:
+    """Return the service name for a fill colour band, or None if unresolvable.
+
+    Tries exact lookup first; falls back to hue-based tolerant matching for fill
+    colours that are desaturated tints of the legend swatch (same hue, large RGB
+    distance).  **Never modifies any length value.**
+    """
+    exact = mech_legend.lookup(colour_key_value)
+    if exact is not None:
+        return exact.service
+    tolerant = mech_legend.lookup_tolerant(colour_key_value)
+    if tolerant is not None:
+        return tolerant.service
+    return None
+
 
 ServiceTakeoffScope = Literal["sheet", "modelspace"]
 _DEFAULT_SCOPE: ServiceTakeoffScope = "sheet"
@@ -408,11 +434,7 @@ async def get_revision_service_takeoff(
                         colour_index=fc.colour_index,
                         colour_rgb=fc.colour_rgb,
                         length_m=fc.length_m,
-                        service_name=(
-                            _mech_entry.service
-                            if (_mech_entry := mech_legend.lookup(fc.colour_key)) is not None
-                            else None
-                        ),
+                        service_name=_resolve_fill_service_name(fc.colour_key, mech_legend),
                     )
                     for fc in raw_fill.per_colour
                 ],
