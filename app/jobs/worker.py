@@ -3,8 +3,6 @@
 # ruff: noqa: SLF001
 
 import asyncio
-import atexit
-import threading
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -45,6 +43,7 @@ from app.jobs import lifecycle as job_lifecycle
 from app.jobs import registered_processor as job_registered_processor
 from app.jobs import runner as job_runner
 from app.jobs import terminal_states as job_terminal_states
+from app.jobs import worker_loop as job_worker_loop
 from app.jobs.conflict_diagnostics import (
     _build_changeset_apply_conflict_details,
     _build_quantity_conflict_summaries,
@@ -203,8 +202,6 @@ _PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Changeset apply job failed unexpec
 _QUANTITY_TAKEOFF_CONFLICT_ERROR_MESSAGE = (
     "Quantity takeoff detected conflicting contributor inputs."
 )
-_WORKER_LOOP_RUNNER: asyncio.Runner | None = None
-_WORKER_LOOP_RUNNER_LOCK = threading.Lock()
 
 
 def is_ingest_worker_job_type(job_type: JobType | str) -> bool:
@@ -407,32 +404,19 @@ _utcnow = job_lifecycle._utcnow
 
 def _get_worker_loop_runner() -> asyncio.Runner:
     """Return the reusable asyncio runner for sync Celery entrypoints."""
-    global _WORKER_LOOP_RUNNER
-    if _WORKER_LOOP_RUNNER is None:
-        _WORKER_LOOP_RUNNER = asyncio.Runner()
-    return _WORKER_LOOP_RUNNER
+    return job_worker_loop.get_worker_loop_runner()
 
 
 def _close_worker_loop_runner() -> None:
     """Close and clear the reusable asyncio runner."""
-    global _WORKER_LOOP_RUNNER
-    with _WORKER_LOOP_RUNNER_LOCK:
-        runner = _WORKER_LOOP_RUNNER
-        if runner is None:
-            return
-        runner.close()
-        _WORKER_LOOP_RUNNER = None
+    job_worker_loop.close_worker_loop_runner()
 
 
 def _run_worker_loop[WorkerLoopResultT](
     coro_factory: Callable[[], Coroutine[Any, Any, WorkerLoopResultT]],
 ) -> WorkerLoopResultT:
     """Run a worker coroutine on the process-local reusable event loop."""
-    with _WORKER_LOOP_RUNNER_LOCK:
-        return _get_worker_loop_runner().run(coro_factory())
-
-
-atexit.register(_close_worker_loop_runner)
+    return job_worker_loop.run_worker_loop(coro_factory)
 
 
 _clear_job_attempt_lease = job_lifecycle._clear_job_attempt_lease
