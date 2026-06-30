@@ -48,6 +48,16 @@ export ADAPTER_TIMEOUT_SECONDS="${ADAPTER_TIMEOUT_SECONDS:-600}"
 # attestations that the GPL/AGPL review has been done for this machine.
 export DRAUPNIR_APPROVED_LICENSE_PROBES="${DRAUPNIR_APPROVED_LICENSE_PROBES:-pymupdf-deployment-review,libredwg-distribution-review}"
 
+# LibreDWG 0.14 (master) toolchain (#802). 0.14 reads R2004 files 0.13.3 cannot
+# (e.g. P-520002, the 0xd40 parse error) and emits per-entity ACI colours that
+# 0.13.3 collapses to BYLAYER. Prepend the pinned 0.14 install so the worker
+# resolves it deterministically regardless of login-shell PATH order (a login
+# shell puts /opt/homebrew/bin — system 0.13.3 — first). Override via env.
+: "${LIBREDWG_DWGREAD:=$HOME/.local/libredwg-0.14/bin/dwgread}"
+if [ -x "$LIBREDWG_DWGREAD" ]; then
+  export PATH="$(dirname "$LIBREDWG_DWGREAD"):$PATH"
+fi
+
 RUN_DIR="$REPO_ROOT/var/run"
 LOG_DIR="$REPO_ROOT/var/log"
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$STORAGE_LOCAL_ROOT"
@@ -58,6 +68,17 @@ CELERY_LOG="$LOG_DIR/celery.log"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!! \033[0m %s\n' "$*"; }
+
+report_dwgread() {
+  local bin ver
+  bin="$(command -v dwgread 2>/dev/null)"
+  if [ -n "$bin" ]; then
+    ver="$(dwgread --version 2>/dev/null | head -1)"
+    log "dwgread: $ver  ($bin)"
+  else
+    warn "dwgread not found on PATH"
+  fi
+}
 
 # --- helpers -----------------------------------------------------------------
 proc_count() { pgrep -f "$1" 2>/dev/null | wc -l | tr -d ' '; }
@@ -140,6 +161,7 @@ cmd_up() {
     sleep 1
   done
   echo
+  report_dwgread
   log "adapter health:"
   health_summary
   echo
@@ -159,6 +181,7 @@ cmd_status() {
   log "infra containers:"
   podman ps --filter "name=draupnir-postgres" --filter "name=draupnir-rabbitmq" \
     --format "    {{.Names}}  {{.Status}}" 2>/dev/null || true
+  report_dwgread
   log "adapter health:"
   health_summary
 }
