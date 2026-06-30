@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     max_upload_mb: int = 200
     max_request_body_mb: int = 10
     libredwg_max_output_mb: int = 32
+    parser_subprocess_max_memory_mb: int = 1024
+    parser_subprocess_cpu_seconds: int = 300
     # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
     # (e.g. 207k+ entities / 447 MB dwgread JSON): set ADAPTER_TIMEOUT_SECONDS=600
     # together with LIBREDWG_MAX_OUTPUT_MB=700 and worker --concurrency=1 (~3 GB RAM
@@ -89,6 +91,20 @@ class Settings(BaseSettings):
     def validate_libredwg_max_output_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
+        return value
+
+    @field_validator("parser_subprocess_max_memory_mb")
+    @classmethod
+    def validate_parser_subprocess_max_memory_mb(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("parser_subprocess_max_memory_mb must be positive")
+        return value
+
+    @field_validator("parser_subprocess_cpu_seconds")
+    @classmethod
+    def validate_parser_subprocess_cpu_seconds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("parser_subprocess_cpu_seconds must be positive")
         return value
 
     @field_validator("adapter_timeout_seconds")

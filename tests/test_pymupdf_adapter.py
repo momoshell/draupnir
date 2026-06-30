@@ -7,7 +7,9 @@ from typing import Any
 
 import pytest
 
+from app.core.config import settings
 from app.ingestion.adapters import pymupdf as pdf_adapter
+from app.ingestion.adapters._process_limits import ParserProcessLimits
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
     AdapterSource,
@@ -421,6 +423,28 @@ async def test_extract_with_process_fails_closed_when_runner_cannot_spawn() -> N
         await pdf_adapter._extract_with_process(
             _pdf_source(), AdapterExecutionOptions(timeout=None), runner=_runner
         )
+
+
+def test_configure_child_process_limits_clamps_cpu_to_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_limits: list[ParserProcessLimits] = []
+    monkeypatch.setattr(settings, "parser_subprocess_max_memory_mb", 384)
+    monkeypatch.setattr(settings, "parser_subprocess_cpu_seconds", 300)
+    monkeypatch.setattr(
+        pdf_adapter,
+        "apply_parser_process_limits",
+        lambda limits: observed_limits.append(limits),
+    )
+
+    pdf_adapter._configure_child_process_limits(timeout_seconds=12.5)
+
+    assert observed_limits == [
+        ParserProcessLimits(
+            max_address_space_bytes=384 * 1024 * 1024,
+            max_cpu_seconds=12.5,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

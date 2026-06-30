@@ -8,7 +8,6 @@ import functools
 import json
 import math
 import re
-import resource
 import shutil
 import tempfile
 from collections import Counter
@@ -21,6 +20,10 @@ from time import perf_counter
 from typing import Any, cast
 
 from app.core.config import settings
+from app.ingestion.adapters._process_limits import (
+    ParserProcessLimits,
+    apply_parser_process_limits,
+)
 from app.ingestion.adapters._units import resolve_units
 from app.ingestion.canonical.entity_provenance import build_entity_provenance
 from app.ingestion.canonical.hashing import (
@@ -630,7 +633,7 @@ async def _spawn_dwgread_process(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                preexec_fn=_configure_child_file_size_limit,
+                preexec_fn=_configure_child_process_limits,
             )
     except FileNotFoundError as exc:
         raise AdapterUnavailableError(
@@ -671,20 +674,15 @@ async def _wait_for_process(
         return returncode
 
 
-def _configure_child_file_size_limit() -> None:
+def _configure_child_process_limits() -> None:
     max_limit = max(_MAX_STDOUT_BYTES, _MAX_STDERR_BYTES, _configured_max_output_bytes())
-
-    try:
-        _, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
-    except (OSError, ValueError):
-        return
-
-    target_limit = max_limit if hard_limit == resource.RLIM_INFINITY else min(max_limit, hard_limit)
-
-    try:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (target_limit, target_limit))
-    except (OSError, ValueError):
-        return
+    apply_parser_process_limits(
+        ParserProcessLimits(
+            max_file_size_bytes=max_limit,
+            max_address_space_bytes=settings.parser_subprocess_max_memory_mb * 1024 * 1024,
+            max_cpu_seconds=settings.parser_subprocess_cpu_seconds,
+        )
+    )
 
 
 def _enforce_live_file_limits(live_limits: tuple[_LiveFileLimit, ...]) -> None:
