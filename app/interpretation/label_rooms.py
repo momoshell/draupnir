@@ -111,6 +111,27 @@ def _looks_like_room_name(text: str) -> bool:
     return True
 
 
+def has_genuine_room_identity(room: Room) -> bool:
+    """Return True when *room* has a genuine identity — a valid room number or a real name.
+
+    Used as the shared presentation filter (#792) in both the ``/rooms`` route response
+    and the ``/summary`` room counts, so the two endpoints always agree.
+
+    Genuine = has a parseable room number (e.g. "1.9.01", "G.04") OR a name that passes
+    the ``_looks_like_room_name`` gate (e.g. "Cooling Plantroom", "Heating & Hot Water").
+
+    What is filtered out:
+      - Anonymous wall-polygon cells (name=None AND number=None): internal registry
+        geometry retained for Phase-R conservation and Voronoi byte-identity guard.
+      - Spec-prose-named cells: polygon cells whose name was stamped from note text
+        (e.g. "ALL PIPEWORK SHALL BE PR", "ACCORDANCE WITH BUILDING REGULATIONS").
+    The registry is never modified; this predicate only affects the API presentation layer.
+    """
+    return (room.number is not None and parse_room_number(room.number) is not None) or (
+        room.name is not None and _looks_like_room_name(room.name)
+    )
+
+
 def room_label_layers(labels: Sequence[RoomLabel]) -> set[str | None] | None:
     """Layers that carry a room-number token — the room-label layers — or None to not restrict.
 
