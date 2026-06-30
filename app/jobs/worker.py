@@ -44,6 +44,7 @@ from app.jobs import export_artifacts as job_export_artifacts
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import registered_processor as job_registered_processor
 from app.jobs import runner as job_runner
+from app.jobs import terminal_states as job_terminal_states
 from app.jobs.conflict_diagnostics import (
     _build_changeset_apply_conflict_details,
     _build_quantity_conflict_summaries,
@@ -1114,8 +1115,14 @@ async def _mark_job_cancelled_with_log(
     log_fields: dict[str, Any] | None = None,
 ) -> None:
     """Persist a cancelled terminal state and emit the matching worker log."""
-    await _mark_job_cancelled(job_id, attempt_token=attempt_token)
-    logger.info(log_event, job_id=str(job_id), **(log_fields or {}))
+    await job_terminal_states.mark_job_cancelled_with_log(
+        job_id,
+        attempt_token=attempt_token,
+        log_event=log_event,
+        mark_job_cancelled=_mark_job_cancelled,
+        logger_instance=logger,
+        log_fields=log_fields,
+    )
 
 
 async def _mark_job_failed_for_revision_conflict(
@@ -1126,18 +1133,13 @@ async def _mark_job_failed_for_revision_conflict(
     exc: _RevisionConflictError,
 ) -> None:
     """Persist and log the shared revision-conflict failure contract."""
-    await _mark_job_failed(
+    await job_terminal_states.mark_job_failed_for_revision_conflict(
         job_id,
-        error_message=exc.message,
-        error_code=ErrorCode.REVISION_CONFLICT,
         attempt_token=attempt_token,
-        error_details=exc.details,
-    )
-    logger.warning(
-        log_event,
-        job_id=str(job_id),
-        error_code=ErrorCode.REVISION_CONFLICT.value,
-        **exc.details,
+        log_event=log_event,
+        exc=exc,
+        mark_job_failed=_mark_job_failed,
+        logger_instance=logger,
     )
 
 
@@ -1150,23 +1152,14 @@ async def _mark_job_failed_with_internal_error_log(
     log_fields: dict[str, Any] | None = None,
 ) -> None:
     """Persist and log unexpected internal worker failures."""
-    await _mark_job_failed(
+    await job_terminal_states.mark_job_failed_with_internal_error_log(
         job_id,
-        error_message=error_message,
         attempt_token=attempt_token,
-    )
-    logger.error(
-        log_event,
-        job_id=str(job_id),
-        **(
-            log_fields
-            if log_fields is not None
-            else {
-                "error_code": ErrorCode.INTERNAL_ERROR.value,
-                "error_message": error_message,
-            }
-        ),
-        exc_info=True,
+        error_message=error_message,
+        log_event=log_event,
+        mark_job_failed=_mark_job_failed,
+        logger_instance=logger,
+        log_fields=log_fields,
     )
 
 
@@ -1178,51 +1171,18 @@ async def _mark_job_failed_if_recovery_safe(
     error_details: dict[str, Any] | None = None,
 ) -> bool:
     """Fail a recovered job only if it is still pending and unowned."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
-        job = locked_source.job
-
-        if (
-            locked_source.project.deleted_at is not None
-            or locked_source.source_file is None
-            or locked_source.source_file.deleted_at is not None
-        ):
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info(
-                "job_recovery_enqueue_failure_mark_skipped_inactive_source",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return False
-
-        if not _job_is_safe_recovery_failure_target(job):
-            logger.info(
-                "job_recovery_enqueue_failure_mark_skipped_changed_state",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return False
-
-        await _persist_job_failed(
-            session,
-            job,
-            error_message=error_message,
-            error_code=error_code,
-            error_details=error_details,
-        )
-        await session.commit()
-
-    return True
+    return await job_terminal_states.mark_job_failed_if_recovery_safe(
+        job_id,
+        error_message=error_message,
+        error_code=error_code,
+        error_details=error_details,
+        session_maker_factory=get_session_maker,
+        lock_job_source_for_terminal_mutation=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source=_cancel_job_for_inactive_source,
+        job_is_safe_recovery_failure_target=_job_is_safe_recovery_failure_target,
+        persist_job_failed=_persist_job_failed,
+        logger_instance=logger,
+    )
 
 
 async def _claim_job_enqueue_intent(job_id: UUID) -> _ClaimedJobEnqueueIntent | None:
@@ -1333,21 +1293,13 @@ async def publish_job_enqueue_intent(
 
 async def _mark_recovery_enqueue_failed(job_id: UUID, *, job_type: str) -> bool:
     """Persist and log a sanitized worker-recovery enqueue failure."""
-    marked_failed = await _mark_job_failed_if_recovery_safe(
+    return await job_terminal_states.mark_recovery_enqueue_failed(
         job_id,
-        error_message=_get_enqueue_job_error_message(job_type),
-    )
-    if not marked_failed:
-        return False
-
-    logger.error(
-        "job_recovery_enqueue_failed",
-        job_id=str(job_id),
         job_type=job_type,
-        error_code=ErrorCode.INTERNAL_ERROR.value,
-        recovery_action="mark_failed",
+        get_enqueue_job_error_message=_get_enqueue_job_error_message,
+        mark_job_failed_if_recovery_safe_func=_mark_job_failed_if_recovery_safe,
+        logger_instance=logger,
     )
-    return True
 
 
 def _finalize_job_cancelled(job: Job) -> None:
