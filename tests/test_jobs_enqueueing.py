@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from app.jobs import enqueueing
-from app.models.job import JobType
+from app.models.job import Job, JobType
 
 
 class _FakeLogger:
@@ -87,3 +88,61 @@ def test_enqueue_backoff_seconds_is_capped() -> None:
     assert enqueueing.enqueue_backoff_seconds(1) == 0.0
     assert enqueueing.enqueue_backoff_seconds(2) == enqueueing.ENQUEUE_BACKOFF_BASE_SECONDS
     assert enqueueing.enqueue_backoff_seconds(50) == enqueueing.ENQUEUE_BACKOFF_MAX_SECONDS
+
+
+def _job(**overrides: Any) -> Job:
+    row = {
+        "enqueue_status": enqueueing.ENQUEUE_STATUS_PENDING,
+        "enqueue_attempts": 3,
+        "enqueue_owner_token": uuid.uuid4(),
+        "enqueue_lease_expires_at": datetime.now(UTC) + timedelta(minutes=5),
+        "enqueue_last_attempted_at": datetime.now(UTC),
+        "enqueue_published_at": datetime.now(UTC),
+    }
+    row.update(overrides)
+    return cast(Job, SimpleNamespace(**row))
+
+
+def test_prepare_job_enqueue_intent_resets_outbox_state() -> None:
+    job = _job()
+
+    enqueueing.prepare_job_enqueue_intent(job)
+
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PENDING
+    assert job.enqueue_attempts == 0
+    assert job.enqueue_owner_token is None
+    assert job.enqueue_lease_expires_at is None
+    assert job.enqueue_last_attempted_at is None
+    assert job.enqueue_published_at is None
+
+
+def test_is_stale_enqueue_intent_handles_missing_naive_and_aware_leases() -> None:
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    assert enqueueing.is_stale_enqueue_intent(_job(enqueue_lease_expires_at=None), now=now)
+    assert enqueueing.is_stale_enqueue_intent(
+        _job(enqueue_lease_expires_at=now.replace(tzinfo=None)),
+        now=now,
+    )
+    assert not enqueueing.is_stale_enqueue_intent(
+        _job(enqueue_lease_expires_at=now + timedelta(seconds=1)),
+        now=now,
+    )
+
+
+def test_claim_enqueue_intent_lease_marks_publishing_and_increments_attempts() -> None:
+    now = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    job = _job(enqueue_attempts=2)
+
+    lease = enqueueing.claim_enqueue_intent_lease(
+        job,
+        now=now,
+        lease_duration=timedelta(seconds=30),
+    )
+
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PUBLISHING
+    assert job.enqueue_attempts == 3
+    assert job.enqueue_owner_token == lease.token
+    assert job.enqueue_lease_expires_at == now + timedelta(seconds=30)
+    assert job.enqueue_last_attempted_at == now
+    assert lease.lease_expires_at == now + timedelta(seconds=30)

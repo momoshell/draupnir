@@ -5,10 +5,9 @@
 import asyncio
 import atexit
 import threading
-import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -160,7 +159,6 @@ _ENQUEUE_STATUS_PUBLISHED = job_enqueueing.ENQUEUE_STATUS_PUBLISHED
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
 _JOB_ATTEMPT_LEASE_RENEW_INTERVAL = _RUNNING_JOB_STALE_AFTER / 3
-_ENQUEUE_LEASE_DURATION = job_enqueueing.ENQUEUE_LEASE_DURATION
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
 _ENQUEUE_BACKOFF_BASE_SECONDS = job_enqueueing.ENQUEUE_BACKOFF_BASE_SECONDS
 _ENQUEUE_BACKOFF_MAX_SECONDS = job_enqueueing.ENQUEUE_BACKOFF_MAX_SECONDS
@@ -442,17 +440,12 @@ _clear_job_attempt_lease = job_lifecycle._clear_job_attempt_lease
 
 def _clear_enqueue_intent_lease(job: Job) -> None:
     """Clear persisted ownership fencing for a durable enqueue intent."""
-    job.enqueue_owner_token = None
-    job.enqueue_lease_expires_at = None
+    job_enqueueing.clear_enqueue_intent_lease(job)
 
 
 def prepare_job_enqueue_intent(job: Job) -> None:
     """Reset a job's durable enqueue intent to the pending outbox state."""
-    job.enqueue_status = _ENQUEUE_STATUS_PENDING
-    job.enqueue_attempts = 0
-    job.enqueue_last_attempted_at = None
-    job.enqueue_published_at = None
-    _clear_enqueue_intent_lease(job)
+    job_enqueueing.prepare_job_enqueue_intent(job)
 
 
 def _claim_job_attempt_lease(
@@ -547,24 +540,12 @@ async def _with_job_attempt_lease_renewal[ResultT](
 
 def _is_stale_enqueue_intent(job: Job, *, now: datetime) -> bool:
     """Return whether an in-flight enqueue publish claim can be reclaimed."""
-    lease_expires_at = job.enqueue_lease_expires_at
-    if lease_expires_at is None:
-        return True
-    if lease_expires_at.tzinfo is None:
-        lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
-    return lease_expires_at <= now
+    return job_enqueueing.is_stale_enqueue_intent(job, now=now)
 
 
 def _claim_enqueue_intent_lease(job: Job, *, now: datetime) -> _EnqueueIntentLease:
     """Mint and persist a fresh ownership lease for broker publication."""
-    token = uuid.uuid4()
-    lease_expires_at = now + _ENQUEUE_LEASE_DURATION
-    job.enqueue_status = _ENQUEUE_STATUS_PUBLISHING
-    job.enqueue_attempts += 1
-    job.enqueue_owner_token = token
-    job.enqueue_lease_expires_at = lease_expires_at
-    job.enqueue_last_attempted_at = now
-    return _EnqueueIntentLease(token=token, lease_expires_at=lease_expires_at)
+    return job_enqueueing.claim_enqueue_intent_lease(job, now=now)
 
 
 _get_job_for_update = job_lifecycle._get_job_for_update

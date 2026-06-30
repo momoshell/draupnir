@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
+
+from app.models.job import Job
 
 ENQUEUE_STATUS_PENDING = "pending"
 ENQUEUE_STATUS_PUBLISHING = "publishing"
@@ -61,6 +64,48 @@ def current_enqueue_countdown() -> float | None:
     """Return the active enqueue backoff in seconds, or None when there is none."""
     countdown = _ENQUEUE_COUNTDOWN_SECONDS.get()
     return countdown if countdown > 0.0 else None
+
+
+def clear_enqueue_intent_lease(job: Job) -> None:
+    """Clear persisted ownership fencing for a durable enqueue intent."""
+    job.enqueue_owner_token = None
+    job.enqueue_lease_expires_at = None
+
+
+def prepare_job_enqueue_intent(job: Job) -> None:
+    """Reset a job's durable enqueue intent to the pending outbox state."""
+    job.enqueue_status = ENQUEUE_STATUS_PENDING
+    job.enqueue_attempts = 0
+    job.enqueue_last_attempted_at = None
+    job.enqueue_published_at = None
+    clear_enqueue_intent_lease(job)
+
+
+def is_stale_enqueue_intent(job: Job, *, now: datetime) -> bool:
+    """Return whether an in-flight enqueue publish claim can be reclaimed."""
+    lease_expires_at = job.enqueue_lease_expires_at
+    if lease_expires_at is None:
+        return True
+    if lease_expires_at.tzinfo is None:
+        lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+    return lease_expires_at <= now
+
+
+def claim_enqueue_intent_lease(
+    job: Job,
+    *,
+    now: datetime,
+    lease_duration: timedelta = ENQUEUE_LEASE_DURATION,
+) -> EnqueueIntentLease:
+    """Mint and persist a fresh ownership lease for broker publication."""
+    token = uuid.uuid4()
+    lease_expires_at = now + lease_duration
+    job.enqueue_status = ENQUEUE_STATUS_PUBLISHING
+    job.enqueue_attempts += 1
+    job.enqueue_owner_token = token
+    job.enqueue_lease_expires_at = lease_expires_at
+    job.enqueue_last_attempted_at = now
+    return EnqueueIntentLease(token=token, lease_expires_at=lease_expires_at)
 
 
 async def publish_job_enqueue_intent(
