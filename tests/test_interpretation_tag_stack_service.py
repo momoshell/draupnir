@@ -634,3 +634,80 @@ def test_normalize_header_without_from_prefix() -> None:
     assert _normalize_header("BOTTOM TO TOP") == "BOTTOM TO TOP"
     assert _normalize_header("LEFT TO RIGHT reference") == "LEFT TO RIGHT"
     assert _normalize_header("RIGHT TO LEFT") == "RIGHT TO LEFT"
+
+
+# ---------------------------------------------------------------------------
+# bundle_service_sets: new field (additive; existing field values unchanged)
+# ---------------------------------------------------------------------------
+
+
+def test_bundle_service_sets_multi_service_stack() -> None:
+    """Multi-service stack (MA/VAC/AGSS) -> its service frozenset present in bundle_service_sets.
+
+    Uses the m540003-style fixture: orange=MA, brown=VAC x4, green=AGSS x4 (3 distinct
+    services). Exactly one entry expected, containing all three service names.
+    """
+    result = assign_services_by_tag_stack(
+        tags=_m540003_tags(),
+        headers=_m540003_header(),
+        bundle_bands_by_colour=_m540003_bands(),
+    )
+    assert result.matched_stack_count == 1
+    assert len(result.bundle_service_sets) == 1
+    assert result.bundle_service_sets[0] == frozenset({"MA", "VAC", "AGSS"})
+
+
+def test_bundle_service_sets_single_service_stack_empty() -> None:
+    """A single-service stack (all VAC) is degenerate -> abstains -> bundle_service_sets empty."""
+    tags = [
+        TagStackText(text="50 mm VAC", point=(0.0, 3.0)),
+        TagStackText(text="76 mm VAC", point=(0.0, 2.0)),
+        TagStackText(text="42 mm VAC", point=(0.0, 1.0)),
+    ]
+    headers = [StackHeader(text="TOP TO BOTTOM", point=(0.0, 3.5))]
+    bands = {
+        "c1": [_vband("c1", 4.0 + i * 0.5, 4.4 + i * 0.5, 1.0, 3.0) for i in range(4)],
+        "c2": [_vband("c2", 4.0 + i * 0.5, 4.4 + i * 0.5, 0.0, 1.0) for i in range(4)],
+    }
+    result = assign_services_by_tag_stack(tags=tags, headers=headers, bundle_bands_by_colour=bands)
+    assert result.ambiguous is True
+    assert result.bundle_service_sets == ()
+
+
+def test_bundle_service_sets_abstained_stack_empty() -> None:
+    """Abstained (no header in range) -> bundle_service_sets empty."""
+    tags = [
+        TagStackText(text="50 mm AA", point=(0.0, 3.0)),
+        TagStackText(text="76 mm BB", point=(0.0, 2.0)),
+    ]
+    headers = [StackHeader(text="TOP TO BOTTOM", point=(999.0, 999.0))]
+    bands = {
+        "c1": [_vband("c1", 4.0 + i * 0.5, 4.4 + i * 0.5, 2.0, 3.0) for i in range(4)],
+        "c2": [_vband("c2", 4.0 + i * 0.5, 4.4 + i * 0.5, 1.0, 2.0) for i in range(4)],
+    }
+    result = assign_services_by_tag_stack(tags=tags, headers=headers, bundle_bands_by_colour=bands)
+    assert result.ambiguous is True
+    assert result.bundle_service_sets == ()
+
+
+def test_bundle_service_sets_additive_existing_fields_unchanged() -> None:
+    """Adding bundle_service_sets does not alter any existing result field values."""
+    result = assign_services_by_tag_stack(
+        tags=_m540003_tags(),
+        headers=_m540003_header(),
+        bundle_bands_by_colour=_m540003_bands(),
+    )
+    # All pre-existing fields must retain exactly the same values as before the change.
+    assert result.matched_stack_count == 1
+    assert result.ambiguous is False
+    by_colour = {a.colour_key: a for a in result.assignments}
+    assert by_colour["orange"].service == "MA"
+    assert by_colour["brown"].service == "VAC"
+    assert by_colour["green"].service == "AGSS"
+    assert len(by_colour["brown"].sizes) == 4
+    assert "cyan" in result.unmatched_colour_keys
+    # New field is populated but existing ones are untouched.
+    assert len(result.bundle_service_sets) == 1
+    assert "MA" in result.bundle_service_sets[0]
+    assert "VAC" in result.bundle_service_sets[0]
+    assert "AGSS" in result.bundle_service_sets[0]
