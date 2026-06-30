@@ -39,6 +39,7 @@ from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.jobs import changeset_apply_execution as job_changeset_apply_execution
 from app.jobs import enqueueing as job_enqueueing
+from app.jobs import execution_adapters as job_execution_adapters
 from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
 from app.jobs import lifecycle as job_lifecycle
@@ -67,9 +68,6 @@ from app.jobs.export_execution_input import (
 )
 from app.jobs.export_execution_input import (
     _ExportJobInputError as _ExportJobInputError,
-)
-from app.jobs.export_execution_input import (
-    build_export_execution_input as build_export_execution_input,
 )
 from app.jobs.finalization_persister import (
     DEFAULT_FINALIZATION_PERSISTER,
@@ -111,9 +109,6 @@ from app.jobs.quantity_execution_input import (
 from app.jobs.quantity_execution_input import (
     _QuantityTakeoffJobError as _QuantityTakeoffJobError,
 )
-from app.jobs.quantity_execution_input import (
-    build_quantity_takeoff_execution_input as build_quantity_takeoff_execution_input,
-)
 from app.jobs.revision_queries import _assert_job_base_revision_invariants
 from app.jobs.revision_queries import (
     _build_revision_conflict_details as _build_revision_conflict_details,
@@ -149,16 +144,8 @@ from app.jobs.worker_deps import WorkerDeps
 from app.models.cad_changeset import CadChangeSet
 from app.models.changeset_apply_job_input import ChangeSetApplyJobInput
 from app.models.drawing_revision import DrawingRevision
-from app.models.estimate_version import EstimateVersion
-from app.models.export_job_input import ExportJobInput
 from app.models.extraction_profile import ExtractionProfile
 from app.models.job import Job, JobType
-from app.models.quantity_takeoff import QuantityTakeoff
-from app.models.revision_materialization import (
-    RevisionEntity,
-    RevisionEntityManifest,
-)
-from app.models.validation_report import ValidationReport
 from app.storage import get_storage
 
 logger = get_logger(__name__)
@@ -714,118 +701,33 @@ def _requested_input_family_from_pdf_input_mode(
     pdf_input_mode: str | None,
 ) -> InputFamily | None:
     """Map persisted PDF input mode to an explicit runner input family override."""
-
-    if pdf_input_mode == "vector":
-        return InputFamily.PDF_VECTOR
-    if pdf_input_mode == "raster":
-        return InputFamily.PDF_RASTER
-    return None
+    return job_execution_adapters.requested_input_family_from_pdf_input_mode(pdf_input_mode)
 
 
 async def _build_ingestion_run_request(job_id: UUID, *, attempt_token: UUID) -> IngestionRunRequest:
     """Load persisted job and file metadata for the ingestion runner."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        bootstrap = await _get_job_lock_bootstrap(session, job_id)
-        if bootstrap is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        project = await _get_project(session, bootstrap.project_id, for_update=True)
-        if project is None:
-            raise LookupError(
-                f"Project with identifier '{bootstrap.project_id}' for job '{job_id}' not found"
-            )
-
-        job = await _get_job_for_update_with_metadata(
-            session,
-            job_id,
-            expected_project_id=bootstrap.project_id,
-            expected_file_id=bootstrap.file_id,
-        )
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-        _assert_job_base_revision_invariants(job)
-
-        if project.deleted_at is not None:
-            cancelled = await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-                attempt_token=attempt_token,
-            )
-            if not cancelled:
-                raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-            raise _InactiveSourceError(
-                f"Project with identifier '{job.project_id}' for job '{job_id}' is no longer active"
-            )
-
-        source_file = await _get_source_file(
-            session,
-            project_id=job.project_id,
-            file_id=job.file_id,
-            for_update=True,
-        )
-        if source_file is None or source_file.deleted_at is not None:
-            cancelled = await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-                attempt_token=attempt_token,
-            )
-            if not cancelled:
-                raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-            raise _InactiveSourceError(
-                f"File with identifier '{job.file_id}' for job '{job_id}' is no longer active"
-            )
-
-        requested_input_family = None
-        if job.extraction_profile_id is not None:
-            extraction_profile = await _get_extraction_profile(
-                session,
-                extraction_profile_id=job.extraction_profile_id,
-            )
-            requested_input_family = _requested_input_family_from_pdf_input_mode(
-                extraction_profile.pdf_input_mode if extraction_profile is not None else None
-            )
-
-        return IngestionRunRequest(
-            job_id=job.id,
-            file_id=source_file.id,
-            checksum_sha256=source_file.checksum_sha256,
-            detected_format=source_file.detected_format,
-            media_type=source_file.media_type,
-            original_name=source_file.original_filename,
-            extraction_profile_id=job.extraction_profile_id,
-            initial_job_id=source_file.initial_job_id,
-            requested_input_family=requested_input_family,
-        )
+    return await job_execution_adapters.build_ingestion_run_request(
+        job_id,
+        attempt_token=attempt_token,
+        session_maker_factory=get_session_maker,
+        get_job_lock_bootstrap=_get_job_lock_bootstrap,
+        get_project=_get_project,
+        get_job_for_update_with_metadata=_get_job_for_update_with_metadata,
+        job_attempt_is_current=_job_attempt_is_current,
+        assert_job_base_revision_invariants=_assert_job_base_revision_invariants,
+        cancel_job_for_inactive_source=_cancel_job_for_inactive_source,
+        get_source_file=_get_source_file,
+        get_extraction_profile=_get_extraction_profile,
+        inactive_source_error_type=_InactiveSourceError,
+        stale_job_attempt_error_type=_StaleJobAttemptError,
+    )
 
 
-class _SessionExportRowLoader:
+class _SessionExportRowLoader(job_execution_adapters.SessionExportRowLoader):
     """Session-backed ``ExportRowLoader`` used by the worker export path."""
 
     def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def get_job(self, job_id: UUID) -> Job | None:
-        return await self._session.get(Job, job_id)
-
-    async def get_export_job_input(self, job_id: UUID) -> ExportJobInput | None:
-        return await self._session.get(ExportJobInput, job_id)
-
-    async def get_drawing_revision(self, revision_id: UUID) -> DrawingRevision | None:
-        return await _get_drawing_revision(self._session, revision_id=revision_id)
-
-    async def get_quantity_takeoff(self, takeoff_id: UUID) -> QuantityTakeoff | None:
-        return await self._session.get(QuantityTakeoff, takeoff_id)
-
-    async def get_estimate_version(self, version_id: UUID) -> EstimateVersion | None:
-        return await self._session.get(EstimateVersion, version_id)
+        super().__init__(session, get_drawing_revision=_get_drawing_revision)
 
 
 async def _build_export_execution_input(
@@ -834,59 +736,26 @@ async def _build_export_execution_input(
     attempt_token: UUID,
 ) -> _ExportExecutionInput:
     """Load deterministic persisted inputs for a claimed export job."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        return await build_export_execution_input(
-            job_id,
-            attempt_token=attempt_token,
-            loader=_SessionExportRowLoader(session),
-            resolve_export_spec=_get_export_kind_spec,
-            build_artifact_name=_build_export_artifact_name,
-        )
+    return await job_execution_adapters.build_export_execution_input(
+        job_id,
+        attempt_token=attempt_token,
+        session_maker_factory=get_session_maker,
+        row_loader_factory=_SessionExportRowLoader,
+        resolve_export_spec=_get_export_kind_spec,
+        build_artifact_name=_build_export_artifact_name,
+    )
 
 
-class _SessionQuantityRowLoader:
+class _SessionQuantityRowLoader(job_execution_adapters.SessionQuantityRowLoader):
     """Session-backed ``QuantityRowLoader`` used by the worker quantity path."""
 
     def __init__(self, session: AsyncSession) -> None:
-        self._session = session
-
-    async def get_job(self, job_id: UUID) -> Job | None:
-        return await self._session.get(Job, job_id)
-
-    async def get_drawing_revision(self, revision_id: UUID) -> DrawingRevision | None:
-        return await _get_drawing_revision(self._session, revision_id=revision_id)
-
-    async def get_validation_report(
-        self, *, project_id: UUID, drawing_revision_id: UUID
-    ) -> ValidationReport | None:
-        return await _get_validation_report_for_revision(
-            self._session,
-            project_id=project_id,
-            drawing_revision_id=drawing_revision_id,
-        )
-
-    async def get_entity_manifest(
-        self, *, project_id: UUID, source_file_id: UUID, drawing_revision_id: UUID
-    ) -> RevisionEntityManifest | None:
-        return await _get_revision_entity_manifest_for_revision(
-            self._session,
-            project_id=project_id,
-            source_file_id=source_file_id,
-            drawing_revision_id=drawing_revision_id,
-        )
-
-    async def get_revision_entities(
-        self, *, project_id: UUID, source_file_id: UUID, drawing_revision_id: UUID
-    ) -> list[RevisionEntity]:
-        return await _get_revision_entities_for_revision(
-            self._session,
-            project_id=project_id,
-            source_file_id=source_file_id,
-            drawing_revision_id=drawing_revision_id,
+        super().__init__(
+            session,
+            get_drawing_revision=_get_drawing_revision,
+            get_validation_report_for_revision=_get_validation_report_for_revision,
+            get_revision_entity_manifest_for_revision=(_get_revision_entity_manifest_for_revision),
+            get_revision_entities_for_revision=_get_revision_entities_for_revision,
         )
 
 
@@ -896,16 +765,12 @@ async def _build_quantity_takeoff_execution_input(
     attempt_token: UUID,
 ) -> _QuantityTakeoffExecutionInput:
     """Load unlocked quantity engine inputs for a claimed persisted job."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        return await build_quantity_takeoff_execution_input(
-            job_id,
-            attempt_token=attempt_token,
-            loader=_SessionQuantityRowLoader(session),
-        )
+    return await job_execution_adapters.build_quantity_takeoff_execution_input(
+        job_id,
+        attempt_token=attempt_token,
+        session_maker_factory=get_session_maker,
+        row_loader_factory=_SessionQuantityRowLoader,
+    )
 
 
 async def emit_job_event(
