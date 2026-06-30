@@ -6,6 +6,7 @@ Pure — no DB, no ORM, no fixtures beyond local fakes. Covers:
 - build_mechanical_legend: empty, by_key(), lookup().
 - Permutation-invariance: 8 M-560103 rows.
 - Module purity: no sqlalchemy/fastapi imports.
+- lookup_tolerant: hue-trap regression, achromatic gate, margin guard, empty legend.
 """
 
 from __future__ import annotations
@@ -287,3 +288,164 @@ def test_module_purity() -> None:
         if hasattr(obj, "__module__"):
             pkg = (obj.__module__ or "").split(".")[0]
             assert pkg not in disallowed, f"mechanical_legend imports {obj.__module__} via {name!r}"
+
+
+# ---------------------------------------------------------------------------
+# 15. lookup_tolerant — P-520001 legend fixture
+# ---------------------------------------------------------------------------
+
+# P-520001 mechanical legend swatches (rev 78d00585):
+#   c2ffb120  255,177,32   hue≈39°  → "SVP SOIL VENT PIPE"
+#   c2f5b9b9  245,185,185  hue≈0°   → "VENT PIPE"
+#   c2008700  0,135,0      hue≈120° → "RAIN WATER PIPE"
+#   c2ff80d5  255,128,213  hue≈320° → "CDP"  (already exact-matches fill)
+_P520001_INPUTS = [
+    MechSwatchInput(color={"rgb": "c2ffb120"}, text="SVP SOIL VENT PIPE"),
+    MechSwatchInput(color={"rgb": "c2f5b9b9"}, text="VENT PIPE"),
+    MechSwatchInput(color={"rgb": "c2008700"}, text="RAIN WATER PIPE"),
+    MechSwatchInput(color={"rgb": "c2ff80d5"}, text="CDP"),
+]
+
+
+def _p520001_legend() -> MechanicalLegend:
+    return build_mechanical_legend(_P520001_INPUTS)
+
+
+def test_lookup_tolerant_hue_trap_svp() -> None:
+    """THE regression test: ffd480 (hue≈40°) is RGB-nearer to VP swatch f5b9b9 but
+    hue-nearer to SVP swatch ffb120 — must resolve to SVP SOIL VENT PIPE.
+
+    RGB distances:
+      ffd480 → ffb120 (SVP): ≈102   (large)
+      ffd480 → f5b9b9 (VP):  ≈64    (smaller — the trap)
+    Hue distances:
+      40° → 39° (SVP): 1°   (tiny)
+      40° → 0°  (VP):  40°  (large)
+    """
+    legend = _p520001_legend()
+    entry = legend.lookup_tolerant("c2ffd480")
+    assert entry is not None, "SVP fill should resolve via hue matcher"
+    assert entry.service == "SVP SOIL VENT PIPE"
+
+
+def test_lookup_tolerant_vp_tint() -> None:
+    """e7bdb4 (hue≈11°) resolves to VENT PIPE (VP swatch hue≈0°)."""
+    legend = _p520001_legend()
+    entry = legend.lookup_tolerant("c2e7bdb4")
+    assert entry is not None, "VP tint fill should resolve via hue matcher"
+    assert entry.service == "VENT PIPE"
+
+
+def test_lookup_tolerant_rwp_green() -> None:
+    """007f00 (hue=120°) resolves to RAIN WATER PIPE (RWP swatch hue≈120°)."""
+    legend = _p520001_legend()
+    # 007f00 without the c2 prefix
+    entry = legend.lookup_tolerant("c2007f00")
+    assert entry is not None, "RWP fill should resolve via hue matcher"
+    assert entry.service == "RAIN WATER PIPE"
+
+
+def test_lookup_tolerant_achromatic_bylayer_returns_none() -> None:
+    """c3000007 (RGB 0,0,7 — near-black, achromatic) must return None (saturation gate)."""
+    legend = _p520001_legend()
+    entry = legend.lookup_tolerant("c3000007")
+    assert entry is None, "Achromatic BYLAYER colour must not match any service"
+
+
+def test_lookup_tolerant_exact_match_colour_not_returned() -> None:
+    """The exact-match colour c2ffb120 is already in the legend index; lookup_tolerant
+    still works correctly for it (it IS chromatic and hue-matches itself)."""
+    legend = _p520001_legend()
+    # Exact key: should also succeed via tolerant (distance 0°)
+    entry = legend.lookup_tolerant("c2ffb120")
+    assert entry is not None
+    assert entry.service == "SVP SOIL VENT PIPE"
+
+
+def test_lookup_tolerant_outside_tolerance_returns_none() -> None:
+    """A colour with hue 180° (cyan) has no legend entry within 22° → returns None."""
+    legend = _p520001_legend()
+    # 00ffff = RGB(0, 255, 255) → hue=180°; nearest legend entry is RWP at 120° (dist=60°)
+    entry = legend.lookup_tolerant("c200ffff")
+    assert entry is None, "Cyan fill is too far from any legend entry"
+
+
+def test_lookup_tolerant_ambiguous_near_tie_returns_none() -> None:
+    """When two legend entries are nearly equidistant in hue from the query colour,
+    lookup_tolerant abstains (returns None) rather than making an uncertain guess.
+
+    This test uses a synthetic legend with two entries at hue 10° and 30°, and a
+    query at 20° (equidistant: 10° from each).  The margin_deg=8 gate fires.
+    """
+    # Two entries 20° apart: hue≈10° and hue≈30°
+    # c2ff4400 ≈ RGB(255,68,0) → hue≈16°
+    # c2ffc800 ≈ RGB(255,200,0) → hue≈47°
+    # Query c2ffaa00 ≈ RGB(255,170,0) → hue≈40°: 24° from first, 7° from second.
+    # With margin_deg=8: best=7°, second=24°, gap=17° > 8 → should match (not a tie).
+    # For a genuine tie we need entries equidistant from query.
+    # c2ff2000 ≈ RGB(255,32,0) → hue≈7.5°
+    # c2ff8000 ≈ RGB(255,128,0) → hue≈30°
+    # query c2ff5000 ≈ RGB(255,80,0) → hue≈18.8°; dist to 7.5°=11.3°, dist to 30°=11.2° → tie
+    tie_inputs = [
+        MechSwatchInput(color={"rgb": "c2ff2000"}, text="SERVICE A"),
+        MechSwatchInput(color={"rgb": "c2ff8000"}, text="SERVICE B"),
+    ]
+    legend = build_mechanical_legend(tie_inputs)
+    # c2ff5000 = RGB(255,80,0) → hue ≈ 18.8°; equidistant from both entries
+    entry = legend.lookup_tolerant("c2ff5000", margin_deg=8.0)
+    assert entry is None, "Near-tie must return None (abstain)"
+
+
+def test_lookup_tolerant_empty_legend_returns_none() -> None:
+    """lookup_tolerant on an empty legend always returns None."""
+    legend = build_mechanical_legend([])
+    assert legend.lookup_tolerant("c2ffd480") is None
+
+
+def test_lookup_tolerant_none_key_returns_none() -> None:
+    """None key always returns None."""
+    legend = _p520001_legend()
+    assert legend.lookup_tolerant(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 16. _resolve_fill_service_name — route helper (no length modification)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_fill_service_name_exact_takes_priority() -> None:
+    """Exact match is used when available; tolerant fallback never fires for known keys."""
+    from app.api.v1.revision_routes.service_takeoff import _resolve_fill_service_name
+
+    legend = _p520001_legend()
+    # Exact key for CDP
+    name = _resolve_fill_service_name("c2ff80d5", legend)
+    assert name == "CDP"
+
+
+def test_resolve_fill_service_name_tolerant_fallback() -> None:
+    """For a tint not in the index, tolerant lookup fills service_name."""
+    from app.api.v1.revision_routes.service_takeoff import _resolve_fill_service_name
+
+    legend = _p520001_legend()
+    # SVP tint — not exact-matched, resolved by hue
+    name = _resolve_fill_service_name("c2ffd480", legend)
+    assert name == "SVP SOIL VENT PIPE"
+
+
+def test_resolve_fill_service_name_achromatic_returns_none() -> None:
+    """Achromatic fill returns None; no length value is touched by this helper."""
+    from app.api.v1.revision_routes.service_takeoff import _resolve_fill_service_name
+
+    legend = _p520001_legend()
+    name = _resolve_fill_service_name("c3000007", legend)
+    assert name is None
+
+
+def test_resolve_fill_service_name_unknown_colour_returns_none() -> None:
+    """Unresolvable fill key returns None honestly."""
+    from app.api.v1.revision_routes.service_takeoff import _resolve_fill_service_name
+
+    legend = _p520001_legend()
+    name = _resolve_fill_service_name("c200ffff", legend)
+    assert name is None
