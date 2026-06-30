@@ -37,6 +37,7 @@ from app.estimating.quantities.engine import compute_quantities
 from app.ingestion.contracts import AdapterTimeout, InputFamily
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
+from app.jobs import changeset_apply_execution as job_changeset_apply_execution
 from app.jobs import enqueueing as job_enqueueing
 from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
@@ -269,16 +270,7 @@ _RevisionConflictError = job_lifecycle._RevisionConflictError
 _QueuedJobEvent = job_execution_monitoring.QueuedJobEvent
 
 
-@dataclass(frozen=True, slots=True)
-class _ChangeSetApplyJobError(Exception):
-    """Raised for deterministic changeset apply execution failures."""
-
-    error_code: ErrorCode
-    message: str
-    details: dict[str, Any] | None = None
-
-    def __str__(self) -> str:
-        return self.message
+_ChangeSetApplyJobError = job_changeset_apply_execution.ChangeSetApplyJobError
 
 
 type _RegisteredJobInputError = (
@@ -1882,16 +1874,10 @@ async def _query_changeset_apply_job_inputs(
     job_id: UUID,
 ) -> list[ChangeSetApplyJobInput]:
     """Load persisted immutable inputs for one changeset-apply job."""
-    with session.no_autoflush:
-        result = await session.execute(
-            select(ChangeSetApplyJobInput)
-            .where(ChangeSetApplyJobInput.source_job_id == job_id)
-            .order_by(
-                ChangeSetApplyJobInput.created_at.asc(),
-                ChangeSetApplyJobInput.source_job_id.asc(),
-            )
-        )
-    return list(result.scalars().all())
+    return await job_changeset_apply_execution.query_changeset_apply_job_inputs(
+        session,
+        job_id=job_id,
+    )
 
 
 async def _load_changeset_apply_job_input(
@@ -1900,42 +1886,11 @@ async def _load_changeset_apply_job_input(
     job: Job,
 ) -> ChangeSetApplyJobInput:
     """Validate that one immutable apply input exists and matches the persisted job."""
-    apply_inputs = await _query_changeset_apply_job_inputs(session, job_id=job.id)
-    if not apply_inputs:
-        raise _ChangeSetApplyJobError(
-            error_code=ErrorCode.NOT_FOUND,
-            message="Changeset apply job input is missing.",
-            details=None,
-        )
-    if len(apply_inputs) != 1:
-        raise _ChangeSetApplyJobError(
-            error_code=ErrorCode.INPUT_INVALID,
-            message="Changeset apply job has multiple immutable inputs.",
-            details={"input_count": len(apply_inputs)},
-        )
-
-    apply_input = apply_inputs[0]
-    if (
-        apply_input.project_id != job.project_id
-        or apply_input.source_file_id != job.file_id
-        or apply_input.drawing_revision_id != job.base_revision_id
-        or apply_input.source_job_id != job.id
-        or apply_input.source_job_type != JobType.CHANGESET_APPLY.value
-    ):
-        raise _ChangeSetApplyJobError(
-            error_code=ErrorCode.INPUT_INVALID,
-            message="Changeset apply job input lineage does not match the persisted job.",
-            details={
-                "source_job_type": apply_input.source_job_type,
-                "source_file_id": str(apply_input.source_file_id),
-                "file_id": str(job.file_id),
-                "drawing_revision_id": str(apply_input.drawing_revision_id),
-                "base_revision_id": (
-                    str(job.base_revision_id) if job.base_revision_id is not None else None
-                ),
-            },
-        )
-    return apply_input
+    return await job_changeset_apply_execution.load_changeset_apply_job_input(
+        session,
+        job=job,
+        query_job_inputs=_query_changeset_apply_job_inputs,
+    )
 
 
 async def _load_changeset_apply_job_input_if_valid(
@@ -1944,32 +1899,16 @@ async def _load_changeset_apply_job_input_if_valid(
     job: Job,
 ) -> ChangeSetApplyJobInput | None:
     """Return the immutable apply input when exactly one lineage-matching row exists."""
-    apply_inputs = await _query_changeset_apply_job_inputs(session, job_id=job.id)
-    if len(apply_inputs) != 1:
-        return None
-
-    apply_input = apply_inputs[0]
-    if (
-        apply_input.project_id != job.project_id
-        or apply_input.source_file_id != job.file_id
-        or apply_input.drawing_revision_id != job.base_revision_id
-        or apply_input.source_job_id != job.id
-        or apply_input.source_job_type != JobType.CHANGESET_APPLY.value
-    ):
-        return None
-    return apply_input
+    return await job_changeset_apply_execution.load_changeset_apply_job_input_if_valid(
+        session,
+        job=job,
+        query_job_inputs=_query_changeset_apply_job_inputs,
+    )
 
 
 def _parse_uuid_value(value: Any) -> UUID | None:
     """Best-effort UUID parsing for persisted error payloads."""
-    if isinstance(value, UUID):
-        return value
-    if not isinstance(value, str):
-        return None
-    try:
-        return UUID(value)
-    except ValueError:
-        return None
+    return job_changeset_apply_execution.parse_uuid_value(value)
 
 
 async def _resolve_changeset_apply_failure_target(
@@ -1979,17 +1918,12 @@ async def _resolve_changeset_apply_failure_target(
     fallback_change_set_id: UUID | None = None,
 ) -> CadChangeSet | None:
     """Resolve the mutable changeset row for an apply-job terminal failure."""
-    apply_input = await _load_changeset_apply_job_input_if_valid(session, job=job)
-    change_set_id = apply_input.change_set_id if apply_input is not None else fallback_change_set_id
-    if change_set_id is None:
-        return None
-
-    change_set = await session.get(CadChangeSet, change_set_id)
-    if change_set is None or change_set.project_id != job.project_id:
-        return None
-    if job.base_revision_id is not None and change_set.base_revision_id != job.base_revision_id:
-        return None
-    return change_set
+    return await job_changeset_apply_execution.resolve_changeset_apply_failure_target(
+        session,
+        job=job,
+        fallback_change_set_id=fallback_change_set_id,
+        load_input_if_valid=_load_changeset_apply_job_input_if_valid,
+    )
 
 
 async def _mark_changeset_apply_job_failed(
@@ -2101,13 +2035,7 @@ async def _mark_changeset_apply_job_failed_for_input_error(
 
 def _build_changeset_apply_error_details(result: ChangeSetApplyError) -> dict[str, Any]:
     """Convert a deterministic apply-engine failure into worker job failure details."""
-    details: dict[str, Any] = {
-        "change_set_id": str(result.change_set_id),
-        "apply_error_code": result.error_code,
-    }
-    if result.details:
-        details.update(dict(result.details))
-    return details
+    return job_changeset_apply_execution.build_changeset_apply_error_details(result)
 
 
 async def _execute_changeset_apply_job_attempt(
