@@ -88,6 +88,12 @@ class PyMuPDFExtractionLimitError(RuntimeError):
     failure_reason = "extraction_limit"
 
 
+class PyMuPDFIsolationUnavailableError(RuntimeError):
+    """Raised when untrusted PDF parsing cannot run in an isolated child process."""
+
+    failure_reason = "isolation_unavailable"
+
+
 class _EntityBudgetError(PyMuPDFExtractionLimitError):
     """Internal signal that the configurable entity cap was reached.
 
@@ -1668,10 +1674,10 @@ def _raise_if_cancelled(options: AdapterExecutionOptions) -> None:
         raise asyncio.CancelledError
 
 
-#: Runs an extraction request out-of-process and returns the result envelope. Raises
-#: AssertionError/OSError when a subprocess cannot be spawned (the caller then falls back to
-#: in-process extraction). Injectable so the spawn-failure/timeout/decode paths are testable
-#: with a fake runner, no real processes.
+#: Runs an extraction request out-of-process and returns the result envelope.
+#: AssertionError/OSError mean subprocess isolation could not be established; those failures
+#: must fail closed because PDF input is untrusted. Injectable so the spawn-failure/timeout/decode
+#: paths are testable with a fake runner, no real processes.
 SubprocessExtractionRunner = Callable[
     [_ProcessExtractionRequest, AdapterExecutionOptions], Awaitable[dict[str, Any]]
 ]
@@ -1712,9 +1718,10 @@ async def _extract_with_process(
     except (AssertionError, OSError) as exc:
         # A daemonic parent (e.g. a Celery prefork pool worker) cannot spawn child
         # processes — multiprocessing raises AssertionError("daemonic processes are not
-        # allowed to have children"). Subprocess isolation is unavailable here, so fall
-        # back to in-process extraction (cooperative budget timeout still applies).
-        return await _extract_in_current_process(request, reason=str(exc) or type(exc).__name__)
+        # allowed to have children"). Untrusted PDF parsing must not continue in-process.
+        raise PyMuPDFIsolationUnavailableError(
+            "PyMuPDF extraction requires subprocess isolation for untrusted PDF input."
+        ) from exc
     return _decode_process_envelope(envelope)
 
 
@@ -1723,11 +1730,11 @@ async def _extract_in_current_process(
     *,
     reason: str,
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
-    """Run extraction in-process when subprocess isolation is unavailable.
+    """Run extraction in-process for trusted tests and explicitly local diagnostics.
 
     Reuses the exact child-process code path and envelope decoding, so error and
-    warning behaviour is identical to the isolated run. CPU-bound work is offloaded
-    to a worker thread to keep the event loop responsive.
+    warning behaviour is identical to the isolated run. Production untrusted ingestion
+    must use ``_extract_with_process`` so subprocess isolation failures fail closed.
     """
 
     envelope = await asyncio.to_thread(_extract_in_child_process, request)

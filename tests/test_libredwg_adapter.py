@@ -129,6 +129,40 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     return merged_counts
 
 
+def test_iter_mapping_candidates_preserves_wrapper_record_shape() -> None:
+    payload = {"object": {"type": "LINE", "handle": "1A"}}
+
+    assert adapter_module._iter_mapping_candidates(payload) == [payload]
+
+
+def test_iter_mapping_candidates_rejects_excessive_depth() -> None:
+    payload: dict[str, object] = {"type": "LINE", "handle": "1A"}
+    for _ in range(adapter_module._MAX_OUTPUT_STRUCTURE_DEPTH + 1):
+        payload = {"payload": payload}
+
+    with pytest.raises(adapter_module._OutputStructureLimitExceededError) as exc_info:
+        adapter_module._iter_mapping_candidates(payload)
+
+    assert exc_info.value.reason == "output_structure_depth_cap_exceeded"
+    assert exc_info.value.adapter_key == "libredwg"
+
+
+def test_iter_mapping_candidates_rejects_excessive_record_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(adapter_module, "_MAX_OUTPUT_RECORD_CANDIDATES", 2)
+    payload = [
+        {"type": "LINE", "handle": "1"},
+        {"type": "LINE", "handle": "2"},
+        {"type": "LINE", "handle": "3"},
+    ]
+
+    with pytest.raises(adapter_module._OutputStructureLimitExceededError) as exc_info:
+        adapter_module._iter_mapping_candidates(payload)
+
+    assert exc_info.value.reason == "output_record_candidate_cap_exceeded"
+
+
 _HATCH_SQUARE_POINTS = (
     {"x": 0.0, "y": 0.0, "z": 0.0},
     {"x": 4.0, "y": 0.0, "z": 0.0},

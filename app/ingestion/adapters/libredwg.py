@@ -63,6 +63,9 @@ _PROCESS_KILL_GRACE_SECONDS = 0.2
 _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+_MAX_OUTPUT_STRUCTURE_DEPTH = 256
+_MAX_OUTPUT_STRUCTURE_NODES = 200_000
+_MAX_OUTPUT_RECORD_CANDIDATES = 100_000
 _MAX_HATCH_BOUNDARY_COMPONENTS = 512
 _MAX_HATCH_LOOPS = 256
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
@@ -240,6 +243,16 @@ class _OutputLimitExceededError(RuntimeError):
         self.max_output_bytes = max_output_bytes
         self.output_size_bytes = output_size_bytes
         self.reason = "output_cap_exceeded"
+        self.stage = stage
+        self.adapter_key = "libredwg"
+
+
+class _OutputStructureLimitExceededError(RuntimeError):
+    """Raised when dwgread JSON is structurally too complex to traverse safely."""
+
+    def __init__(self, message: str, *, reason: str, stage: str = "parse") -> None:
+        super().__init__(message)
+        self.reason = reason
         self.stage = stage
         self.adapter_key = "libredwg"
 
@@ -1834,29 +1847,77 @@ def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
 
 
 def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
-    if isinstance(value, list):
-        list_candidates: list[Mapping[str, Any]] = []
-        for item in value:
-            if isinstance(item, Mapping):
-                list_candidates.extend(_iter_mapping_candidates(item))
-        return list_candidates
-    if not isinstance(value, Mapping):
+    if not isinstance(value, (Mapping, list)):
         return []
-    if _extract_record_type_from_current_mapping(value) is not None:
-        return [cast(Mapping[str, Any], value)]
 
-    candidates: list[Mapping[str, Any]] = []
-    for nested_value in value.values():
-        if isinstance(nested_value, Mapping):
-            candidates.extend(_iter_mapping_candidates(nested_value))
-        elif isinstance(nested_value, list):
-            for item in nested_value:
-                if isinstance(item, Mapping):
-                    candidates.extend(_iter_mapping_candidates(item))
+    candidates_by_id: dict[int, list[Mapping[str, Any]]] = {}
+    visited_nodes = 0
+    stack: list[tuple[Any, int, bool]] = [(value, 0, False)]
 
-    if len(candidates) == 1 and _extract_record_type_from_wrapper_views(value) is not None:
-        return [cast(Mapping[str, Any], value)]
-    return candidates
+    def _require_candidate_budget(candidate_count: int) -> None:
+        if candidate_count > _MAX_OUTPUT_RECORD_CANDIDATES:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the record candidate limit.",
+                reason="output_record_candidate_cap_exceeded",
+            )
+
+    def _child_candidates(children: Sequence[Any]) -> list[Mapping[str, Any]]:
+        child_candidates: list[Mapping[str, Any]] = []
+        for child in children:
+            if isinstance(child, (Mapping, list)):
+                child_candidates.extend(candidates_by_id.get(id(child), []))
+        _require_candidate_budget(len(child_candidates))
+        return child_candidates
+
+    while stack:
+        current, depth, expanded = stack.pop()
+        if not isinstance(current, (Mapping, list)):
+            continue
+        visited_nodes += 1
+        if visited_nodes > _MAX_OUTPUT_STRUCTURE_NODES:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the structure node limit.",
+                reason="output_structure_node_cap_exceeded",
+            )
+        if depth > _MAX_OUTPUT_STRUCTURE_DEPTH:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the structure depth limit.",
+                reason="output_structure_depth_cap_exceeded",
+            )
+
+        if isinstance(current, list):
+            if expanded:
+                candidates_by_id[id(current)] = _child_candidates(current)
+                continue
+            stack.append((current, depth, True))
+            for item in reversed(current):
+                if isinstance(item, (Mapping, list)):
+                    stack.append((item, depth + 1, False))
+            continue
+
+        current_id = id(current)
+        current_mapping = cast(Mapping[str, Any], current)
+        if expanded:
+            child_candidates = _child_candidates(tuple(current_mapping.values()))
+            if (
+                len(child_candidates) == 1
+                and _extract_record_type_from_wrapper_views(current_mapping) is not None
+            ):
+                candidates_by_id[current_id] = [current_mapping]
+            else:
+                candidates_by_id[current_id] = child_candidates
+            continue
+
+        if _extract_record_type_from_current_mapping(current_mapping) is not None:
+            candidates_by_id[current_id] = [current_mapping]
+            continue
+
+        stack.append((current_mapping, depth, True))
+        for nested_value in reversed(tuple(current_mapping.values())):
+            if isinstance(nested_value, (Mapping, list)):
+                stack.append((nested_value, depth + 1, False))
+
+    return candidates_by_id.get(id(value), [])
 
 
 def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
