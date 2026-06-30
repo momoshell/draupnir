@@ -18,6 +18,7 @@ from sqlalchemy import select
 import app.api.v1.files as files_api
 import app.db.session as session_module
 import app.jobs.worker as worker_module
+from app.api.v1 import file_uploads
 from app.core.config import settings
 from app.core.exceptions import raise_not_found
 from app.models.extraction_profile import ExtractionProfile
@@ -27,6 +28,74 @@ from app.models.project import Project
 from app.storage import LocalFilesystemStorage, StoredObjectMeta, get_storage
 from tests.conftest import requires_database
 from tests.test_jobs import _build_fake_ingest_payload
+
+
+class _BytesUploadFile:
+    def __init__(self, payload: bytes, *, filename: str = "upload.pdf") -> None:
+        self.filename = filename
+        self.content_type = "application/pdf"
+        self._payload = payload
+        self._offset = 0
+        self.close_calls = 0
+
+    async def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._payload) - self._offset
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_file_uploads_sniff_format_supported_signatures() -> None:
+    assert file_uploads.sniff_format(b"%PDF-1.7\n") == "pdf"
+    assert file_uploads.sniff_format(b"AC1027 rest") == "dwg"
+    assert file_uploads.sniff_format(b"ISO-10303-21;") == "ifc"
+    assert file_uploads.sniff_format(b"AutoCAD Binary DXF\r\n\x1a\x00payload") == "dxf"
+    assert file_uploads.sniff_format(b"\xef\xbb\xbf \r\n0\nSECTION\n") == "dxf"
+    assert file_uploads.sniff_format(b"not a drawing") is None
+
+
+@pytest.mark.asyncio
+async def test_file_uploads_stage_upload_file_records_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"%PDF-1.7\nmock-pdf-content\n"
+    upload = _BytesUploadFile(payload)
+    file_id = uuid.uuid4()
+    monkeypatch.setattr(settings, "storage_local_root", str(tmp_path))
+
+    staged = await file_uploads.stage_upload_file(cast(Any, upload), file_id=file_id)
+
+    assert staged.file_id == file_id
+    assert staged.detected_format == "pdf"
+    assert staged.size_bytes == len(payload)
+    assert staged.checksum_sha256 == hashlib.sha256(payload).hexdigest()
+    assert staged.staging_path.read_bytes() == payload
+    assert staged.staging_path.parent.name == ".staging"
+    assert upload.close_calls == 0
+
+    file_uploads.cleanup_uploaded_path(staged.staging_path)
+    assert not staged.staging_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_file_uploads_stage_upload_file_closes_invalid_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upload = _BytesUploadFile(b"not a drawing")
+    monkeypatch.setattr(settings, "storage_local_root", str(tmp_path))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await file_uploads.stage_upload_file(cast(Any, upload), file_id=uuid.uuid4())
+
+    assert exc_info.value.status_code == 415
+    assert upload.close_calls == 1
+    assert list(tmp_path.rglob("*.part")) == []
 
 
 @pytest_asyncio.fixture
