@@ -10,7 +10,6 @@ import threading
 import uuid
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
-from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -56,6 +55,7 @@ from app.exports.revision_json import (
 from app.ingestion.contracts import AdapterTimeout, InputFamily, ProgressUpdate
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
+from app.jobs import enqueueing as job_enqueueing
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import runner as job_runner
 from app.jobs.conflict_diagnostics import (
@@ -192,39 +192,18 @@ _RECOVERABLE_INGEST_JOB_TYPES = job_runner.INGEST_WORKER_JOB_TYPES
 _RECOVERABLE_ENQUEUE_JOB_TYPES = job_runner.RECOVERABLE_ENQUEUE_JOB_TYPES
 _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = job_runner.JOB_TYPES_WITHOUT_ENQUEUE_PUBLISHER
 _TERMINAL_JOB_STATUSES = job_lifecycle._TERMINAL_JOB_STATUSES
-_ENQUEUE_STATUS_PENDING = "pending"
-_ENQUEUE_STATUS_PUBLISHING = "publishing"
-_ENQUEUE_STATUS_PUBLISHED = "published"
+_ENQUEUE_STATUS_PENDING = job_enqueueing.ENQUEUE_STATUS_PENDING
+_ENQUEUE_STATUS_PUBLISHING = job_enqueueing.ENQUEUE_STATUS_PUBLISHING
+_ENQUEUE_STATUS_PUBLISHED = job_enqueueing.ENQUEUE_STATUS_PUBLISHED
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
 _JOB_ATTEMPT_LEASE_RENEW_INTERVAL = _RUNNING_JOB_STALE_AFTER / 3
-_ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
+_ENQUEUE_LEASE_DURATION = job_enqueueing.ENQUEUE_LEASE_DURATION
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
-# Capped exponential backoff between job attempts. The first attempt runs with no
-# delay; each subsequent re-enqueue waits base * 2**(attempt-1), capped, so a job
-# that keeps failing is spaced out instead of being retried as fast as the broker
-# can redeliver it (the attempt count is still bounded by ``Job.max_attempts``).
-_ENQUEUE_BACKOFF_BASE_SECONDS = 5.0
-_ENQUEUE_BACKOFF_MAX_SECONDS = 300.0
-
-
-def _enqueue_backoff_seconds(attempts: int) -> float:
-    """Return the retry delay for a job that has already made ``attempts`` tries."""
-    if attempts <= 1:
-        return 0.0
-    delay = _ENQUEUE_BACKOFF_BASE_SECONDS * (2.0 ** (attempts - 2))
-    return min(delay, _ENQUEUE_BACKOFF_MAX_SECONDS)
-
-
-# Carries the computed backoff to the real ``enqueue_*`` publishers without changing
-# their ``(job_id)`` call signature (test fakes and direct calls see the 0.0 default).
-_ENQUEUE_COUNTDOWN_SECONDS: ContextVar[float] = ContextVar("enqueue_countdown_seconds", default=0.0)
-
-
-def _current_enqueue_countdown() -> float | None:
-    """Return the active enqueue backoff in seconds, or None when there is none."""
-    countdown = _ENQUEUE_COUNTDOWN_SECONDS.get()
-    return countdown if countdown > 0.0 else None
+_ENQUEUE_BACKOFF_BASE_SECONDS = job_enqueueing.ENQUEUE_BACKOFF_BASE_SECONDS
+_ENQUEUE_BACKOFF_MAX_SECONDS = job_enqueueing.ENQUEUE_BACKOFF_MAX_SECONDS
+_enqueue_backoff_seconds = job_enqueueing.enqueue_backoff_seconds
+_current_enqueue_countdown = job_enqueueing.current_enqueue_countdown
 
 
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
@@ -700,23 +679,8 @@ def _get_export_kind_spec(export_kind: str) -> _ExportKindSpec:
 
 
 _JobAttemptLease = job_lifecycle._JobAttemptLease
-
-
-@dataclass(frozen=True, slots=True)
-class _EnqueueIntentLease:
-    """Persisted ownership token for a claimed durable enqueue intent."""
-
-    token: UUID
-    lease_expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class _ClaimedJobEnqueueIntent:
-    """Persisted enqueue claim bundled with the routed worker job type."""
-
-    lease: _EnqueueIntentLease
-    job_type: str
-    attempts: int
+_EnqueueIntentLease = job_enqueueing.EnqueueIntentLease
+_ClaimedJobEnqueueIntent = job_enqueueing.ClaimedJobEnqueueIntent
 
 
 _JobLockBootstrap = job_lifecycle._JobLockBootstrap
@@ -1796,63 +1760,18 @@ async def publish_job_enqueue_intent(
     suppress_exceptions: bool = False,
 ) -> bool:
     """Best-effort publish for a durable enqueue intent recorded in Postgres."""
-    claimed_intent: _ClaimedJobEnqueueIntent | None = None
-    try:
-        claimed_intent = await _claim_job_enqueue_intent(job_id)
-        if claimed_intent is None:
-            return False
-
-        publish = publisher or get_job_enqueue_publisher(claimed_intent.job_type)
-        if publish is None:
-            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
-            return False
-        countdown_token = _ENQUEUE_COUNTDOWN_SECONDS.set(
-            _enqueue_backoff_seconds(claimed_intent.attempts)
-        )
-        try:
-            publish(job_id)
-        except Exception:
-            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
-            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
-            if recovery:
-                await _mark_recovery_enqueue_failed(job_id, job_type=claimed_intent.job_type)
-            else:
-                logger.warning(
-                    "job_enqueue_deferred",
-                    job_id=str(job_id),
-                    job_type=claimed_intent.job_type,
-                    recovery_action="worker_start_recovery",
-                )
-            return False
-        else:
-            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
-
-        published = await _mark_job_enqueue_published(
-            job_id, lease_token=claimed_intent.lease.token
-        )
-        if not published:
-            # The broker publish already succeeded; the enqueue intent is at-least-once and
-            # job execution is idempotent, so we still report success. But the PUBLISHED
-            # transition was skipped because another owner reclaimed the lease (or the status
-            # moved off PUBLISHING) between claim and mark — surface that race for observability.
-            logger.warning(
-                "job_enqueue_publish_mark_skipped",
-                job_id=str(job_id),
-                job_type=claimed_intent.job_type,
-                reason="stale_enqueue_lease",
-            )
-        return True
-    except Exception:
-        if not suppress_exceptions:
-            raise
-
-        logger.warning(
-            "job_enqueue_deferred",
-            job_id=str(job_id),
-            job_type=claimed_intent.job_type if claimed_intent is not None else None,
-            recovery_action="worker_start_recovery",
-        )
-        return False
+    return await job_enqueueing.publish_job_enqueue_intent(
+        job_id,
+        claim_job_enqueue_intent=_claim_job_enqueue_intent,
+        release_job_enqueue_intent=_release_job_enqueue_intent,
+        mark_job_enqueue_published=_mark_job_enqueue_published,
+        mark_recovery_enqueue_failed=_mark_recovery_enqueue_failed,
+        get_job_enqueue_publisher=get_job_enqueue_publisher,
+        logger_instance=logger,
+        recovery=recovery,
+        publisher=publisher,
+        suppress_exceptions=suppress_exceptions,
+    )
 
 
 async def _mark_recovery_enqueue_failed(job_id: UUID, *, job_type: str) -> bool:
