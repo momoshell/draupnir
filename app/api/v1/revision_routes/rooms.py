@@ -41,7 +41,7 @@ from app.interpretation.rooms import (
     _smallest_containing_room,
 )
 from app.interpretation.service_takeoff_loaders import _resolve_input_family
-from app.models.revision_materialization import RevisionEntity
+from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.rooms import (
     DeviceRoomAssignmentRead,
@@ -221,6 +221,7 @@ async def list_revision_room_entities(
             centroid_x <= room.bounds[2],
             centroid_y >= room.bounds[1],
             centroid_y <= room.bounds[3],
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         .order_by(RevisionEntity.sequence_index.asc(), RevisionEntity.id.asc())
     )

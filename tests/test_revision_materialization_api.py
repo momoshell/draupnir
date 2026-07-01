@@ -535,6 +535,93 @@ class TestRevisionMaterializationApi:
         assert all(e.materialization_tier == "primary" for e in default_tier)
         assert fill_noise == []
 
+    async def test_dense_sliver_chain_on_unnamed_layer_tiers_fill_noise_and_loader_excludes(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#831 PR-2: a dense chain of sub-cm LINE entities on an unnamed layer (mirrors the
+        Z000/A700 hatch-fill sliver mass) is stamped 'fill_noise' at materialization, and
+        ``load_revision_entities_by_type``'s default ``tier='primary'`` excludes it while
+        ``tier=None`` still surfaces it (#831: tier, don't drop)."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        def _sliver_chain_entity(index: int) -> dict[str, Any]:
+            entity = _build_contract_entity(
+                entity_id=f"sliver-{index}",
+                entity_type="line",
+                layer_ref="Z000",  # unnamed arch-convention layer: no consumed-layer token
+                source_id=f"sliver-source-{index}",
+            )
+            # Each segment is 0.001m (< SLIVER_LEN_M) and shares an endpoint with the next,
+            # forming one 60-member connected component (>= FILL_COMPONENT_MIN).
+            entity["geometry_json"] = {
+                "start": {"x": float(index) * 0.001, "y": 0.0},
+                "end": {"x": float(index + 1) * 0.001, "y": 0.0},
+            }
+            return entity
+
+        chain_count = 60
+        sliver_entities = [_sliver_chain_entity(i) for i in range(chain_count)]
+        control_entity = _build_contract_entity(
+            entity_id="control-wall",
+            entity_type="line",
+            layer_ref="A-WALL",
+            source_id="control-wall-source",
+        )
+        control_entity["geometry_json"] = {
+            "start": {"x": 0.0, "y": 10.0},
+            "end": {"x": 5.0, "y": 10.0},
+        }
+
+        async def _run(request: IngestionRunRequest) -> IngestFinalizationPayload:
+            payload = _build_fake_ingest_payload(request)
+            return _replace_fake_canonical_payload(
+                payload,
+                layouts=[{"layout_ref": "Model", "name": "Model"}],
+                layers=[
+                    {"layer_ref": "Z000", "name": "Z000"},
+                    {"layer_ref": "A-WALL", "name": "A-WALL"},
+                ],
+                blocks=[],
+                entities=[*sliver_entities, control_entity],
+            )
+
+        monkeypatch.setattr(worker_module, "run_ingestion", _run)
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            default_tier = await load_revision_entities_by_type(session, revision_id, ("line",))
+            all_tiers = await load_revision_entities_by_type(
+                session, revision_id, ("line",), tier=None
+            )
+            fill_noise_only = await load_revision_entities_by_type(
+                session, revision_id, ("line",), tier="fill_noise"
+            )
+
+        default_ids = {e.entity_id for e in default_tier}
+        all_ids = {e.entity_id for e in all_tiers}
+        fill_noise_ids = {e.entity_id for e in fill_noise_only}
+
+        sliver_ids = {f"sliver-{i}" for i in range(chain_count)}
+        assert fill_noise_ids == sliver_ids  # the whole dense chain tiers fill_noise
+        assert default_ids == {"control-wall"}  # default excludes fill_noise
+        assert all_ids == sliver_ids | {"control-wall"}  # tier=None sees everything
+
     async def test_enumerate_devices_exclude_off_sheet_drops_off_sheet_roots(
         self,
         async_client: httpx.AsyncClient,
