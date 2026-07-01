@@ -40,6 +40,7 @@ from app.jobs import execution_monitoring as job_execution_monitoring
 from app.jobs import export_artifacts as job_export_artifacts
 from app.jobs import ingest_execution as job_ingest_execution
 from app.jobs import lifecycle as job_lifecycle
+from app.jobs import recovery as job_recovery
 from app.jobs import registered_processor as job_registered_processor
 from app.jobs import runner as job_runner
 from app.jobs import terminal_states as job_terminal_states
@@ -1667,35 +1668,19 @@ async def recover_incomplete_jobs() -> list[UUID]:
         )
         jobs = result.scalars().all()
 
-        recovered_job_ids: list[UUID] = []
-        for job in jobs:
-            if job.status == "running":
-                if not _is_stale_running_job(job, now=now):
-                    continue
-                job.status = "pending"
-                job.started_at = None
-                job.finished_at = None
-                job.error_code = None
-                job.error_message = None
-                _clear_job_attempt_lease(job)
-                prepare_job_enqueue_intent(job)
-                recovered_job_ids.append(job.id)
-                continue
-
-            if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING and not _is_stale_enqueue_intent(
-                job,
-                now=now,
-            ):
-                continue
-
-            if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING:
-                job.enqueue_status = _ENQUEUE_STATUS_PENDING
-                _clear_enqueue_intent_lease(job)
-
-            if job.enqueue_status != _ENQUEUE_STATUS_PENDING:
-                continue
-
-            recovered_job_ids.append(job.id)
+        recovered_job_ids = job_recovery.recover_incomplete_job_ids(
+            jobs,
+            now=now,
+            policy=job_recovery.RecoveryPolicy(
+                enqueue_status_pending=_ENQUEUE_STATUS_PENDING,
+                enqueue_status_publishing=_ENQUEUE_STATUS_PUBLISHING,
+                is_stale_running_job=_is_stale_running_job,
+                is_stale_enqueue_intent=_is_stale_enqueue_intent,
+                clear_job_attempt_lease=_clear_job_attempt_lease,
+                clear_enqueue_intent_lease=_clear_enqueue_intent_lease,
+                prepare_job_enqueue_intent=prepare_job_enqueue_intent,
+            ),
+        )
 
         await session.commit()
 
