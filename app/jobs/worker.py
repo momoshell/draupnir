@@ -15,11 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cad.changeset import (
-    ChangeSetApplyConflict,
     ChangeSetApplyError,
-    ChangeSetApplyLoadError,
-    ChangeSetApplySuccess,
-    load_and_apply_change_set,
 )
 from app.core.config import settings
 from app.core.errors import ErrorCode
@@ -1569,56 +1565,16 @@ async def _execute_changeset_apply_job_attempt(
 ) -> _RegisteredJobAttemptResult | None:
     """Load immutable apply input, re-run apply loading, and defer success finalization."""
     _ = deps  # uniform dispatch contract; no injected collaborators in this stage
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await session.get(Job, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
-        if job.job_type != JobType.CHANGESET_APPLY.value:
-            raise ValueError(f"Unsupported changeset apply job type '{job.job_type}'")
-        if job.base_revision_id is None:
-            raise _RevisionConflictError(
-                message="Changeset apply job is missing its finalized base revision.",
-                details={
-                    "base_revision_id": None,
-                    "current_revision_id": None,
-                },
-            )
-
-        apply_input = await _load_changeset_apply_job_input(session, job=job)
-        try:
-            apply_result = await load_and_apply_change_set(
-                session,
-                project_id=job.project_id,
-                change_set_id=apply_input.change_set_id,
-            )
-        except ChangeSetApplyLoadError as exc:
-            raise _ChangeSetApplyJobError(
-                error_code=ErrorCode.INPUT_INVALID,
-                message=str(exc),
-                details={
-                    "change_set_id": str(apply_input.change_set_id),
-                },
-            ) from exc
-
-    if isinstance(apply_result, ChangeSetApplyConflict):
-        raise _RevisionConflictError(
-            message="Changeset apply base revision is stale relative to the current revision.",
-            details=_build_changeset_apply_conflict_details(apply_result),
-        )
-    if isinstance(apply_result, ChangeSetApplyError):
-        raise _ChangeSetApplyJobError(
-            error_code=ErrorCode.INPUT_INVALID,
-            message=apply_result.message,
-            details=_build_changeset_apply_error_details(apply_result),
-        )
-
-    assert isinstance(apply_result, ChangeSetApplySuccess)
+    apply_result = await job_changeset_apply_execution.execute_changeset_apply_job_attempt(
+        job_id,
+        attempt_token=attempt_token,
+        session_maker_factory=get_session_maker,
+        job_attempt_is_current=_job_attempt_is_current,
+        load_apply_job_input=_load_changeset_apply_job_input,
+        build_conflict_details=_build_changeset_apply_conflict_details,
+        stale_job_attempt_error_type=_StaleJobAttemptError,
+        revision_conflict_error_type=_RevisionConflictError,
+    )
     return _RegisteredJobAttemptResult(finalize_kwargs={"apply_result": apply_result})
 
 
