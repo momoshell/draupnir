@@ -24,5 +24,6 @@ from . import job_event as job_event
 from . import project as project
 from . import quantity_takeoff as quantity_takeoff
 from . import revision_materialization as revision_materialization
+from . import revision_room as revision_room
 from . import revision_routed_length as revision_routed_length
 from . import validation_report as validation_report
