@@ -185,7 +185,15 @@ def _enrich_with_labels(
     base: RoomInterpretation, labels: Sequence[RoomLabel]
 ) -> RoomInterpretation:
     """Stamp label name/number onto containing polygon rooms, flag cross-wall duplicate numbers,
-    and append unmatched label identities — deduped by number into one room each (#549, #581)."""
+    and append unmatched label identities — deduped by number into one room each (#549, #581).
+
+    Coarse-polygon collision (#828 PR-4): when several DISTINCT room numbers land inside the
+    SAME polygon (e.g. a coarse grid layer auto-selected as the "wall" layer), only the first
+    identity stamps that polygon — every other distinct number is routed to the label-only path
+    below (rather than silently dropped) so each still surfaces as its own room. This is a
+    strictly different concern from the cross-wall duplicate flag (b), which is the SAME number
+    appearing in >=2 polygons.
+    """
     identities = identify_rooms_from_labels(labels)
     if not identities:
         return base
@@ -230,13 +238,26 @@ def _enrich_with_labels(
     if flagged:
         rooms = [replace(r, needs_review=True) if r.number in flagged else r for r in rooms]
 
-    # (c) Label-only identities: drop those whose number a polygon room already carries, then
-    # merge same-number placements into one room with all anchors (#581 — U-shape).
+    # (c) Label-only identities: an identity is routed here when it has no containing polygon
+    # at all, OR — for a NUMBERED identity only — its containing polygon was already stamped
+    # under a DIFFERENT number (the coarse-polygon collision case above; never for the identity
+    # that IS the stamped number itself, including a repeated placement of that same number).
+    # A name-only identity whose polygon is already claimed keeps the pre-existing behaviour
+    # (dropped, not surfaced) — collision handling here is scoped strictly to distinct numbers.
+    # Then drop numbered identities whose number a polygon room already carries under that SAME
+    # number, and merge same-number placements into one room with all anchors (#581 — U-shape).
     numbered_polygons = {r.number for r in rooms if r.polygon is not None and r.number is not None}
     label_only = [
         identity
         for identity, target in pairs
-        if target is None and (identity.number is None or identity.number not in numbered_polygons)
+        if (
+            target is None
+            or (
+                identity.number is not None
+                and stamp.get(target.id, (None, None))[1] != identity.number
+            )
+        )
+        and (identity.number is None or identity.number not in numbered_polygons)
     ]
     merged = dedupe_label_rooms_by_number(label_only)
     if not merged:

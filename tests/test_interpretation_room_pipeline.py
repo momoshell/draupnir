@@ -344,6 +344,83 @@ def test_same_number_across_walls_is_flagged_not_merged() -> None:
     assert all(room.needs_review for room in numbered)  # both flagged for review
 
 
+# --- #828 PR-4: coarse-polygon collision (distinct numbers, one polygon) ---
+
+
+def test_distinct_numbers_colliding_in_one_coarse_polygon_all_surfaced() -> None:
+    # A coarse grid cell (one big polygon) contains 3 DISTINCT numbered labels + 1 name label.
+    # Only the first should stamp the polygon; the other two must still surface as their own
+    # (label-only) rooms rather than vanish (#828 PR-4 — the ~34-number DWG collision bug).
+    entities = _square_wall_lines()  # SQUARE 0..10, one coarse polygon
+    labels = [
+        RoomLabel("Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("0.9.02", (2.0, 2.0), layer="A-IDEN"),
+        RoomLabel("0.9.03", (8.0, 8.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    numbers = {room.number for room in result.rooms if room.number is not None}
+    assert numbers == {"0.9.01", "0.9.02", "0.9.03"}  # all 3 distinct numbers surfaced
+
+    stamped = next(r for r in result.rooms if r.number == "0.9.01")
+    assert stamped.polygon is not None  # first identity still stamps the polygon
+    assert stamped.name == "Plant"
+
+    for number in ("0.9.02", "0.9.03"):
+        collided = next(r for r in result.rooms if r.number == number)
+        assert collided.polygon is None  # routed to the label-only path, not dropped
+        assert collided.needs_review is False  # a coarse-polygon collision, not a #581 flag
+
+
+def test_same_number_twice_in_colliding_polygon_dedupes_to_one_room() -> None:
+    # The SAME number placed twice inside the coarse polygon (both stamping candidates land in
+    # the one polygon) must still dedupe to a single room, not double-count.
+    entities = _square_wall_lines()
+    labels = [
+        RoomLabel("Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("0.9.01", (8.0, 8.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    numbered = [room for room in result.rooms if room.number == "0.9.01"]
+    assert len(numbered) == 1  # deduped, not double-counted
+    assert numbered[0].polygon is not None  # the stamped polygon room
+
+
+def test_coarse_polygon_collision_does_not_disturb_cross_wall_flag() -> None:
+    # A coarse-polygon collision (distinct numbers) alongside a genuine cross-wall duplicate
+    # (#581, same number in two separate wall-bounded polygons) — both concerns coexist and
+    # neither corrupts the other.
+    entities = [
+        *_square_wall_lines(),
+        *_square_wall_lines_at(100.0, 100.0),
+        *_square_wall_lines_at(200.0, 200.0),
+    ]
+    labels = [
+        # Coarse-polygon collision inside the first square: two distinct numbers.
+        RoomLabel("Plant", (5.0, 5.4), layer="A-IDEN"),
+        RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN"),
+        RoomLabel("0.9.02", (2.0, 2.0), layer="A-IDEN"),
+        # Cross-wall duplicate: same number "0.9.04" in the OTHER two squares.
+        RoomLabel("AHU Plant", (108.0, 108.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (108.0, 108.0), layer="A-IDEN"),
+        RoomLabel("AHU Plant", (208.0, 208.4), layer="A-IDEN"),
+        RoomLabel("0.9.04", (208.0, 208.0), layer="A-IDEN"),
+    ]
+    result = interpret_rooms(entities, devices=[], labels=labels)
+    numbers = {room.number for room in result.rooms if room.number is not None}
+    assert {"0.9.01", "0.9.02"} <= numbers
+
+    collided = next(r for r in result.rooms if r.number == "0.9.02")
+    assert collided.polygon is None
+    assert collided.needs_review is False
+
+    cross_wall = [room for room in result.rooms if room.number == "0.9.04"]
+    assert len(cross_wall) == 2  # still flagged, not merged
+    assert all(room.polygon is not None for room in cross_wall)
+    assert all(room.needs_review for room in cross_wall)
+
+
 # --- PDF annotation-zone exclusion gate (#828 PR-2) ---
 
 
