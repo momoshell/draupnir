@@ -463,6 +463,15 @@ def test_extract_angle_degrees_radians_default_and_degrees_hint() -> None:
     assert extract({"start_angle": 45, "angle_units": "deg"}) == 45.0
 
 
+def test_mapping_get_cache_uses_live_key_signature_for_same_size_mappings() -> None:
+    record = {"start_angle": math.radians(135)}
+    adapter_module._mapping_normalized_cache[(id(record), len(record), ("other_key",))] = [
+        ("otherkey", "other_key")
+    ]
+
+    assert round(adapter_module._extract_angle_degrees(record, "start_angle") or 0.0, 6) == 135.0
+
+
 def test_resolve_orientation_pins_angbase_angdir() -> None:
     resolve = adapter_module._resolve_orientation
     # no header → unconfirmed default, not rotated

@@ -4903,16 +4903,18 @@ def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
 # Sentinel for "key not present" — distinct from None (a valid field value).
 _MISSING: object = object()
 
-# Build-scoped caches, keyed by (id(), len()).  Cleared once per
+# Build-scoped caches.  Cleared once per
 # _build_canonical_output call via _clear_field_caches().  Within one build the
-# dicts stay alive so id() values are stable.  Including len() in the key
-# prevents false cache hits when Python reuses an id() for a different-sized
-# dict between calls (e.g. in tests that never go through _build_canonical_output).
+# record-view dicts stay alive so id() values are stable.  The mapping-normalized
+# cache does not retain mappings, so its key includes the current string-key
+# signature to prevent false cache hits when Python reuses an id() for another
+# same-sized dict between calls (e.g. in tests that never go through
+# _build_canonical_output).
 #
 # IMPORTANT: field-accessed records are MUTATED in-place mid-build
 # (_resolve_handle_named_refs does `record["layer"] = resolved`), so values MUST
 # be read fresh from the live mapping — only the key normalization is cached here.
-_mapping_normalized_cache: dict[tuple[int, int], list[tuple[str, str]]] = {}
+_mapping_normalized_cache: dict[tuple[int, int, tuple[str, ...]], list[tuple[str, str]]] = {}
 _record_views_cache: dict[tuple[int, int], tuple[Mapping[str, Any], ...]] = {}
 
 
@@ -4987,15 +4989,16 @@ def _sanitize_text_content(value: str) -> str:
 
 def _mapping_get(mapping: Mapping[str, Any], *candidates: str) -> Any:
     # Build (or fetch) the pre-normalized [(norm_key, orig_key), ...] pairs for this
-    # mapping, preserving original iteration order so the first-match semantics
-    # are identical to the original loop.  Values are NOT cached — they must be read
-    # fresh because records are mutated in-place during _resolve_handle_named_refs
-    # (e.g. `record["layer"] = resolved_name`).  The (id, len) key is stable within
-    # one build because dicts stay alive; an add/delete changes len → miss → rebuild.
-    cache_key = (id(mapping), len(mapping))
+    # mapping, preserving original iteration order so the first-match semantics are
+    # identical to the original loop.  Values are NOT cached — they must be read fresh
+    # because records are mutated in-place during _resolve_handle_named_refs (e.g.
+    # `record["layer"] = resolved_name`).  Include the string-key signature because
+    # this cache stores only normalized key pairs, not a strong reference to mapping.
+    string_keys = tuple(key for key in mapping if isinstance(key, str))
+    cache_key = (id(mapping), len(mapping), string_keys)
     normalized_pairs = _mapping_normalized_cache.get(cache_key)
     if normalized_pairs is None:
-        normalized_pairs = [(_normalize_lookup_key(k), k) for k in mapping if isinstance(k, str)]
+        normalized_pairs = [(_normalize_lookup_key(k), k) for k in string_keys]
         _mapping_normalized_cache[cache_key] = normalized_pairs
     normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
     for norm_key, orig_key in normalized_pairs:
