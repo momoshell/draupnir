@@ -15,7 +15,13 @@ import math
 import re
 from collections.abc import Sequence
 
-from app.interpretation.rooms import Room, RoomLabel, parse_room_number, room_from_label
+from app.interpretation.rooms import (
+    Room,
+    RoomLabel,
+    is_plausible_room_number,
+    parse_room_number,
+    room_from_label,
+)
 
 # Real room names are short labels: "Cooling Plantroom", "Heating & Hot Water",
 # "Life Safety & Essential", "UPS LV plantroom". Spec-prose note text stamped by
@@ -111,7 +117,13 @@ def _looks_like_room_name(text: str) -> bool:
     return True
 
 
-def has_genuine_room_identity(room: Room) -> bool:
+# Input family whose confirmed-room rule is stricter (#828 PR-3). Duplicated here (rather than
+# imported from room_pipeline) to avoid a circular import — room_pipeline already imports this
+# module. Kept in exact sync with room_pipeline.INPUT_FAMILY_PDF_VECTOR.
+_INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
+
+
+def has_genuine_room_identity(room: Room, *, input_family: str | None = None) -> bool:
     """Return True when *room* has a genuine identity — a valid room number or a real name.
 
     Used as the shared presentation filter (#792) in both the ``/rooms`` route response
@@ -126,7 +138,17 @@ def has_genuine_room_identity(room: Room) -> bool:
       - Spec-prose-named cells: polygon cells whose name was stamped from note text
         (e.g. "ALL PIPEWORK SHALL BE PR", "ACCORDANCE WITH BUILDING REGULATIONS").
     The registry is never modified; this predicate only affects the API presentation layer.
+
+    ``input_family`` (#828 PR-3) tightens the rule for ``pdf_vector`` only — PDF has no
+    sheet-scoping, so interior pipe-tag annotation (e.g. "RE", "U1", "100∅SVP AT HL DROPS TB")
+    passes ``_looks_like_room_name`` and would otherwise be miscounted as a confirmed room:
+    a PDF room is genuine only when its number passes the stricter
+    :func:`~app.interpretation.rooms.is_plausible_room_number` — a name alone is never
+    sufficient on PDF. Any other family (including ``None``, unknown origin) keeps the
+    existing numbered-OR-named rule, byte-identical to pre-#828-PR-3 behaviour.
     """
+    if input_family == _INPUT_FAMILY_PDF_VECTOR:
+        return room.number is not None and is_plausible_room_number(room.number)
     return (room.number is not None and parse_room_number(room.number) is not None) or (
         room.name is not None and _looks_like_room_name(room.name)
     )

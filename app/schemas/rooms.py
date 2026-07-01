@@ -56,8 +56,11 @@ class RoomRead(BaseModel):
     needs_review: bool = Field(
         False,
         description=(
-            "The same room number was found in regions separated by walls (a likely numbering "
-            "error) — surfaced for review, not silently merged (#581)."
+            "Flagged for manual review, not silently merged/dropped. Reasons: the same room "
+            "number was found in regions separated by walls (a likely numbering error, #581); "
+            "or, on PDF revisions, the room lacks a plausible room number — a name-only room or "
+            "a numbered room whose number is interior-annotation noise (#828 PR-3) — and so is "
+            "excluded from the confirmed-room count even though it is still returned here."
         ),
     )
     confidence: float | None = Field(

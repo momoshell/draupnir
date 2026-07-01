@@ -15,6 +15,7 @@ from app.interpretation.rooms import (
     RoomLabel,
     assign_devices_to_rooms,
     assign_labels_to_rooms,
+    is_plausible_room_number,
     room_from_polygon,
 )
 
@@ -186,3 +187,55 @@ def test_genuine_identity_name_only_no_number_passes() -> None:
     """A name-only room with no number but a real name is genuine."""
     room = _polygon_room("r8", name="Server Room")
     assert has_genuine_room_identity(room) is True
+
+
+# --- has_genuine_room_identity, PDF-gated (#828 PR-3) ---
+
+
+def test_pdf_genuine_identity_plausible_numbered_room_passes() -> None:
+    """On PDF, a room with a plausible building room number is genuine."""
+    room = _polygon_room("r9", number="0.2.17")
+    assert has_genuine_room_identity(room, input_family="pdf_vector") is True
+
+
+def test_pdf_genuine_identity_name_only_room_fails() -> None:
+    """On PDF, a name-only room (no plausible number) is NOT genuine — unlike DWG/other."""
+    room = _polygon_room("r10", name="Cooling Plantroom")
+    assert has_genuine_room_identity(room, input_family="pdf_vector") is False
+    assert has_genuine_room_identity(room) is True  # non-PDF unaffected
+
+
+def test_pdf_genuine_identity_noise_numbered_room_fails() -> None:
+    """On PDF, a room whose number is interior-annotation noise is NOT genuine."""
+    room = _polygon_room("r11", number="20.4")
+    assert has_genuine_room_identity(room, input_family="pdf_vector") is False
+    # parse_room_number accepts "20.4" (2-part dotted token), so non-PDF still passes.
+    assert has_genuine_room_identity(room) is True
+
+
+def test_pdf_genuine_identity_name_and_plausible_number_passes() -> None:
+    """On PDF, a room with both a real name and a plausible number is genuine."""
+    room = _polygon_room("r12", name="Server Room", number="0.0.09A")
+    assert has_genuine_room_identity(room, input_family="pdf_vector") is True
+
+
+def test_non_pdf_family_keeps_existing_numbered_or_named_rule() -> None:
+    """Any other family (dwg_vector, unknown) keeps the byte-identical numbered-OR-named rule."""
+    numbered = _polygon_room("r13", number="20.4")
+    named = _polygon_room("r14", name="Cooling Plantroom")
+    for family in ("dwg_vector", None):
+        assert has_genuine_room_identity(numbered, input_family=family) is True
+        assert has_genuine_room_identity(named, input_family=family) is True
+
+
+# --- is_plausible_room_number (#828 PR-3) ---
+
+
+def test_is_plausible_room_number_accepts_real_forms() -> None:
+    for text in ("0.2.17", "0.0.09A", "0.2.C1", "0.8.02"):
+        assert is_plausible_room_number(text) is True, text
+
+
+def test_is_plausible_room_number_rejects_noise() -> None:
+    for text in ("20.4", "NO.14784", "17.AIR", "2NO.45", "1.5T", "1.621aaa"):
+        assert is_plausible_room_number(text) is False, text

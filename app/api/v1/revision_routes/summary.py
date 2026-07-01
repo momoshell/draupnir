@@ -13,7 +13,7 @@ from app.api.v1.revision_lineage import (
     _get_active_validation_report,
     _manifest_counts,
 )
-from app.api.v1.revision_routes.rooms import _resolve_rooms
+from app.api.v1.revision_routes.rooms import _resolve_rooms_with_family
 from app.api.v1.revision_routes.scale import resolve_revision_scale
 from app.db.session import get_db
 from app.interpretation.devices import enumerate_devices
@@ -63,9 +63,15 @@ async def get_revision_summary(
 
     # Rooms — go through the SAME resolver as /rooms (its defaults: auto strategy + printed-sheet
     # scope + all-text labels) so the two endpoints can never disagree on room counts (#584/#792).
-    # Apply the same presentation filter as /rooms: only genuine rooms (valid number or real name).
-    rooms_result = await _resolve_rooms(db, revision_id)
-    genuine_rooms = [room for room in rooms_result.rooms if has_genuine_room_identity(room)]
+    # Apply the same presentation filter as /rooms, family-aware (#828 PR-3): only genuine rooms
+    # (valid number or real name on DWG/other; PDF requires a plausible number, see
+    # has_genuine_room_identity).
+    rooms_result, input_family = await _resolve_rooms_with_family(db, revision_id)
+    genuine_rooms = [
+        room
+        for room in rooms_result.rooms
+        if has_genuine_room_identity(room, input_family=input_family)
+    ]
     named_rooms = sum(1 for room in genuine_rooms if room.name is not None)
 
     # Scale/units (A3) + the extraction-coverage block (validation report).

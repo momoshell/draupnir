@@ -12,6 +12,7 @@ from typing import Any
 
 from app.api.v1.revision_routes.rooms import _device_placements, _room_labels
 from app.interpretation.devices import Device, _TagCandidate
+from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.room_pipeline import (
     ROOM_STRATEGY_EXPLICIT,
     ROOM_STRATEGY_IFC,
@@ -445,3 +446,80 @@ def test_dedupe_label_rooms_by_number_unit() -> None:
     assert by_number["1"].name == "Lab"  # first non-null name retained
     assert by_number["2"].anchors == ((5.0, 5.0),)
     assert any(room.number is None and room.name == "Hall" for room in deduped)
+
+
+# --- PDF-gated confirmed-room rule (#828 PR-3) ---
+
+
+def _pdf_confirmed_room_fixture_labels() -> list[RoomLabel]:
+    """A mix of plausible-numbered, name-only "tag", and noise-numbered rooms (P-520001-like).
+
+    Sheet-corner anchors set a 1000x800 extent (matching the PR-2 zone fixture); every room
+    candidate sits well inside the 5% grid-margin band on every side, and far enough apart
+    (beyond the label-cluster radius) that each surfaces as its own independent label-only
+    room rather than pairing into name+number clusters.
+    """
+    return [
+        RoomLabel("0", (0.0, 0.0)),
+        RoomLabel("Z", (1000.0, 800.0)),
+        # Plausible-numbered real rooms.
+        RoomLabel("0.2.17", (200.0, 200.0), layer="A-IDEN"),
+        RoomLabel("0.0.09A", (600.0, 200.0), layer="A-IDEN"),
+        # Name-only interior annotation ("tag" text) that passes _looks_like_room_name.
+        RoomLabel("RE", (200.0, 400.0), layer="A-IDEN"),
+        RoomLabel("U1", (600.0, 400.0), layer="A-IDEN"),
+        # Noise-numbered tokens that parse_room_number wrongly accepts.
+        RoomLabel("20.4", (200.0, 600.0), layer="A-IDEN"),
+        RoomLabel("NO.14784", (600.0, 600.0), layer="A-IDEN"),
+    ]
+
+
+def test_pdf_family_confirms_only_plausible_numbered_rooms() -> None:
+    labels = _pdf_confirmed_room_fixture_labels()
+    result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+
+    plausible = [
+        room
+        for room in result.rooms
+        if room.number in ("0.2.17", "0.0.09A") or room.name in ("RE", "U1")
+    ]
+    assert len(plausible) == 4  # all 4 still surfaced, none dropped
+
+    confirmed = [
+        room for room in result.rooms if has_genuine_room_identity(room, input_family="pdf_vector")
+    ]
+    confirmed_numbers = {room.number for room in confirmed}
+    assert confirmed_numbers == {"0.2.17", "0.0.09A"}
+    assert all(room.name not in ("RE", "U1") for room in confirmed)
+
+    # Name-only "tag" rooms: kept, flagged for review, not confirmed.
+    for name in ("RE", "U1"):
+        tag_room = next(room for room in result.rooms if room.name == name)
+        assert tag_room.needs_review is True
+        assert has_genuine_room_identity(tag_room, input_family="pdf_vector") is False
+
+    # Noise-numbered rooms: kept, flagged for review, not confirmed.
+    noise_rooms = [room for room in result.rooms if room.number in ("20.4", "NO.14784")]
+    assert len(noise_rooms) >= 1  # at least the parseable "20.4" survives as a room candidate
+    for room in noise_rooms:
+        assert room.needs_review is True
+        assert has_genuine_room_identity(room, input_family="pdf_vector") is False
+
+
+def test_dwg_and_other_family_stay_byte_identical_for_confirmed_rooms() -> None:
+    """DWG (and unknown-origin) keep the pre-#828-PR-3 numbered-OR-named rule — nothing demoted."""
+    labels = _pdf_confirmed_room_fixture_labels()
+    dwg_result = interpret_rooms([], devices=[], labels=labels, input_family="dwg_vector")
+    unknown_result = interpret_rooms([], devices=[], labels=labels, input_family=None)
+    assert dwg_result.rooms == unknown_result.rooms
+
+    # A name-only "RE" room stays confirmed (real name, no PDF gate) and is not flagged.
+    re_room = next(room for room in dwg_result.rooms if room.name == "RE")
+    assert re_room.needs_review is False
+    assert has_genuine_room_identity(re_room) is True
+    assert has_genuine_room_identity(re_room, input_family="dwg_vector") is True
+
+    # A noise-numbered "20.4" room (parseable by parse_room_number) stays confirmed on DWG.
+    noise_room = next(room for room in dwg_result.rooms if room.number == "20.4")
+    assert noise_room.needs_review is False
+    assert has_genuine_room_identity(noise_room, input_family="dwg_vector") is True
