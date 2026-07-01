@@ -92,6 +92,10 @@ def test_enqueue_backoff_seconds_is_capped() -> None:
 
 def _job(**overrides: Any) -> Job:
     row = {
+        "id": uuid.uuid4(),
+        "job_type": JobType.INGEST.value,
+        "status": "pending",
+        "attempts": 3,
         "enqueue_status": enqueueing.ENQUEUE_STATUS_PENDING,
         "enqueue_attempts": 3,
         "enqueue_owner_token": uuid.uuid4(),
@@ -101,6 +105,53 @@ def _job(**overrides: Any) -> Job:
     }
     row.update(overrides)
     return cast(Job, SimpleNamespace(**row))
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.commits = 0
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class _FakeSessionContext:
+    def __init__(self, session: _FakeSession) -> None:
+        self.session = session
+
+    async def __aenter__(self) -> _FakeSession:
+        return self.session
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        return None
+
+
+class _FakeSessionMaker:
+    def __init__(self, session: _FakeSession) -> None:
+        self.session = session
+
+    def __call__(self) -> _FakeSessionContext:
+        return _FakeSessionContext(self.session)
+
+
+def _session_maker_factory(session: _FakeSession) -> Any:
+    return lambda: _FakeSessionMaker(session)
+
+
+def _utcnow() -> datetime:
+    return datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+
+async def _get_job_for_update(
+    session: _FakeSession,
+    job_id: uuid.UUID,
+    *,
+    job: Job | None,
+) -> Job | None:
+    _ = session
+    if job is not None:
+        assert job_id == job.id
+    return job
 
 
 def test_prepare_job_enqueue_intent_resets_outbox_state() -> None:
@@ -146,3 +197,163 @@ def test_claim_enqueue_intent_lease_marks_publishing_and_increments_attempts() -
     assert job.enqueue_lease_expires_at == now + timedelta(seconds=30)
     assert job.enqueue_last_attempted_at == now
     assert lease.lease_expires_at == now + timedelta(seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_claim_job_enqueue_intent_claims_pending_job() -> None:
+    session = _FakeSession()
+    job = _job(enqueue_owner_token=None, enqueue_lease_expires_at=None, attempts=4)
+
+    claimed = await enqueueing.claim_job_enqueue_intent(
+        job.id,
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        is_recoverable_enqueue_job_type=lambda job_type: job_type == JobType.INGEST.value,
+        utcnow_func=_utcnow,
+    )
+
+    assert claimed is not None
+    assert claimed.job_type == JobType.INGEST.value
+    assert claimed.attempts == 4
+    assert claimed.lease.token == job.enqueue_owner_token
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PUBLISHING
+    assert job.enqueue_attempts == 4
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_job_enqueue_intent_skips_fresh_publishing_lease() -> None:
+    session = _FakeSession()
+    job = _job(
+        enqueue_status=enqueueing.ENQUEUE_STATUS_PUBLISHING,
+        enqueue_lease_expires_at=_utcnow() + timedelta(seconds=1),
+    )
+
+    claimed = await enqueueing.claim_job_enqueue_intent(
+        job.id,
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        is_recoverable_enqueue_job_type=lambda _job_type: True,
+        utcnow_func=_utcnow,
+    )
+
+    assert claimed is None
+    assert session.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_release_job_enqueue_intent_requeues_pending_job() -> None:
+    session = _FakeSession()
+    lease_token = uuid.uuid4()
+    job = _job(
+        enqueue_status=enqueueing.ENQUEUE_STATUS_PUBLISHING,
+        enqueue_owner_token=lease_token,
+    )
+
+    released = await enqueueing.release_job_enqueue_intent(
+        job.id,
+        lease_token=lease_token,
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        utcnow_func=_utcnow,
+    )
+
+    assert released is True
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PENDING
+    assert job.enqueue_owner_token is None
+    assert job.enqueue_lease_expires_at is None
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_release_job_enqueue_intent_marks_nonpending_job_published() -> None:
+    session = _FakeSession()
+    lease_token = uuid.uuid4()
+    job = _job(
+        status="running",
+        enqueue_status=enqueueing.ENQUEUE_STATUS_PUBLISHING,
+        enqueue_owner_token=lease_token,
+    )
+
+    released = await enqueueing.release_job_enqueue_intent(
+        job.id,
+        lease_token=lease_token,
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        utcnow_func=_utcnow,
+    )
+
+    assert released is True
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PUBLISHED
+    assert job.enqueue_published_at == _utcnow()
+    assert job.enqueue_owner_token is None
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_job_enqueue_published_requires_matching_lease() -> None:
+    session = _FakeSession()
+    lease_token = uuid.uuid4()
+    job = _job(
+        enqueue_status=enqueueing.ENQUEUE_STATUS_PUBLISHING,
+        enqueue_owner_token=lease_token,
+    )
+
+    published = await enqueueing.mark_job_enqueue_published(
+        job.id,
+        lease_token=lease_token,
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        utcnow_func=_utcnow,
+    )
+
+    assert published is True
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PUBLISHED
+    assert job.enqueue_published_at == _utcnow()
+    assert job.enqueue_owner_token is None
+    assert session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_job_enqueue_published_skips_stale_lease() -> None:
+    session = _FakeSession()
+    job = _job(
+        enqueue_status=enqueueing.ENQUEUE_STATUS_PUBLISHING,
+        enqueue_owner_token=uuid.uuid4(),
+    )
+
+    published = await enqueueing.mark_job_enqueue_published(
+        job.id,
+        lease_token=uuid.uuid4(),
+        session_maker_factory=_session_maker_factory(session),
+        get_job_for_update=lambda session, job_id: _get_job_for_update(
+            session,
+            job_id,
+            job=job,
+        ),
+        utcnow_func=_utcnow,
+    )
+
+    assert published is False
+    assert job.enqueue_status == enqueueing.ENQUEUE_STATUS_PUBLISHING
+    assert session.commits == 0

@@ -963,86 +963,35 @@ async def _mark_job_failed_if_recovery_safe(
 
 async def _claim_job_enqueue_intent(job_id: UUID) -> _ClaimedJobEnqueueIntent | None:
     """Claim a durable enqueue intent for best-effort or recovery publication."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    now = _utcnow()
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if not is_recoverable_enqueue_job_type(job.job_type) or job.status != "pending":
-            return None
-
-        if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHED:
-            return None
-
-        if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING and not _is_stale_enqueue_intent(
-            job,
-            now=now,
-        ):
-            return None
-
-        lease = _claim_enqueue_intent_lease(job, now=now)
-        attempts = job.attempts
-        await session.commit()
-        return _ClaimedJobEnqueueIntent(lease=lease, job_type=job.job_type, attempts=attempts)
+    return await job_enqueueing.claim_job_enqueue_intent(
+        job_id,
+        session_maker_factory=get_session_maker,
+        get_job_for_update=_get_job_for_update,
+        is_recoverable_enqueue_job_type=is_recoverable_enqueue_job_type,
+        utcnow_func=_utcnow,
+    )
 
 
 async def _release_job_enqueue_intent(job_id: UUID, *, lease_token: UUID) -> bool:
     """Release a claimed durable enqueue intent after a publish failure."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if (
-            job.enqueue_status != _ENQUEUE_STATUS_PUBLISHING
-            or job.enqueue_owner_token != lease_token
-        ):
-            return False
-
-        if job.status == "pending":
-            job.enqueue_status = _ENQUEUE_STATUS_PENDING
-            _clear_enqueue_intent_lease(job)
-            await session.commit()
-            return True
-
-        job.enqueue_status = _ENQUEUE_STATUS_PUBLISHED
-        job.enqueue_published_at = _utcnow()
-        _clear_enqueue_intent_lease(job)
-        await session.commit()
-        return True
+    return await job_enqueueing.release_job_enqueue_intent(
+        job_id,
+        lease_token=lease_token,
+        session_maker_factory=get_session_maker,
+        get_job_for_update=_get_job_for_update,
+        utcnow_func=_utcnow,
+    )
 
 
 async def _mark_job_enqueue_published(job_id: UUID, *, lease_token: UUID) -> bool:
     """Finalize a claimed durable enqueue intent after broker publication."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if (
-            job.enqueue_status != _ENQUEUE_STATUS_PUBLISHING
-            or job.enqueue_owner_token != lease_token
-        ):
-            return False
-
-        job.enqueue_status = _ENQUEUE_STATUS_PUBLISHED
-        job.enqueue_published_at = _utcnow()
-        _clear_enqueue_intent_lease(job)
-        await session.commit()
-        return True
+    return await job_enqueueing.mark_job_enqueue_published(
+        job_id,
+        lease_token=lease_token,
+        session_maker_factory=get_session_maker,
+        get_job_for_update=_get_job_for_update,
+        utcnow_func=_utcnow,
+    )
 
 
 async def publish_job_enqueue_intent(
