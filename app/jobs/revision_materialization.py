@@ -30,6 +30,7 @@ from app.ingestion.ref_resolution import (
     string_ref,
 )
 from app.models.revision_materialization import (
+    MATERIALIZATION_TIER_PRIMARY,
     RevisionBlock,
     RevisionEntityManifest,
     RevisionLayer,
@@ -548,6 +549,7 @@ def _build_revision_materialization_rows(
                 "entity_id": entity_id,
                 "entity_type": entity_type,
                 "entity_schema_version": entity_schema_version,
+                "materialization_tier": MATERIALIZATION_TIER_PRIMARY,
                 "parent_entity_ref": parent_entity_ref,
                 "confidence_json": confidence_json,
                 "geometry_json": geometry_json,
@@ -662,6 +664,7 @@ def _build_changeset_revision_materialization_rows(
                 "entity_id": entity.entity_id,
                 "entity_type": entity.entity_type,
                 "entity_schema_version": entity.entity_schema_version,
+                "materialization_tier": MATERIALIZATION_TIER_PRIMARY,
                 "parent_entity_ref": parent_entity_ref,
                 "confidence_json": _copy_json_mapping(entity.confidence_json),
                 "geometry_json": geometry_json,

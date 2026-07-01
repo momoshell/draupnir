@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.adapter_run_output import AdapterRunOutput
 from app.models.drawing_revision import DrawingRevision
-from app.models.revision_materialization import RevisionEntity
+from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
 
 async def load_revision_entities_by_type(
@@ -28,6 +28,7 @@ async def load_revision_entities_by_type(
     layer_refs: Sequence[str] | None = None,
     exclude_off_sheet: bool = False,
     ordered: bool = True,
+    tier: str | None = MATERIALIZATION_TIER_PRIMARY,
 ) -> list[RevisionEntity]:
     """Load a revision's entities of the given type(s), optionally restricted to layer refs.
 
@@ -35,6 +36,11 @@ async def load_revision_entities_by_type(
     (``on_sheet IS FALSE``, #569) are dropped while on-sheet (True) and undetermined
     (NULL — e.g. a drawing with no viewports) entities are kept, so the filter degrades
     gracefully instead of emptying drawings whose sheet membership couldn't be determined.
+
+    ``tier`` filters by ``materialization_tier`` (#831): defaults to ``"primary"`` (today,
+    every materialized entity is "primary", so this default is byte-identical to the
+    pre-#831 unfiltered behavior). Pass ``tier=None`` to see every tier, including any future
+    ``"fill_noise"`` rows (e.g. materialization-inspection/debug routes).
     """
 
     query = select(RevisionEntity).where(
@@ -45,6 +51,8 @@ async def load_revision_entities_by_type(
         query = query.where(RevisionEntity.layer_ref.in_(list(layer_refs)))
     if exclude_off_sheet:
         query = query.where(RevisionEntity.on_sheet.isnot(False))
+    if tier is not None:
+        query = query.where(RevisionEntity.materialization_tier == tier)
     if ordered:
         query = query.order_by(RevisionEntity.sequence_index, RevisionEntity.id)
     return list((await db.execute(query)).scalars().all())
@@ -55,16 +63,22 @@ async def load_legend_text_candidates(
     revision_id: UUID,
     *,
     legend_layers: list[str] | None = None,
+    tier: str | None = MATERIALIZATION_TIER_PRIMARY,
 ) -> list[str]:
     """Load raw text strings from legend/key layers for Source B prose input.
 
     Matches text entities on layers containing LEGEND or KEY (case-insensitive),
     or restricted to ``legend_layers`` when provided. Returns raw text strings only.
+
+    ``tier`` filters by ``materialization_tier`` (#831); see
+    ``load_revision_entities_by_type`` for semantics and the default's compatibility guarantee.
     """
     query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
     )
+    if tier is not None:
+        query = query.where(RevisionEntity.materialization_tier == tier)
     if legend_layers:
         query = query.where(RevisionEntity.layer_ref.in_(list(legend_layers)))
     else:
