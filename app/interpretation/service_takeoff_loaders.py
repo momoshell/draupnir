@@ -617,11 +617,12 @@ async def load_routed_entities(
         # (ADR-003 / ADR-006: honest UNKNOWN groups, never legend-filter the selection).
         from sqlalchemy import select
 
-        from app.models.revision_materialization import RevisionEntity
+        from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type.in_(list(ROUTED_ENTITY_TYPES)),
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -650,12 +651,13 @@ async def load_routed_entities(
     # DWG/DXF (or unknown family): ilike-based layer selection, ADR-003 compliant.
     from sqlalchemy import or_, select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     async def _query_by_tokens(tokens: tuple[str, ...]) -> list[Any]:
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type.in_(list(ROUTED_ENTITY_TYPES)),
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -706,7 +708,7 @@ async def _build_pdf_service_legend(db: AsyncSession, revision_id: UUID) -> Serv
     """
     from sqlalchemy import select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         text_blocks = await _load_text_blocks(db, revision_id)
@@ -759,6 +761,7 @@ async def _build_pdf_service_legend(db: AsyncSession, revision_id: UUID) -> Serv
                         RevisionEntity.drawing_revision_id == revision_id,
                         RevisionEntity.entity_type.in_(["line", "polyline"]),
                         RevisionEntity.bbox_min_x.is_not(None),
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                     )
                 )
             )
@@ -912,7 +915,7 @@ async def _build_dwg_legend_from_anchor(
     try:
         from sqlalchemy import select
 
-        from app.models.revision_materialization import RevisionEntity
+        from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
         # --- Step 1: load all text entities (any layer) ---
         text_rows = list(
@@ -922,6 +925,7 @@ async def _build_dwg_legend_from_anchor(
                     .where(
                         RevisionEntity.drawing_revision_id == revision_id,
                         RevisionEntity.entity_type.in_(["text", "mtext"]),
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                     )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
@@ -959,7 +963,10 @@ async def _build_dwg_legend_from_anchor(
             (
                 await db.execute(
                     select(RevisionEntity)
-                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
+                    )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
             )
@@ -1059,7 +1066,7 @@ async def build_service_legend(
 
     from sqlalchemy import or_, select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     swatch_inputs: list[SwatchInput] = []
 
@@ -1070,6 +1077,7 @@ async def build_service_legend(
             .where(
                 RevisionEntity.drawing_revision_id == revision_id,
                 RevisionEntity.layer_ref.in_(list(legend_layers)),
+                RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
             )
             .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
         )
@@ -1121,6 +1129,7 @@ async def build_service_legend(
                         RevisionEntity.layer_ref.ilike("%LEGEND%"),
                         RevisionEntity.layer_ref.ilike("%KEY%"),
                     ),
+                    RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                 )
                 .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
             )
@@ -1198,12 +1207,13 @@ async def load_tag_placements(
         # Explicit caller override — entity-based path regardless of input_family.
         from sqlalchemy import select
 
-        from app.models.revision_materialization import RevisionEntity
+        from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
         query = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type == "text",
             RevisionEntity.layer_ref.in_(list(tag_layers)),
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         rows = list((await db.execute(query)).scalars().all())
         placements: list[TagPlacement] = []
@@ -1254,11 +1264,12 @@ async def load_tag_placements(
     # When broaden_tag_layers is False: legacy ilike filter over _DEFAULT_TAG_LAYER_TOKENS.
     from sqlalchemy import or_, select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     if not broaden_tag_layers:
         # _DEFAULT_TAG_LAYER_TOKENS is a non-empty constant, so or_ always receives >= 1 arg.
@@ -1317,13 +1328,14 @@ async def load_rise_drop_entities(
     else:
         from sqlalchemy import or_, select
 
-        from app.models.revision_materialization import RevisionEntity
+        from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
         tokens = _DEFAULT_RISE_LAYER_TOKENS if kind == KIND_RISE else _DEFAULT_DROP_LAYER_TOKENS
 
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type.in_(list(RISE_DROP_ENTITY_TYPES)),
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -1374,12 +1386,13 @@ async def load_service_fill_bands(
     from sqlalchemy import or_, select
 
     from app.ingestion.centerline_contract import _xy_list
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type == "hatch",
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -1454,12 +1467,13 @@ async def load_service_fitting_bands(
     from sqlalchemy import or_, select
 
     from app.ingestion.centerline_contract import _xy_list
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type == "hatch",
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -1552,7 +1566,7 @@ async def load_stack_headers(
     """
     del input_family  # accepted for symmetry; headers are layer-agnostic in all families
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         q = (
@@ -1560,6 +1574,7 @@ async def load_stack_headers(
             .where(
                 RevisionEntity.drawing_revision_id == revision_id,
                 RevisionEntity.entity_type.in_(["text", "mtext"]),
+                RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
             )
             .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
         )
@@ -1891,7 +1906,7 @@ async def build_containment_legend_db(
 
     from sqlalchemy import select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         # --- Step 1: load all text/mtext entities for anchor detection ---
@@ -1902,6 +1917,7 @@ async def build_containment_legend_db(
                     .where(
                         RevisionEntity.drawing_revision_id == revision_id,
                         RevisionEntity.entity_type.in_(["text", "mtext"]),
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                     )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
@@ -1947,7 +1963,10 @@ async def build_containment_legend_db(
             (
                 await db.execute(
                     select(RevisionEntity)
-                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
+                    )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
             )
@@ -2056,12 +2075,13 @@ async def load_containment_bands(
     from sqlalchemy import or_, select
 
     from app.ingestion.centerline_contract import _xy_list
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         q = select(RevisionEntity).where(
             RevisionEntity.drawing_revision_id == revision_id,
             RevisionEntity.entity_type == "hatch",
+            RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
         )
         if exclude_off_sheet:
             q = q.where(RevisionEntity.on_sheet.isnot(False))
@@ -2267,7 +2287,7 @@ async def build_mech_service_legend_db(
 
     from sqlalchemy import select
 
-    from app.models.revision_materialization import RevisionEntity
+    from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
     try:
         # --- Step 1: load all text/mtext entities for anchor detection ---
@@ -2278,6 +2298,7 @@ async def build_mech_service_legend_db(
                     .where(
                         RevisionEntity.drawing_revision_id == revision_id,
                         RevisionEntity.entity_type.in_(["text", "mtext"]),
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                     )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
@@ -2327,7 +2348,10 @@ async def build_mech_service_legend_db(
             (
                 await db.execute(
                     select(RevisionEntity)
-                    .where(RevisionEntity.drawing_revision_id == revision_id)
+                    .where(
+                        RevisionEntity.drawing_revision_id == revision_id,
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
+                    )
                     .order_by(RevisionEntity.sequence_index, RevisionEntity.id)
                 )
             )

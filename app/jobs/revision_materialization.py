@@ -29,6 +29,10 @@ from app.ingestion.ref_resolution import (
     collection_identity,
     string_ref,
 )
+from app.jobs.materialization_tiering import (
+    classify_materialization_tier,
+    compute_line_component_sizes,
+)
 from app.models.revision_materialization import (
     MATERIALIZATION_TIER_PRIMARY,
     RevisionBlock,
@@ -380,6 +384,31 @@ def _resolve_entity_id(
     )
 
 
+def _stamp_materialization_tiers(entities: list[dict[str, Any]]) -> None:
+    """Stamp each entity row's ``materialization_tier`` in place (#831 PR-2).
+
+    Computes the shared-endpoint connected-component size once over the revision's
+    LINE rows, then re-stamps every row's tier via
+    :func:`~app.jobs.materialization_tiering.classify_materialization_tier`. Rows built
+    with the PR-1 hard ``"primary"`` default are overwritten here — this is the single
+    seam where tiering is decided, so both the ingest and changeset row builders share
+    identical behavior.
+    """
+    line_entities = [
+        (row["id"], row["geometry_json"]) for row in entities if row["entity_type"] == "line"
+    ]
+    component_size_by_id = compute_line_component_sizes(line_entities)
+
+    for row in entities:
+        component_size = component_size_by_id.get(row["id"], 0)
+        row["materialization_tier"] = classify_materialization_tier(
+            entity_type=row["entity_type"],
+            geometry_json=row["geometry_json"],
+            layer_ref=row["layer_ref"],
+            component_size=component_size,
+        )
+
+
 def _resolve_entity_type(entity_payload_json: dict[str, Any]) -> str:
     """Resolve a stable non-null entity type from contract or legacy payloads."""
     return (
@@ -585,6 +614,8 @@ def _build_revision_materialization_rows(
             else None
         )
 
+    _stamp_materialization_tiers(entities)
+
     counts_json = {
         "layouts": len(layouts),
         "layers": len(layers),
@@ -698,6 +729,8 @@ def _build_changeset_revision_materialization_rows(
             if parent_entity_ref is not None
             else None
         )
+
+    _stamp_materialization_tiers(entities)
 
     counts_json = _json_object(base_manifest.counts_json)
     counts_json.update(

@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ingestion.centerline_contract import _xy
 from app.interpretation.grid_registration import GridFiducial, normalize_label
-from app.models.revision_materialization import RevisionEntity
+from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
 
 # Default configurable-default layer tokens (ADR-003).
 _DEFAULT_GRID_LAYER_TOKENS: tuple[str, ...] = ("z030g", "grid")
@@ -126,6 +126,7 @@ async def load_grid_fiducials(
             *ilike_conditions,
             RevisionEntity.block_ref.ilike("%grid%"),
         ),
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     insert_rows = list((await db.execute(insert_query)).scalars().all())
 
@@ -133,6 +134,7 @@ async def load_grid_fiducials(
     text_query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type.in_(["text", "mtext"]),
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     text_rows_db = list((await db.execute(text_query)).scalars().all())
 

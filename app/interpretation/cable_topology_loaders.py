@@ -40,7 +40,11 @@ from app.interpretation.device_identity import (
     ARCHITECTURE_FAMILY_PATTERNS,
 )
 from app.interpretation.devices import enumerate_devices
-from app.models.revision_materialization import RevisionBlock, RevisionEntity
+from app.models.revision_materialization import (
+    MATERIALIZATION_TIER_PRIMARY,
+    RevisionBlock,
+    RevisionEntity,
+)
 
 # ---------------------------------------------------------------------------
 # v1 block-ref filter (architecture + annotation families)
@@ -247,6 +251,7 @@ async def load_spline_inputs(
     query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "spline",
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     if exclude_off_sheet:
         query = query.where(RevisionEntity.on_sheet.isnot(False))
@@ -340,6 +345,7 @@ async def load_device_footprints(
                     select(RevisionEntity).where(
                         RevisionEntity.drawing_revision_id == revision_id,
                         RevisionEntity.entity_id.in_(root_entity_ids),
+                        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
                     )
                 )
             )

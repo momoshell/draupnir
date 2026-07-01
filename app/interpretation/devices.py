@@ -21,7 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.interpretation.legend_dictionary import FamilyInput, LegendDictionary
 from app.interpretation.loaders import load_revision_entities_by_type
 from app.interpretation.models import EntityRow
-from app.models.revision_materialization import RevisionBlock, RevisionEntity
+from app.models.revision_materialization import (
+    MATERIALIZATION_TIER_PRIMARY,
+    RevisionBlock,
+    RevisionEntity,
+)
 
 if TYPE_CHECKING:
     from app.interpretation.device_identity import DeviceIdentity
@@ -297,6 +301,7 @@ async def load_tag_candidates(
     base = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     if exclude_off_sheet:
         base = base.where(RevisionEntity.on_sheet.isnot(False))
@@ -331,6 +336,7 @@ async def load_text_candidates(
     query = select(RevisionEntity).where(
         RevisionEntity.drawing_revision_id == revision_id,
         RevisionEntity.entity_type == "text",
+        RevisionEntity.materialization_tier == MATERIALIZATION_TIER_PRIMARY,
     )
     if exclude_off_sheet:
         query = query.where(RevisionEntity.on_sheet.isnot(False))
