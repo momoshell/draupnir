@@ -409,6 +409,23 @@ def test_pdf_gate_keeps_genuine_room_label_near_but_outside_border_band() -> Non
     assert "2" not in numbers
 
 
+def test_pdf_gate_never_excludes_a_room_number_label_even_inside_a_zone() -> None:
+    # Conservatism: a label whose text parses as a room number, and its paired name label,
+    # must survive zone-exclusion even when both points fall inside a discovered zone (e.g.
+    # the label-cloud-derived grid-margin band) — this reproduces the CI regression where a
+    # tiny label point-cloud (few labels near the origin) made the margin band clip genuine
+    # room labels (#828).
+    name_in_margin = RoomLabel("PH Plantroom", (5.0, 5.4), layer="A-IDEN")
+    number_in_margin = RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN")  # inside the margin band
+    device_tag = RoomLabel("H", (50.0, 50.0), layer="Device Tags")  # far corner sets sheet bounds
+    labels = [name_in_margin, number_in_margin, device_tag]
+    result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+    numbers = {room.number for room in result.rooms}
+    names = {room.name for room in result.rooms}
+    assert "0.9.01" in numbers
+    assert "PH Plantroom" in names
+
+
 def test_dedupe_label_rooms_by_number_unit() -> None:
     from app.interpretation.rooms import (
         dedupe_label_rooms_by_number,

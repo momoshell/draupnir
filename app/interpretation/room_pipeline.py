@@ -12,6 +12,7 @@ unit-testable with fixtures; the route does the DB loading and adaptation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -19,7 +20,11 @@ from app.interpretation.annotation_zones import discover_zones, filter_labels_by
 from app.interpretation.explicit_rooms import interpret_explicit_rooms
 from app.interpretation.geometry import point_in_polygon
 from app.interpretation.ifc_rooms import interpret_ifc_rooms
-from app.interpretation.label_rooms import identify_rooms_from_labels, room_label_layers
+from app.interpretation.label_rooms import (
+    DEFAULT_LABEL_CLUSTER_RADIUS,
+    identify_rooms_from_labels,
+    room_label_layers,
+)
 from app.interpretation.models import EntityRow
 from app.interpretation.rooms import (
     DevicePlacement,
@@ -28,6 +33,7 @@ from app.interpretation.rooms import (
     RoomLabel,
     assign_devices_to_label_rooms,
     dedupe_label_rooms_by_number,
+    parse_room_number,
 )
 from app.interpretation.wall_rooms import (
     DEFAULT_WALL_MIN_AREA,
@@ -91,11 +97,36 @@ def interpret_rooms(
     grid-margin zone are excluded from room-label candidacy before scoping and label
     identification. Any other family (including ``None``, unknown origin) skips this pass —
     DWG stays byte-identical.
+
+    Conservatism: a label whose text parses as a room number (:func:`parse_room_number`) is
+    always exempt from zone-exclusion, even when its point falls inside a discovered zone —
+    the zone heuristics (esp. the label-cloud-derived grid-margin band) are approximate and
+    must never be able to drop a genuine room label (#828 PR-2 follow-up). Any other excluded
+    label sitting within the label-clustering radius of a protected room-number label is also
+    kept — it is very likely that number's paired name (e.g. ``PH Plantroom`` next to
+    ``0.9.01``), and dropping it would silently demote a would-be named room to number-only.
     """
     if input_family == INPUT_FAMILY_PDF_VECTOR:
         sheet_extent = _label_bounds(labels)
         zones = discover_zones(labels, sheet_extent)
-        labels, _excluded = filter_labels_by_zones(labels, zones)
+        kept, excluded = filter_labels_by_zones(labels, zones)
+        protected_numbers = [
+            excluded_label.label
+            for excluded_label in excluded
+            if parse_room_number(excluded_label.label.text) is not None
+        ]
+        protected_names = [
+            excluded_label.label
+            for excluded_label in excluded
+            if parse_room_number(excluded_label.label.text) is None
+            and any(
+                _distance(excluded_label.label.point, number_label.point)
+                <= DEFAULT_LABEL_CLUSTER_RADIUS
+                for number_label in protected_numbers
+            )
+        ]
+        protected = [*protected_numbers, *protected_names]
+        labels = [*kept, *protected] if protected else kept
 
     # Scope to the room-label layer(s) (those bearing a room number) when present, so polygon
     # naming and label-room identification both ignore device-tag text on other layers (#549).
@@ -188,6 +219,11 @@ def _enrich_with_labels(
     # Re-id the appended label rooms so ids stay unique + stable within the merged list.
     appended = [replace(room, id=f"label-room-{index}") for index, room in enumerate(merged)]
     return replace(base, rooms=[*rooms, *appended])
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Euclidean distance between two points."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def _label_bounds(labels: Sequence[RoomLabel]) -> tuple[float, float, float, float] | None:
