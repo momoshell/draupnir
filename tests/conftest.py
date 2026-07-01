@@ -253,6 +253,7 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "revision_blocks",
     "revision_entities",
     "revision_routed_lengths",
+    "revision_rooms",
 )
 _PROJECT_TRUNCATE_CASCADE_CATALOG_TABLES: tuple[str, ...] = (
     "formula_definition_supersessions",
@@ -338,6 +339,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "changeset_apply": "db_lineage",
     "lineage_delete_restrictions": "db_lineage",
     "revision_routed_length_model": "db_lineage",
+    "revision_room_model": "db_lineage",
     "db": "db_migration",
     "jobs_base_revision_migration": "db_migration",
     "jobs_revision_scoped_contract_migration": "db_migration",

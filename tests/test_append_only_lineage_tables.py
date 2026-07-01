@@ -31,6 +31,7 @@ from app.models.estimate_version import EstimateItem, EstimateSnapshotEntry
 from app.models.estimation_catalog import EstimationRate
 from app.models.export_job_input import ExportJobInput
 from app.models.job import Job, JobStatus, JobType
+from app.models.revision_room import RevisionRoom
 from app.models.revision_routed_length import RevisionRoutedLength
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
@@ -99,6 +100,7 @@ class _ProtectedRowIds:
     revision_block_id: uuid.UUID
     revision_entity_id: uuid.UUID
     revision_routed_length_id: uuid.UUID
+    revision_room_id: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,7 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "revision_blocks": row_ids.revision_block_id,
         "revision_entities": row_ids.revision_entity_id,
         "revision_routed_lengths": row_ids.revision_routed_length_id,
+        "revision_rooms": row_ids.revision_room_id,
     }
     return ids_by_table[table_name]
 
@@ -496,6 +499,35 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
             geometry_json=None,
         )
         session.add(revision_routed_length)
+        await session.flush()
+        revision_room = RevisionRoom(
+            id=uuid.uuid4(),
+            project_id=quantity_seed.project_id,
+            source_file_id=quantity_seed.file_id,
+            extraction_profile_id=adapter_outputs[0].extraction_profile_id,
+            source_job_id=quantity_seed.ingest_job_id,
+            drawing_revision_id=drawing_revisions[0].id,
+            adapter_run_output_id=adapter_outputs[0].id,
+            canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            algo_version="test",
+            room_key="room-append-only-001",
+            name="Append-only room",
+            number="101",
+            source="polygon",
+            area=12.5,
+            bounds_min_x=0.0,
+            bounds_min_y=0.0,
+            bounds_max_x=5.0,
+            bounds_max_y=2.5,
+            polygon_geometry_json={"type": "polygon", "coordinates": [[0.0, 0.0], [5.0, 2.5]]},
+            anchors_json=[{"x": 2.5, "y": 1.25}],
+            needs_review=False,
+            confidence=0.9,
+            strategy="wall_derived",
+            source_layers_json=["A-AREA"],
+            input_family="dwg",
+        )
+        session.add(revision_room)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -541,6 +573,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         revision_block_id=blocks[0].id,
         revision_entity_id=entities[0].id,
         revision_routed_length_id=revision_routed_length.id,
+        revision_room_id=revision_room.id,
     )
 
 
