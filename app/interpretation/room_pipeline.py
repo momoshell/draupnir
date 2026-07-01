@@ -12,13 +12,19 @@ unit-testable with fixtures; the route does the DB loading and adaptation.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
+from app.interpretation.annotation_zones import discover_zones, filter_labels_by_zones
 from app.interpretation.explicit_rooms import interpret_explicit_rooms
 from app.interpretation.geometry import point_in_polygon
 from app.interpretation.ifc_rooms import interpret_ifc_rooms
-from app.interpretation.label_rooms import identify_rooms_from_labels, room_label_layers
+from app.interpretation.label_rooms import (
+    DEFAULT_LABEL_CLUSTER_RADIUS,
+    identify_rooms_from_labels,
+    room_label_layers,
+)
 from app.interpretation.models import EntityRow
 from app.interpretation.rooms import (
     DevicePlacement,
@@ -27,12 +33,19 @@ from app.interpretation.rooms import (
     RoomLabel,
     assign_devices_to_label_rooms,
     dedupe_label_rooms_by_number,
+    parse_room_number,
 )
 from app.interpretation.wall_rooms import (
     DEFAULT_WALL_MIN_AREA,
     DEFAULT_WALL_SNAP_TOLERANCE,
     interpret_wall_rooms,
 )
+
+# PDF has no sheet-scoping mechanism (tag_sheet_membership is a DWG-only no-op on PDF), so
+# every room-name-ish text token becomes a room candidate unless annotation zones (legend,
+# key, notes, title-block, grid margin) are masked out first (#828 PR-2). DWG (and any other
+# family) skips this pass entirely — byte-identical output.
+INPUT_FAMILY_PDF_VECTOR = "pdf_vector"
 
 ROOM_STRATEGY_AUTO = "auto"
 ROOM_STRATEGY_IFC = "ifc_space"
@@ -69,6 +82,7 @@ def interpret_rooms(
     strategy: str = ROOM_STRATEGY_AUTO,
     snap_tolerance: float = 0.0,
     min_area: float = 0.0,
+    input_family: str | None = None,
 ) -> RoomInterpretation:
     """Interpret rooms by geometry, then enrich + supplement with label identities (#549).
 
@@ -77,7 +91,43 @@ def interpret_rooms(
     ``0.9.01``) then (a) stamp name/number onto the polygon room that contains them and
     (b) surface as label-only rooms when no polygon contains them — so a fully-labeled but
     un-polygonizable drawing still yields named, numbered rooms.
+
+    ``input_family`` gates the PDF-only annotation-zone exclusion pass (#828 PR-2): on
+    ``pdf_vector`` revisions, labels landing in a discovered legend/key/notes/title-block/
+    grid-margin zone are excluded from room-label candidacy before scoping and label
+    identification. Any other family (including ``None``, unknown origin) skips this pass —
+    DWG stays byte-identical.
+
+    Conservatism: a label whose text parses as a room number (:func:`parse_room_number`) is
+    always exempt from zone-exclusion, even when its point falls inside a discovered zone —
+    the zone heuristics (esp. the label-cloud-derived grid-margin band) are approximate and
+    must never be able to drop a genuine room label (#828 PR-2 follow-up). Any other excluded
+    label sitting within the label-clustering radius of a protected room-number label is also
+    kept — it is very likely that number's paired name (e.g. ``PH Plantroom`` next to
+    ``0.9.01``), and dropping it would silently demote a would-be named room to number-only.
     """
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
+        sheet_extent = _label_bounds(labels)
+        zones = discover_zones(labels, sheet_extent)
+        kept, excluded = filter_labels_by_zones(labels, zones)
+        protected_numbers = [
+            excluded_label.label
+            for excluded_label in excluded
+            if parse_room_number(excluded_label.label.text) is not None
+        ]
+        protected_names = [
+            excluded_label.label
+            for excluded_label in excluded
+            if parse_room_number(excluded_label.label.text) is None
+            and any(
+                _distance(excluded_label.label.point, number_label.point)
+                <= DEFAULT_LABEL_CLUSTER_RADIUS
+                for number_label in protected_numbers
+            )
+        ]
+        protected = [*protected_numbers, *protected_names]
+        labels = [*kept, *protected] if protected else kept
+
     # Scope to the room-label layer(s) (those bearing a room number) when present, so polygon
     # naming and label-room identification both ignore device-tag text on other layers (#549).
     allowed = room_label_layers(labels)
@@ -169,6 +219,26 @@ def _enrich_with_labels(
     # Re-id the appended label rooms so ids stay unique + stable within the merged list.
     appended = [replace(room, id=f"label-room-{index}") for index, room in enumerate(merged)]
     return replace(base, rooms=[*rooms, *appended])
+
+
+def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Euclidean distance between two points."""
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _label_bounds(labels: Sequence[RoomLabel]) -> tuple[float, float, float, float] | None:
+    """Derive a sheet-extent proxy from the label point cloud, or ``None`` when too sparse.
+
+    No canonical page-size metadata is available to this pure pipeline, so the label bounds
+    stand in for the sheet extent (grid bubbles + genuine rooms are both text, so the outer
+    ring of the label cloud approximates the printed sheet border). Requires at least 2 labels
+    so a degenerate single-point bound (zero width/height) can't produce a spurious margin.
+    """
+    if len(labels) < 2:
+        return None
+    xs = [label.point[0] for label in labels]
+    ys = [label.point[1] for label in labels]
+    return (min(xs), min(ys), max(xs), max(ys))
 
 
 def _containing_polygon_room(point: tuple[float, float], rooms: Sequence[Room]) -> Room | None:

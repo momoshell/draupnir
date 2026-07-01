@@ -40,6 +40,7 @@ from app.interpretation.rooms import (
     RoomLabel,
     _smallest_containing_room,
 )
+from app.interpretation.service_takeoff_loaders import _resolve_input_family
 from app.models.revision_materialization import RevisionEntity
 from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.rooms import (
@@ -285,6 +286,10 @@ async def _resolve_rooms(
         if tag_layer
         else await load_text_candidates(db, revision_id, exclude_off_sheet=exclude_off_sheet)
     )
+    # PDF-gated annotation-zone exclusion (#828 PR-2): input_family is resolved from the
+    # revision's adapter run (same helper service_takeoff_loaders uses); None (unknown origin)
+    # or any non-pdf family leaves interpret_rooms's gate a no-op — DWG stays byte-identical.
+    input_family = await _resolve_input_family(db, revision_id)
     return interpret_rooms(
         entities,
         devices=_device_placements(devices),
@@ -292,6 +297,7 @@ async def _resolve_rooms(
         strategy=resolved_strategy,
         snap_tolerance=snap_tolerance,
         min_area=min_area,
+        input_family=input_family,
     )
 
 

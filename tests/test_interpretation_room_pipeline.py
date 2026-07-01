@@ -343,6 +343,89 @@ def test_same_number_across_walls_is_flagged_not_merged() -> None:
     assert all(room.needs_review for room in numbered)  # both flagged for review
 
 
+# --- PDF annotation-zone exclusion gate (#828 PR-2) ---
+
+
+def _pdf_zone_fixture_labels() -> list[RoomLabel]:
+    """Legend/key/grid/tag noise plus two genuine interior room labels (P-520001-like).
+
+    Sheet extent is derived from the label bounds (x: 0..1000, y: 0..800), so the interior
+    room labels are placed well inside the 5% grid-margin band on every side.
+    """
+    return [
+        # Sheet-corner anchors establishing the bounds (also exercise the border band).
+        RoomLabel("0", (0.0, 0.0)),
+        RoomLabel("Z", (1000.0, 800.0)),
+        # Legend block, anchored top-left of the sheet.
+        RoomLabel("LEGEND", (10.0, 780.0)),
+        RoomLabel("SVP SOIL VENT PIPE", (12.0, 770.0)),
+        # Drainage key block.
+        RoomLabel("DRAINAGE KEY", (10.0, 600.0)),
+        RoomLabel("CDP COLD DOWNPIPE", (12.0, 590.0)),
+        # Grid bubbles hugging the sheet border.
+        RoomLabel("1", (5.0, 400.0)),
+        RoomLabel("A", (500.0, 5.0)),
+        # Genuine interior room labels, well away from any zone.
+        RoomLabel("0.2.07", (500.0, 400.0)),
+        RoomLabel("MRI Scanner Rm 1", (500.0, 420.4)),
+    ]
+
+
+def test_pdf_family_excludes_annotation_zone_labels_from_rooms() -> None:
+    labels = _pdf_zone_fixture_labels()
+    result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+    room_texts = {room.name for room in result.rooms} | {room.number for room in result.rooms}
+    assert "LEGEND" not in room_texts
+    assert "SVP SOIL VENT PIPE" not in room_texts
+    assert "DRAINAGE KEY" not in room_texts
+    assert "CDP COLD DOWNPIPE" not in room_texts
+    assert "1" not in room_texts
+    assert "0.2.07" in room_texts
+    assert "MRI Scanner Rm 1" in room_texts
+
+
+def test_non_pdf_family_is_unfiltered_no_op() -> None:
+    labels = _pdf_zone_fixture_labels()
+    pdf_result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+    dwg_result = interpret_rooms([], devices=[], labels=labels, input_family="dwg_vector")
+    unknown_result = interpret_rooms([], devices=[], labels=labels, input_family=None)
+    # DWG (and unknown-origin) skip zone exclusion entirely — byte-identical to each other,
+    # and strictly more rooms than the PDF-filtered result (legend/key/grid noise retained).
+    assert dwg_result.rooms == unknown_result.rooms
+    assert len(dwg_result.rooms) > len(pdf_result.rooms)
+
+
+def test_pdf_gate_keeps_genuine_room_label_near_but_outside_border_band() -> None:
+    # Conservatism: an interior room label placed just outside the grid-margin band (5% of
+    # a 0..1000 x 0..800 sheet -> 50 units in x, 40 in y) must survive the PDF gate even
+    # though it sits near the sheet edge; a label just inside the band is excluded.
+    near_border_room = RoomLabel("0.1.02", (55.0, 400.0))  # just outside the left margin (50)
+    in_margin_tag = RoomLabel("2", (45.0, 400.0))  # just inside the left margin
+    corners = [RoomLabel("0", (0.0, 0.0)), RoomLabel("Z", (1000.0, 800.0))]
+    labels = [near_border_room, in_margin_tag, *corners]
+    result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+    numbers = {room.number for room in result.rooms}
+    assert "0.1.02" in numbers
+    assert "2" not in numbers
+
+
+def test_pdf_gate_never_excludes_a_room_number_label_even_inside_a_zone() -> None:
+    # Conservatism: a label whose text parses as a room number, and its paired name label,
+    # must survive zone-exclusion even when both points fall inside a discovered zone (e.g.
+    # the label-cloud-derived grid-margin band) — this reproduces the CI regression where a
+    # tiny label point-cloud (few labels near the origin) made the margin band clip genuine
+    # room labels (#828).
+    name_in_margin = RoomLabel("PH Plantroom", (5.0, 5.4), layer="A-IDEN")
+    number_in_margin = RoomLabel("0.9.01", (5.0, 5.0), layer="A-IDEN")  # inside the margin band
+    device_tag = RoomLabel("H", (50.0, 50.0), layer="Device Tags")  # far corner sets sheet bounds
+    labels = [name_in_margin, number_in_margin, device_tag]
+    result = interpret_rooms([], devices=[], labels=labels, input_family="pdf_vector")
+    numbers = {room.number for room in result.rooms}
+    names = {room.name for room in result.rooms}
+    assert "0.9.01" in numbers
+    assert "PH Plantroom" in names
+
+
 def test_dedupe_label_rooms_by_number_unit() -> None:
     from app.interpretation.rooms import (
         dedupe_label_rooms_by_number,
