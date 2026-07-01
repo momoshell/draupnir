@@ -20,6 +20,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 from app.db.mixins import ProjectScopedMixin, RevisionLineageMixin, TimestampMixin, sha256_column
 
+# Entity-reduction materialization tiers (#831). "primary" is the load-bearing tier consumed
+# by every existing downstream loader by default; "fill_noise" is reserved for a later PR's
+# predicate that stamps low-signal fill/hatch entities. Every row is "primary" until then, so
+# introducing this column is purely additive with zero behavior change.
+MATERIALIZATION_TIER_PRIMARY = "primary"
+MATERIALIZATION_TIER_FILL_NOISE = "fill_noise"
+
 
 class RevisionEntityManifest(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Base):
     """Manifest row recording whether revision entities were materialized."""
@@ -456,6 +463,11 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
             "(length(source_hash) = 64 AND source_hash = lower(source_hash))",
             name="ck_revision_entities_source_hash",
         ),
+        CheckConstraint(
+            f"materialization_tier IN "
+            f"('{MATERIALIZATION_TIER_PRIMARY}', '{MATERIALIZATION_TIER_FILL_NOISE}')",
+            name="ck_revision_entities_materialization_tier",
+        ),
         Index(
             "ix_revision_entities_revision_entity_type_sequence_id",
             "drawing_revision_id",
@@ -533,6 +545,15 @@ class RevisionEntity(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, B
         String(16),
         nullable=False,
         comment="Canonical entity schema version for this entity row",
+    )
+    materialization_tier: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        server_default=MATERIALIZATION_TIER_PRIMARY,
+        comment=(
+            "Entity-reduction materialization tier (#831): 'primary' (load-bearing, "
+            "returned by default) or 'fill_noise' (low-signal, opt-in via loader tier=None)"
+        ),
     )
     parent_entity_ref: Mapped[str | None] = mapped_column(
         String(255),

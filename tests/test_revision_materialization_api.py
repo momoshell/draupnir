@@ -493,6 +493,48 @@ class TestRevisionMaterializationApi:
         ]  # off-sheet dropped, NULL kept
         assert sorted(e.entity_id for e in full) == ["off", "on", "undet"]  # full modelspace
 
+    async def test_load_revision_entities_by_type_default_tier_matches_unfiltered(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """#831 PR-1: every materialized entity is 'primary', so the loader's default
+        ``tier='primary'`` returns the exact same rows as before the column existed
+        (``tier=None``); ``tier='fill_noise'`` returns none since nothing is tiered yet."""
+        _ = self
+        _ = cleanup_projects
+        _ = enqueued_job_ids
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        await process_ingest_job(job.id)
+        (_outputs, drawing_revisions, _reports, _artifacts) = await _load_project_outputs(
+            project["id"]
+        )
+        revision_id = drawing_revisions[0].id
+
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            default_tier = await load_revision_entities_by_type(session, revision_id, ("line",))
+            explicit_primary = await load_revision_entities_by_type(
+                session, revision_id, ("line",), tier="primary"
+            )
+            all_tiers = await load_revision_entities_by_type(
+                session, revision_id, ("line",), tier=None
+            )
+            fill_noise = await load_revision_entities_by_type(
+                session, revision_id, ("line",), tier="fill_noise"
+            )
+
+        assert [e.id for e in default_tier] == [e.id for e in all_tiers]
+        assert [e.id for e in default_tier] == [e.id for e in explicit_primary]
+        assert default_tier, "fixture must materialize at least one 'line' entity"
+        assert all(e.materialization_tier == "primary" for e in default_tier)
+        assert fill_noise == []
+
     async def test_enumerate_devices_exclude_off_sheet_drops_off_sheet_roots(
         self,
         async_client: httpx.AsyncClient,
