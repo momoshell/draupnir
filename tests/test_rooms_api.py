@@ -61,6 +61,11 @@ def _closed_polyline(vertices: list[tuple[float, float]]) -> dict[str, Any]:
 SQUARE = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
 
 
+async def _fake_input_family(db: Any, revision_id: uuid.UUID) -> str | None:
+    """No-DB stand-in for ``_resolve_input_family`` — unknown origin (DWG/DXF path)."""
+    return None
+
+
 @pytest.fixture
 def rooms_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
     """App with the room loaders patched to in-memory fixtures (no DB)."""
@@ -109,6 +114,7 @@ def rooms_app(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI
     # Room labels now come from all text (#549); device-tag source kept for the override path.
     monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
     monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(rooms_route, "_resolve_input_family", _fake_input_family)
 
     yield app
     app.dependency_overrides.clear()
@@ -198,6 +204,7 @@ def rooms_app_capture_scope(
     monkeypatch.setattr(rooms_route, "load_revision_entities_by_type", _fake_entities)
     monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
     monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_text)
+    monkeypatch.setattr(rooms_route, "_resolve_input_family", _fake_input_family)
     yield app, seen
     app.dependency_overrides.clear()
 
@@ -287,6 +294,7 @@ def rooms_app_mixed(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[F
     monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
     monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
     monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(rooms_route, "_resolve_input_family", _fake_input_family)
 
     yield app
     app.dependency_overrides.clear()
@@ -403,6 +411,7 @@ def rooms_app_prose(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[F
     monkeypatch.setattr(rooms_route, "enumerate_devices", _fake_devices)
     monkeypatch.setattr(rooms_route, "load_text_candidates", _fake_tags)
     monkeypatch.setattr(rooms_route, "load_tag_candidates", _fake_tags)
+    monkeypatch.setattr(rooms_route, "_resolve_input_family", _fake_input_family)
 
     yield app
     app.dependency_overrides.clear()
