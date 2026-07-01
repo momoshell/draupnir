@@ -12,6 +12,14 @@ from app.jobs import ingest_execution
 from app.jobs.execution_monitoring import PersistedJobCancellationHandle
 
 
+class _FakeLogger:
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, dict[str, Any]]] = []
+
+    def error(self, event: str, **fields: Any) -> None:
+        self.errors.append((event, fields))
+
+
 def _request() -> IngestionRunRequest:
     return IngestionRunRequest(
         job_id=uuid.uuid4(),
@@ -145,3 +153,96 @@ async def test_invoke_ingestion_runner_passes_all_keywords_to_var_keyword_runner
             },
         }
     ]
+
+
+async def test_handle_ingest_runner_error_marks_cancellation_without_failure_log() -> None:
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    logger = _FakeLogger()
+    cancelled_calls: list[dict[str, Any]] = []
+    failed_calls: list[dict[str, Any]] = []
+    error = IngestionRunnerError(
+        error_code=ErrorCode.JOB_CANCELLED,
+        failure_kind=AdapterFailureKind.CANCELLED,
+        message="Job was cancelled.",
+    )
+
+    async def mark_job_cancelled_with_log(job_id: uuid.UUID, **kwargs: Any) -> bool:
+        cancelled_calls.append({"job_id": job_id, **kwargs})
+        return True
+
+    async def mark_job_failed(job_id: uuid.UUID, **kwargs: Any) -> bool:
+        failed_calls.append({"job_id": job_id, **kwargs})
+        return True
+
+    await ingest_execution.handle_ingest_runner_error(
+        job_id,
+        attempt_token=attempt_token,
+        exc=error,
+        mark_job_cancelled_with_log=mark_job_cancelled_with_log,
+        mark_job_failed=mark_job_failed,
+        logger_instance=logger,
+    )
+
+    assert cancelled_calls == [
+        {
+            "job_id": job_id,
+            "attempt_token": attempt_token,
+            "log_event": "ingest_job_cancelled_during_execution",
+            "log_fields": {"error_code": ErrorCode.JOB_CANCELLED.value},
+        }
+    ]
+    assert failed_calls == []
+    assert logger.errors == []
+
+
+async def test_handle_ingest_runner_error_marks_failure_with_safe_details() -> None:
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    logger = _FakeLogger()
+    failed_calls: list[dict[str, Any]] = []
+    error = IngestionRunnerError(
+        error_code=ErrorCode.ADAPTER_FAILED,
+        failure_kind=AdapterFailureKind.FAILED,
+        message="Adapter execution failed.",
+        details={"adapter_key": "pymupdf", "stderr": "do not persist"},
+    )
+
+    async def mark_job_cancelled_with_log(job_id: uuid.UUID, **kwargs: Any) -> bool:
+        raise AssertionError("non-cancelled failures should not mark cancelled")
+
+    async def mark_job_failed(job_id: uuid.UUID, **kwargs: Any) -> bool:
+        failed_calls.append({"job_id": job_id, **kwargs})
+        return True
+
+    await ingest_execution.handle_ingest_runner_error(
+        job_id,
+        attempt_token=attempt_token,
+        exc=error,
+        mark_job_cancelled_with_log=mark_job_cancelled_with_log,
+        mark_job_failed=mark_job_failed,
+        logger_instance=logger,
+    )
+
+    expected_details = {
+        "error_code": ErrorCode.ADAPTER_FAILED.value,
+        "failure_kind": AdapterFailureKind.FAILED.value,
+        "error_message": "Adapter execution failed.",
+        "adapter_key": "pymupdf",
+    }
+    assert failed_calls == [
+        {
+            "job_id": job_id,
+            "error_message": "Adapter execution failed.",
+            "error_code": ErrorCode.ADAPTER_FAILED,
+            "attempt_token": attempt_token,
+            "error_details": expected_details,
+        }
+    ]
+    assert logger.errors == [("ingest_job_failed", {"job_id": str(job_id), **expected_details})]
+
+
+def test_build_ingest_finalization_error_log_fields_preserves_legacy_payload() -> None:
+    assert ingest_execution.build_ingest_finalization_error_log_fields(
+        RuntimeError("finalize exploded")
+    ) == {"error": "finalize exploded"}

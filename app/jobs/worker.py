@@ -1234,28 +1234,19 @@ async def _handle_ingest_runner_error(
     exc: IngestionRunnerError,
 ) -> None:
     """Persist and log the expected ingest runner failure contract."""
-    if exc.error_code is ErrorCode.JOB_CANCELLED:
-        await _mark_job_cancelled_with_log(
-            job_id,
-            attempt_token=attempt_token,
-            log_event="ingest_job_cancelled_during_execution",
-            log_fields={"error_code": exc.error_code.value},
-        )
-        return
-
-    await _mark_job_failed(
+    await job_ingest_execution.handle_ingest_runner_error(
         job_id,
-        error_message=exc.message,
-        error_code=exc.error_code,
         attempt_token=attempt_token,
-        error_details=_runner_error_log_fields(exc),
+        exc=exc,
+        mark_job_cancelled_with_log=_mark_job_cancelled_with_log,
+        mark_job_failed=_mark_job_failed,
+        logger_instance=logger,
     )
-    logger.error("ingest_job_failed", job_id=str(job_id), **_runner_error_log_fields(exc))
 
 
 def _build_ingest_finalization_error_log_fields(exc: Exception) -> dict[str, str]:
     """Preserve the legacy ingest finalization error log payload."""
-    return {"error": str(exc)}
+    return job_ingest_execution.build_ingest_finalization_error_log_fields(exc)
 
 
 def _get_registered_job_handler(job_type_name: job_runner.JobTypeName) -> job_runner.JobHandler:

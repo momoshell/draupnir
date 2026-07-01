@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
+from uuid import UUID
 
+from app.core.errors import ErrorCode
 from app.ingestion.contracts import AdapterTimeout
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest
@@ -69,3 +71,41 @@ async def invoke_ingestion_runner(
     if runner_supports_keyword(runner, "on_progress"):
         kwargs["on_progress"] = on_progress
     return cast(IngestFinalizationPayload, await runner(request, **kwargs))
+
+
+async def handle_ingest_runner_error(
+    job_id: UUID,
+    *,
+    attempt_token: UUID,
+    exc: IngestionRunnerError,
+    mark_job_cancelled_with_log: Callable[..., Awaitable[Any]],
+    mark_job_failed: Callable[..., Awaitable[Any]],
+    logger_instance: Any,
+    runner_error_log_fields_func: Callable[[IngestionRunnerError], dict[str, Any]] = (
+        runner_error_log_fields
+    ),
+) -> None:
+    """Persist and log the expected ingest runner failure contract."""
+    if exc.error_code is ErrorCode.JOB_CANCELLED:
+        await mark_job_cancelled_with_log(
+            job_id,
+            attempt_token=attempt_token,
+            log_event="ingest_job_cancelled_during_execution",
+            log_fields={"error_code": exc.error_code.value},
+        )
+        return
+
+    error_details = runner_error_log_fields_func(exc)
+    await mark_job_failed(
+        job_id,
+        error_message=exc.message,
+        error_code=exc.error_code,
+        attempt_token=attempt_token,
+        error_details=error_details,
+    )
+    logger_instance.error("ingest_job_failed", job_id=str(job_id), **error_details)
+
+
+def build_ingest_finalization_error_log_fields(exc: Exception) -> dict[str, str]:
+    """Preserve the legacy ingest finalization error log payload."""
+    return {"error": str(exc)}
