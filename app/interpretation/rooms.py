@@ -29,6 +29,18 @@ from app.interpretation.geometry import (
 # Matches ``0.9.01``, ``G.04``, ``A1.02``.
 _ROOM_NUMBER_RE = re.compile(r"\b[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+\b")
 
+# A "plausible" room number (#828 PR-3): the stricter, PDF-only room-number form used to
+# tell a genuine building-numbering token (e.g. "0.2.17", "0.0.09A", "0.2.C1", "0.8.02") apart
+# from PDF interior-annotation noise that ``parse_room_number`` (deliberately loose, relied on
+# by other consumers/buildings) accepts — e.g. "20.4" (only 2 dotted parts), "NO.14784" /
+# "2NO.45" / "17.AIR" (not digit-led, or a unit/word suffix rather than a room segment),
+# "1.5T" (2 parts), "1.621aaa" (3rd part isn't a valid short alphanumeric segment). Requires:
+#   - at least 3 dot-separated segments (building.floor.room, the observed ground-truth shape);
+#   - the first segment is purely digits (a floor/block index, never a word like "NO");
+#   - every segment is short (<=3 chars) so a long numeric run ("14784") or word ("AIR") can't
+#     pass as a segment.
+_PLAUSIBLE_ROOM_NUMBER_RE = re.compile(r"\b\d{1,3}(?:\.[A-Za-z0-9]{1,3}){2,}\b")
+
 
 @dataclass(frozen=True, slots=True)
 class Room:
@@ -152,6 +164,24 @@ def parse_room_number(text: str) -> str | None:
         if any(char.isdigit() for char in token):
             return token
     return None
+
+
+def is_plausible_room_number(text: str) -> bool:
+    """Return True when *text* is a plausible building room-number token (#828 PR-3).
+
+    Stricter than :func:`parse_room_number` — additive, PDF-only use. Requires a digit-led
+    token of >=3 short (<=3 char) dot-separated segments, e.g. ``0.2.17``, ``0.0.09A``,
+    ``0.2.C1``, ``0.8.02`` (the observed building.floor.room ground-truth shape).
+
+    Rejects PDF interior-annotation noise that ``parse_room_number`` wrongly accepts:
+    ``20.4`` (only 2 segments), ``NO.14784`` / ``2NO.45`` (not digit-led), ``17.AIR`` (a
+    word suffix, not a room segment), ``1.5T`` (2 segments), ``1.621aaa`` (no valid 3rd
+    segment — too long and no separating dot).
+
+    Does NOT change :func:`parse_room_number`, which stays intentionally loose for other
+    consumers/buildings that rely on its looser 2-segment match.
+    """
+    return _PLAUSIBLE_ROOM_NUMBER_RE.search(text) is not None
 
 
 def assign_labels_to_rooms(

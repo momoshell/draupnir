@@ -22,6 +22,7 @@ from app.interpretation.geometry import point_in_polygon
 from app.interpretation.ifc_rooms import interpret_ifc_rooms
 from app.interpretation.label_rooms import (
     DEFAULT_LABEL_CLUSTER_RADIUS,
+    has_genuine_room_identity,
     identify_rooms_from_labels,
     room_label_layers,
 )
@@ -151,9 +152,33 @@ def interpret_rooms(
         already_assigned={a.device_id for a in enriched.device_assignments},
         radius=DEFAULT_DEVICE_LABEL_ROOM_RADIUS,
     )
-    if not extra:
-        return enriched
-    return replace(enriched, device_assignments=[*enriched.device_assignments, *extra])
+    result = (
+        enriched
+        if not extra
+        else replace(enriched, device_assignments=[*enriched.device_assignments, *extra])
+    )
+    if input_family == INPUT_FAMILY_PDF_VECTOR:
+        result = replace(result, rooms=_flag_unconfirmed_pdf_rooms(result.rooms))
+    return result
+
+
+def _flag_unconfirmed_pdf_rooms(rooms: Sequence[Room]) -> list[Room]:
+    """PDF-only (#828 PR-3): flag rooms that fail the stricter PDF confirmed-room rule.
+
+    A name-only room (real-looking name, no plausible number) or a numbered room whose
+    number is PDF interior-annotation noise (fails ``is_plausible_room_number``) is kept —
+    reclassified, not deleted — with ``needs_review`` set so it is surfaced but excluded
+    from the confirmed-room count (``/rooms`` genuine set, ``/summary`` room counts; see
+    ``has_genuine_room_identity``). Rooms already flagged (e.g. cross-wall duplicate
+    numbers, #581) keep that flag regardless of this check.
+    """
+    return [
+        room
+        if room.needs_review
+        or has_genuine_room_identity(room, input_family=INPUT_FAMILY_PDF_VECTOR)
+        else replace(room, needs_review=True)
+        for room in rooms
+    ]
 
 
 def _enrich_with_labels(

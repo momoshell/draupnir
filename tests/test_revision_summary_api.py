@@ -290,12 +290,17 @@ def _summary_app_with_rooms(
     async def _fake_manifest(revision_id: uuid.UUID, db: Any) -> SimpleNamespace:
         return _manifest()
 
-    async def _fake_resolve_rooms(db: Any, revision_id: uuid.UUID, **_: Any) -> RoomInterpretation:
-        return RoomInterpretation(
-            rooms=rooms,
-            device_assignments=[],
-            strategy="explicit_layer",
-            source_layers=(),
+    async def _fake_resolve_rooms_with_family(
+        db: Any, revision_id: uuid.UUID, **_: Any
+    ) -> tuple[RoomInterpretation, str | None]:
+        return (
+            RoomInterpretation(
+                rooms=rooms,
+                device_assignments=[],
+                strategy="explicit_layer",
+                source_layers=(),
+            ),
+            None,
         )
 
     async def _fake_devices(db: Any, revision_id: uuid.UUID, **_: Any) -> list[Any]:
@@ -315,7 +320,9 @@ def _summary_app_with_rooms(
         return None
 
     monkeypatch.setattr(summary_route, "_get_active_revision_manifest_or_409", _fake_manifest)
-    monkeypatch.setattr(summary_route, "_resolve_rooms", _fake_resolve_rooms)
+    monkeypatch.setattr(
+        summary_route, "_resolve_rooms_with_family", _fake_resolve_rooms_with_family
+    )
     monkeypatch.setattr(summary_route, "enumerate_devices", _fake_devices)
     monkeypatch.setattr(summary_route, "resolve_revision_scale", _fake_scale)
     monkeypatch.setattr(summary_route, "_get_active_validation_report", _fake_validation_report)
