@@ -7,13 +7,11 @@ import atexit
 import hashlib
 import inspect
 import threading
-import uuid
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
-from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -57,6 +55,7 @@ from app.ingestion.contracts import AdapterTimeout, InputFamily, ProgressUpdate
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
 from app.jobs import lifecycle as job_lifecycle
+from app.jobs import recovery as job_recovery
 from app.jobs import runner as job_runner
 from app.jobs.conflict_diagnostics import (
     _build_changeset_apply_conflict_details,
@@ -195,39 +194,18 @@ _RECOVERABLE_INGEST_JOB_TYPES = job_runner.INGEST_WORKER_JOB_TYPES
 _RECOVERABLE_ENQUEUE_JOB_TYPES = job_runner.RECOVERABLE_ENQUEUE_JOB_TYPES
 _KNOWN_ENQUEUE_JOB_TYPES_WITHOUT_PUBLISHER = job_runner.JOB_TYPES_WITHOUT_ENQUEUE_PUBLISHER
 _TERMINAL_JOB_STATUSES = job_lifecycle._TERMINAL_JOB_STATUSES
-_ENQUEUE_STATUS_PENDING = "pending"
-_ENQUEUE_STATUS_PUBLISHING = "publishing"
-_ENQUEUE_STATUS_PUBLISHED = "published"
+_ENQUEUE_STATUS_PENDING = job_recovery._ENQUEUE_STATUS_PENDING
+_ENQUEUE_STATUS_PUBLISHING = job_recovery._ENQUEUE_STATUS_PUBLISHING
+_ENQUEUE_STATUS_PUBLISHED = job_recovery._ENQUEUE_STATUS_PUBLISHED
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
-_RUNNING_JOB_STALE_AFTER = _DEFAULT_ADAPTER_TIMEOUT * 2
+_RUNNING_JOB_STALE_AFTER = job_recovery._RUNNING_JOB_STALE_AFTER
 _JOB_ATTEMPT_LEASE_RENEW_INTERVAL = _RUNNING_JOB_STALE_AFTER / 3
-_ENQUEUE_LEASE_DURATION = timedelta(minutes=1)
+_ENQUEUE_LEASE_DURATION = job_recovery._ENQUEUE_LEASE_DURATION
 _JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
-# Capped exponential backoff between job attempts. The first attempt runs with no
-# delay; each subsequent re-enqueue waits base * 2**(attempt-1), capped, so a job
-# that keeps failing is spaced out instead of being retried as fast as the broker
-# can redeliver it (the attempt count is still bounded by ``Job.max_attempts``).
-_ENQUEUE_BACKOFF_BASE_SECONDS = 5.0
-_ENQUEUE_BACKOFF_MAX_SECONDS = 300.0
-
-
-def _enqueue_backoff_seconds(attempts: int) -> float:
-    """Return the retry delay for a job that has already made ``attempts`` tries."""
-    if attempts <= 1:
-        return 0.0
-    delay = _ENQUEUE_BACKOFF_BASE_SECONDS * (2.0 ** (attempts - 2))
-    return min(delay, _ENQUEUE_BACKOFF_MAX_SECONDS)
-
-
-# Carries the computed backoff to the real ``enqueue_*`` publishers without changing
-# their ``(job_id)`` call signature (test fakes and direct calls see the 0.0 default).
-_ENQUEUE_COUNTDOWN_SECONDS: ContextVar[float] = ContextVar("enqueue_countdown_seconds", default=0.0)
-
-
-def _current_enqueue_countdown() -> float | None:
-    """Return the active enqueue backoff in seconds, or None when there is none."""
-    countdown = _ENQUEUE_COUNTDOWN_SECONDS.get()
-    return countdown if countdown > 0.0 else None
+_ENQUEUE_BACKOFF_BASE_SECONDS = job_recovery._ENQUEUE_BACKOFF_BASE_SECONDS
+_ENQUEUE_BACKOFF_MAX_SECONDS = job_recovery._ENQUEUE_BACKOFF_MAX_SECONDS
+_enqueue_backoff_seconds = job_recovery._enqueue_backoff_seconds
+_current_enqueue_countdown = job_recovery._current_enqueue_countdown
 
 
 _JOB_CANCELLED_ERROR_CODE = ErrorCode.JOB_CANCELLED.value
@@ -723,23 +701,8 @@ def _get_export_kind_spec(export_kind: str) -> _ExportKindSpec:
 
 
 _JobAttemptLease = job_lifecycle._JobAttemptLease
-
-
-@dataclass(frozen=True, slots=True)
-class _EnqueueIntentLease:
-    """Persisted ownership token for a claimed durable enqueue intent."""
-
-    token: UUID
-    lease_expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class _ClaimedJobEnqueueIntent:
-    """Persisted enqueue claim bundled with the routed worker job type."""
-
-    lease: _EnqueueIntentLease
-    job_type: str
-    attempts: int
+_EnqueueIntentLease = job_recovery._EnqueueIntentLease
+_ClaimedJobEnqueueIntent = job_recovery._ClaimedJobEnqueueIntent
 
 
 _JobLockBootstrap = job_lifecycle._JobLockBootstrap
@@ -862,21 +825,8 @@ atexit.register(_close_worker_loop_runner)
 
 
 _clear_job_attempt_lease = job_lifecycle._clear_job_attempt_lease
-
-
-def _clear_enqueue_intent_lease(job: Job) -> None:
-    """Clear persisted ownership fencing for a durable enqueue intent."""
-    job.enqueue_owner_token = None
-    job.enqueue_lease_expires_at = None
-
-
-def prepare_job_enqueue_intent(job: Job) -> None:
-    """Reset a job's durable enqueue intent to the pending outbox state."""
-    job.enqueue_status = _ENQUEUE_STATUS_PENDING
-    job.enqueue_attempts = 0
-    job.enqueue_last_attempted_at = None
-    job.enqueue_published_at = None
-    _clear_enqueue_intent_lease(job)
+_clear_enqueue_intent_lease = job_recovery._clear_enqueue_intent_lease
+prepare_job_enqueue_intent = job_recovery.prepare_job_enqueue_intent
 
 
 def _claim_job_attempt_lease(
@@ -897,18 +847,7 @@ def _claim_job_attempt_lease(
 
 _job_attempt_is_current = job_lifecycle._job_attempt_is_current
 _renew_job_attempt_lease_for_update = job_lifecycle._renew_job_attempt_lease_for_update
-
-
-def _job_is_safe_recovery_failure_target(job: Job) -> bool:
-    """Return whether recovery can still safely mark the job failed."""
-    return (
-        job.status == "pending"
-        and job.attempt_token is None
-        and job.attempt_lease_expires_at is None
-        and job.enqueue_status == _ENQUEUE_STATUS_PENDING
-        and job.enqueue_owner_token is None
-        and job.enqueue_lease_expires_at is None
-    )
+_job_is_safe_recovery_failure_target = job_recovery._job_is_safe_recovery_failure_target
 
 
 def _is_stale_running_job(
@@ -993,26 +932,8 @@ async def _with_job_attempt_lease_renewal[ResultT](
             await renewal_task
 
 
-def _is_stale_enqueue_intent(job: Job, *, now: datetime) -> bool:
-    """Return whether an in-flight enqueue publish claim can be reclaimed."""
-    lease_expires_at = job.enqueue_lease_expires_at
-    if lease_expires_at is None:
-        return True
-    if lease_expires_at.tzinfo is None:
-        lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
-    return lease_expires_at <= now
-
-
-def _claim_enqueue_intent_lease(job: Job, *, now: datetime) -> _EnqueueIntentLease:
-    """Mint and persist a fresh ownership lease for broker publication."""
-    token = uuid.uuid4()
-    lease_expires_at = now + _ENQUEUE_LEASE_DURATION
-    job.enqueue_status = _ENQUEUE_STATUS_PUBLISHING
-    job.enqueue_attempts += 1
-    job.enqueue_owner_token = token
-    job.enqueue_lease_expires_at = lease_expires_at
-    job.enqueue_last_attempted_at = now
-    return _EnqueueIntentLease(token=token, lease_expires_at=lease_expires_at)
+_is_stale_enqueue_intent = job_recovery._is_stale_enqueue_intent
+_claim_enqueue_intent_lease = job_recovery._claim_enqueue_intent_lease
 
 
 _get_job_for_update = job_lifecycle._get_job_for_update
@@ -1103,9 +1024,7 @@ async def _get_drawing_revision_for_changeset(
     return result.scalar_one_or_none()
 
 
-def _get_enqueue_job_error_message(job_type: str) -> str:
-    """Return the persisted enqueue failure message for a worker job type."""
-    return job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE.get(job_type, "Failed to enqueue job")
+_get_enqueue_job_error_message = job_recovery._get_enqueue_job_error_message
 
 
 def _requested_input_family_from_pdf_input_mode(
@@ -1680,135 +1599,34 @@ async def _mark_job_failed_if_recovery_safe(
     error_details: dict[str, Any] | None = None,
 ) -> bool:
     """Fail a recovered job only if it is still pending and unowned."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        locked_source = await _lock_job_source_for_terminal_mutation(session, job_id)
-        job = locked_source.job
-
-        if (
-            locked_source.project.deleted_at is not None
-            or locked_source.source_file is None
-            or locked_source.source_file.deleted_at is not None
-        ):
-            await _cancel_job_for_inactive_source(
-                session,
-                job,
-                reason="source_deleted",
-            )
-            logger.info(
-                "job_recovery_enqueue_failure_mark_skipped_inactive_source",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return False
-
-        if not _job_is_safe_recovery_failure_target(job):
-            logger.info(
-                "job_recovery_enqueue_failure_mark_skipped_changed_state",
-                job_id=str(job_id),
-                job_type=job.job_type,
-                status=job.status,
-            )
-            return False
-
-        await _persist_job_failed(
-            session,
-            job,
-            error_message=error_message,
-            error_code=error_code,
-            error_details=error_details,
-        )
-        await session.commit()
-
-    return True
+    return await job_recovery._mark_job_failed_if_recovery_safe(
+        job_id,
+        error_message=error_message,
+        error_code=error_code,
+        error_details=error_details,
+        lock_job_source_for_terminal_mutation_func=_lock_job_source_for_terminal_mutation,
+        cancel_job_for_inactive_source_func=_cancel_job_for_inactive_source,
+        persist_job_failed_func=_persist_job_failed,
+        logger_instance=logger,
+    )
 
 
 async def _claim_job_enqueue_intent(job_id: UUID) -> _ClaimedJobEnqueueIntent | None:
     """Claim a durable enqueue intent for best-effort or recovery publication."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    now = _utcnow()
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if not is_recoverable_enqueue_job_type(job.job_type) or job.status != "pending":
-            return None
-
-        if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHED:
-            return None
-
-        if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING and not _is_stale_enqueue_intent(
-            job,
-            now=now,
-        ):
-            return None
-
-        lease = _claim_enqueue_intent_lease(job, now=now)
-        attempts = job.attempts
-        await session.commit()
-        return _ClaimedJobEnqueueIntent(lease=lease, job_type=job.job_type, attempts=attempts)
+    return await job_recovery._claim_job_enqueue_intent(
+        job_id,
+        is_recoverable_enqueue_job_type_func=is_recoverable_enqueue_job_type,
+    )
 
 
 async def _release_job_enqueue_intent(job_id: UUID, *, lease_token: UUID) -> bool:
     """Release a claimed durable enqueue intent after a publish failure."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if (
-            job.enqueue_status != _ENQUEUE_STATUS_PUBLISHING
-            or job.enqueue_owner_token != lease_token
-        ):
-            return False
-
-        if job.status == "pending":
-            job.enqueue_status = _ENQUEUE_STATUS_PENDING
-            _clear_enqueue_intent_lease(job)
-            await session.commit()
-            return True
-
-        job.enqueue_status = _ENQUEUE_STATUS_PUBLISHED
-        job.enqueue_published_at = _utcnow()
-        _clear_enqueue_intent_lease(job)
-        await session.commit()
-        return True
+    return await job_recovery._release_job_enqueue_intent(job_id, lease_token=lease_token)
 
 
 async def _mark_job_enqueue_published(job_id: UUID, *, lease_token: UUID) -> bool:
     """Finalize a claimed durable enqueue intent after broker publication."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await _get_job_for_update(session, job_id)
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if (
-            job.enqueue_status != _ENQUEUE_STATUS_PUBLISHING
-            or job.enqueue_owner_token != lease_token
-        ):
-            return False
-
-        job.enqueue_status = _ENQUEUE_STATUS_PUBLISHED
-        job.enqueue_published_at = _utcnow()
-        _clear_enqueue_intent_lease(job)
-        await session.commit()
-        return True
+    return await job_recovery._mark_job_enqueue_published(job_id, lease_token=lease_token)
 
 
 async def publish_job_enqueue_intent(
@@ -1819,82 +1637,27 @@ async def publish_job_enqueue_intent(
     suppress_exceptions: bool = False,
 ) -> bool:
     """Best-effort publish for a durable enqueue intent recorded in Postgres."""
-    claimed_intent: _ClaimedJobEnqueueIntent | None = None
-    try:
-        claimed_intent = await _claim_job_enqueue_intent(job_id)
-        if claimed_intent is None:
-            return False
-
-        publish = publisher or get_job_enqueue_publisher(claimed_intent.job_type)
-        if publish is None:
-            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
-            return False
-        countdown_token = _ENQUEUE_COUNTDOWN_SECONDS.set(
-            _enqueue_backoff_seconds(claimed_intent.attempts)
-        )
-        try:
-            publish(job_id)
-        except Exception:
-            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
-            await _release_job_enqueue_intent(job_id, lease_token=claimed_intent.lease.token)
-            if recovery:
-                await _mark_recovery_enqueue_failed(job_id, job_type=claimed_intent.job_type)
-            else:
-                logger.warning(
-                    "job_enqueue_deferred",
-                    job_id=str(job_id),
-                    job_type=claimed_intent.job_type,
-                    recovery_action="worker_start_recovery",
-                )
-            return False
-        else:
-            _ENQUEUE_COUNTDOWN_SECONDS.reset(countdown_token)
-
-        published = await _mark_job_enqueue_published(
-            job_id, lease_token=claimed_intent.lease.token
-        )
-        if not published:
-            # The broker publish already succeeded; the enqueue intent is at-least-once and
-            # job execution is idempotent, so we still report success. But the PUBLISHED
-            # transition was skipped because another owner reclaimed the lease (or the status
-            # moved off PUBLISHING) between claim and mark — surface that race for observability.
-            logger.warning(
-                "job_enqueue_publish_mark_skipped",
-                job_id=str(job_id),
-                job_type=claimed_intent.job_type,
-                reason="stale_enqueue_lease",
-            )
-        return True
-    except Exception:
-        if not suppress_exceptions:
-            raise
-
-        logger.warning(
-            "job_enqueue_deferred",
-            job_id=str(job_id),
-            job_type=claimed_intent.job_type if claimed_intent is not None else None,
-            recovery_action="worker_start_recovery",
-        )
-        return False
+    return await job_recovery.publish_job_enqueue_intent(
+        job_id,
+        recovery=recovery,
+        publisher=publisher,
+        suppress_exceptions=suppress_exceptions,
+        publisher_resolver=get_job_enqueue_publisher,
+        claim_job_enqueue_intent_func=_claim_job_enqueue_intent,
+        release_job_enqueue_intent_func=_release_job_enqueue_intent,
+        mark_job_enqueue_published_func=_mark_job_enqueue_published,
+        mark_recovery_enqueue_failed_func=_mark_recovery_enqueue_failed,
+    )
 
 
 async def _mark_recovery_enqueue_failed(job_id: UUID, *, job_type: str) -> bool:
     """Persist and log a sanitized worker-recovery enqueue failure."""
-    marked_failed = await _mark_job_failed_if_recovery_safe(
+    return await job_recovery._mark_recovery_enqueue_failed(
         job_id,
-        error_message=_get_enqueue_job_error_message(job_type),
-    )
-    if not marked_failed:
-        return False
-
-    logger.error(
-        "job_recovery_enqueue_failed",
-        job_id=str(job_id),
         job_type=job_type,
-        error_code=ErrorCode.INTERNAL_ERROR.value,
-        recovery_action="mark_failed",
+        mark_job_failed_if_recovery_safe_func=_mark_job_failed_if_recovery_safe,
+        logger_instance=logger,
     )
-    return True
 
 
 def _finalize_job_cancelled(job: Job) -> None:
@@ -2700,92 +2463,26 @@ async def process_ingest_job(job_id: UUID, *, deps: WorkerDeps | None = None) ->
 
 async def recover_incomplete_jobs() -> list[UUID]:
     """Requeue incomplete persisted worker jobs on worker startup."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    now = _utcnow()
-
-    async with session_maker() as session:
-        result = await session.execute(
-            select(Job)
-            .where(
-                (Job.job_type.in_(_RECOVERABLE_ENQUEUE_JOB_TYPES))
-                & (
-                    (Job.status == "running")
-                    | (
-                        (Job.status == "pending")
-                        & (
-                            Job.enqueue_status.in_(
-                                (_ENQUEUE_STATUS_PENDING, _ENQUEUE_STATUS_PUBLISHING)
-                            )
-                        )
-                    )
-                )
-            )
-            .order_by(Job.created_at.asc(), Job.id.asc())
-            .with_for_update(skip_locked=True)
-        )
-        jobs = result.scalars().all()
-
-        recovered_job_ids: list[UUID] = []
-        for job in jobs:
-            if job.status == "running":
-                if not _is_stale_running_job(job, now=now):
-                    continue
-                job.status = "pending"
-                job.started_at = None
-                job.finished_at = None
-                job.error_code = None
-                job.error_message = None
-                _clear_job_attempt_lease(job)
-                prepare_job_enqueue_intent(job)
-                recovered_job_ids.append(job.id)
-                continue
-
-            if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING and not _is_stale_enqueue_intent(
-                job,
-                now=now,
-            ):
-                continue
-
-            if job.enqueue_status == _ENQUEUE_STATUS_PUBLISHING:
-                job.enqueue_status = _ENQUEUE_STATUS_PENDING
-                _clear_enqueue_intent_lease(job)
-
-            if job.enqueue_status != _ENQUEUE_STATUS_PENDING:
-                continue
-
-            recovered_job_ids.append(job.id)
-
-        await session.commit()
-
-    enqueued_job_ids: list[UUID] = []
-    for job_id in recovered_job_ids:
-        if await publish_job_enqueue_intent(job_id, recovery=True):
-            enqueued_job_ids.append(job_id)
-
-    return enqueued_job_ids
+    return await job_recovery.recover_incomplete_jobs(
+        recoverable_enqueue_job_types=_RECOVERABLE_ENQUEUE_JOB_TYPES,
+        publish_job_enqueue_intent_func=publish_job_enqueue_intent,
+    )
 
 
 async def recover_incomplete_ingest_jobs() -> list[UUID]:
     """Compatibility alias for incomplete worker job recovery."""
-    return await recover_incomplete_jobs()
+    return await job_recovery.recover_incomplete_ingest_jobs(
+        recoverable_enqueue_job_types=_RECOVERABLE_ENQUEUE_JOB_TYPES,
+        publish_job_enqueue_intent_func=publish_job_enqueue_intent,
+    )
 
 
 def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
     """Requeue incomplete persisted worker jobs when a worker starts."""
-    try:
-        recovered_job_ids = _run_worker_loop(recover_incomplete_ingest_jobs)
-    except Exception as exc:
-        logger.error("ingest_job_recovery_failed", error=str(exc), exc_info=True)
-        return
-
-    if recovered_job_ids:
-        logger.info(
-            "ingest_job_recovery_completed",
-            recovered_job_ids=[str(job_id) for job_id in recovered_job_ids],
-        )
+    job_recovery.recover_incomplete_ingest_jobs_on_worker_start(
+        run_worker_loop_func=_run_worker_loop,
+        recover_incomplete_ingest_jobs_func=recover_incomplete_ingest_jobs,
+    )
 
 
 worker_ready.connect(recover_incomplete_ingest_jobs_on_worker_start)
