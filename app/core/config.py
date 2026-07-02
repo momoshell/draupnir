@@ -39,8 +39,13 @@ class Settings(BaseSettings):
     # must include {binary}, {output}, and {source} placeholders.
     libredwg_sandbox_command: str | None = None
     libredwg_require_sandbox: bool = False
-    parser_subprocess_max_memory_mb: int = 1024
-    parser_subprocess_cpu_seconds: int = 300
+    # Parser child-process resource caps (RLIMIT_AS / RLIMIT_CPU). OPT-IN: default
+    # None = unbounded, preserving the documented big-sheet envelope — a dense
+    # full-floor DWG (447 MB dwgread JSON, P-520001) needs multi-GB address space
+    # and can exceed 300s CPU inside the 600s adapter wall-clock. When enabling,
+    # size comfortably above that case (e.g. 6144 MB / 900 s).
+    parser_subprocess_max_memory_mb: int | None = None
+    parser_subprocess_cpu_seconds: int | None = None
     # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
     # (e.g. 207k+ entities / 447 MB dwgread JSON): set ADAPTER_TIMEOUT_SECONDS=600
     # together with LIBREDWG_MAX_OUTPUT_MB=700 and worker --concurrency=1 (~3 GB RAM
@@ -107,16 +112,16 @@ class Settings(BaseSettings):
 
     @field_validator("parser_subprocess_max_memory_mb")
     @classmethod
-    def validate_parser_subprocess_max_memory_mb(cls, value: int) -> int:
-        if value <= 0:
-            raise ValueError("parser_subprocess_max_memory_mb must be positive")
+    def validate_parser_subprocess_max_memory_mb(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("parser_subprocess_max_memory_mb must be positive when set")
         return value
 
     @field_validator("parser_subprocess_cpu_seconds")
     @classmethod
-    def validate_parser_subprocess_cpu_seconds(cls, value: int) -> int:
-        if value <= 0:
-            raise ValueError("parser_subprocess_cpu_seconds must be positive")
+    def validate_parser_subprocess_cpu_seconds(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("parser_subprocess_cpu_seconds must be positive when set")
         return value
 
     @field_validator("adapter_timeout_seconds")

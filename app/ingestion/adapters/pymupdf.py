@@ -1839,12 +1839,16 @@ def _run_process_extraction_child(sender: Any, request: _ProcessExtractionReques
 
 
 def _configure_child_process_limits(timeout_seconds: float | None) -> None:
-    cpu_seconds: int | float = settings.parser_subprocess_cpu_seconds
+    # None = unbounded (opt-in caps); see config.parser_subprocess_* comments.
+    cpu_seconds: int | float | None = settings.parser_subprocess_cpu_seconds
     if timeout_seconds is not None:
-        cpu_seconds = min(cpu_seconds, timeout_seconds)
+        cpu_seconds = timeout_seconds if cpu_seconds is None else min(cpu_seconds, timeout_seconds)
+    max_memory_mb = settings.parser_subprocess_max_memory_mb
     apply_parser_process_limits(
         ParserProcessLimits(
-            max_address_space_bytes=settings.parser_subprocess_max_memory_mb * 1024 * 1024,
+            max_address_space_bytes=(
+                max_memory_mb * 1024 * 1024 if max_memory_mb is not None else None
+            ),
             max_cpu_seconds=cpu_seconds,
         )
     )

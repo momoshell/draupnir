@@ -808,10 +808,15 @@ async def _wait_for_process(
 
 def _configure_child_process_limits() -> None:
     max_limit = max(_MAX_STDOUT_BYTES, _MAX_STDERR_BYTES, _configured_max_output_bytes())
+    max_memory_mb = settings.parser_subprocess_max_memory_mb
     apply_parser_process_limits(
         ParserProcessLimits(
             max_file_size_bytes=max_limit,
-            max_address_space_bytes=settings.parser_subprocess_max_memory_mb * 1024 * 1024,
+            # None = unbounded (opt-in cap): dense full-floor DWGs need multi-GB
+            # address space; see config.parser_subprocess_max_memory_mb.
+            max_address_space_bytes=(
+                max_memory_mb * 1024 * 1024 if max_memory_mb is not None else None
+            ),
             max_cpu_seconds=settings.parser_subprocess_cpu_seconds,
         )
     )
