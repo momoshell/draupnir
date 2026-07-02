@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 import pytest
+from celery.exceptions import WorkerLostError
 from sqlalchemy import select
 from structlog.testing import capture_logs
 
@@ -1909,3 +1910,206 @@ class TestJobsWorkerLifecycle:
         assert updated_job.status == "succeeded"
         assert updated_job.attempt_token is None
         assert updated_job.attempt_lease_expires_at is None
+
+    async def test_reap_stale_running_jobs_requeues_lease_expired_job(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """A lease-stale running job with attempts left should be reaped and requeued."""
+        _ = self
+        _ = cleanup_projects
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        stale_attempt_token = uuid.uuid4()
+
+        await _update_job(job.id, status="running", attempts=1, max_attempts=3)
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.started_at = datetime.now(UTC)
+            persisted_job.attempt_token = stale_attempt_token
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        enqueued_job_ids.clear()
+
+        reaped = await worker_module.reap_stale_running_job(job.id)
+
+        assert reaped == [job.id]
+        assert enqueued_job_ids == [str(job.id)]
+
+        reaped_job = await _get_job(job.id)
+        assert reaped_job.status == "pending"
+        assert reaped_job.attempts == 1
+        assert reaped_job.started_at is None
+        assert reaped_job.attempt_token is None
+        assert reaped_job.attempt_lease_expires_at is None
+
+    async def test_reap_stale_running_jobs_fails_job_at_attempt_ceiling(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """A lease-stale running job with attempts exhausted should be marked failed."""
+        _ = self
+        _ = cleanup_projects
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+
+        await _update_job(job.id, status="running", attempts=3, max_attempts=3)
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.started_at = datetime.now(UTC)
+            persisted_job.attempt_token = uuid.uuid4()
+            persisted_job.attempt_lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+        enqueued_job_ids.clear()
+
+        reaped = await worker_module.reap_stale_running_job(job.id)
+
+        assert reaped == []
+        assert enqueued_job_ids == []
+
+        failed_job = await _get_job(job.id)
+        assert failed_job.status == "failed"
+        assert failed_job.error_code == ErrorCode.MAX_ATTEMPTS_EXCEEDED.value
+        assert failed_job.attempts == 3
+        assert failed_job.attempt_token is None
+        assert failed_job.attempt_lease_expires_at is None
+
+    async def test_reap_stale_running_jobs_skips_live_lease(
+        self,
+        async_client: httpx.AsyncClient,
+        cleanup_projects: None,
+        enqueued_job_ids: list[str],
+    ) -> None:
+        """A running job with an unexpired lease should not be reaped."""
+        _ = self
+        _ = cleanup_projects
+
+        project = await _create_project(async_client)
+        uploaded = await _upload_file(async_client, project["id"])
+        job = await _get_job_for_file(str(uploaded["id"]))
+        live_attempt_token = uuid.uuid4()
+        live_lease_expires_at = datetime.now(UTC) + worker_module._RUNNING_JOB_STALE_AFTER
+
+        await _update_job(job.id, status="running", attempts=1, max_attempts=3)
+        session_maker = session_module.AsyncSessionLocal
+        assert session_maker is not None
+        async with session_maker() as session:
+            persisted_job = await session.get(Job, job.id)
+            assert persisted_job is not None
+            persisted_job.started_at = datetime.now(UTC)
+            persisted_job.attempt_token = live_attempt_token
+            persisted_job.attempt_lease_expires_at = live_lease_expires_at
+            await session.commit()
+
+        enqueued_job_ids.clear()
+
+        reaped = await worker_module.reap_stale_running_job(job.id)
+
+        assert reaped == []
+        assert enqueued_job_ids == []
+
+        unchanged_job = await _get_job(job.id)
+        assert unchanged_job.status == "running"
+        assert unchanged_job.attempt_token == live_attempt_token
+        assert unchanged_job.attempt_lease_expires_at == live_lease_expires_at
+
+    def test_task_failure_signal_reaps_job_on_worker_lost_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The celery task_failure handler should dispatch the reaper for a WorkerLostError."""
+        _ = self
+
+        job_id = uuid.uuid4()
+        reaped_job_ids: list[uuid.UUID] = []
+
+        async def _fake_reap(reap_job_id: uuid.UUID) -> list[uuid.UUID]:
+            reaped_job_ids.append(reap_job_id)
+            return [reap_job_id]
+
+        monkeypatch.setattr(worker_module, "reap_stale_running_job", _fake_reap)
+
+        with capture_logs() as logs:
+            worker_module._on_task_failure(
+                task_id=str(job_id),
+                exception=WorkerLostError("Worker exited prematurely: signal 9 (SIGKILL)"),
+            )
+
+        assert reaped_job_ids == [job_id]
+
+        reaped_events = [
+            entry for entry in logs if entry.get("event") == "job_reaped_after_worker_lost"
+        ]
+        assert reaped_events == [
+            {
+                "event": "job_reaped_after_worker_lost",
+                "job_id": str(job_id),
+                "requeued": True,
+                "log_level": "info",
+            }
+        ]
+
+    def test_task_failure_signal_ignores_non_worker_lost_exceptions(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A generic task failure should not trigger job reaping."""
+        _ = self
+
+        job_id = uuid.uuid4()
+        reaped_job_ids: list[uuid.UUID] = []
+
+        async def _fake_reap(reap_job_id: uuid.UUID) -> list[uuid.UUID]:
+            reaped_job_ids.append(reap_job_id)
+            return [reap_job_id]
+
+        monkeypatch.setattr(worker_module, "reap_stale_running_job", _fake_reap)
+
+        worker_module._on_task_failure(
+            task_id=str(job_id),
+            exception=RuntimeError("some unrelated task failure"),
+        )
+
+        assert reaped_job_ids == []
+
+    def test_task_failure_signal_never_raises_when_reap_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The signal handler should swallow and log unexpected reap failures."""
+        _ = self
+
+        job_id = uuid.uuid4()
+
+        def _raise_run_worker_loop(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("database is unavailable")
+
+        monkeypatch.setattr(worker_module, "_run_worker_loop", _raise_run_worker_loop)
+
+        with capture_logs() as logs:
+            worker_module._on_task_failure(
+                task_id=str(job_id),
+                exception=WorkerLostError("Worker exited prematurely: signal 9 (SIGKILL)"),
+            )
+
+        failure_events = [
+            entry for entry in logs if entry.get("event") == "job_reaped_after_worker_lost_failed"
+        ]
+        assert len(failure_events) == 1
+        assert failure_events[0]["job_id"] == str(job_id)
