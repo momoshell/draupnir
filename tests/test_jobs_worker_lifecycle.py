@@ -53,6 +53,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         JobType.EXPORT.value,
         JobType.CHANGESET_APPLY.value,
         JobType.CENTERLINE.value,
+        JobType.ROOMS.value,
     )
     expected_ingest_worker_job_types = (
         JobType.INGEST.value,
@@ -68,6 +69,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         "process_export_job": (JobType.EXPORT.value,),
         "process_changeset_apply_job": (JobType.CHANGESET_APPLY.value,),
         "process_centerline_job": (JobType.CENTERLINE.value,),
+        "process_rooms_job": (JobType.ROOMS.value,),
     }
 
     assert [handler.job_type_name for handler in runner_module.JOB_HANDLERS] == [
@@ -78,6 +80,7 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         JobType.EXPORT.value,
         JobType.CHANGESET_APPLY.value,
         JobType.CENTERLINE.value,
+        JobType.ROOMS.value,
     ]
     assert expected_recoverable_job_types == runner_module.RECOVERABLE_ENQUEUE_JOB_TYPES
     assert expected_ingest_worker_job_types == runner_module.INGEST_WORKER_JOB_TYPES
@@ -152,6 +155,21 @@ def test_job_handler_registry_explicitly_covers_worker_job_types() -> None:
         == "centerline_job_reclaimed_stale_running_status"
     )
 
+    rooms_handler = runner_module.get_job_handler(JobType.ROOMS.value)
+    rooms_route = runner_module.get_begin_or_resume_route("process_rooms_job")
+    assert rooms_handler is not None
+    assert rooms_route is not None
+    assert rooms_handler.execute_name == "_execute_rooms_job_attempt"
+    assert rooms_handler.finalize_name == "_finalize_rooms_job"
+    assert rooms_handler.process_name == "process_rooms_job"
+    assert rooms_handler.run_task_name == "run_rooms_job"
+    assert rooms_handler.enqueue_publisher_name == "enqueue_rooms_job"
+    assert rooms_handler.enqueue_error_message == "Failed to enqueue rooms job"
+    assert rooms_route.supported_job_types == (JobType.ROOMS.value,)
+    assert (
+        rooms_route.log_keys.reclaimed_stale_running == "rooms_job_reclaimed_stale_running_status"
+    )
+
 
 def test_worker_registry_derived_helpers_preserve_public_compatibility(
     monkeypatch: pytest.MonkeyPatch,
@@ -190,6 +208,7 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
         JobType.EXPORT,
         JobType.CHANGESET_APPLY,
         JobType.CENTERLINE,
+        JobType.ROOMS,
     ):
         assert worker_module.is_recoverable_enqueue_job_type(job_type) is True
 

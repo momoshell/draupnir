@@ -54,6 +54,7 @@ from app.interpretation.tag_stack_service import (
     assign_services_by_tag_stack,
 )
 from app.jobs.worker import enqueue_centerline_job as _enqueue_centerline_job_direct
+from app.jobs.worker import enqueue_rooms_job as _enqueue_rooms_job_direct
 from app.jobs.worker import prepare_job_enqueue_intent as _prepare_job_enqueue_intent_direct
 from app.jobs.worker import publish_job_enqueue_intent as _publish_job_enqueue_intent_direct
 from app.models.job import Job, JobType
@@ -104,6 +105,7 @@ def _resolve_fill_service_name(
 ServiceTakeoffScope = Literal["sheet", "modelspace"]
 _DEFAULT_SCOPE: ServiceTakeoffScope = "sheet"
 _CENTERLINE_INFLIGHT_STATUSES: tuple[str, ...] = ("pending", "running")
+_ROOMS_INFLIGHT_STATUSES: tuple[str, ...] = ("pending", "running")
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +116,11 @@ _CENTERLINE_INFLIGHT_STATUSES: tuple[str, ...] = ("pending", "running")
 def _enqueue_centerline_job(job_id: UUID) -> None:
     """Route-local centerline enqueue seam for tests."""
     _enqueue_centerline_job_direct(job_id)
+
+
+def _enqueue_rooms_job(job_id: UUID) -> None:
+    """Route-local rooms enqueue seam for tests."""
+    _enqueue_rooms_job_direct(job_id)
 
 
 def _prepare_job_enqueue_intent(job: Job) -> None:
@@ -184,6 +191,70 @@ async def _enqueue_centerline_materialization(
     except Exception:
         # Enqueue failure must never degrade the read -- serve provisional, but surface a signal.
         logger.warning("centerline_enqueue_failed", revision_id=str(revision_id), exc_info=True)
+
+
+async def _enqueue_rooms_materialization(
+    *, revision_id: UUID, project_id: UUID, source_file_id: UUID
+) -> None:
+    """Best-effort lazy trigger for room materialization of a revision.
+
+    Deduped: skips when a non-terminal ROOMS job already exists for the revision, so
+    repeated/concurrent reads of an unmaterialized revision do not pile up jobs. Runs on its
+    OWN short-lived session so the read handler's snapshot is untouched, and never raises into
+    the read path (enqueue failure -> serve provisional, logged).
+
+    Not yet wired into any route -- the read path (``/rooms``) still recomputes
+    ``interpret_rooms`` directly. A future PR flips the read to serve materialized rows and
+    calls this helper to lazily backfill unmaterialized revisions.
+    """
+    session_maker = get_session_maker()
+    if session_maker is None:
+        return
+    try:
+        async with session_maker() as session:
+            existing = await session.scalar(
+                select(Job.id)
+                .where(
+                    Job.base_revision_id == revision_id,
+                    Job.job_type == JobType.ROOMS.value,
+                    Job.status.in_(_ROOMS_INFLIGHT_STATUSES),
+                )
+                .limit(1)
+            )
+            if existing is not None:
+                return  # already queued/running -- dedup
+            rooms_job = Job(
+                id=uuid4(),
+                project_id=project_id,
+                file_id=source_file_id,
+                extraction_profile_id=None,
+                base_revision_id=revision_id,
+                parent_job_id=None,
+                job_type=JobType.ROOMS.value,
+                status="pending",
+                attempts=0,
+                max_attempts=3,
+                enqueue_status="pending",
+                enqueue_attempts=0,
+                cancel_requested=False,
+                error_code=None,
+                error_message=None,
+                started_at=None,
+                finished_at=None,
+            )
+            session.add(rooms_job)
+            _prepare_job_enqueue_intent(rooms_job)
+            await session.flush()
+            job_id = rooms_job.id
+            await session.commit()
+        await _publish_job_enqueue_intent(
+            job_id,
+            publisher=_enqueue_rooms_job,
+            suppress_exceptions=True,
+        )
+    except Exception:
+        # Enqueue failure must never degrade the read -- serve provisional, but surface a signal.
+        logger.warning("rooms_enqueue_failed", revision_id=str(revision_id), exc_info=True)
 
 
 # Default tag-association radius in metres (#661 — adapters pre-scale geometry to metres).

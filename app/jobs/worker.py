@@ -117,6 +117,9 @@ from app.jobs.finalizers import (
 from app.jobs.finalizers import (
     _finalize_quantity_takeoff_job as _finalize_quantity_takeoff_job,
 )
+from app.jobs.finalizers import (
+    _finalize_rooms_job as _finalize_rooms_job,
+)
 from app.jobs.quantity_execution_input import (
     _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE as _QUANTITY_TAKEOFF_MATERIALIZATION_MISSING_ERROR_MESSAGE,  # noqa: E501
 )
@@ -247,15 +250,20 @@ _ENQUEUE_EXPORT_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYP
 _ENQUEUE_CHANGESET_APPLY_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
     JobType.CHANGESET_APPLY.value
 ]
+_ENQUEUE_ROOMS_JOB_ERROR_MESSAGE = job_runner.ENQUEUE_ERROR_MESSAGES_BY_JOB_TYPE[
+    JobType.ROOMS.value
+]
 _FINALIZE_INGEST_JOB_ERROR_MESSAGE = "Failed to finalize ingest job"
 _PROCESS_INGEST_JOB_ERROR_MESSAGE = "Ingest job failed unexpectedly."
 _FINALIZE_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Failed to finalize quantity takeoff job"
 _FINALIZE_CENTERLINE_JOB_ERROR_MESSAGE = "Failed to finalize centerline job"
+_FINALIZE_ROOMS_JOB_ERROR_MESSAGE = "Failed to finalize rooms job"
 _FINALIZE_ESTIMATE_JOB_ERROR_MESSAGE = "Failed to finalize estimate job"
 _FINALIZE_EXPORT_JOB_ERROR_MESSAGE = "Failed to finalize export job"
 _FINALIZE_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Failed to finalize changeset apply job"
 _PROCESS_QUANTITY_TAKEOFF_JOB_ERROR_MESSAGE = "Quantity takeoff job failed unexpectedly."
 _PROCESS_CENTERLINE_JOB_ERROR_MESSAGE = "Centerline job failed unexpectedly."
+_PROCESS_ROOMS_JOB_ERROR_MESSAGE = "Rooms job failed unexpectedly."
 _PROCESS_ESTIMATE_JOB_ERROR_MESSAGE = "Estimate job failed unexpectedly."
 _PROCESS_EXPORT_JOB_ERROR_MESSAGE = "Export job failed unexpectedly."
 _PROCESS_CHANGESET_APPLY_JOB_ERROR_MESSAGE = "Changeset apply job failed unexpectedly."
@@ -468,6 +476,21 @@ _CENTERLINE_PROCESS_SPEC = _RegisteredJobProcessSpec(
     succeeded_log_event="centerline_job_succeeded",
     process_error_message=_PROCESS_CENTERLINE_JOB_ERROR_MESSAGE,
     finalize_error_message=_FINALIZE_CENTERLINE_JOB_ERROR_MESSAGE,
+)
+
+_ROOMS_PROCESS_SPEC = _RegisteredJobProcessSpec(
+    job_type_name="rooms",
+    input_error_type=None,
+    input_failure_log_event=None,
+    stale_attempt_log_event="rooms_job_stale_attempt_skipped",
+    revision_conflict_log_event="rooms_job_revision_conflict",
+    cancelled_during_execution_log_event="rooms_job_cancelled_during_execution",
+    cancelled_during_finalization_log_event="rooms_job_cancelled_during_finalization",
+    process_failed_log_event="rooms_job_failed",
+    finalization_failed_log_event="rooms_job_finalization_failed",
+    succeeded_log_event="rooms_job_succeeded",
+    process_error_message=_PROCESS_ROOMS_JOB_ERROR_MESSAGE,
+    finalize_error_message=_FINALIZE_ROOMS_JOB_ERROR_MESSAGE,
 )
 
 
@@ -1909,6 +1932,11 @@ async def _begin_or_resume_centerline_job(job_id: UUID) -> _JobAttemptLease | No
     return await _begin_or_resume_registered_job(job_id, process_name="process_centerline_job")
 
 
+async def _begin_or_resume_rooms_job(job_id: UUID) -> _JobAttemptLease | None:
+    """Claim, resume, or cancel a persisted rooms job under a row lock."""
+    return await _begin_or_resume_registered_job(job_id, process_name="process_rooms_job")
+
+
 async def _execute_ingest_job_attempt(
     job_id: UUID,
     *,
@@ -2220,6 +2248,18 @@ async def _execute_centerline_job_attempt(
     deps: WorkerDeps,
 ) -> _RegisteredJobAttemptResult:
     """Defer all centerline work to the finalization step (no separate execute phase)."""
+    _ = deps  # uniform dispatch contract; execution is embedded in the finalizer
+    _ = attempt_token
+    return _RegisteredJobAttemptResult(finalize_kwargs={})
+
+
+async def _execute_rooms_job_attempt(
+    _job_id: UUID,
+    *,
+    attempt_token: UUID,
+    deps: WorkerDeps,
+) -> _RegisteredJobAttemptResult:
+    """Defer all rooms work to the finalization step (no separate execute phase)."""
     _ = deps  # uniform dispatch contract; execution is embedded in the finalizer
     _ = attempt_token
     return _RegisteredJobAttemptResult(finalize_kwargs={})
@@ -2827,6 +2867,34 @@ def run_centerline_job(job_id: str) -> None:
 def enqueue_centerline_job(job_id: UUID) -> None:
     """Publish a persisted centerline job to Celery."""
     run_centerline_job.apply_async(
+        args=(str(job_id),),
+        task_id=str(job_id),
+        retry=False,
+        countdown=_current_enqueue_countdown(),
+    )
+
+
+async def process_rooms_job(job_id: UUID, *, deps: WorkerDeps | None = None) -> None:
+    """Load a persisted rooms job and materialize the full room registry."""
+    await _process_registered_job(
+        job_id, spec=_ROOMS_PROCESS_SPEC, deps=deps or default_worker_deps()
+    )
+
+
+@celery_app.task(
+    name="app.jobs.worker.run_rooms_job",
+    ignore_result=True,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def run_rooms_job(job_id: str) -> None:
+    """Celery task wrapper for persisted rooms jobs."""
+    _run_worker_loop(lambda: process_rooms_job(UUID(job_id)))
+
+
+def enqueue_rooms_job(job_id: UUID) -> None:
+    """Publish a persisted rooms job to Celery."""
+    run_rooms_job.apply_async(
         args=(str(job_id),),
         task_id=str(job_id),
         retry=False,
