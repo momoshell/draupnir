@@ -8,7 +8,7 @@ import functools
 import json
 import math
 import re
-import resource
+import shlex
 import shutil
 import tempfile
 from collections import Counter
@@ -21,6 +21,10 @@ from time import perf_counter
 from typing import Any, cast
 
 from app.core.config import settings
+from app.ingestion.adapters._process_limits import (
+    ParserProcessLimits,
+    apply_parser_process_limits,
+)
 from app.ingestion.adapters._units import resolve_units
 from app.ingestion.canonical.entity_provenance import build_entity_provenance
 from app.ingestion.canonical.hashing import (
@@ -63,6 +67,9 @@ _PROCESS_KILL_GRACE_SECONDS = 0.2
 _MAX_STDOUT_BYTES = 8 * 1024
 _MAX_STDERR_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+_MAX_OUTPUT_STRUCTURE_DEPTH = 256
+_MAX_OUTPUT_STRUCTURE_NODES = 200_000
+_MAX_OUTPUT_RECORD_CANDIDATES = 100_000
 _MAX_HATCH_BOUNDARY_COMPONENTS = 512
 _MAX_HATCH_LOOPS = 256
 _PLACEHOLDER_CONFIDENCE_SCORE = 0.4
@@ -215,12 +222,21 @@ class _CapturedText:
 
 @dataclass(frozen=True, slots=True)
 class _DwgreadRunResult:
+    command: tuple[str, ...]
+    sandboxed: bool
     stdout: _CapturedText
     stderr: _CapturedText
     output_size_bytes: int
     output_kind: str
     output_key_count: int | None
     output_payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _DwgreadExecutionPlan:
+    command: tuple[str, ...]
+    display_command: tuple[str, ...]
+    sandboxed: bool
 
 
 class _OutputLimitExceededError(RuntimeError):
@@ -240,6 +256,16 @@ class _OutputLimitExceededError(RuntimeError):
         self.max_output_bytes = max_output_bytes
         self.output_size_bytes = output_size_bytes
         self.reason = "output_cap_exceeded"
+        self.stage = stage
+        self.adapter_key = "libredwg"
+
+
+class _OutputStructureLimitExceededError(RuntimeError):
+    """Raised when dwgread JSON is structurally too complex to traverse safely."""
+
+    def __init__(self, message: str, *, reason: str, stage: str = "parse") -> None:
+        super().__init__(message)
+        self.reason = reason
         self.stage = stage
         self.adapter_key = "libredwg"
 
@@ -366,6 +392,8 @@ class LibreDWGAdapter(IngestionAdapter):
         details: dict[str, JSONValue] = {
             "binary": _BINARY_NAME,
             "distribution_review_required": True,
+            "sandbox_configured": _configured_sandbox_command() is not None,
+            "sandbox_required": settings.libredwg_require_sandbox,
         }
         if binary_path is not None:
             details["binary_name"] = Path(binary_path).name
@@ -398,7 +426,8 @@ class LibreDWGAdapter(IngestionAdapter):
         elapsed_ms = (perf_counter() - started_at) * 1000.0
 
         diagnostic_details: dict[str, JSONValue] = {
-            "command": (_BINARY_NAME, "-O", "JSON", "-o", "<tempdir>/dwgread.json", "<source>"),
+            "command": run_result.command,
+            "sandboxed": run_result.sandboxed,
             "stdout_bytes": run_result.stdout.byte_count,
             "stdout_truncated": run_result.stdout.truncated,
             "stdout_excerpt": run_result.stdout.text,
@@ -517,11 +546,14 @@ async def _run_dwgread(
         output_path = temp_path / "dwgread.json"
         stdout_path = temp_path / "dwgread.stdout.log"
         stderr_path = temp_path / "dwgread.stderr.log"
-
-        process = await _spawn_dwgread_process(
+        execution_plan = _build_dwgread_execution_plan(
             binary_path=binary_path,
             source=source,
             output_path=output_path,
+        )
+
+        process = await _spawn_dwgread_process(
+            execution_plan=execution_plan,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
@@ -588,6 +620,8 @@ async def _run_dwgread(
         output_kind, output_key_count = _summarize_output_payload(output_payload)
 
         return _DwgreadRunResult(
+            command=execution_plan.display_command,
+            sandboxed=execution_plan.sandboxed,
             stdout=stdout,
             stderr=stderr,
             output_size_bytes=output_size_bytes,
@@ -599,31 +633,145 @@ async def _run_dwgread(
 
 async def _spawn_dwgread_process(
     *,
-    binary_path: str,
-    source: AdapterSource,
-    output_path: Path,
+    execution_plan: _DwgreadExecutionPlan,
     stdout_path: Path,
     stderr_path: Path,
 ) -> asyncio.subprocess.Process:
     try:
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
             return await asyncio.create_subprocess_exec(
-                binary_path,
-                "-O",
-                "JSON",
-                "-o",
-                str(output_path),
-                str(source.file_path),
+                *execution_plan.command,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=stdout_handle,
                 stderr=stderr_handle,
-                preexec_fn=_configure_child_file_size_limit,
+                preexec_fn=_configure_child_process_limits,
             )
     except FileNotFoundError as exc:
+        detail = (
+            "LibreDWG sandbox command could not be started."
+            if execution_plan.sandboxed
+            else "LibreDWG dwgread binary is not installed."
+        )
+        availability_reason = (
+            AvailabilityReason.PROBE_FAILED
+            if execution_plan.sandboxed
+            else AvailabilityReason.MISSING_BINARY
+        )
         raise AdapterUnavailableError(
-            AvailabilityReason.MISSING_BINARY,
-            detail="LibreDWG dwgread binary is not installed.",
+            availability_reason,
+            detail=detail,
         ) from exc
+
+
+def _build_dwgread_execution_plan(
+    *,
+    binary_path: str,
+    source: AdapterSource,
+    output_path: Path,
+) -> _DwgreadExecutionPlan:
+    sandbox_command = _configured_sandbox_command()
+    direct_command = (binary_path, "-O", "JSON", "-o", str(output_path), str(source.file_path))
+    if sandbox_command is None:
+        if settings.libredwg_require_sandbox:
+            raise AdapterUnavailableError(
+                AvailabilityReason.DISABLED_BY_CONFIG,
+                detail="LibreDWG sandbox command is required before parsing untrusted DWG input.",
+            )
+        return _DwgreadExecutionPlan(
+            command=direct_command,
+            display_command=_sanitize_execution_command(
+                direct_command,
+                binary_path=binary_path,
+                source_path=source.file_path,
+                output_path=output_path,
+            ),
+            sandboxed=False,
+        )
+
+    _validate_sandbox_command_template(sandbox_command)
+    command = _format_sandbox_command(
+        sandbox_command,
+        binary_path=binary_path,
+        source_path=source.file_path,
+        output_path=output_path,
+    )
+    return _DwgreadExecutionPlan(
+        command=command,
+        display_command=_sanitize_execution_command(
+            command,
+            binary_path=binary_path,
+            source_path=source.file_path,
+            output_path=output_path,
+        ),
+        sandboxed=True,
+    )
+
+
+def _configured_sandbox_command() -> str | None:
+    command = settings.libredwg_sandbox_command
+    if command is None:
+        return None
+    stripped = command.strip()
+    return stripped or None
+
+
+def _validate_sandbox_command_template(command: str) -> None:
+    missing_placeholders = tuple(
+        name for name in ("binary", "output", "source") if f"{{{name}}}" not in command
+    )
+    if missing_placeholders:
+        raise AdapterUnavailableError(
+            AvailabilityReason.DISABLED_BY_CONFIG,
+            detail=(
+                "LibreDWG sandbox command must include placeholders: "
+                "{binary}, {output}, and {source}."
+            ),
+        )
+
+
+def _format_sandbox_command(
+    command: str,
+    *,
+    binary_path: str,
+    source_path: Path,
+    output_path: Path,
+) -> tuple[str, ...]:
+    try:
+        command_parts = shlex.split(command)
+        if not command_parts:
+            raise ValueError("empty command")
+        return tuple(
+            part.format(
+                binary=binary_path,
+                output=str(output_path),
+                source=str(source_path),
+            )
+            for part in command_parts
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        raise AdapterUnavailableError(
+            AvailabilityReason.DISABLED_BY_CONFIG,
+            detail="LibreDWG sandbox command is invalid.",
+        ) from exc
+
+
+def _sanitize_execution_command(
+    command: tuple[str, ...],
+    *,
+    binary_path: str,
+    source_path: Path,
+    output_path: Path,
+) -> tuple[str, ...]:
+    source_text = str(source_path)
+    output_text = str(output_path)
+    sanitized: list[str] = []
+    for part in command:
+        sanitized.append(
+            part.replace(binary_path, _BINARY_NAME)
+            .replace(output_text, "<tempdir>/dwgread.json")
+            .replace(source_text, "<source>")
+        )
+    return tuple(sanitized)
 
 
 async def _wait_for_process(
@@ -658,20 +806,20 @@ async def _wait_for_process(
         return returncode
 
 
-def _configure_child_file_size_limit() -> None:
+def _configure_child_process_limits() -> None:
     max_limit = max(_MAX_STDOUT_BYTES, _MAX_STDERR_BYTES, _configured_max_output_bytes())
-
-    try:
-        _, hard_limit = resource.getrlimit(resource.RLIMIT_FSIZE)
-    except (OSError, ValueError):
-        return
-
-    target_limit = max_limit if hard_limit == resource.RLIM_INFINITY else min(max_limit, hard_limit)
-
-    try:
-        resource.setrlimit(resource.RLIMIT_FSIZE, (target_limit, target_limit))
-    except (OSError, ValueError):
-        return
+    max_memory_mb = settings.parser_subprocess_max_memory_mb
+    apply_parser_process_limits(
+        ParserProcessLimits(
+            max_file_size_bytes=max_limit,
+            # None = unbounded (opt-in cap): dense full-floor DWGs need multi-GB
+            # address space; see config.parser_subprocess_max_memory_mb.
+            max_address_space_bytes=(
+                max_memory_mb * 1024 * 1024 if max_memory_mb is not None else None
+            ),
+            max_cpu_seconds=settings.parser_subprocess_cpu_seconds,
+        )
+    )
 
 
 def _enforce_live_file_limits(live_limits: tuple[_LiveFileLimit, ...]) -> None:
@@ -1834,29 +1982,77 @@ def _iter_object_records(payload: Any) -> tuple[Mapping[str, Any], ...]:
 
 
 def _iter_mapping_candidates(value: Any) -> list[Mapping[str, Any]]:
-    if isinstance(value, list):
-        list_candidates: list[Mapping[str, Any]] = []
-        for item in value:
-            if isinstance(item, Mapping):
-                list_candidates.extend(_iter_mapping_candidates(item))
-        return list_candidates
-    if not isinstance(value, Mapping):
+    if not isinstance(value, (Mapping, list)):
         return []
-    if _extract_record_type_from_current_mapping(value) is not None:
-        return [cast(Mapping[str, Any], value)]
 
-    candidates: list[Mapping[str, Any]] = []
-    for nested_value in value.values():
-        if isinstance(nested_value, Mapping):
-            candidates.extend(_iter_mapping_candidates(nested_value))
-        elif isinstance(nested_value, list):
-            for item in nested_value:
-                if isinstance(item, Mapping):
-                    candidates.extend(_iter_mapping_candidates(item))
+    candidates_by_id: dict[int, list[Mapping[str, Any]]] = {}
+    visited_nodes = 0
+    stack: list[tuple[Any, int, bool]] = [(value, 0, False)]
 
-    if len(candidates) == 1 and _extract_record_type_from_wrapper_views(value) is not None:
-        return [cast(Mapping[str, Any], value)]
-    return candidates
+    def _require_candidate_budget(candidate_count: int) -> None:
+        if candidate_count > _MAX_OUTPUT_RECORD_CANDIDATES:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the record candidate limit.",
+                reason="output_record_candidate_cap_exceeded",
+            )
+
+    def _child_candidates(children: Sequence[Any]) -> list[Mapping[str, Any]]:
+        child_candidates: list[Mapping[str, Any]] = []
+        for child in children:
+            if isinstance(child, (Mapping, list)):
+                child_candidates.extend(candidates_by_id.get(id(child), []))
+        _require_candidate_budget(len(child_candidates))
+        return child_candidates
+
+    while stack:
+        current, depth, expanded = stack.pop()
+        if not isinstance(current, (Mapping, list)):
+            continue
+        visited_nodes += 1
+        if visited_nodes > _MAX_OUTPUT_STRUCTURE_NODES:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the structure node limit.",
+                reason="output_structure_node_cap_exceeded",
+            )
+        if depth > _MAX_OUTPUT_STRUCTURE_DEPTH:
+            raise _OutputStructureLimitExceededError(
+                "LibreDWG JSON output exceeded the structure depth limit.",
+                reason="output_structure_depth_cap_exceeded",
+            )
+
+        if isinstance(current, list):
+            if expanded:
+                candidates_by_id[id(current)] = _child_candidates(current)
+                continue
+            stack.append((current, depth, True))
+            for item in reversed(current):
+                if isinstance(item, (Mapping, list)):
+                    stack.append((item, depth + 1, False))
+            continue
+
+        current_id = id(current)
+        current_mapping = cast(Mapping[str, Any], current)
+        if expanded:
+            child_candidates = _child_candidates(tuple(current_mapping.values()))
+            if (
+                len(child_candidates) == 1
+                and _extract_record_type_from_wrapper_views(current_mapping) is not None
+            ):
+                candidates_by_id[current_id] = [current_mapping]
+            else:
+                candidates_by_id[current_id] = child_candidates
+            continue
+
+        if _extract_record_type_from_current_mapping(current_mapping) is not None:
+            candidates_by_id[current_id] = [current_mapping]
+            continue
+
+        stack.append((current_mapping, depth, True))
+        for nested_value in reversed(tuple(current_mapping.values())):
+            if isinstance(nested_value, (Mapping, list)):
+                stack.append((nested_value, depth + 1, False))
+
+    return candidates_by_id.get(id(value), [])
 
 
 def _build_line_entity(record: Mapping[str, Any], *, units: _UnitsResolution) -> _JSONDict | None:
@@ -4712,16 +4908,18 @@ def _source_locator(record: Mapping[str, Any], *, record_type: str) -> str:
 # Sentinel for "key not present" — distinct from None (a valid field value).
 _MISSING: object = object()
 
-# Build-scoped caches, keyed by (id(), len()).  Cleared once per
+# Build-scoped caches.  Cleared once per
 # _build_canonical_output call via _clear_field_caches().  Within one build the
-# dicts stay alive so id() values are stable.  Including len() in the key
-# prevents false cache hits when Python reuses an id() for a different-sized
-# dict between calls (e.g. in tests that never go through _build_canonical_output).
+# record-view dicts stay alive so id() values are stable.  The mapping-normalized
+# cache does not retain mappings, so its key includes the current string-key
+# signature to prevent false cache hits when Python reuses an id() for another
+# same-sized dict between calls (e.g. in tests that never go through
+# _build_canonical_output).
 #
 # IMPORTANT: field-accessed records are MUTATED in-place mid-build
 # (_resolve_handle_named_refs does `record["layer"] = resolved`), so values MUST
 # be read fresh from the live mapping — only the key normalization is cached here.
-_mapping_normalized_cache: dict[tuple[int, int], list[tuple[str, str]]] = {}
+_mapping_normalized_cache: dict[tuple[int, int, tuple[str, ...]], list[tuple[str, str]]] = {}
 _record_views_cache: dict[tuple[int, int], tuple[Mapping[str, Any], ...]] = {}
 
 
@@ -4796,15 +4994,16 @@ def _sanitize_text_content(value: str) -> str:
 
 def _mapping_get(mapping: Mapping[str, Any], *candidates: str) -> Any:
     # Build (or fetch) the pre-normalized [(norm_key, orig_key), ...] pairs for this
-    # mapping, preserving original iteration order so the first-match semantics
-    # are identical to the original loop.  Values are NOT cached — they must be read
-    # fresh because records are mutated in-place during _resolve_handle_named_refs
-    # (e.g. `record["layer"] = resolved_name`).  The (id, len) key is stable within
-    # one build because dicts stay alive; an add/delete changes len → miss → rebuild.
-    cache_key = (id(mapping), len(mapping))
+    # mapping, preserving original iteration order so the first-match semantics are
+    # identical to the original loop.  Values are NOT cached — they must be read fresh
+    # because records are mutated in-place during _resolve_handle_named_refs (e.g.
+    # `record["layer"] = resolved_name`).  Include the string-key signature because
+    # this cache stores only normalized key pairs, not a strong reference to mapping.
+    string_keys = tuple(key for key in mapping if isinstance(key, str))
+    cache_key = (id(mapping), len(mapping), string_keys)
     normalized_pairs = _mapping_normalized_cache.get(cache_key)
     if normalized_pairs is None:
-        normalized_pairs = [(_normalize_lookup_key(k), k) for k in mapping if isinstance(k, str)]
+        normalized_pairs = [(_normalize_lookup_key(k), k) for k in string_keys]
         _mapping_normalized_cache[cache_key] = normalized_pairs
     normalized_candidates = {_normalize_lookup_key(candidate) for candidate in candidates}
     for norm_key, orig_key in normalized_pairs:

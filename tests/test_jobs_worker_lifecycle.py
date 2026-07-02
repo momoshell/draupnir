@@ -247,6 +247,90 @@ def test_worker_registry_derived_helpers_preserve_public_compatibility(
 
 
 @pytest.mark.asyncio
+async def test_job_attempt_lease_renewal_cancels_when_work_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The registered-job shell should not leave the renewal companion running."""
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    expected_attempt_token = attempt_token
+    renewal_cancelled = asyncio.Event()
+
+    async def _fake_renew_until_cancelled(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> None:
+        assert received_job_id == job_id
+        assert attempt_token == expected_attempt_token
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            renewal_cancelled.set()
+            raise
+
+    async def _work() -> str:
+        return "done"
+
+    monkeypatch.setattr(
+        worker_module,
+        "_renew_job_attempt_lease_until_cancelled",
+        _fake_renew_until_cancelled,
+    )
+
+    result = await worker_module._with_job_attempt_lease_renewal(
+        _work(),
+        job_id=job_id,
+        attempt_token=attempt_token,
+    )
+
+    assert result == "done"
+    assert renewal_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_job_attempt_lease_renewal_failure_cancels_active_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing lease ownership should stop active work before another attempt can own it."""
+    job_id = uuid.uuid4()
+    attempt_token = uuid.uuid4()
+    expected_attempt_token = attempt_token
+    work_cancelled = asyncio.Event()
+
+    async def _fake_renew_until_cancelled(
+        received_job_id: uuid.UUID,
+        *,
+        attempt_token: uuid.UUID,
+    ) -> None:
+        assert received_job_id == job_id
+        assert attempt_token == expected_attempt_token
+        raise worker_module._StaleJobAttemptError("lost lease")
+
+    async def _work() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            work_cancelled.set()
+            raise
+
+    monkeypatch.setattr(
+        worker_module,
+        "_renew_job_attempt_lease_until_cancelled",
+        _fake_renew_until_cancelled,
+    )
+
+    with pytest.raises(worker_module._StaleJobAttemptError):
+        await worker_module._with_job_attempt_lease_renewal(
+            _work(),
+            job_id=job_id,
+            attempt_token=attempt_token,
+        )
+
+    assert work_cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_process_ingest_job_wrapper_late_binds_registered_callables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

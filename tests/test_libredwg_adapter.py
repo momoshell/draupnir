@@ -15,6 +15,7 @@ import pytest
 
 from app.core.config import settings
 from app.ingestion.adapters import libredwg as adapter_module
+from app.ingestion.adapters._process_limits import ParserProcessLimits
 from app.ingestion.contracts import (
     AdapterExecutionOptions,
     AdapterSource,
@@ -127,6 +128,186 @@ def _with_hatch_counts(counts: Mapping[str, int]) -> dict[str, int]:
     merged_counts.setdefault("supported_dimensions", 0)
     merged_counts.setdefault("supported_splines", 0)
     return merged_counts
+
+
+def test_iter_mapping_candidates_preserves_wrapper_record_shape() -> None:
+    payload = {"object": {"type": "LINE", "handle": "1A"}}
+
+    assert adapter_module._iter_mapping_candidates(payload) == [payload]
+
+
+def test_iter_mapping_candidates_rejects_excessive_depth() -> None:
+    payload: dict[str, object] = {"type": "LINE", "handle": "1A"}
+    for _ in range(adapter_module._MAX_OUTPUT_STRUCTURE_DEPTH + 1):
+        payload = {"payload": payload}
+
+    with pytest.raises(adapter_module._OutputStructureLimitExceededError) as exc_info:
+        adapter_module._iter_mapping_candidates(payload)
+
+    assert exc_info.value.reason == "output_structure_depth_cap_exceeded"
+    assert exc_info.value.adapter_key == "libredwg"
+
+
+def test_iter_mapping_candidates_rejects_excessive_record_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(adapter_module, "_MAX_OUTPUT_RECORD_CANDIDATES", 2)
+    payload = [
+        {"type": "LINE", "handle": "1"},
+        {"type": "LINE", "handle": "2"},
+        {"type": "LINE", "handle": "3"},
+    ]
+
+    with pytest.raises(adapter_module._OutputStructureLimitExceededError) as exc_info:
+        adapter_module._iter_mapping_candidates(payload)
+
+    assert exc_info.value.reason == "output_record_candidate_cap_exceeded"
+
+
+def test_configure_child_process_limits_includes_file_cpu_and_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_limits: list[ParserProcessLimits] = []
+    monkeypatch.setattr(settings, "libredwg_max_output_mb", 2)
+    monkeypatch.setattr(settings, "parser_subprocess_max_memory_mb", 512)
+    monkeypatch.setattr(settings, "parser_subprocess_cpu_seconds", 17)
+    monkeypatch.setattr(
+        adapter_module,
+        "apply_parser_process_limits",
+        lambda limits: observed_limits.append(limits),
+    )
+
+    adapter_module._configure_child_process_limits()
+
+    assert observed_limits == [
+        ParserProcessLimits(
+            max_file_size_bytes=2 * 1024 * 1024,
+            max_address_space_bytes=512 * 1024 * 1024,
+            max_cpu_seconds=17,
+        )
+    ]
+
+
+def test_build_dwgread_execution_plan_uses_direct_command_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_sandbox_command", None)
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    source = _build_source()
+    output_path = Path("/tmp/libredwg-test/dwgread.json")
+    plan = adapter_module._build_dwgread_execution_plan(
+        binary_path="/opt/homebrew/bin/dwgread",
+        source=source,
+        output_path=output_path,
+    )
+
+    assert plan.sandboxed is False
+    assert plan.command == (
+        "/opt/homebrew/bin/dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        str(output_path),
+        str(source.file_path),
+    )
+    assert plan.display_command == (
+        "dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        "<tempdir>/dwgread.json",
+        "<source>",
+    )
+
+
+def test_build_dwgread_execution_plan_formats_sandbox_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "libredwg_sandbox_command",
+        "sandbox-run --ro {source} --out {output} -- {binary} -O JSON -o {output} {source}",
+    )
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    source = _build_source()
+    output_path = Path("/tmp/libredwg-test/dwgread.json")
+    plan = adapter_module._build_dwgread_execution_plan(
+        binary_path="/opt/homebrew/bin/dwgread",
+        source=source,
+        output_path=output_path,
+    )
+
+    assert plan.sandboxed is True
+    assert plan.command == (
+        "sandbox-run",
+        "--ro",
+        str(source.file_path),
+        "--out",
+        str(output_path),
+        "--",
+        "/opt/homebrew/bin/dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        str(output_path),
+        str(source.file_path),
+    )
+    assert plan.display_command == (
+        "sandbox-run",
+        "--ro",
+        "<source>",
+        "--out",
+        "<tempdir>/dwgread.json",
+        "--",
+        "dwgread",
+        "-O",
+        "JSON",
+        "-o",
+        "<tempdir>/dwgread.json",
+        "<source>",
+    )
+
+
+def test_build_dwgread_execution_plan_requires_sandbox_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "libredwg_sandbox_command", None)
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", True)
+
+    with pytest.raises(AdapterUnavailableError) as exc_info:
+        adapter_module._build_dwgread_execution_plan(
+            binary_path="/opt/homebrew/bin/dwgread",
+            source=_build_source(),
+            output_path=Path("/tmp/libredwg-test/dwgread.json"),
+        )
+
+    assert exc_info.value.availability_reason == AvailabilityReason.DISABLED_BY_CONFIG
+    assert exc_info.value.detail is not None
+    assert "sandbox command is required" in exc_info.value.detail
+
+
+def test_build_dwgread_execution_plan_rejects_incomplete_sandbox_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "libredwg_sandbox_command",
+        "sandbox-run -- {binary} -O JSON",
+    )
+    monkeypatch.setattr(settings, "libredwg_require_sandbox", False)
+
+    with pytest.raises(AdapterUnavailableError) as exc_info:
+        adapter_module._build_dwgread_execution_plan(
+            binary_path="/opt/homebrew/bin/dwgread",
+            source=_build_source(),
+            output_path=Path("/tmp/libredwg-test/dwgread.json"),
+        )
+
+    assert exc_info.value.availability_reason == AvailabilityReason.DISABLED_BY_CONFIG
+    assert exc_info.value.detail is not None
+    assert "{source}" in exc_info.value.detail
 
 
 _HATCH_SQUARE_POINTS = (
@@ -280,6 +461,15 @@ def test_extract_angle_degrees_radians_default_and_degrees_hint() -> None:
     # explicit degrees hint → used as-is (no conversion)
     assert extract({"start_angle": 90, "angle_units": "degrees"}) == 90.0
     assert extract({"start_angle": 45, "angle_units": "deg"}) == 45.0
+
+
+def test_mapping_get_cache_uses_live_key_signature_for_same_size_mappings() -> None:
+    record = {"start_angle": math.radians(135)}
+    adapter_module._mapping_normalized_cache[(id(record), len(record), ("other_key",))] = [
+        ("otherkey", "other_key")
+    ]
+
+    assert round(adapter_module._extract_angle_degrees(record, "start_angle") or 0.0, 6) == 135.0
 
 
 def test_resolve_orientation_pins_angbase_angdir() -> None:
@@ -6034,6 +6224,8 @@ def test_libredwg_parse_build_memory_guard(tmp_path: Path) -> None:
 
         output_kind, output_key_count = adapter_module._summarize_output_payload(output_payload)
         run_result = adapter_module._DwgreadRunResult(
+            command=("dwgread", "-O", "JSON", "-o", "<tempdir>/dwgread.json", "<source>"),
+            sandboxed=False,
             stdout=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
             stderr=adapter_module._CapturedText(text="", byte_count=0, truncated=False),
             output_size_bytes=fixture_path.stat().st_size,

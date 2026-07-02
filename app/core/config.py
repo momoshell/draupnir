@@ -33,7 +33,19 @@ class Settings(BaseSettings):
 
     # Application settings
     max_upload_mb: int = 200
+    max_request_body_mb: int = 10
     libredwg_max_output_mb: int = 32
+    # Optional wrapper around dwgread, e.g. a local sandbox launcher. The command
+    # must include {binary}, {output}, and {source} placeholders.
+    libredwg_sandbox_command: str | None = None
+    libredwg_require_sandbox: bool = False
+    # Parser child-process resource caps (RLIMIT_AS / RLIMIT_CPU). OPT-IN: default
+    # None = unbounded, preserving the documented big-sheet envelope — a dense
+    # full-floor DWG (447 MB dwgread JSON, P-520001) needs multi-GB address space
+    # and can exceed 300s CPU inside the 600s adapter wall-clock. When enabling,
+    # size comfortably above that case (e.g. 6144 MB / 900 s).
+    parser_subprocess_max_memory_mb: int | None = None
+    parser_subprocess_cpu_seconds: int | None = None
     # Ingestion adapter execution timeout. Raise for dense full-floor DWGs
     # (e.g. 207k+ entities / 447 MB dwgread JSON): set ADAPTER_TIMEOUT_SECONDS=600
     # together with LIBREDWG_MAX_OUTPUT_MB=700 and worker --concurrency=1 (~3 GB RAM
@@ -76,11 +88,40 @@ class Settings(BaseSettings):
             raise ValueError("max_upload_mb must be positive")
         return value
 
+    @field_validator("max_request_body_mb")
+    @classmethod
+    def validate_max_request_body_mb(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("max_request_body_mb must be positive")
+        return value
+
     @field_validator("libredwg_max_output_mb")
     @classmethod
     def validate_libredwg_max_output_mb(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("libredwg_max_output_mb must be positive")
+        return value
+
+    @field_validator("libredwg_sandbox_command")
+    @classmethod
+    def validate_libredwg_sandbox_command(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("parser_subprocess_max_memory_mb")
+    @classmethod
+    def validate_parser_subprocess_max_memory_mb(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("parser_subprocess_max_memory_mb must be positive when set")
+        return value
+
+    @field_validator("parser_subprocess_cpu_seconds")
+    @classmethod
+    def validate_parser_subprocess_cpu_seconds(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("parser_subprocess_cpu_seconds must be positive when set")
         return value
 
     @field_validator("adapter_timeout_seconds")

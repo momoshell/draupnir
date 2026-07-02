@@ -19,6 +19,11 @@ from time import perf_counter
 from types import ModuleType
 from typing import Any, cast
 
+from app.core.config import settings
+from app.ingestion.adapters._process_limits import (
+    ParserProcessLimits,
+    apply_parser_process_limits,
+)
 from app.ingestion.canonical import build_entity_provenance
 from app.ingestion.contracts import (
     AdapterAvailability,
@@ -86,6 +91,12 @@ class PyMuPDFExtractionLimitError(RuntimeError):
 
     #: Coarse, content-free token surfaced to the runner/job for diagnosis.
     failure_reason = "extraction_limit"
+
+
+class PyMuPDFIsolationUnavailableError(RuntimeError):
+    """Raised when untrusted PDF parsing cannot run in an isolated child process."""
+
+    failure_reason = "isolation_unavailable"
 
 
 class _EntityBudgetError(PyMuPDFExtractionLimitError):
@@ -1668,10 +1679,10 @@ def _raise_if_cancelled(options: AdapterExecutionOptions) -> None:
         raise asyncio.CancelledError
 
 
-#: Runs an extraction request out-of-process and returns the result envelope. Raises
-#: AssertionError/OSError when a subprocess cannot be spawned (the caller then falls back to
-#: in-process extraction). Injectable so the spawn-failure/timeout/decode paths are testable
-#: with a fake runner, no real processes.
+#: Runs an extraction request out-of-process and returns the result envelope.
+#: AssertionError/OSError mean subprocess isolation could not be established; those failures
+#: must fail closed because PDF input is untrusted. Injectable so the spawn-failure/timeout/decode
+#: paths are testable with a fake runner, no real processes.
 SubprocessExtractionRunner = Callable[
     [_ProcessExtractionRequest, AdapterExecutionOptions], Awaitable[dict[str, Any]]
 ]
@@ -1712,9 +1723,10 @@ async def _extract_with_process(
     except (AssertionError, OSError) as exc:
         # A daemonic parent (e.g. a Celery prefork pool worker) cannot spawn child
         # processes — multiprocessing raises AssertionError("daemonic processes are not
-        # allowed to have children"). Subprocess isolation is unavailable here, so fall
-        # back to in-process extraction (cooperative budget timeout still applies).
-        return await _extract_in_current_process(request, reason=str(exc) or type(exc).__name__)
+        # allowed to have children"). Untrusted PDF parsing must not continue in-process.
+        raise PyMuPDFIsolationUnavailableError(
+            "PyMuPDF extraction requires subprocess isolation for untrusted PDF input."
+        ) from exc
     return _decode_process_envelope(envelope)
 
 
@@ -1723,11 +1735,11 @@ async def _extract_in_current_process(
     *,
     reason: str,
 ) -> tuple[dict[str, JSONValue], list[AdapterWarning]]:
-    """Run extraction in-process when subprocess isolation is unavailable.
+    """Run extraction in-process for trusted tests and explicitly local diagnostics.
 
     Reuses the exact child-process code path and envelope decoding, so error and
-    warning behaviour is identical to the isolated run. CPU-bound work is offloaded
-    to a worker thread to keep the event loop responsive.
+    warning behaviour is identical to the isolated run. Production untrusted ingestion
+    must use ``_extract_with_process`` so subprocess isolation failures fail closed.
     """
 
     envelope = await asyncio.to_thread(_extract_in_child_process, request)
@@ -1811,6 +1823,7 @@ async def _stop_process_handle(handle: _ProcessExtractionHandle) -> None:
 
 def _run_process_extraction_child(sender: Any, request: _ProcessExtractionRequest) -> None:
     try:
+        _configure_child_process_limits(request.timeout_seconds)
         sender.send(_extract_in_child_process(request))
     except BaseException:
         with suppress(Exception):
@@ -1823,6 +1836,22 @@ def _run_process_extraction_child(sender: Any, request: _ProcessExtractionReques
             )
     finally:
         sender.close()
+
+
+def _configure_child_process_limits(timeout_seconds: float | None) -> None:
+    # None = unbounded (opt-in caps); see config.parser_subprocess_* comments.
+    cpu_seconds: int | float | None = settings.parser_subprocess_cpu_seconds
+    if timeout_seconds is not None:
+        cpu_seconds = timeout_seconds if cpu_seconds is None else min(cpu_seconds, timeout_seconds)
+    max_memory_mb = settings.parser_subprocess_max_memory_mb
+    apply_parser_process_limits(
+        ParserProcessLimits(
+            max_address_space_bytes=(
+                max_memory_mb * 1024 * 1024 if max_memory_mb is not None else None
+            ),
+            max_cpu_seconds=cpu_seconds,
+        )
+    )
 
 
 def _extract_in_child_process(request: _ProcessExtractionRequest) -> dict[str, Any]:
