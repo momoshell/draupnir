@@ -17,13 +17,13 @@ from sqlalchemy import select
 import app.api.v1.revision_routes.service_takeoff as service_takeoff_route
 import app.db.session as session_module
 import app.jobs.worker as worker_module
-from app.api.v1.revision_routes.rooms import _resolve_rooms_with_family
 from app.api.v1.revision_routes.service_takeoff import _enqueue_rooms_materialization
 from app.ingestion.finalization import IngestFinalizationPayload, compute_adapter_result_checksum
 from app.ingestion.runner import IngestionRunRequest
 from app.ingestion.validation.reconciliation import build_reconciliation
 from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.room_loaders import load_rooms
+from app.interpretation.room_resolution import _resolve_rooms_with_family
 from app.jobs.room_materialization import ROOM_ALGO_VERSION, materialize_rooms
 from app.jobs.worker import process_ingest_job, process_rooms_job
 from app.models.drawing_revision import DrawingRevision

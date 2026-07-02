@@ -3,9 +3,9 @@
 Single entry point: ``load_room_registry`` fetches rooms from the DB and hands them
 to the pure ``build_room_registry``.
 
-The import of ``_resolve_rooms`` from ``app.api.v1.revision_routes.rooms`` is LAZY
-(inside the function body) to avoid an interpretation→api module cycle (#705 class).
-This mirrors the pattern used by ``service_takeoff_loaders``.
+``_resolve_rooms`` / ``_room_labels`` now live in ``app.interpretation.room_resolution``
+(#852), so this is a plain interpretation→interpretation import — the module-level lazy
+import that used to dodge the interpretation→api cycle (#705 class) is no longer needed.
 """
 
 from __future__ import annotations
@@ -15,13 +15,16 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.interpretation.devices import load_text_candidates
 from app.interpretation.geometry import point_in_polygon
+from app.interpretation.label_rooms import identify_rooms_from_labels
 from app.interpretation.room_fusion import (
     DEFAULT_VORONOI_CONFIDENCE,
     RoomRegistry,
     build_room_registry,
 )
 from app.interpretation.room_pipeline import ROOM_STRATEGY_AUTO
+from app.interpretation.room_resolution import _resolve_rooms, _room_labels
 from app.interpretation.room_voronoi import DEFAULT_BOUND_MARGIN_M, RoomTag
 from app.interpretation.rooms import Room
 
@@ -52,11 +55,6 @@ async def load_room_registry(
     RoomTag map.  Passed to ``build_room_registry`` so ``classify`` can
     sub-partition under-segmented polygons.
     """
-    # Lazy import — keeps this module importable without app.api at module level.
-    from app.api.v1.revision_routes.rooms import _resolve_rooms, _room_labels
-    from app.interpretation.devices import load_text_candidates
-    from app.interpretation.label_rooms import identify_rooms_from_labels
-
     exclude_off_sheet = scope == "sheet"
 
     result = await _resolve_rooms(

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.interpretation.label_rooms import has_genuine_room_identity
+from app.interpretation.room_resolution import _resolve_rooms_with_family
 from app.interpretation.rooms import Room
 from app.models.revision_room import RevisionRoom
 from app.models.revision_room_summary import RevisionRoomSummary
@@ -117,10 +118,6 @@ async def materialize_rooms(
         The genuine (surfaced) room set — the same rooms ``/rooms`` returns — which may be
         empty if the revision has no room geometry or labels with a genuine identity.
     """
-    # Lazy import avoids a jobs -> api.v1.revision_routes -> interpretation import cycle (mirrors
-    # the _resolve_input_family lazy import in service_takeoff_loaders.py, #705).
-    from app.api.v1.revision_routes.rooms import _resolve_rooms_with_family
-
     result, input_family = await _resolve_rooms_with_family(session, drawing_revision_id)
     rooms = [
         room for room in result.rooms if has_genuine_room_identity(room, input_family=input_family)

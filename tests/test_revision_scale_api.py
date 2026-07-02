@@ -582,13 +582,13 @@ class TestResolvePdfScale:
     """Unit tests for _resolve_pdf_scale — no DB required."""
 
     def test_returns_none_when_both_absent(self) -> None:
-        from app.api.v1.revision_routes.scale import _resolve_pdf_scale
+        from app.interpretation.scale_resolution import _resolve_pdf_scale
 
         assert _resolve_pdf_scale({}) is None
         assert _resolve_pdf_scale({"units": {"normalized": "unknown"}}) is None
 
     def test_top_level_wins_over_metadata_nested(self) -> None:
-        from app.api.v1.revision_routes.scale import _resolve_pdf_scale
+        from app.interpretation.scale_resolution import _resolve_pdf_scale
 
         top = {"status": "derived_from_text", "points_to_real": 1.0}
         nested = {"status": "unconfirmed"}
@@ -598,7 +598,7 @@ class TestResolvePdfScale:
         assert result["status"] == "derived_from_text"
 
     def test_metadata_nested_found_when_top_absent(self) -> None:
-        from app.api.v1.revision_routes.scale import _resolve_pdf_scale
+        from app.interpretation.scale_resolution import _resolve_pdf_scale
 
         nested = {"status": "derived_from_text", "points_to_real": 17.638889}
         canonical = {"metadata": {"pdf_scale": nested}}
@@ -608,7 +608,7 @@ class TestResolvePdfScale:
         assert result["points_to_real"] == pytest.approx(17.638889)
 
     def test_non_dict_top_level_falls_through_to_metadata(self) -> None:
-        from app.api.v1.revision_routes.scale import _resolve_pdf_scale
+        from app.interpretation.scale_resolution import _resolve_pdf_scale
 
         nested = {"status": "derived_from_text"}
         canonical = {"pdf_scale": "not_a_dict", "metadata": {"pdf_scale": nested}}
@@ -621,7 +621,7 @@ class TestEnrichUnitsFromPdfScale:
     """Unit tests for _enrich_units_from_pdf_scale — no DB required."""
 
     def test_enriches_when_all_gates_pass(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units = {"normalized": "unknown"}
         pdf_scale = {
@@ -634,7 +634,7 @@ class TestEnrichUnitsFromPdfScale:
         assert result["confidence"] == "confirmed"
 
     def test_does_not_mutate_original_units(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units: dict[str, Any] = {"normalized": "unknown"}
         pdf_scale = {
@@ -645,7 +645,7 @@ class TestEnrichUnitsFromPdfScale:
         assert units == {"normalized": "unknown"}
 
     def test_no_enrichment_for_non_pdf_family(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units = {"normalized": "unknown"}
         pdf_scale = {"status": "derived_from_text", "real_world_unit": "millimeter"}
@@ -654,7 +654,7 @@ class TestEnrichUnitsFromPdfScale:
             assert result.get("normalized") == "unknown", f"enriched for family={family}"
 
     def test_no_enrichment_for_unconfirmed_status(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units = {"normalized": "unknown"}
         for status in ("unconfirmed", "ambiguous_multi_scale", "not_set", None):
@@ -665,7 +665,7 @@ class TestEnrichUnitsFromPdfScale:
             assert result.get("normalized") == "unknown", f"enriched for status={status}"
 
     def test_no_enrichment_for_unknown_real_world_unit(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units = {"normalized": "unknown"}
         pdf_scale = {"status": "derived_from_text", "real_world_unit": "inch"}
@@ -673,7 +673,7 @@ class TestEnrichUnitsFromPdfScale:
         assert result.get("normalized") == "unknown"
 
     def test_no_enrichment_when_pdf_scale_none(self) -> None:
-        from app.api.v1.revision_routes.scale import _enrich_units_from_pdf_scale
+        from app.interpretation.scale_resolution import _enrich_units_from_pdf_scale
 
         units = {"normalized": "unknown"}
         result = _enrich_units_from_pdf_scale(units, None, "pdf_vector")

@@ -10,7 +10,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from app.api.v1.revision_routes.rooms import _device_placements, _room_labels
 from app.interpretation.devices import Device, _TagCandidate
 from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.room_pipeline import (
@@ -19,6 +18,7 @@ from app.interpretation.room_pipeline import (
     ROOM_STRATEGY_WALLS,
     interpret_rooms,
 )
+from app.interpretation.room_resolution import _device_placements, _room_labels
 from app.interpretation.rooms import DevicePlacement, RoomLabel
 
 
