@@ -5,13 +5,15 @@ Owns the pending/running staleness recovery sweep that runs on worker startup
 (claim/publish/release) that backs at-least-once broker publication for
 recoverable job types.
 
-#841 seam: ``reap_stale_running_jobs()`` will land here, beside the staleness
-detection primitives it depends on (``_is_stale_running_job`` /
-``_JobAttemptLease`` staleness in ``app.jobs.lifecycle``). It will be callable
-from a celery ``task_failure``/``worker_lost`` handler in ``app.jobs.worker``,
-now that the #850 heartbeat lease makes attempt staleness detectable without
-waiting for the coarse ``recover_incomplete_jobs`` startup sweep. Not
-implemented yet.
+#841: ``reap_stale_running_jobs()`` lives here, beside the staleness detection
+primitives it depends on (``_is_stale_running_job`` / lease staleness in
+``app.jobs.lifecycle``). It is called from a celery ``task_failure`` handler
+in ``app.jobs.worker`` when the failure is a ``WorkerLostError`` (fork
+SIGKILLed mid-job), now that the #850 heartbeat lease makes attempt staleness
+detectable without waiting for the coarse ``recover_incomplete_jobs`` startup
+sweep — a job orphaned by a crashed fork on a MainProcess that survives is
+otherwise never reaped, since worker-start recovery only runs once, at
+startup.
 """
 
 import uuid
@@ -34,6 +36,7 @@ from app.jobs.lifecycle import (
     _get_job_for_update,
     _is_stale_running_job,
     _LockedJobSource,
+    _persist_job_failed,
     _utcnow,
 )
 from app.models.job import Job
@@ -474,6 +477,88 @@ async def recover_incomplete_jobs(
     for job_id in recovered_job_ids:
         if await publish_job_enqueue_intent_func(job_id, recovery=True):
             enqueued_job_ids.append(job_id)
+
+    return enqueued_job_ids
+
+
+async def reap_stale_running_jobs(
+    *,
+    recoverable_enqueue_job_types: Any,
+    publish_job_enqueue_intent_func: Callable[..., Awaitable[bool]],
+    job_id: UUID | None = None,
+) -> list[UUID]:
+    """Reap ``running`` jobs whose attempt lease has expired without waiting for a worker restart.
+
+    This is the per-job core of ``recover_incomplete_jobs`` (same requeue-or-fail
+    semantics, same lease-staleness primitive) filtered to lease-stale ``running``
+    jobs only, callable outside the worker-startup sweep — notably from a celery
+    ``task_failure`` handler when a forked job process is SIGKILLed and the
+    MainProcess survives, so worker-start recovery never runs again to catch it.
+
+    When ``job_id`` is given, only that job is considered (still re-validating its
+    status/lease under the row lock, so a concurrent redelivery/reclaim wins the
+    race exactly as it would under ``recover_incomplete_jobs``).
+    """
+    session_maker = get_session_maker()
+    if session_maker is None:
+        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
+
+    now = _utcnow()
+
+    async with session_maker() as session:
+        statement = (
+            select(Job)
+            .where((Job.job_type.in_(recoverable_enqueue_job_types)) & (Job.status == "running"))
+            .order_by(Job.created_at.asc(), Job.id.asc())
+            .with_for_update(skip_locked=True)
+        )
+        if job_id is not None:
+            statement = statement.where(Job.id == job_id)
+
+        result = await session.execute(statement)
+        jobs = result.scalars().all()
+
+        recovered_job_ids: list[UUID] = []
+        failed_job_ids: list[UUID] = []
+        for job in jobs:
+            if not _is_stale_running_job(job, now=now, stale_after=_RUNNING_JOB_STALE_AFTER):
+                continue
+
+            if job.attempts >= job.max_attempts:
+                await _persist_job_failed(
+                    session,
+                    job,
+                    error_message=(
+                        f"Job exhausted its {job.max_attempts} attempt(s) after its worker"
+                        " process was lost."
+                    ),
+                    error_code=ErrorCode.MAX_ATTEMPTS_EXCEEDED,
+                    error_details={"attempts": job.attempts, "max_attempts": job.max_attempts},
+                )
+                failed_job_ids.append(job.id)
+                continue
+
+            job.status = "pending"
+            job.started_at = None
+            job.finished_at = None
+            job.error_code = None
+            job.error_message = None
+            _clear_job_attempt_lease(job)
+            prepare_job_enqueue_intent(job)
+            recovered_job_ids.append(job.id)
+
+        await session.commit()
+
+    for failed_job_id in failed_job_ids:
+        logger.warning(
+            "job_reaped_after_worker_lost_max_attempts_exceeded",
+            job_id=str(failed_job_id),
+        )
+
+    enqueued_job_ids: list[UUID] = []
+    for recovered_job_id in recovered_job_ids:
+        if await publish_job_enqueue_intent_func(recovered_job_id, recovery=True):
+            enqueued_job_ids.append(recovered_job_id)
 
     return enqueued_job_ids
 

@@ -16,7 +16,8 @@ from typing import Any, cast
 from uuid import UUID
 
 from celery import Celery
-from celery.signals import worker_ready
+from celery.exceptions import WorkerLostError
+from celery.signals import task_failure, worker_ready
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2486,6 +2487,83 @@ def recover_incomplete_ingest_jobs_on_worker_start(**_: object) -> None:
 
 
 worker_ready.connect(recover_incomplete_ingest_jobs_on_worker_start)
+
+
+async def reap_stale_running_job(job_id: UUID) -> list[UUID]:
+    """Reap a single lease-stale ``running`` job (see ``job_recovery.reap_stale_running_jobs``)."""
+    return await job_recovery.reap_stale_running_jobs(
+        recoverable_enqueue_job_types=_RECOVERABLE_ENQUEUE_JOB_TYPES,
+        publish_job_enqueue_intent_func=publish_job_enqueue_intent,
+        job_id=job_id,
+    )
+
+
+def _reap_job_after_worker_lost(task_id: str) -> None:
+    """Requeue-or-fail the job orphaned by a SIGKILLed fork, from a sync signal context."""
+    try:
+        job_id = UUID(task_id)
+    except (TypeError, ValueError):
+        logger.warning("job_reaped_after_worker_lost_invalid_task_id", task_id=task_id)
+        return
+
+    try:
+        reaped_job_ids = _run_worker_loop(lambda: reap_stale_running_job(job_id))
+    except Exception as exc:
+        logger.error(
+            "job_reaped_after_worker_lost_failed",
+            job_id=str(job_id),
+            error=str(exc),
+            exc_info=True,
+        )
+        return
+
+    if reaped_job_ids:
+        logger.info(
+            "job_reaped_after_worker_lost",
+            job_id=str(job_id),
+            requeued=True,
+        )
+    else:
+        logger.info(
+            "job_reaped_after_worker_lost",
+            job_id=str(job_id),
+            requeued=False,
+        )
+
+
+def _on_task_failure(
+    sender: Any = None,
+    task_id: str | None = None,
+    exception: BaseException | None = None,
+    **_: Any,
+) -> None:
+    """Reap the persisted job for a task the broker reports as worker-lost.
+
+    ``WorkerLostError`` is what celery's MainProcess raises via ``task_failure``
+    when a forked worker process disappears (e.g. OOM SIGKILL) — this celery
+    version has no separate ``worker_lost`` signal; ``task_failure`` with this
+    exception type on the MainProcess is the only observable signature (verified
+    against the installed celery's ``trace.handle_failure``, which sends
+    ``task_failure`` for exactly this case). Our task ids are the job ids
+    (``enqueue_ingest_job`` calls ``apply_async(task_id=str(job.id))``), so no
+    extra lookup is needed. This handler must never raise back into celery.
+    """
+    _ = sender
+    if task_id is None or not isinstance(exception, WorkerLostError):
+        return
+
+    try:
+        _reap_job_after_worker_lost(task_id)
+    except Exception as exc:
+        logger.error(
+            "job_reaped_after_worker_lost_failed",
+            task_id=task_id,
+            error=str(exc),
+            exc_info=True,
+        )
+
+
+task_failure.connect(_on_task_failure)
 
 
 @celery_app.task(
