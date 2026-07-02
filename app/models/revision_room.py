@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     ForeignKeyConstraint,
     Index,
+    Integer,
     String,
     UniqueConstraint,
 )
@@ -172,4 +173,22 @@ class RevisionRoom(RevisionLineageMixin, ProjectScopedMixin, TimestampMixin, Bas
         String(32),
         nullable=True,
         comment="Input family of the source drawing (e.g. dwg, pdf_vector)",
+    )
+    assigned_device_ids_json: Mapped[Any] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment=(
+            "device_ids assigned to this genuine room (persisted from live "
+            "result.device_assignments; expanded on read)."
+        ),
+    )
+    ordinal: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment=(
+            "Position of this room in the genuine `interpret_rooms` order; read path "
+            "orders by this to reproduce live item order."
+        ),
     )

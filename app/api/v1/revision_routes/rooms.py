@@ -28,6 +28,7 @@ from app.interpretation.devices import (
 )
 from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.loaders import load_revision_entities_by_type
+from app.interpretation.room_loaders import load_room_summary, load_rooms
 from app.interpretation.room_pipeline import (
     ROOM_STRATEGIES,
     ROOM_STRATEGY_AUTO,
@@ -41,7 +42,13 @@ from app.interpretation.rooms import (
     _smallest_containing_room,
 )
 from app.interpretation.service_takeoff_loaders import _resolve_input_family
-from app.models.revision_materialization import MATERIALIZATION_TIER_PRIMARY, RevisionEntity
+from app.models.revision_materialization import (
+    MATERIALIZATION_TIER_PRIMARY,
+    RevisionEntity,
+    RevisionEntityManifest,
+)
+from app.models.revision_room import RevisionRoom
+from app.models.revision_room_summary import RevisionRoomSummary
 from app.schemas.revision import RevisionEntityManifestRead
 from app.schemas.rooms import (
     DeviceRoomAssignmentRead,
@@ -93,6 +100,82 @@ async def list_revision_rooms(
     full ``modelspace`` (#583).
     """
     manifest = await _get_active_revision_manifest_or_409(revision_id, db)
+
+    # Read-path flip (#831): a version-scoped RevisionRoomSummary row is the materialized
+    # signal. A hit serves the persisted genuine room set directly (no recompute, no
+    # re-filter); a miss lazily enqueues materialization and falls back to the existing
+    # live-compute path so the response is never degraded.
+    summary_row = await load_room_summary(db, revision_id)
+    if summary_row is not None:
+        return await _list_revision_rooms_from_materialized(manifest, db, revision_id, summary_row)
+
+    # Lazy import avoids a rooms.py <-> service_takeoff.py import cycle (service_takeoff.py
+    # imports _resolve_rooms from this module).
+    from app.api.v1.revision_routes.service_takeoff import _enqueue_rooms_materialization
+
+    await _enqueue_rooms_materialization(
+        revision_id=revision_id,
+        project_id=manifest.project_id,
+        source_file_id=manifest.source_file_id,
+    )
+    return await _list_revision_rooms_live(
+        manifest,
+        db,
+        revision_id,
+        strategy=strategy,
+        device_layer=device_layer,
+        tag_layer=tag_layer,
+        snap_tolerance=snap_tolerance,
+        min_area=min_area,
+        max_depth=max_depth,
+        scope=scope,
+    )
+
+
+async def _list_revision_rooms_from_materialized(
+    manifest: RevisionEntityManifest,
+    db: AsyncSession,
+    revision_id: UUID,
+    summary_row: RevisionRoomSummary,
+) -> RevisionRoomListResponse:
+    """Build the /rooms response from persisted rows (materialized hit)."""
+    rooms, assignments = await load_rooms(db, revision_id)
+    named_rooms = sum(1 for room in rooms if room.name is not None)
+    strategy_value, source_layers = await _load_persisted_strategy_and_layers(db, revision_id)
+    return RevisionRoomListResponse(
+        manifest=RevisionEntityManifestRead.model_validate(manifest),
+        strategy=strategy_value,
+        source_layers=source_layers,
+        items=[_room_read(room) for room in rooms],
+        assignments=[
+            DeviceRoomAssignmentRead(device_id=assignment.device_id, room_id=assignment.room_id)
+            for assignment in assignments
+        ],
+        summary={
+            "rooms": len(rooms),
+            "named_rooms": named_rooms,
+            "assigned_devices": len(assignments),
+            # full_registry_size is the interpretation registry size at materialization time;
+            # the difference against the persisted genuine count is the suppressed count.
+            "unlabeled_polygon_count": summary_row.full_registry_size - len(rooms),
+        },
+    )
+
+
+async def _list_revision_rooms_live(
+    manifest: RevisionEntityManifest,
+    db: AsyncSession,
+    revision_id: UUID,
+    *,
+    strategy: str,
+    device_layer: list[str] | None,
+    tag_layer: list[str] | None,
+    snap_tolerance: float,
+    min_area: float,
+    max_depth: int,
+    scope: RoomScope,
+) -> RevisionRoomListResponse:
+    """Build the /rooms response by live recompute (materialization miss/provisional)."""
     result, input_family = await _resolve_rooms_with_family(
         db,
         revision_id,
@@ -118,6 +201,19 @@ async def list_revision_rooms(
     # to needs_review (PDF, #828 PR-3) would inflate named_rooms above the surfaced item count.
     named_rooms = sum(1 for room in identified_rooms if room.name is not None)
 
+    # Narrow assignments to genuine rooms (#831 read-path flip): the materialized/hit path only
+    # persists per-genuine-room device ids, so assignments to non-genuine (junk) polygons are
+    # structurally absent there. Apply the SAME narrowing here so the live/provisional (miss)
+    # response and the persisted (hit) response agree — otherwise the same revision's
+    # `assignments` list and `assigned_devices` count would shrink the moment materialization
+    # lands, mid lazy-enqueue window. Genuine assignments only (room_id in the surfaced set).
+    genuine_room_ids = {room.id for room in identified_rooms}
+    genuine_assignments = [
+        assignment
+        for assignment in result.device_assignments
+        if assignment.room_id in genuine_room_ids
+    ]
+
     return RevisionRoomListResponse(
         manifest=RevisionEntityManifestRead.model_validate(manifest),
         strategy=result.strategy,
@@ -125,17 +221,42 @@ async def list_revision_rooms(
         items=[_room_read(room) for room in identified_rooms],
         assignments=[
             DeviceRoomAssignmentRead(device_id=assignment.device_id, room_id=assignment.room_id)
-            for assignment in result.device_assignments
+            for assignment in genuine_assignments
         ],
         summary={
             "rooms": len(identified_rooms),
             "named_rooms": named_rooms,
-            "assigned_devices": len(result.device_assignments),
+            "assigned_devices": len(genuine_assignments),
             # Count of all suppressed non-room entries: anonymous polygons + spec-prose-named
             # cells. Kept for transparency so consumers can see internal registry size.
             "unlabeled_polygon_count": suppressed_count,
         },
     )
+
+
+async def _load_persisted_strategy_and_layers(
+    db: AsyncSession, revision_id: UUID
+) -> tuple[str, list[str]]:
+    """Return (strategy, source_layers) from any persisted room row for a revision.
+
+    ``strategy`` and ``source_layers_json`` are constant per materialization run (stamped
+    from the same ``RoomInterpretation.strategy`` / ``.source_layers`` on every row), so any
+    one row is representative. No rows (an empty genuine set) falls back to the current
+    ``auto`` default with no source layers.
+    """
+    from app.jobs.room_materialization import ROOM_ALGO_VERSION
+
+    row = await db.scalar(
+        select(RevisionRoom)
+        .where(
+            RevisionRoom.drawing_revision_id == revision_id,
+            RevisionRoom.algo_version == ROOM_ALGO_VERSION,
+        )
+        .limit(1)
+    )
+    if row is None:
+        return ROOM_STRATEGY_AUTO, []
+    return row.strategy, list(row.source_layers_json or [])
 
 
 @rooms_router.get(
