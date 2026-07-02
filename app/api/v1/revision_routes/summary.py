@@ -13,13 +13,13 @@ from app.api.v1.revision_lineage import (
     _get_active_validation_report,
     _manifest_counts,
 )
-from app.api.v1.revision_routes.rooms import _resolve_rooms_with_family
 from app.api.v1.revision_routes.scale import resolve_revision_scale
 from app.db.session import get_db
 from app.interpretation.devices import enumerate_devices
 from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.layer_roles import classify_layer_role
 from app.interpretation.room_loaders import load_room_summary, load_rooms
+from app.interpretation.room_resolution import _resolve_rooms_with_family
 from app.models.revision_materialization import RevisionLayer
 from app.schemas.revision_summary import RevisionSummaryRead
 from app.schemas.validation_report import ValidationReportCoverage

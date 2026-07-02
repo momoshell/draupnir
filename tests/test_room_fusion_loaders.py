@@ -67,8 +67,8 @@ async def test_load_room_registry_returns_registry() -> None:
     revision_id = uuid.uuid4()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         db = AsyncMock()
         registry = await load_room_registry(db, revision_id)
@@ -94,8 +94,8 @@ async def test_load_room_registry_passes_scope_as_exclude_off_sheet() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         await load_room_registry(db, revision_id, scope="sheet")
 
@@ -107,8 +107,8 @@ async def test_load_room_registry_passes_scope_as_exclude_off_sheet() -> None:
     mock_resolve.return_value = fake_result
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         await load_room_registry(db, revision_id, scope="modelspace")
 
@@ -134,8 +134,8 @@ async def test_load_room_registry_voronoi_fallback_propagated() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         registry = await load_room_registry(db, revision_id, voronoi_fallback=False)
 
@@ -209,8 +209,8 @@ async def test_multi_tag_polygon_map_has_three_tags() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         registry = await load_room_registry(db, revision_id)
 
@@ -251,8 +251,8 @@ async def test_multi_tag_polygon_classifies_near_each_tag() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         registry = await load_room_registry(db, revision_id)
 
@@ -299,8 +299,8 @@ async def test_single_tag_polygon_stays_polygon_basis() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         registry = await load_room_registry(db, revision_id)
 
@@ -334,8 +334,8 @@ async def test_sliver_polygon_zero_tags_no_error() -> None:
     db = AsyncMock()
 
     with (
-        patch("app.api.v1.revision_routes.rooms._resolve_rooms", mock_resolve),
-        patch("app.interpretation.devices.load_text_candidates", mock_load_text),
+        patch("app.interpretation.room_fusion_loaders._resolve_rooms", mock_resolve),
+        patch("app.interpretation.room_fusion_loaders.load_text_candidates", mock_load_text),
     ):
         registry = await load_room_registry(db, revision_id)
 
@@ -351,9 +351,10 @@ async def test_sliver_polygon_zero_tags_no_error() -> None:
 def test_room_fusion_loaders_imports_in_isolation_no_api_cycle() -> None:
     """app.interpretation.room_fusion_loaders must import without loading app.api (#705 class).
 
-    The lazy import of _resolve_rooms inside load_room_registry is what prevents
-    the interpretation→api cycle. This subprocess test proves the lazy guard holds
-    at module load time: importing the loader alone does not drag in app.api.
+    ``_resolve_rooms`` / ``_room_labels`` now live in ``app.interpretation.room_resolution``
+    (#852), a pure interpretation module with no ``app.api`` dependency, so the top-level
+    import here no longer needs the lazy-import dodge. This subprocess test proves the
+    invariant still holds: importing the loader alone does not drag in app.api.
 
     Arrange: script imports only room_fusion_loaders (no app.main bootstrap).
     Act:     run in fresh subprocess.

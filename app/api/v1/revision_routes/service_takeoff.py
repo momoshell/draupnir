@@ -15,12 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.revision_lineage import _get_active_revision_manifest_or_409
-from app.api.v1.revision_routes.rooms import _resolve_rooms
 from app.core.logging import get_logger
 from app.db.session import get_db, get_session_maker
 from app.ingestion.centerline_contract import _xy
 from app.interpretation.mechanical_legend import MechanicalLegend
 from app.interpretation.rise_drop import KIND_DROP, KIND_RISE, cluster_rise_drop_symbols
+from app.interpretation.room_resolution import _resolve_rooms
 from app.interpretation.routed_connectivity import refine_shared_by_connectivity
 from app.interpretation.routed_runs import identify_routed_runs
 from app.interpretation.run_service_identity import fuse_run_service_identities
