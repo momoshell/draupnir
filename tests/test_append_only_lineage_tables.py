@@ -32,6 +32,7 @@ from app.models.estimation_catalog import EstimationRate
 from app.models.export_job_input import ExportJobInput
 from app.models.job import Job, JobStatus, JobType
 from app.models.revision_room import RevisionRoom
+from app.models.revision_room_summary import RevisionRoomSummary
 from app.models.revision_routed_length import RevisionRoutedLength
 from tests import test_estimate_version_persistence as estimate_version_persistence
 from tests.conftest import (
@@ -101,6 +102,7 @@ class _ProtectedRowIds:
     revision_entity_id: uuid.UUID
     revision_routed_length_id: uuid.UUID
     revision_room_id: uuid.UUID
+    revision_room_summary_id: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,7 @@ def _row_id_for_table(row_ids: _ProtectedRowIds, table_name: str) -> uuid.UUID:
         "revision_entities": row_ids.revision_entity_id,
         "revision_routed_lengths": row_ids.revision_routed_length_id,
         "revision_rooms": row_ids.revision_room_id,
+        "revision_room_summary": row_ids.revision_room_summary_id,
     }
     return ids_by_table[table_name]
 
@@ -528,6 +531,20 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
             input_family="dwg",
         )
         session.add(revision_room)
+        await session.flush()
+        revision_room_summary = RevisionRoomSummary(
+            id=uuid.uuid4(),
+            project_id=quantity_seed.project_id,
+            source_file_id=quantity_seed.file_id,
+            extraction_profile_id=adapter_outputs[0].extraction_profile_id,
+            source_job_id=quantity_seed.ingest_job_id,
+            drawing_revision_id=drawing_revisions[0].id,
+            adapter_run_output_id=adapter_outputs[0].id,
+            canonical_entity_schema_version=_FAKE_RUNNER_CANONICAL_SCHEMA_VERSION,
+            algo_version="test",
+            full_registry_size=1,
+        )
+        session.add(revision_room_summary)
         await session.commit()
 
     assert len(adapter_outputs) == 1
@@ -574,6 +591,7 @@ async def _seed_protected_rows(async_client: httpx.AsyncClient) -> _ProtectedRow
         revision_entity_id=entities[0].id,
         revision_routed_length_id=revision_routed_length.id,
         revision_room_id=revision_room.id,
+        revision_room_summary_id=revision_room_summary.id,
     )
 
 

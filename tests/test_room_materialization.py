@@ -23,11 +23,13 @@ from app.ingestion.finalization import IngestFinalizationPayload, compute_adapte
 from app.ingestion.runner import IngestionRunRequest
 from app.ingestion.validation.reconciliation import build_reconciliation
 from app.interpretation.label_rooms import has_genuine_room_identity
+from app.interpretation.room_loaders import load_rooms
 from app.jobs.room_materialization import ROOM_ALGO_VERSION, materialize_rooms
 from app.jobs.worker import process_ingest_job, process_rooms_job
 from app.models.drawing_revision import DrawingRevision
 from app.models.job import Job, JobType
 from app.models.revision_room import RevisionRoom
+from app.models.revision_room_summary import RevisionRoomSummary
 from tests.conftest import requires_database, truncate_projects_cascade_for_cleanup
 from tests.jobs_test_helpers import _create_project, _get_job_for_file, _upload_file
 from tests.test_ingest_output_persistence import _load_project_outputs
@@ -262,6 +264,21 @@ async def _load_room_rows(revision_id: UUID) -> list[RevisionRoom]:
         )
 
 
+async def _load_summary_rows(revision_id: UUID) -> list[RevisionRoomSummary]:
+    async with _get_session() as session:
+        return list(
+            (
+                await session.execute(
+                    select(RevisionRoomSummary).where(
+                        RevisionRoomSummary.drawing_revision_id == revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+
 # ---------------------------------------------------------------------------
 # DB-backed tests
 # ---------------------------------------------------------------------------
@@ -329,6 +346,69 @@ async def test_room_materialization_rows_match_interpret_rooms_registry(
             assert row.bounds_min_x is None
             assert row.bounds_max_x is None
         assert row.algo_version == ROOM_ALGO_VERSION
+        expected_device_ids = [
+            a.device_id for a in result.device_assignments if a.room_id == room.id
+        ]
+        assert row.assigned_device_ids_json == expected_device_ids
+
+    summary_rows = await _load_summary_rows(seed.drawing_revision_id)
+    assert len(summary_rows) == 1
+    assert summary_rows[0].algo_version == ROOM_ALGO_VERSION
+    assert summary_rows[0].full_registry_size == len(result.rooms)
+
+
+@requires_database
+async def test_load_rooms_reconstructs_the_live_genuine_set(
+    async_client: httpx.AsyncClient,
+    cleanup_db: Any,
+    enqueued_job_ids: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#831 Phase 2 gate 9: load_rooms reconstructs Room objects matching the live genuine
+    set on every RoomRead-relevant field (not just the persisted-row spot checks above).
+    """
+    seed = await _ingest_and_seed(
+        async_client, monkeypatch, entities=_ROOM_ENTITIES, input_family="dxf"
+    )
+    await _enqueue_and_run_rooms(seed)
+
+    async with _get_session() as session:
+        result, input_family = await _resolve_rooms_with_family(session, seed.drawing_revision_id)
+    expected_rooms = {
+        room.id: room
+        for room in result.rooms
+        if has_genuine_room_identity(room, input_family=input_family)
+    }
+
+    async with _get_session() as session:
+        loaded_rooms, loaded_assignments = await load_rooms(session, seed.drawing_revision_id)
+
+    assert {room.id for room in loaded_rooms} == set(expected_rooms.keys())
+    for loaded_room in loaded_rooms:
+        live_room = expected_rooms[loaded_room.id]
+        assert loaded_room.name == live_room.name
+        assert loaded_room.number == live_room.number
+        assert loaded_room.source == live_room.source
+        assert loaded_room.needs_review == live_room.needs_review
+        assert loaded_room.confidence == live_room.confidence
+        assert loaded_room.bounds == live_room.bounds
+        assert loaded_room.anchors == live_room.anchors
+        assert loaded_room.location == live_room.location
+        if live_room.area is not None:
+            assert loaded_room.area == pytest.approx(live_room.area)
+        else:
+            assert loaded_room.area is None
+
+    # Assignment SET equality: per-room expansion groups assignments by room while the
+    # live pipeline groups by phase, so order is not a contract -- membership is (this
+    # still proves the M1 no-extra/no-missing fix).
+    expected_pairs = [
+        (a.device_id, a.room_id) for a in result.device_assignments if a.room_id in expected_rooms
+    ]
+    loaded_pairs = [(a.device_id, a.room_id) for a in loaded_assignments]
+    assert set(loaded_pairs) == set(expected_pairs)
+    loaded_device_ids = [pair[0] for pair in loaded_pairs]
+    assert len(loaded_device_ids) == len(set(loaded_device_ids))
 
 
 @requires_database
@@ -348,6 +428,9 @@ async def test_room_materialization_idempotency(
     assert rows_first, "Expected rows after first materialization"
     row = rows_first[0]
 
+    summary_rows_first = await _load_summary_rows(seed.drawing_revision_id)
+    assert len(summary_rows_first) == 1
+
     # Run materialization a second time directly to exercise ON CONFLICT DO NOTHING.
     # Reuse the original ROOMS job id (source_job_id has an FK to jobs).
     async with _get_session() as session:
@@ -366,6 +449,10 @@ async def test_room_materialization_idempotency(
     assert len(rows_first) == len(rows_second), (
         f"Expected idempotent insert: first={len(rows_first)}, second={len(rows_second)}"
     )
+
+    summary_rows_second = await _load_summary_rows(seed.drawing_revision_id)
+    assert len(summary_rows_second) == 1, "Expected idempotent summary insert (ON CONFLICT)"
+    assert summary_rows_second[0].id == summary_rows_first[0].id
 
 
 @requires_database

@@ -254,6 +254,7 @@ APPEND_ONLY_PROTECTED_TABLES: tuple[str, ...] = (
     "revision_entities",
     "revision_routed_lengths",
     "revision_rooms",
+    "revision_room_summary",
 )
 _PROJECT_TRUNCATE_CASCADE_CATALOG_TABLES: tuple[str, ...] = (
     "formula_definition_supersessions",
@@ -333,6 +334,7 @@ _DB_LANE_BY_TEST_FILE_KEY: dict[str, str] = {
     "centerline_enqueue": "db_worker",
     "jobs_centerline_materialization": "db_worker",
     "room_materialization": "db_worker",
+    "rooms_readpath_flip": "db_worker",
     "floor_registration_loaders": "db_worker",
     "append_only_lineage_tables": "db_lineage",
     "changeset_validation": "db_lineage",

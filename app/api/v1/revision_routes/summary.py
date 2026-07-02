@@ -19,6 +19,7 @@ from app.db.session import get_db
 from app.interpretation.devices import enumerate_devices
 from app.interpretation.label_rooms import has_genuine_room_identity
 from app.interpretation.layer_roles import classify_layer_role
+from app.interpretation.room_loaders import load_room_summary, load_rooms
 from app.models.revision_materialization import RevisionLayer
 from app.schemas.revision_summary import RevisionSummaryRead
 from app.schemas.validation_report import ValidationReportCoverage
@@ -61,17 +62,33 @@ async def get_revision_summary(
     # Devices (mirrors /devices default enumeration).
     devices = await enumerate_devices(db, revision_id)
 
-    # Rooms — go through the SAME resolver as /rooms (its defaults: auto strategy + printed-sheet
-    # scope + all-text labels) so the two endpoints can never disagree on room counts (#584/#792).
-    # Apply the same presentation filter as /rooms, family-aware (#828 PR-3): only genuine rooms
-    # (valid number or real name on DWG/other; PDF requires a plausible number, see
-    # has_genuine_room_identity).
-    rooms_result, input_family = await _resolve_rooms_with_family(db, revision_id)
-    genuine_rooms = [
-        room
-        for room in rooms_result.rooms
-        if has_genuine_room_identity(room, input_family=input_family)
-    ]
+    # Rooms — read-path flip (#831): a version-scoped RevisionRoomSummary row is the
+    # materialized signal. A hit serves the persisted genuine room set directly (no
+    # re-filter — persisted rows are already genuine); a miss lazily enqueues
+    # materialization and falls back to the live resolver (#584/#792), keeping /summary
+    # and /rooms in agreement either way.
+    summary_row = await load_room_summary(db, revision_id)
+    if summary_row is not None:
+        genuine_rooms, _assignments = await load_rooms(db, revision_id)
+    else:
+        # Lazy import avoids a summary.py <-> service_takeoff.py import cycle
+        # (service_takeoff.py imports _resolve_rooms from rooms.py).
+        from app.api.v1.revision_routes.service_takeoff import _enqueue_rooms_materialization
+
+        await _enqueue_rooms_materialization(
+            revision_id=revision_id,
+            project_id=manifest.project_id,
+            source_file_id=manifest.source_file_id,
+        )
+        # Apply the same presentation filter as /rooms, family-aware (#828 PR-3): only genuine
+        # rooms (valid number or real name on DWG/other; PDF requires a plausible number, see
+        # has_genuine_room_identity).
+        rooms_result, input_family = await _resolve_rooms_with_family(db, revision_id)
+        genuine_rooms = [
+            room
+            for room in rooms_result.rooms
+            if has_genuine_room_identity(room, input_family=input_family)
+        ]
     named_rooms = sum(1 for room in genuine_rooms if room.name is not None)
 
     # Scale/units (A3) + the extraction-coverage block (validation report).
