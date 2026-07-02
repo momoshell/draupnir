@@ -3,15 +3,12 @@
 # ruff: noqa: SLF001
 
 import asyncio
-import atexit
 import hashlib
 import inspect
-import threading
 from collections.abc import Callable, Coroutine
-from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -52,9 +49,11 @@ from app.exports.revision_json import (
     RevisionJsonExportError,
     render_revision_json_export,
 )
-from app.ingestion.contracts import AdapterTimeout, InputFamily, ProgressUpdate
+from app.ingestion.contracts import AdapterTimeout, InputFamily
 from app.ingestion.finalization import IngestFinalizationPayload
 from app.ingestion.runner import IngestionRunnerError, IngestionRunRequest, run_ingestion
+from app.jobs import attempt_leases as job_attempt_leases
+from app.jobs import execution_monitors as job_execution_monitors
 from app.jobs import lifecycle as job_lifecycle
 from app.jobs import recovery as job_recovery
 from app.jobs import runner as job_runner
@@ -200,9 +199,11 @@ _ENQUEUE_STATUS_PUBLISHING = job_recovery._ENQUEUE_STATUS_PUBLISHING
 _ENQUEUE_STATUS_PUBLISHED = job_recovery._ENQUEUE_STATUS_PUBLISHED
 _DEFAULT_ADAPTER_TIMEOUT = timedelta(minutes=5)
 _RUNNING_JOB_STALE_AFTER = job_recovery._RUNNING_JOB_STALE_AFTER
-_JOB_ATTEMPT_LEASE_RENEW_INTERVAL = _RUNNING_JOB_STALE_AFTER / 3
+_JOB_ATTEMPT_LEASE_RENEW_INTERVAL = job_attempt_leases._JOB_ATTEMPT_LEASE_RENEW_INTERVAL
 _ENQUEUE_LEASE_DURATION = job_recovery._ENQUEUE_LEASE_DURATION
-_JOB_CANCELLATION_POLL_INTERVAL_SECONDS = 0.1
+_JOB_CANCELLATION_POLL_INTERVAL_SECONDS = (
+    job_execution_monitors._JOB_CANCELLATION_POLL_INTERVAL_SECONDS
+)
 _ENQUEUE_BACKOFF_BASE_SECONDS = job_recovery._ENQUEUE_BACKOFF_BASE_SECONDS
 _ENQUEUE_BACKOFF_MAX_SECONDS = job_recovery._ENQUEUE_BACKOFF_MAX_SECONDS
 _enqueue_backoff_seconds = job_recovery._enqueue_backoff_seconds
@@ -264,9 +265,6 @@ _SAFE_RUNNER_ERROR_DETAIL_KEYS = (
     "output_size_bytes",
 )
 
-_WORKER_LOOP_RUNNER: asyncio.Runner | None = None
-_WORKER_LOOP_RUNNER_LOCK = threading.Lock()
-
 
 def is_ingest_worker_job_type(job_type: JobType | str) -> bool:
     """Return whether a job type is published to the ingest worker."""
@@ -300,15 +298,7 @@ _StaleJobAttemptError = job_lifecycle._StaleJobAttemptError
 
 
 _RevisionConflictError = job_lifecycle._RevisionConflictError
-
-
-@dataclass(frozen=True, slots=True)
-class _QueuedJobEvent:
-    """Buffered job event persisted by the progress drain."""
-
-    level: str
-    message: str
-    data_json: dict[str, Any]
+_QueuedJobEvent = job_execution_monitors._QueuedJobEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -710,69 +700,20 @@ _JobLockBootstrap = job_lifecycle._JobLockBootstrap
 _LockedJobSource = job_lifecycle._LockedJobSource
 
 
-class _PersistedJobCancellationHandle:
-    """Cancellation handle backed by worker polling."""
-
-    def __init__(self) -> None:
-        self._cancel_requested = False
-
-    def is_cancelled(self) -> bool:
-        return self._cancel_requested
-
-    def mark_cancelled(self) -> None:
-        self._cancel_requested = True
+_PersistedJobCancellationHandle = job_execution_monitors._PersistedJobCancellationHandle
+_progress_event_data = job_execution_monitors._progress_event_data
 
 
-class _JobProgressEventBridge:
-    """Synchronous progress callback with async DB draining."""
+class _JobProgressEventBridge(job_execution_monitors._JobProgressEventBridge):
+    """Synchronous progress callback with async DB draining.
 
-    _STOP = object()
+    Thin subclass so ``worker_module._JobProgressEventBridge(job_id,
+    attempt_token=...)`` keeps its original two-argument call shape while
+    injecting the worker's current (possibly test-patched) ``emit_job_event``.
+    """
 
     def __init__(self, job_id: UUID, *, attempt_token: UUID) -> None:
-        self._job_id = job_id
-        self._attempt_token = attempt_token
-        self._queue: asyncio.Queue[_QueuedJobEvent | object] = asyncio.Queue()
-        self._drain_task = asyncio.create_task(self._drain())
-        self._closed = False
-
-    def callback(self, update: ProgressUpdate) -> None:
-        if self._closed:
-            raise RuntimeError("Progress callback received update after bridge closed.")
-
-        self._queue.put_nowait(
-            _QueuedJobEvent(
-                level="info",
-                message=update.message or f"Job progress: {update.stage}",
-                data_json=_progress_event_data(update),
-            )
-        )
-
-    async def flush(self) -> None:
-        if self._closed:
-            await self._drain_task
-            return
-
-        self._closed = True
-        self._queue.put_nowait(self._STOP)
-        await self._drain_task
-
-    async def _drain(self) -> None:
-        while True:
-            queued = await self._queue.get()
-            try:
-                if queued is self._STOP:
-                    return
-
-                assert isinstance(queued, _QueuedJobEvent)
-                await emit_job_event(
-                    self._job_id,
-                    level=queued.level,
-                    message=queued.message,
-                    data_json=queued.data_json,
-                    attempt_token=self._attempt_token,
-                )
-            finally:
-                self._queue.task_done()
+        super().__init__(job_id, attempt_token=attempt_token, emit_job_event_func=emit_job_event)
 
 
 celery_app = Celery(
@@ -794,35 +735,9 @@ celery_app.autodiscover_tasks(["app.jobs"], force=True)
 
 _utcnow = job_lifecycle._utcnow
 
-
-def _get_worker_loop_runner() -> asyncio.Runner:
-    """Return the reusable asyncio runner for sync Celery entrypoints."""
-    global _WORKER_LOOP_RUNNER
-    if _WORKER_LOOP_RUNNER is None:
-        _WORKER_LOOP_RUNNER = asyncio.Runner()
-    return _WORKER_LOOP_RUNNER
-
-
-def _close_worker_loop_runner() -> None:
-    """Close and clear the reusable asyncio runner."""
-    global _WORKER_LOOP_RUNNER
-    with _WORKER_LOOP_RUNNER_LOCK:
-        runner = _WORKER_LOOP_RUNNER
-        if runner is None:
-            return
-        runner.close()
-        _WORKER_LOOP_RUNNER = None
-
-
-def _run_worker_loop[WorkerLoopResultT](
-    coro_factory: Callable[[], Coroutine[Any, Any, WorkerLoopResultT]],
-) -> WorkerLoopResultT:
-    """Run a worker coroutine on the process-local reusable event loop."""
-    with _WORKER_LOOP_RUNNER_LOCK:
-        return _get_worker_loop_runner().run(coro_factory())
-
-
-atexit.register(_close_worker_loop_runner)
+_get_worker_loop_runner = job_execution_monitors._get_worker_loop_runner
+_close_worker_loop_runner = job_execution_monitors._close_worker_loop_runner
+_run_worker_loop = job_execution_monitors._run_worker_loop
 
 
 _clear_job_attempt_lease = job_lifecycle._clear_job_attempt_lease
@@ -830,73 +745,15 @@ _clear_enqueue_intent_lease = job_recovery._clear_enqueue_intent_lease
 prepare_job_enqueue_intent = job_recovery.prepare_job_enqueue_intent
 
 
-def _claim_job_attempt_lease(
-    job: Job,
-    *,
-    now: datetime,
-    increment_attempt: bool,
-    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
-) -> _JobAttemptLease:
-    """Mint and persist a fresh job-attempt ownership lease."""
-    return job_lifecycle._claim_job_attempt_lease(
-        job,
-        now=now,
-        increment_attempt=increment_attempt,
-        stale_after=stale_after,
-    )
-
-
+_claim_job_attempt_lease = job_attempt_leases._claim_job_attempt_lease
 _job_attempt_is_current = job_lifecycle._job_attempt_is_current
 _renew_job_attempt_lease_for_update = job_lifecycle._renew_job_attempt_lease_for_update
 _job_is_safe_recovery_failure_target = job_recovery._job_is_safe_recovery_failure_target
-
-
-def _is_stale_running_job(
-    job: Job,
-    *,
-    now: datetime,
-    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
-) -> bool:
-    """Return whether a running job is old enough to treat as orphaned."""
-    return job_lifecycle._is_stale_running_job(
-        job,
-        now=now,
-        stale_after=stale_after,
-    )
-
-
-async def _renew_job_attempt_lease(
-    job_id: UUID,
-    *,
-    attempt_token: UUID,
-    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
-) -> _JobAttemptLease | None:
-    """Extend a persisted job-attempt lease if this worker still owns it."""
-    return await _renew_job_attempt_lease_for_update(
-        job_id,
-        attempt_token=attempt_token,
-        stale_after=stale_after,
-        session_maker_factory=get_session_maker,
-    )
-
-
-async def _renew_job_attempt_lease_until_cancelled(
-    job_id: UUID,
-    *,
-    attempt_token: UUID,
-    stale_after: timedelta = _RUNNING_JOB_STALE_AFTER,
-    interval: timedelta = _JOB_ATTEMPT_LEASE_RENEW_INTERVAL,
-) -> None:
-    """Keep an active job attempt from being reclaimed while execution is still alive."""
-    while True:
-        await asyncio.sleep(interval.total_seconds())
-        lease = await _renew_job_attempt_lease(
-            job_id,
-            attempt_token=attempt_token,
-            stale_after=stale_after,
-        )
-        if lease is None:
-            raise _StaleJobAttemptError(f"Job attempt for '{job_id}' no longer owns the lease")
+_is_stale_running_job = job_attempt_leases._is_stale_running_job
+_renew_job_attempt_lease = job_attempt_leases._renew_job_attempt_lease
+_renew_job_attempt_lease_until_cancelled = (
+    job_attempt_leases._renew_job_attempt_lease_until_cancelled
+)
 
 
 async def _with_job_attempt_lease_renewal[ResultT](
@@ -905,32 +762,20 @@ async def _with_job_attempt_lease_renewal[ResultT](
     job_id: UUID,
     attempt_token: UUID,
 ) -> ResultT:
-    """Run job work while a companion task renews the persisted attempt lease."""
-    work_task = asyncio.create_task(work)
-    renewal_task = asyncio.create_task(
-        _renew_job_attempt_lease_until_cancelled(job_id, attempt_token=attempt_token)
-    )
-    try:
-        done, _pending = await asyncio.wait(
-            {work_task, renewal_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if renewal_task in done:
-            work_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await work_task
-            await renewal_task
+    """Run job work while a companion task renews the persisted attempt lease.
 
-        renewal_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await renewal_task
-        return await work_task
-    finally:
-        for task in (work_task, renewal_task):
-            if not task.done():
-                task.cancel()
-        with suppress(asyncio.CancelledError):
-            await renewal_task
+    Thin wrapper (not a direct alias) so tests that monkeypatch
+    ``worker_module._renew_job_attempt_lease_until_cancelled`` are honored: this
+    calls the renewal loop through ``attempt_leases`` but the actual renewal
+    task run by ``app.jobs.attempt_leases._with_job_attempt_lease_renewal``
+    resolves the loop by late-bound worker-module lookup below.
+    """
+    return await job_attempt_leases._with_job_attempt_lease_renewal(
+        work,
+        job_id=job_id,
+        attempt_token=attempt_token,
+        renew_until_cancelled_func=_renew_job_attempt_lease_until_cancelled,
+    )
 
 
 _is_stale_enqueue_intent = job_recovery._is_stale_enqueue_intent
@@ -1305,24 +1150,6 @@ async def emit_job_event(
     )
 
 
-def _progress_event_data(update: ProgressUpdate) -> dict[str, Any]:
-    """Build a stable persisted progress event payload."""
-    data_json: dict[str, Any] = {
-        "status": "running",
-        "event": "progress",
-        "stage": update.stage,
-    }
-    if update.message is not None:
-        data_json["detail"] = update.message
-    if update.completed is not None:
-        data_json["completed"] = update.completed
-    if update.total is not None:
-        data_json["total"] = update.total
-    if update.percent is not None:
-        data_json["percent"] = update.percent
-    return data_json
-
-
 def _runner_error_log_fields(exc: IngestionRunnerError) -> dict[str, Any]:
     """Return whitelisted structured fields for expected runner failures."""
     data_json: dict[str, Any] = {
@@ -1373,37 +1200,14 @@ async def _poll_job_cancellation(
     stop_event: asyncio.Event,
 ) -> None:
     """Poll persisted cancellation without holding DB locks during execution."""
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    while not stop_event.is_set() and not cancellation.is_cancelled():
-        async with session_maker() as session:
-            job = await session.get(Job, job_id)
-
-        if job is None:
-            raise LookupError(f"Job with identifier '{job_id}' not found")
-
-        if job.cancel_requested:
-            cancellation.mark_cancelled()
-            run_task.cancel()
-            return
-
-        if job.status == "cancelled":
-            cancellation.mark_cancelled()
-            run_task.cancel()
-            return
-
-        if not _job_attempt_is_current(job, attempt_token=attempt_token):
-            return
-
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=_JOB_CANCELLATION_POLL_INTERVAL_SECONDS,
-            )
-        except TimeoutError:
-            continue
+    return await job_execution_monitors._poll_job_cancellation(
+        job_id,
+        attempt_token=attempt_token,
+        cancellation=cancellation,
+        run_task=run_task,
+        stop_event=stop_event,
+        job_attempt_is_current_func=_job_attempt_is_current,
+    )
 
 
 async def _cancel_registered_job_if_requested(
@@ -1423,40 +1227,17 @@ async def _cancel_registered_job_if_requested(
     immediately instead of waiting until finalization. Cancellation that arrives *during*
     a synchronous compute is still only observed at the finalize row-lock.
     """
-    session_maker = get_session_maker()
-    if session_maker is None:
-        raise RuntimeError("Database is not configured. Set DATABASE_URL environment variable.")
-
-    async with session_maker() as session:
-        job = await session.get(Job, job_id)
-
-    if job is None:
-        raise LookupError(f"Job with identifier '{job_id}' not found")
-
-    if not _job_attempt_is_current(job, attempt_token=attempt_token):
-        return False
-
-    if not job.cancel_requested and job.status != "cancelled":
-        return False
-
-    cancelled = await _mark_job_cancelled(job_id, attempt_token=attempt_token)
-    if cancelled:
-        logger.info(log_event, job_id=str(job_id))
-    return cancelled
+    return await job_execution_monitors._cancel_registered_job_if_requested(
+        job_id,
+        attempt_token=attempt_token,
+        log_event=log_event,
+        job_attempt_is_current_func=_job_attempt_is_current,
+        mark_job_cancelled_func=_mark_job_cancelled,
+        logger_instance=logger,
+    )
 
 
-async def _stop_job_execution_monitor(
-    *,
-    progress_bridge: _JobProgressEventBridge,
-    stop_event: asyncio.Event,
-    cancellation_task: asyncio.Task[None],
-) -> None:
-    """Flush queued progress and stop background execution monitors."""
-    stop_event.set()
-    try:
-        await cancellation_task
-    finally:
-        await progress_bridge.flush()
+_stop_job_execution_monitor = job_execution_monitors._stop_job_execution_monitor
 
 
 async def _persist_job_failed(
