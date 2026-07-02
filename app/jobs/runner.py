@@ -15,6 +15,7 @@ type JobTypeName = Literal[
     "export",
     "changeset_apply",
     "centerline",
+    "rooms",
 ]
 
 
@@ -111,6 +112,15 @@ JOB_HANDLERS: Final[tuple[JobHandler, ...]] = (
         enqueue_publisher_name="enqueue_centerline_job",
         enqueue_error_message="Failed to enqueue centerline job",
     ),
+    JobHandler(
+        job_type_name="rooms",
+        execute_name="_execute_rooms_job_attempt",
+        finalize_name="_finalize_rooms_job",
+        process_name="process_rooms_job",
+        run_task_name="run_rooms_job",
+        enqueue_publisher_name="enqueue_rooms_job",
+        enqueue_error_message="Failed to enqueue rooms job",
+    ),
 )
 
 _JOB_HANDLERS_BY_TYPE: Final[dict[str, JobHandler]] = {
@@ -203,6 +213,19 @@ BEGIN_OR_RESUME_ROUTES: Final[tuple[BeginOrResumeRoute, ...]] = (
             duplicate_delivery="centerline_job_duplicate_delivery_skipped_running_attempt",
             max_attempts_exceeded="centerline_job_max_attempts_exceeded",
             cancelled="centerline_job_cancelled",
+        ),
+    ),
+    BeginOrResumeRoute(
+        process_name="process_rooms_job",
+        supported_job_types=_job_types_for_process("process_rooms_job"),
+        log_keys=BeginOrResumeLogKeys(
+            unsupported_type="rooms_job_unsupported_type_skipped",
+            terminal_status="rooms_job_skipped_terminal_status",
+            inactive_source="rooms_job_cancelled_inactive_source",
+            reclaimed_stale_running="rooms_job_reclaimed_stale_running_status",
+            duplicate_delivery="rooms_job_duplicate_delivery_skipped_running_attempt",
+            max_attempts_exceeded="rooms_job_max_attempts_exceeded",
+            cancelled="rooms_job_cancelled",
         ),
     ),
 )

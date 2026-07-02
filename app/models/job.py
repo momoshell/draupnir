@@ -31,6 +31,7 @@ class JobType(StrEnum):
     EXPORT = "export"
     CHANGESET_APPLY = "changeset_apply"
     CENTERLINE = "centerline"
+    ROOMS = "rooms"
 
 
 class JobStatus(StrEnum):
@@ -55,6 +56,7 @@ _BASE_REQUIRED_JOB_TYPE_VALUES = (
     JobType.EXPORT.value,
     JobType.CHANGESET_APPLY.value,
     JobType.CENTERLINE.value,
+    JobType.ROOMS.value,
 )
 _EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
     JobType.QUANTITY_TAKEOFF.value,
@@ -62,6 +64,7 @@ _EXTRACTION_PROFILE_FORBIDDEN_JOB_TYPE_VALUES = (
     JobType.EXPORT.value,
     JobType.CHANGESET_APPLY.value,
     JobType.CENTERLINE.value,
+    JobType.ROOMS.value,
 )
 
 
